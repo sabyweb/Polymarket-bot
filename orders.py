@@ -1,4 +1,6 @@
 import logging
+import requests as req
+import json
 from py_clob_client.clob_types import OrderArgs
 from py_clob_client.order_builder.constants import BUY, SELL
 from config import (
@@ -12,6 +14,8 @@ from alerts import (
 
 log = logging.getLogger(__name__)
 
+GAMMA_API = "https://gamma-api.polymarket.com"
+
 
 class OrderManager:
 
@@ -22,11 +26,31 @@ class OrderManager:
         self.active_orders    = {}
         self.failure_counts   = {"yes": 0, "no": 0}
 
+    # ── Fresh Price Fetch ─────────────────────────────────────────────────────
+    def _fetch_fresh_yes_price(self):
+        """
+        Fetch the latest yes_price directly from Gamma API
+        for this specific market. Called when order book is sparse.
+        """
+        try:
+            condition_id = self.market["condition_id"]
+            url          = f"{GAMMA_API}/markets"
+            params       = {"conditionId": condition_id}
+            response     = req.get(url, params=params, timeout=5)
+            data         = response.json()
+            if data and isinstance(data, list):
+                prices = json.loads(data[0].get("outcomePrices", "[]"))
+                if prices:
+                    return float(prices[0])
+        except Exception as e:
+            log.debug(f"Could not fetch fresh yes_price: {e}")
+        return None
+
     # ── Order Book ────────────────────────────────────────────────────────────
     def get_best_prices(self):
         """
-        Fetch live order book. If the book is sparse (spread > 50%),
-        fall back to yes_price from Gamma API as midpoint reference.
+        Fetch live order book. If sparse, fetch fresh yes_price
+        from Gamma API rather than using stale stored value.
         """
         try:
             token_id   = self.market["token_ids"][0]
@@ -35,18 +59,28 @@ class OrderManager:
             best_bid = float(order_book.bids[0].price) if order_book.bids else None
             best_ask = float(order_book.asks[0].price) if order_book.asks else None
 
-            # If spread is wider than 50 cents, order book is too sparse to trust
+            # If spread wider than 50 cents, order book is too sparse to trust
             if best_bid and best_ask:
                 if (best_ask - best_bid) > 0.50:
-                    log.debug(f"Sparse order book detected — falling back to yes_price")
+                    log.debug("Sparse order book — fetching fresh price")
                     best_bid = None
                     best_ask = None
 
-            # Fall back to yes_price from Gamma API
+            # Fall back to fresh yes_price from Gamma API
             if best_bid is None or best_ask is None:
-                yes_price = self.market["yes_price"] or 0.50
-                best_bid  = round(yes_price - 0.01, 4)
-                best_ask  = round(yes_price + 0.01, 4)
+                fresh_price = self._fetch_fresh_yes_price()
+                if fresh_price:
+                    self.market["yes_price"] = fresh_price
+                    best_bid = round(fresh_price - 0.01, 4)
+                    best_ask = round(fresh_price + 0.01, 4)
+                    log.debug(
+                        f"Fresh yes_price={fresh_price:.4f} | "
+                        f"{self.market['question'][:40]}"
+                    )
+                else:
+                    yes_price = self.market["yes_price"] or 0.50
+                    best_bid  = round(yes_price - 0.01, 4)
+                    best_ask  = round(yes_price + 0.01, 4)
 
             return best_bid, best_ask
 
@@ -61,7 +95,6 @@ class OrderManager:
         """
         Calculate where to place our orders.
         Places orders at SPREAD_DEPTH fraction of max_spread from midpoint.
-        e.g. SPREAD_DEPTH=0.5, max_spread=0.03 → offset=0.015 from midpoint
         """
         try:
             max_spread = self.market["max_spread"]
@@ -80,7 +113,7 @@ class OrderManager:
                 our_bid = round(our_ask - 0.01, 4)
 
             log.debug(
-                f"Prices calculated | midpoint={midpoint:.4f} | "
+                f"Prices | midpoint={midpoint:.4f} | "
                 f"offset={offset:.4f} | "
                 f"bid={our_bid:.4f} | ask={our_ask:.4f}"
             )
@@ -94,7 +127,6 @@ class OrderManager:
     def check_order_zone(self, order_id, best_bid, best_ask):
         """
         Check which zone an order is in relative to the midpoint.
-        Uses yes_price as reference — more reliable than sparse order book.
 
         DANGER → too close to midpoint (risk of fill)
         REWARD → inside max spread window (earning rewards)
@@ -108,7 +140,7 @@ class OrderManager:
         side       = order["side"]
         max_spread = self.market["max_spread"]
 
-        # Use yes_price as midpoint — more stable than live order book
+        # Use fresh yes_price as midpoint reference
         midpoint = self.market["yes_price"]
         if midpoint is None:
             midpoint = (best_bid + best_ask) / 2
@@ -127,7 +159,6 @@ class OrderManager:
         if gap > max_spread + DEAD_ZONE_BUFFER:
             return "DEAD"
 
-        # REWARD ZONE — inside spread window, earning rewards
         return "REWARD"
 
     # ── Order Placement ───────────────────────────────────────────────────────
@@ -199,7 +230,10 @@ class OrderManager:
     def cancel_order(self, order_id, reason="manual"):
         """Cancel a single order."""
         if DRY_RUN:
-            log.info(f"[DRY RUN] Would cancel | id={order_id} | reason={reason}")
+            log.info(
+                f"[DRY RUN] Would cancel | "
+                f"id={order_id} | reason={reason}"
+            )
             if order_id in self.active_orders:
                 del self.active_orders[order_id]
             return
@@ -224,7 +258,7 @@ class OrderManager:
     def detect_fills(self):
         """
         Compare tracked orders against open orders on exchange.
-        Any order no longer on exchange has been filled or cancelled.
+        Any order no longer on exchange has been filled.
         Skipped in dry run mode.
         """
         if not self.active_orders or DRY_RUN:
@@ -275,7 +309,7 @@ class OrderManager:
         # Step 2: Get best prices
         best_bid, best_ask = self.get_best_prices()
         if best_bid is None or best_ask is None:
-            log.warning(f"No prices available for {question[:40]} — skipping")
+            log.warning(f"No prices for {question[:40]} — skipping")
             return
 
         log.info(
