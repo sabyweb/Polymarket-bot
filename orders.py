@@ -197,8 +197,17 @@ class OrderManager:
         budget_shares = ORDER_SIZE / yes_price
         # Use whichever is larger — min_shares or our budget in shares
         # This ensures we always qualify for rewards
-        size          = size or max(min_shares, budget_shares)
-        size          = round(size, 2)
+        size = size or max(min_shares, budget_shares)
+        size = round(size, 2)
+
+        # Hard cap — never spend more than ORDER_SIZE * 1.5 on a single order
+        max_shares = (ORDER_SIZE * 1.5) / yes_price
+        if size > max_shares:
+            log.debug(
+                f"Size capped from {size} to {max_shares:.2f} shares "
+                f"(hard cap at ${ORDER_SIZE * 1.5:.0f})"
+            )
+            size = round(max_shares, 2)
         log.debug(
             f"Order size | min_shares={min_shares} | "
             f"budget_shares={budget_shares:.1f} | "

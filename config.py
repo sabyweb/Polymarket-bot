@@ -19,7 +19,7 @@ CHAIN_ID = 137  # Polygon mainnet
 # ── Market Selection ──────────────────────────────────────────────────────────
 MAX_MARKETS           = 3     # Maximum number of markets to trade at once
 MIN_SCORE_THRESHOLD   = 60    # Minimum score (out of 100) to trade a market
-MARKET_REFRESH_SECS   = 3600  # Re-score and refresh markets every 1 hour
+MARKET_REFRESH_SECS   = 1800  # Re-score and refresh markets every 1 hour
 
 # ── Scoring Weights (must sum to 100) ─────────────────────────────────────────
 WEIGHT_DAILY_RATE  = 25
@@ -38,7 +38,7 @@ MIN_LIQUIDITY       = 1000   # Skip if liquidity below $1000
 MIN_SPREAD_ALLOWED  = 0.01   # Skip if max spread below 1¢
 
 # ── Order Management ──────────────────────────────────────────────────────────
-ORDER_SIZE          = 50     # USDC per order
+ORDER_SIZE          = 100     # USDC per order
 MAX_ORDER_SIZE      = 100      # Alias used by market.py hygiene check
 ORDER_REFRESH_SECS  = 30     # Cancel and replace orders every 30 seconds
 

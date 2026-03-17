@@ -7,8 +7,10 @@ from config import (
     HOST, CHAIN_ID, PRIVATE_KEY,
     CLOB_API_KEY, CLOB_SECRET, CLOB_PASS_PHRASE,
     MAX_MARKETS, MIN_SCORE_THRESHOLD,
-    MARKET_REFRESH_SECS, ORDER_REFRESH_SECS
+    MARKET_REFRESH_SECS, ORDER_REFRESH_SECS,
+    ORDER_SIZE
 )
+
 from market import get_rewards_markets
 from position import PositionTracker
 from orders import OrderManager
@@ -142,7 +144,7 @@ class MarketMakerBot:
         log.info("🤖  Market Making Bot Starting...")
         log.info(f"    Max markets:      {MAX_MARKETS}")
         log.info(f"    Score threshold:  {MIN_SCORE_THRESHOLD}/100")
-        log.info(f"    Order size:       ${ORDER_REFRESH_SECS}")
+        log.info(f"    Order size:       ${ORDER_SIZE}")
         log.info(f"    Order refresh:    every {ORDER_REFRESH_SECS}s")
         log.info(f"    Market refresh:   every {MARKET_REFRESH_SECS}s")
 
