@@ -28,45 +28,45 @@ class OrderManager:
 
     # ── Fresh Price Fetch ─────────────────────────────────────────────────────
     def _fetch_fresh_yes_price(self):
-    """
-    Fetch the latest yes_price directly from Gamma API.
-    Tries multiple query approaches for reliability.
-    """
-    try:
-        condition_id = self.market["condition_id"]
+        """
+        Fetch the latest yes_price directly from Gamma API.
+        Tries multiple query approaches for reliability.
+        """
+        try:
+            condition_id = self.market["condition_id"]
+            url          = f"{GAMMA_API}/markets"
 
-        # Try fetching by conditionId first
-        url      = f"{GAMMA_API}/markets"
-        params   = {"conditionId": condition_id}
-        response = req.get(url, params=params, timeout=5)
-        data     = response.json()
-
-        if data and isinstance(data, list) and len(data) > 0:
-            prices_raw = data[0].get("outcomePrices", "[]")
-            prices     = json.loads(prices_raw)
-            if prices and float(prices[0]) > 0:
-                price = float(prices[0])
-                log.debug(
-                    f"Fresh price fetched | "
-                    f"{self.market['question'][:40]} | "
-                    f"yes_price={price:.4f}"
-                )
-                return price
-
-        # If conditionId query fails, try by slug
-        slug = self.market.get("slug")
-        if slug:
-            params   = {"slug": slug}
+            # Try by conditionId first
+            params   = {"conditionId": condition_id}
             response = req.get(url, params=params, timeout=5)
             data     = response.json()
-            if data and isinstance(data, list) and len(data) > 0:
-                prices = json.loads(data[0].get("outcomePrices", "[]"))
-                if prices and float(prices[0]) > 0:
-                    return float(prices[0])
 
-    except Exception as e:
-        log.debug(f"Could not fetch fresh yes_price: {e}")
-    return None
+            if data and isinstance(data, list) and len(data) > 0:
+                prices_raw = data[0].get("outcomePrices", "[]")
+                prices     = json.loads(prices_raw)
+                if prices and float(prices[0]) > 0:
+                    price = float(prices[0])
+                    log.debug(
+                        f"Fresh price | "
+                        f"{self.market['question'][:40]} | "
+                        f"yes={price:.4f}"
+                    )
+                    return price
+
+            # Fall back to slug if conditionId fails
+            slug = self.market.get("slug")
+            if slug:
+                params   = {"slug": slug}
+                response = req.get(url, params=params, timeout=5)
+                data     = response.json()
+                if data and isinstance(data, list) and len(data) > 0:
+                    prices = json.loads(data[0].get("outcomePrices", "[]"))
+                    if prices and float(prices[0]) > 0:
+                        return float(prices[0])
+
+        except Exception as e:
+            log.debug(f"Could not fetch fresh yes_price: {e}")
+        return None
 
     # ── Order Book ────────────────────────────────────────────────────────────
     def get_best_prices(self):
@@ -96,7 +96,7 @@ class OrderManager:
                     best_bid = round(fresh_price - 0.01, 4)
                     best_ask = round(fresh_price + 0.01, 4)
                     log.debug(
-                        f"Fresh yes_price={fresh_price:.4f} | "
+                        f"Using fresh price={fresh_price:.4f} | "
                         f"{self.market['question'][:40]}"
                     )
                 else:
@@ -107,8 +107,7 @@ class OrderManager:
             return best_bid, best_ask
 
         except Exception as e:
-            log.error(f"Failed to fetch order book for "
-                      f"{self.market['question'][:40]}: {e}")
+            log.error(f"Failed to fetch order book: {e}")
             yes_price = self.market["yes_price"] or 0.50
             return round(yes_price - 0.01, 4), round(yes_price + 0.01, 4)
 
@@ -188,13 +187,24 @@ class OrderManager:
         """Place a single limit order on one side."""
         condition_id = self.market["condition_id"]
         question     = self.market["question"]
+
         # Calculate order size in shares
         # Must meet min_size requirement but stay within USD budget
+       # Calculate order size in shares
+        # Always respect min_size as the floor to qualify for rewards
         yes_price     = self.market["yes_price"] or 0.50
         min_shares    = self.market["min_size"]
         budget_shares = ORDER_SIZE / yes_price
+        # Use whichever is larger — min_shares or our budget in shares
+        # This ensures we always qualify for rewards
         size          = size or max(min_shares, budget_shares)
         size          = round(size, 2)
+        log.debug(
+            f"Order size | min_shares={min_shares} | "
+            f"budget_shares={budget_shares:.1f} | "
+            f"final_size={size} | "
+            f"est_cost=${size * yes_price:.2f}"
+        )
 
 
         # Gate: check position limit before placing

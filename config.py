@@ -39,7 +39,7 @@ MIN_SPREAD_ALLOWED  = 0.01   # Skip if max spread below 1¢
 
 # ── Order Management ──────────────────────────────────────────────────────────
 ORDER_SIZE          = 50     # USDC per order
-MAX_ORDER_SIZE      = 50      # Alias used by market.py hygiene check
+MAX_ORDER_SIZE      = 100      # Alias used by market.py hygiene check
 ORDER_REFRESH_SECS  = 30     # Cancel and replace orders every 30 seconds
 
 # How far inside the max spread to place orders (as a fraction)
