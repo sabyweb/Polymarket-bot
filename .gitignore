@@ -1,0 +1,15 @@
+# Credentials
+.env
+
+# Generated keys script (contains private key)
+generate_keys.py
+
+# Logs
+logs/
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
