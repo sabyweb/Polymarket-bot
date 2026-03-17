@@ -28,23 +28,45 @@ class OrderManager:
 
     # ── Fresh Price Fetch ─────────────────────────────────────────────────────
     def _fetch_fresh_yes_price(self):
-        """
-        Fetch the latest yes_price directly from Gamma API
-        for this specific market. Called when order book is sparse.
-        """
-        try:
-            condition_id = self.market["condition_id"]
-            url          = f"{GAMMA_API}/markets"
-            params       = {"conditionId": condition_id}
-            response     = req.get(url, params=params, timeout=5)
-            data         = response.json()
-            if data and isinstance(data, list):
+    """
+    Fetch the latest yes_price directly from Gamma API.
+    Tries multiple query approaches for reliability.
+    """
+    try:
+        condition_id = self.market["condition_id"]
+
+        # Try fetching by conditionId first
+        url      = f"{GAMMA_API}/markets"
+        params   = {"conditionId": condition_id}
+        response = req.get(url, params=params, timeout=5)
+        data     = response.json()
+
+        if data and isinstance(data, list) and len(data) > 0:
+            prices_raw = data[0].get("outcomePrices", "[]")
+            prices     = json.loads(prices_raw)
+            if prices and float(prices[0]) > 0:
+                price = float(prices[0])
+                log.debug(
+                    f"Fresh price fetched | "
+                    f"{self.market['question'][:40]} | "
+                    f"yes_price={price:.4f}"
+                )
+                return price
+
+        # If conditionId query fails, try by slug
+        slug = self.market.get("slug")
+        if slug:
+            params   = {"slug": slug}
+            response = req.get(url, params=params, timeout=5)
+            data     = response.json()
+            if data and isinstance(data, list) and len(data) > 0:
                 prices = json.loads(data[0].get("outcomePrices", "[]"))
-                if prices:
+                if prices and float(prices[0]) > 0:
                     return float(prices[0])
-        except Exception as e:
-            log.debug(f"Could not fetch fresh yes_price: {e}")
-        return None
+
+    except Exception as e:
+        log.debug(f"Could not fetch fresh yes_price: {e}")
+    return None
 
     # ── Order Book ────────────────────────────────────────────────────────────
     def get_best_prices(self):
@@ -166,7 +188,14 @@ class OrderManager:
         """Place a single limit order on one side."""
         condition_id = self.market["condition_id"]
         question     = self.market["question"]
-        size         = size or max(ORDER_SIZE, self.market["min_size"])
+        # Calculate order size in shares
+        # Must meet min_size requirement but stay within USD budget
+        yes_price     = self.market["yes_price"] or 0.50
+        min_shares    = self.market["min_size"]
+        budget_shares = ORDER_SIZE / yes_price
+        size          = size or max(min_shares, budget_shares)
+        size          = round(size, 2)
+
 
         # Gate: check position limit before placing
         if not self.position_tracker.can_quote(condition_id, side):

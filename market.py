@@ -169,10 +169,16 @@ def hygiene_check(market, rewards):
     if yes_price is not None:
         if yes_price < MIN_YES_PRICE or yes_price > MAX_YES_PRICE:
             return False, f"Price too skewed (Yes={yes_price:.3f})"
-
-    # 5. Min shares must be within our budget
-    if rewards["min_size"] > MAX_ORDER_SIZE:
-        return False, f"Min size {rewards['min_size']} exceeds budget"
+    
+    # 5. Min shares cost must be within our budget
+    yes_price = parse_yes_price(market) or 0.50
+    min_cost_usd = rewards["min_size"] * yes_price
+    if min_cost_usd > MAX_ORDER_SIZE:
+        return False, (
+            f"Min cost ${min_cost_usd:.2f} "
+            f"({rewards['min_size']} shares @ {yes_price:.2f}) "
+            f"exceeds budget ${MAX_ORDER_SIZE}"
+        )
 
     # 6. Max spread must be meaningful
     if rewards["max_spread"] < MIN_SPREAD_ALLOWED:
@@ -246,6 +252,7 @@ def get_rewards_markets(limit=MAX_MARKETS):
             passed.append({
                 "condition_id": market.get("conditionId"),
                 "question":     market.get("question"),
+                "slug":         market.get("slug"),
                 "token_ids":    parse_token_ids(market),
                 "yes_price":    parse_yes_price(market),
                 "daily_rate":   rewards["daily_rate"],
