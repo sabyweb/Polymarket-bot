@@ -12,7 +12,7 @@ from config import (
     MIN_LIQUIDITY, MIN_SPREAD_ALLOWED,
     WEIGHT_DAILY_RATE, WEIGHT_COMPETITION,
     WEIGHT_PRICE_BAL, WEIGHT_EXPIRY,
-    WEIGHT_SPREAD, WEIGHT_LIQUIDITY
+    WEIGHT_SPREAD, WEIGHT_LIQUIDITY,FUNDER,SIGNATURE_TYPE
 )
 
 log = logging.getLogger(__name__)
@@ -27,7 +27,14 @@ def get_client():
         api_secret=CLOB_SECRET,
         api_passphrase=CLOB_PASS_PHRASE,
     )
-    return ClobClient(HOST, key=PRIVATE_KEY, chain_id=CHAIN_ID, creds=creds)
+    return ClobClient(
+        HOST,
+        key=PRIVATE_KEY,
+        chain_id=CHAIN_ID,
+        creds=creds,
+        signature_type=SIGNATURE_TYPE,
+        funder=FUNDER
+    )
 
 
 # ── Fetching ──────────────────────────────────────────────────────────────────
