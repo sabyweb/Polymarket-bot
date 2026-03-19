@@ -13,7 +13,7 @@ CLOB_API_KEY   = os.getenv("CLOB_API_KEY")
 CLOB_SECRET    = os.getenv("CLOB_SECRET")
 CLOB_PASS_PHRASE = os.getenv("CLOB_PASS_PHRASE")
 FUNDER = os.getenv("FUNDER")
-SIGNATURE_TYPE = 0  # 0 for external wallets (Rabby, MetaMask etc)
+SIGNATURE_TYPE = 2  # 2 for browser wallet proxy signatures
 
 HOST     = "https://clob.polymarket.com"
 CHAIN_ID = 137  # Polygon mainnet
