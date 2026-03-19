@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 # ── Dry Run Mode ──────────────────────────────────────────────────────────────
-DRY_RUN = True   # Set to False when ready to trade with real money
+DRY_RUN = False   # Set to False when ready to trade with real money
 
 
 # ── API Credentials ───────────────────────────────────────────────────────────
