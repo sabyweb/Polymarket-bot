@@ -1,22 +1,12 @@
 import requests
 import json
 import logging
+from datetime import datetime, timezone
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds
 from config import (
     HOST, CHAIN_ID, PRIVATE_KEY,
-    CLOB_API_KEY, CLOB_SECRET, CLOB_PASS_PHRASE
-)
-
-def get_client():
-    creds = ApiCreds(
-        api_key=CLOB_API_KEY,
-        api_secret=CLOB_SECRET,
-        api_passphrase=CLOB_PASS_PHRASE,
-    )
-    return ClobClient(HOST, key=PRIVATE_KEY, chain_id=CHAIN_ID, creds=creds)
-from datetime import datetime, timezone
-from config import (
+    CLOB_API_KEY, CLOB_SECRET, CLOB_PASS_PHRASE,
     MAX_MARKETS, MAX_ORDER_SIZE, MIN_DAYS_TO_EXPIRY,
     MIN_YES_PRICE, MAX_YES_PRICE, MIN_DAILY_RATE,
     MIN_LIQUIDITY, MIN_SPREAD_ALLOWED,
@@ -28,6 +18,16 @@ from config import (
 log = logging.getLogger(__name__)
 
 GAMMA_API = "https://gamma-api.polymarket.com"
+
+
+# ── Client ────────────────────────────────────────────────────────────────────
+def get_client():
+    creds = ApiCreds(
+        api_key=CLOB_API_KEY,
+        api_secret=CLOB_SECRET,
+        api_passphrase=CLOB_PASS_PHRASE,
+    )
+    return ClobClient(HOST, key=PRIVATE_KEY, chain_id=CHAIN_ID, creds=creds)
 
 
 # ── Fetching ──────────────────────────────────────────────────────────────────
@@ -169,9 +169,9 @@ def hygiene_check(market, rewards):
     if yes_price is not None:
         if yes_price < MIN_YES_PRICE or yes_price > MAX_YES_PRICE:
             return False, f"Price too skewed (Yes={yes_price:.3f})"
-    
+
     # 5. Min shares cost must be within our budget
-    yes_price = parse_yes_price(market) or 0.50
+    yes_price    = parse_yes_price(market) or 0.50
     min_cost_usd = rewards["min_size"] * yes_price
     if min_cost_usd > MAX_ORDER_SIZE:
         return False, (
@@ -199,7 +199,7 @@ def score_market(market, rewards):
     rate_score = min(rewards["daily_rate"] / 500.0, 1.0) * WEIGHT_DAILY_RATE
     score += rate_score
 
-    # 2. Competition (lower liquidity/volume ratio = less competition)
+    # 2. Competition
     try:
         liquidity = parse_liquidity(market)
         volume    = parse_volume_24h(market)
@@ -212,14 +212,14 @@ def score_market(market, rewards):
     except Exception:
         pass
 
-    # 3. Price balance — quadratic bonus for proximity to 0.50
+    # 3. Price balance
     yes_price = parse_yes_price(market)
     if yes_price is not None:
-        distance = abs(yes_price - 0.50)
+        distance      = abs(yes_price - 0.50)
         balance_score = max(0, 1.0 - (distance / 0.45) ** 2) * WEIGHT_PRICE_BAL
         score += balance_score
 
-    # 4. Days remaining — capped at 60 days
+    # 4. Days remaining
     days_left = parse_days_remaining(market)
     if days_left is not None:
         expiry_score = min(days_left / 60.0, 1.0) * WEIGHT_EXPIRY
@@ -230,7 +230,7 @@ def score_market(market, rewards):
     score += spread_score
 
     # 6. Liquidity
-    liq = parse_liquidity(market)
+    liq       = parse_liquidity(market)
     liq_score = min(liq / 5_000_000.0, 1.0) * WEIGHT_LIQUIDITY
     score += liq_score
 
@@ -245,7 +245,7 @@ def get_rewards_markets(limit=MAX_MARKETS):
     rejected = []
 
     for market in raw_markets:
-        rewards = parse_clob_rewards(market)
+        rewards    = parse_clob_rewards(market)
         ok, reason = hygiene_check(market, rewards)
 
         if ok:
@@ -258,6 +258,7 @@ def get_rewards_markets(limit=MAX_MARKETS):
                 "daily_rate":   rewards["daily_rate"],
                 "min_size":     rewards["min_size"],
                 "max_spread":   rewards["max_spread"],
+                "tick_size":    float(market.get("orderPriceMinTickSize") or 0.01),
                 "days_left":    parse_days_remaining(market),
                 "liquidity":    parse_liquidity(market),
                 "volume_24h":   parse_volume_24h(market),
@@ -297,6 +298,7 @@ if __name__ == "__main__":
             print(f"    Daily Rate:  ${m['daily_rate']:.2f}/day")
             print(f"    Min Size:    {m['min_size']} shares")
             print(f"    Max Spread:  {m['max_spread']*100:.1f}c")
+            print(f"    Tick Size:   {m['tick_size']}")
             print(f"    Days Left:   {days}")
             print(f"    Liquidity:   ${m['liquidity']:,.0f}")
             print()

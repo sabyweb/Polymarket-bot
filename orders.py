@@ -25,6 +25,20 @@ class OrderManager:
         self.position_tracker = position_tracker
         self.active_orders    = {}
         self.failure_counts   = {"yes": 0, "no": 0}
+        # ── Tick Size Rounding ────────────────────────────────────────────────────
+    def round_to_tick(self, price):
+        """
+        Round a price to the nearest valid tick size for this market.
+        e.g. tick_size=0.01 → 0.2915 becomes 0.29
+             tick_size=0.001 → 0.2915 becomes 0.292
+        """
+        tick = self.market.get("tick_size", 0.01)
+        if tick <= 0:
+            tick = 0.01
+        rounded = round(round(price / tick) * tick, 10)
+        # Clean up floating point artifacts
+        decimal_places = len(str(tick).rstrip("0").split(".")[-1])
+        return round(rounded, decimal_places)
 
     # ── Fresh Price Fetch ─────────────────────────────────────────────────────
     def _fetch_fresh_yes_price(self):
@@ -122,8 +136,8 @@ class OrderManager:
             midpoint   = (best_bid + best_ask) / 2
 
             offset  = max_spread * SPREAD_DEPTH
-            our_bid = round(midpoint - offset, 4)
-            our_ask = round(midpoint + offset, 4)
+            our_bid = self.round_to_tick(midpoint - offset)
+            our_ask = self.round_to_tick(midpoint + offset)
 
             # Safety clamps
             our_bid = max(0.01, min(our_bid, 0.98))
@@ -131,7 +145,7 @@ class OrderManager:
 
             # Ensure bid is always below ask
             if our_bid >= our_ask:
-                our_bid = round(our_ask - 0.01, 4)
+                our_bid = self.round_to_tick(our_ask - self.market.get("tick_size", 0.01))
 
             log.debug(
                 f"Prices | midpoint={midpoint:.4f} | "
