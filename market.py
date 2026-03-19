@@ -35,6 +35,7 @@ def fetch_all_rewards_markets():
     url       = f"{GAMMA_API}/markets"
     page_size = 100
     offset    = 0
+    max_offset = 50  # Only scan top 50 markets by volume
     all_rewards = []
 
     log.info("Paginating through all Gamma API markets...")
@@ -77,6 +78,10 @@ def fetch_all_rewards_markets():
             break
 
         offset += page_size
+
+        if offset >= max_offset:
+            log.info(f"Reached max offset {max_offset} — stopping pagination")
+            break
 
     log.info(f"Total rewards markets found: {len(all_rewards)}")
     return all_rewards
