@@ -10,7 +10,7 @@ import logging
 from py_clob_client.clob_types import OrderArgs
 from py_clob_client.order_builder.constants import BUY
 from config import (
-    ORDER_SIZE, DANGER_ZONE_CENTS, DEAD_ZONE_BUFFER,
+    ORDER_SIZE, MAX_ORDER_BUDGET, DANGER_ZONE_CENTS, DEAD_ZONE_BUFFER,
     MAX_ORDER_FAILURES, DRY_RUN, MAX_ORDERBOOK_SPREAD,
     MIN_LIQUIDITY_BUFFER,
 )
@@ -325,34 +325,40 @@ class OrderManager:
 
         min_shares = self.market["min_size"]
         budget_shares = ORDER_SIZE / clob_price
+        min_cost = min_shares * clob_price
 
-        # If the market minimum exceeds our budget, skip
-        if min_shares * clob_price > ORDER_SIZE:
+        # If the rewards minimum exceeds our hard cap, skip this side
+        if min_cost > MAX_ORDER_BUDGET:
             log.warning(
                 f"Min order ({min_shares} shares × ${clob_price:.2f} "
-                f"= ${min_shares * clob_price:.0f}) exceeds budget "
-                f"${ORDER_SIZE} — skipping {side.upper()}"
+                f"= ${min_cost:.0f}) exceeds hard cap "
+                f"${MAX_ORDER_BUDGET} — skipping {side.upper()}"
             )
             return None
 
-        # Use budget_shares (up to ORDER_SIZE), but at least min_shares
+        # Always place at least min_shares to qualify for rewards.
+        # Use ORDER_SIZE as preferred budget, but allow up to
+        # MAX_ORDER_BUDGET if the rewards minimum demands it.
         if size is None:
             size = max(min_shares, budget_shares)
         size = round(size, 2)
 
-        # Hard cap — never exceed ORDER_SIZE USD
-        max_shares = ORDER_SIZE / clob_price
+        # Hard cap — never exceed MAX_ORDER_BUDGET
+        max_shares = MAX_ORDER_BUDGET / clob_price
         if size > max_shares:
             log.debug(
                 f"Size capped from {size} to {max_shares:.2f} shares "
-                f"(hard cap at ${ORDER_SIZE})"
+                f"(hard cap at ${MAX_ORDER_BUDGET})"
             )
             size = round(max_shares, 2)
 
-        log.debug(
+        est_cost = size * clob_price
+        log.info(
             f"Order size | {side.upper()} | clob_price={clob_price:.4f} | "
             f"min_shares={min_shares} | budget_shares={budget_shares:.1f} | "
-            f"final_size={size} | est_cost=${size * clob_price:.2f}"
+            f"final_size={size} | est_cost=${est_cost:.2f}"
+            + (f" (above target ${ORDER_SIZE}, needed for rewards min)"
+               if est_cost > ORDER_SIZE else "")
         )
 
         # Gate: check position limit before placing

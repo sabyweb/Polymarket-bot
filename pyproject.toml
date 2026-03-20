@@ -2,6 +2,12 @@
 name = "polymarket-bot"
 version = "1.0.0"
 requires-python = ">=3.12"
+dependencies = [
+    "py-clob-client",
+    "requests",
+    "python-dotenv",
+    "web3",
+]
 
 [tool.ruff]
 target-version = "py312"

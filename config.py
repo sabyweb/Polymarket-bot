@@ -50,8 +50,9 @@ MIN_LIQUIDITY: int = 1000        # Skip if liquidity below $1000
 MIN_SPREAD_ALLOWED: float = 0.01 # Skip if max spread below 1c
 
 # ── Order Management ──────────────────────────────────────────────────────────
-ORDER_SIZE: int = 100        # USDC per order
-MAX_ORDER_SIZE: int = 100    # Alias used by market.py hygiene check
+ORDER_SIZE: int = 100        # Preferred USDC per order (target budget)
+MAX_ORDER_BUDGET: int = 500  # Hard cap — never spend more than this per order
+MAX_ORDER_SIZE: int = MAX_ORDER_BUDGET  # Alias used by market.py hygiene check
 ORDER_REFRESH_SECS: int = 30 # Cancel and replace orders every 30 seconds
 
 # ── Orderbook Safety ─────────────────────────────────────────────────────────

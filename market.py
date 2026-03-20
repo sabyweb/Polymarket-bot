@@ -256,13 +256,19 @@ def hygiene_check(market: dict, rewards: dict) -> tuple[bool, str]:
         if yes_price < MIN_YES_PRICE or yes_price > MAX_YES_PRICE:
             return False, f"Price too skewed (Yes={yes_price:.3f})"
 
-    # 5. Min shares cost must be within our budget
+    # 5. Min shares cost must be within our budget (check BOTH sides)
     yes_price = parse_yes_price(market) or 0.50
-    min_cost_usd = rewards["min_size"] * yes_price
+    no_price = 1 - yes_price
+    yes_cost = rewards["min_size"] * yes_price
+    no_cost = rewards["min_size"] * no_price
+    # The cheaper side must fit within budget; otherwise we can't
+    # place even one side.  Both costs are logged for transparency.
+    min_cost_usd = min(yes_cost, no_cost)
+    max_cost_usd = max(yes_cost, no_cost)
     if min_cost_usd > MAX_ORDER_SIZE:
         return False, (
-            f"Min cost ${min_cost_usd:.2f} "
-            f"({rewards['min_size']} shares @ {yes_price:.2f}) "
+            f"Min cost ${min_cost_usd:.2f}/${max_cost_usd:.2f} "
+            f"(YES/NO, {rewards['min_size']} shares) "
             f"exceeds budget ${MAX_ORDER_SIZE}"
         )
 

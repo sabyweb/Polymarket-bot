@@ -168,6 +168,9 @@ class MarketMakerBot:
         log.info(f"    Order refresh:    every {ORDER_REFRESH_SECS}s")
         log.info(f"    Market refresh:   every {MARKET_REFRESH_SECS}s")
 
+        # Cancel any orphaned orders from previous sessions
+        self._cancel_orphaned_orders()
+
         # Initial market fetch
         self.refresh_markets()
 
@@ -214,6 +217,41 @@ class MarketMakerBot:
                 alert_bot_restart(str(e))
                 log.info("Restarting in 30s...")
                 time.sleep(30)
+
+    # ── Orphaned Order Cleanup ────────────────────────────────────────────────
+    def _cancel_orphaned_orders(self) -> None:
+        """Cancel ALL open orders on the exchange from previous sessions.
+
+        When the bot restarts (crash, deploy, server reboot), in-memory
+        active_orders is empty but old orders may still be live.  This
+        method fetches all open orders and cancels them so we start clean.
+        """
+        try:
+            open_orders = self.client.get_orders()
+            if not open_orders:
+                log.info("No orphaned orders found — starting clean.")
+                return
+
+            log.warning(
+                f"Found {len(open_orders)} orphaned order(s) from "
+                f"previous session — cancelling all..."
+            )
+            for order in open_orders:
+                try:
+                    self.client.cancel(order["id"])
+                    log.info(
+                        f"Cancelled orphaned order {order['id'][:16]}... "
+                        f"({order.get('side', '?')} @ {order.get('price', '?')})"
+                    )
+                except Exception as e:
+                    log.error(
+                        f"Failed to cancel orphaned order "
+                        f"{order['id'][:16]}...: {e}"
+                    )
+            log.info("Orphaned order cleanup complete.")
+        except Exception as e:
+            log.error(f"Could not fetch open orders for cleanup: {e}")
+            log.warning("Old orders may still be live — check Polymarket UI")
 
     # ── Shutdown ─────────────────────────────────────────────────────────────
     def _shutdown(self) -> None:
