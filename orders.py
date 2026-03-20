@@ -376,6 +376,7 @@ class OrderManager:
                 "size": float(size),
                 "original_size": float(size),
                 "placed_at": _time.time(),
+                "miss_count": 0,
             }
             log.info(
                 f"[DRY RUN] Would place {side.upper()} | "
@@ -415,6 +416,7 @@ class OrderManager:
                     "size": float(size),
                     "original_size": float(size),
                     "placed_at": _time.time(),
+                    "miss_count": 0,
                 }
                 self.failure_counts[side] = 0
                 log_order_placed(side.upper(), price, size, question, order_id)
@@ -591,7 +593,20 @@ class OrderManager:
                     continue
 
                 if oid not in open_map:
-                    # Full fill — order no longer on exchange
+                    # Order missing from exchange — increment miss counter.
+                    # Only declare a fill after 3 consecutive misses (90s)
+                    # to tolerate transient API hiccups.
+                    order["miss_count"] = order.get("miss_count", 0) + 1
+                    if order["miss_count"] < 3:
+                        log.info(
+                            f"Order {oid[:16]}... missing from exchange "
+                            f"(miss #{order['miss_count']}/3) — "
+                            f"waiting to confirm | {side.upper()} | "
+                            f"market={self.market['question'][:40]}"
+                        )
+                        continue
+
+                    # 3 consecutive misses — confirmed full fill
                     filled_usd = order["price"] * order["original_size"]
                     log.info(
                         f"FILL (FULL) | {side.upper()} | "
@@ -612,6 +627,9 @@ class OrderManager:
                     )
                     del self.active_orders[oid]
                 else:
+                    # Order found on exchange — reset miss counter
+                    order["miss_count"] = 0
+
                     # Check for partial fill
                     exchange_order = open_map[oid]
                     orig = float(exchange_order["original_size"])
