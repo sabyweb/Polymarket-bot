@@ -7,6 +7,7 @@ buffer to minimise adverse fill risk.
 """
 
 import logging
+import time as _time
 from py_clob_client.clob_types import OrderArgs
 from py_clob_client.order_builder.constants import BUY
 from config import (
@@ -374,6 +375,7 @@ class OrderManager:
                 "price": price,
                 "size": float(size),
                 "original_size": float(size),
+                "placed_at": _time.time(),
             }
             log.info(
                 f"[DRY RUN] Would place {side.upper()} | "
@@ -412,6 +414,7 @@ class OrderManager:
                     "price": price,
                     "size": float(size),
                     "original_size": float(size),
+                    "placed_at": _time.time(),
                 }
                 self.failure_counts[side] = 0
                 log_order_placed(side.upper(), price, size, question, order_id)
@@ -453,8 +456,7 @@ class OrderManager:
         Returns:
             The exchange order ID, or None if not found.
         """
-        import time
-        time.sleep(0.5)  # Brief pause to let the exchange register the order
+        _time.sleep(0.5)  # Brief pause to let the exchange register the order
         try:
             open_orders = self.client.get_orders()
             if not open_orders:
@@ -547,9 +549,46 @@ class OrderManager:
                     if o.get("asset_id") in market_tokens
                 }
 
+            log.debug(
+                f"Fill check | tracked={len(self.active_orders)} | "
+                f"on_exchange={len(open_map)} | "
+                f"market={self.market['question'][:30]}"
+            )
+
+            # Safety: if ALL tracked orders are missing, it's likely
+            # an external cancel (another bot instance, manual cancel),
+            # not simultaneous fills. Clear tracker and skip.
+            now = _time.time()
+            missing = [
+                oid for oid in self.active_orders
+                if oid not in open_map
+                and now - self.active_orders[oid].get("placed_at", 0) >= 90
+            ]
+            eligible_count = sum(
+                1 for o in self.active_orders.values()
+                if now - o.get("placed_at", 0) >= 90
+            )
+            if len(missing) == eligible_count and eligible_count > 1:
+                log.warning(
+                    f"ALL {eligible_count} orders missing from exchange "
+                    f"— likely external cancel, NOT fills. "
+                    f"Clearing tracker for {self.market['question'][:40]}"
+                )
+                self.active_orders.clear()
+                return
+
             for oid in list(self.active_orders.keys()):
                 order = self.active_orders[oid]
                 side = order["side"]
+
+                # Grace period: skip fill detection for orders < 90s old
+                age = now - order.get("placed_at", 0)
+                if age < 90:
+                    log.debug(
+                        f"Skipping fill check for {side.upper()} "
+                        f"order (age={age:.0f}s < 90s)"
+                    )
+                    continue
 
                 if oid not in open_map:
                     # Full fill — order no longer on exchange

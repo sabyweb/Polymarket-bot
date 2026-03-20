@@ -24,6 +24,9 @@ from config import (
     FUNDER, SIGNATURE_TYPE, GAMMA_API,
 )
 
+# Cache for CLOB rewards params (refreshed each market refresh cycle)
+_clob_rewards_cache: dict[str, dict] = {}
+
 log = logging.getLogger(__name__)
 
 
@@ -109,6 +112,60 @@ def fetch_all_rewards_markets() -> list[dict]:
 
     log.info(f"Total rewards markets found: {len(all_rewards)}")
     return all_rewards
+
+
+def fetch_clob_rewards_params() -> dict[str, dict]:
+    """Fetch real rewards parameters (min_size, max_spread) from the CLOB API.
+
+    The Gamma API does NOT return rewardsMinSize or rewardsMaxSpread.
+    The authoritative source is the CLOB API endpoint:
+        GET https://clob.polymarket.com/rewards/markets/current
+
+    Returns:
+        Dict keyed by condition_id (hex string) with values:
+            {"min_size": float, "max_spread": float}
+        max_spread is converted from cents to price units (4.5 → 0.045).
+    """
+    global _clob_rewards_cache
+    url = f"{HOST}/rewards/markets/current"
+    result: dict[str, dict] = {}
+    cursor = None
+
+    try:
+        while True:
+            params = {}
+            if cursor:
+                params["next_cursor"] = cursor
+
+            response = requests.get(url, params=params, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+
+            items = data.get("data", []) if isinstance(data, dict) else data
+            if not isinstance(items, list):
+                break
+
+            for m in items:
+                cid = m.get("condition_id", "")
+                min_size = float(m.get("rewards_min_size") or 5)
+                # max_spread comes as cents (e.g. 4.5 = 4.5 cents)
+                max_spread_cents = float(m.get("rewards_max_spread") or 3.0)
+                max_spread = max_spread_cents / 100.0
+                result[cid] = {"min_size": min_size, "max_spread": max_spread}
+
+            cursor = data.get("next_cursor") if isinstance(data, dict) else None
+            if not cursor or len(items) == 0:
+                break
+
+        log.info(f"Fetched CLOB rewards params for {len(result)} markets")
+        _clob_rewards_cache = result
+        return result
+
+    except Exception as e:
+        log.warning(f"Could not fetch CLOB rewards params: {e}")
+        if result:
+            _clob_rewards_cache = result
+        return _clob_rewards_cache
 
 
 # ── Parsers ──────────────────────────────────────────────────────────────────
@@ -381,5 +438,14 @@ def get_rewards_markets(limit: int = MAX_MARKETS) -> list[dict]:
     log.info(f"Passed hygiene: {len(passed)} | Rejected: {len(rejected)}")
     for q, r in rejected[:5]:
         log.debug(f"  Rejected: {q} — {r}")
+
+    # Enrich with real rewards params from CLOB API
+    # (Gamma API doesn't return min_size or max_spread)
+    clob_rewards = fetch_clob_rewards_params()
+    for market in passed:
+        cid = market["condition_id"]
+        if cid in clob_rewards:
+            market["min_size"] = clob_rewards[cid]["min_size"]
+            market["max_spread"] = clob_rewards[cid]["max_spread"]
 
     return passed[:limit]
