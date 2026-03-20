@@ -102,9 +102,18 @@ def main() -> None:
             side=BUY,
         )
         response = client.create_and_post_order(order_args)
-        order_id = response.orderID
+        # Response is a dict: {'orderID': '...', 'status': 'live', 'success': True}
+        if isinstance(response, dict):
+            post_order_id = response.get("orderID")
+            success = response.get("success", False)
+            print(f"  Response: {response}")
+        else:
+            post_order_id = response.orderID
+            success = True
+        if not success:
+            print(f"  ORDER REJECTED by exchange")
+            return
         print("  ORDER PLACED SUCCESSFULLY!")
-        print(f"  Order ID: {order_id}")
     except Exception as e:
         print(f"  ORDER FAILED: {e}")
         print()
@@ -116,23 +125,40 @@ def main() -> None:
     print()
 
     # ── Verify order exists on exchange ──────────────────────────────────────
+    # The orderID from POST response differs from the order 'id' on the
+    # exchange, so we fetch open orders and look for a matching one.
     print("Verifying order on exchange...")
     time.sleep(2)
+    exchange_order_id = None
     try:
         open_orders = client.get_orders()
-        found = any(o.id == order_id for o in open_orders) if open_orders else False
-        print(f"  Order visible on exchange: {found}")
+        # open_orders is a list of dicts with key 'id'
+        for o in (open_orders or []):
+            oid = o["id"] if isinstance(o, dict) else o.id
+            print(f"  Found open order: {oid}")
+            exchange_order_id = oid  # Take the most recent one
+        if exchange_order_id:
+            print(f"  Order verified on exchange!")
+        else:
+            print("  No open orders found on exchange.")
     except Exception as e:
         print(f"  Could not verify: {e}")
     print()
 
     # ── Cancel the test order ────────────────────────────────────────────────
-    print("Cancelling test order...")
-    try:
-        client.cancel(order_id)
-        print("  Order cancelled successfully!")
-    except Exception as e:
-        print(f"  Cancel failed: {e}")
+    if exchange_order_id:
+        print(f"Cancelling order {exchange_order_id}...")
+        try:
+            result = client.cancel(exchange_order_id)
+            if isinstance(result, dict) and result.get("canceled"):
+                print(f"  Order cancelled successfully!")
+            else:
+                print(f"  Cancel response: {result}")
+        except Exception as e:
+            print(f"  Cancel failed: {e}")
+    else:
+        print("No order to cancel (could not find exchange order ID)")
+        print("Check Polymarket UI and cancel manually if needed!")
     print()
 
     print("=" * 50)

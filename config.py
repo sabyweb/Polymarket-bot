@@ -20,7 +20,7 @@ CLOB_API_KEY: str | None = os.getenv("CLOB_API_KEY")
 CLOB_SECRET: str | None = os.getenv("CLOB_SECRET")
 CLOB_PASS_PHRASE: str | None = os.getenv("CLOB_PASS_PHRASE")
 FUNDER: str | None = os.getenv("FUNDER")
-SIGNATURE_TYPE: int = 1  # 1 = POLY_PROXY for Polymarket proxy wallet
+SIGNATURE_TYPE: int = 2  # 2 = POLY_GNOSIS_SAFE for Polymarket proxy wallet
 
 HOST: str = "https://clob.polymarket.com"
 CHAIN_ID: int = 137  # Polygon mainnet

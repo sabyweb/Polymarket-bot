@@ -301,7 +301,32 @@ class OrderManager:
                 side=clob_side,
             )
             response = self.client.create_and_post_order(order_args)
-            order_id = response.orderID
+
+            # Check the POST response for success
+            if isinstance(response, dict):
+                if not response.get("success", True):
+                    raise Exception(
+                        f"Order rejected: {response.get('errorMsg', response)}"
+                    )
+
+            # The POST response 'orderID' differs from the exchange 'id'.
+            # Fetch open orders and find ours by matching asset + price + side.
+            exchange_id = self._find_exchange_order_id(
+                token_id, str(price), clob_side
+            )
+
+            if exchange_id:
+                order_id = exchange_id
+            else:
+                # Fallback: use POST orderID (cancel may not work)
+                if isinstance(response, dict):
+                    order_id = response.get("orderID", "unknown")
+                else:
+                    order_id = response.orderID
+                log.warning(
+                    "Could not find exchange order ID — "
+                    "using POST orderID (cancel may fail)"
+                )
 
             self.active_orders[order_id] = {
                 "side": side,
@@ -321,6 +346,43 @@ class OrderManager:
                 self.failure_counts[side],
             )
             return None
+
+    def _find_exchange_order_id(
+        self, token_id: str, price: str, side: str
+    ) -> str | None:
+        """Fetch open orders and find the exchange ID for a just-placed order.
+
+        The POST response 'orderID' is not the same as the exchange 'id'
+        used for cancellation and tracking.  This method matches by
+        asset_id, price, and side to find the correct exchange ID.
+
+        Args:
+            token_id: The token/asset ID of the order.
+            price: The order price as a string.
+            side: BUY or SELL constant.
+
+        Returns:
+            The exchange order ID, or None if not found.
+        """
+        import time
+        time.sleep(0.5)  # Brief pause to let the exchange register the order
+        try:
+            open_orders = self.client.get_orders()
+            if not open_orders:
+                return None
+            for o in open_orders:
+                o_id = o["id"]
+                # Skip orders we already track
+                if o_id in self.active_orders:
+                    continue
+                # Match on asset_id + price + side
+                if (o["asset_id"] == token_id
+                        and o["price"] == price
+                        and o["side"] == side):
+                    return o_id
+        except Exception as e:
+            log.debug(f"Could not fetch exchange order ID: {e}")
+        return None
 
     def place_both_sides(
         self, our_bid: float, our_ask: float
@@ -387,9 +449,10 @@ class OrderManager:
 
         try:
             open_orders = self.client.get_orders()
-            open_map: dict[str, object] = {}
+            open_map: dict[str, dict] = {}
             if open_orders:
-                open_map = {o.id: o for o in open_orders}
+                # get_orders() returns a list of dicts with 'id', 'size_matched', etc.
+                open_map = {o["id"]: o for o in open_orders}
 
             for oid in list(self.active_orders.keys()):
                 order = self.active_orders[oid]
@@ -418,7 +481,10 @@ class OrderManager:
                     del self.active_orders[oid]
                 else:
                     # Check for partial fill
-                    remaining = float(open_map[oid].size)
+                    exchange_order = open_map[oid]
+                    orig = float(exchange_order["original_size"])
+                    matched = float(exchange_order["size_matched"])
+                    remaining = orig - matched
                     original = order["original_size"]
                     if remaining < original:
                         filled_shares = original - remaining
