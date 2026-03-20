@@ -1,61 +1,82 @@
+"""
+Configuration for the Polymarket market-making bot.
+
+All tunable parameters live here. Sensitive credentials are loaded
+from environment variables via a .env file.
+"""
+
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
-# ── Dry Run Mode ──────────────────────────────────────────────────────────────
-DRY_RUN = False   # Set to False when ready to trade with real money
 
+# ── Dry Run Mode ──────────────────────────────────────────────────────────────
+DRY_RUN: bool = False  # Set to False when ready to trade with real money
 
 # ── API Credentials ───────────────────────────────────────────────────────────
-PRIVATE_KEY    = os.getenv("PRIVATE_KEY")
-WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
-CLOB_API_KEY   = os.getenv("CLOB_API_KEY")
-CLOB_SECRET    = os.getenv("CLOB_SECRET")
-CLOB_PASS_PHRASE = os.getenv("CLOB_PASS_PHRASE")
-FUNDER = os.getenv("FUNDER")
-SIGNATURE_TYPE = 1  # 1 for external wallets (Rabby, MetaMask etc)
+PRIVATE_KEY: str | None = os.getenv("PRIVATE_KEY")
+WALLET_ADDRESS: str | None = os.getenv("WALLET_ADDRESS")
+CLOB_API_KEY: str | None = os.getenv("CLOB_API_KEY")
+CLOB_SECRET: str | None = os.getenv("CLOB_SECRET")
+CLOB_PASS_PHRASE: str | None = os.getenv("CLOB_PASS_PHRASE")
+FUNDER: str | None = os.getenv("FUNDER")
+SIGNATURE_TYPE: int = 1  # 1 = POLY_PROXY for Polymarket proxy wallet
 
-HOST     = "https://clob.polymarket.com"
-CHAIN_ID = 137  # Polygon mainnet
+HOST: str = "https://clob.polymarket.com"
+CHAIN_ID: int = 137  # Polygon mainnet
+
+# ── External APIs ─────────────────────────────────────────────────────────────
+GAMMA_API: str = "https://gamma-api.polymarket.com"
 
 # ── Market Selection ──────────────────────────────────────────────────────────
-MAX_MARKETS           = 3     # Maximum number of markets to trade at once
-MIN_SCORE_THRESHOLD   = 60    # Minimum score (out of 100) to trade a market
-MARKET_REFRESH_SECS   = 1800  # Re-score and refresh markets every 1 hour
+MAX_MARKETS: int = 3          # Maximum number of markets to trade at once
+MIN_SCORE_THRESHOLD: int = 60 # Minimum score (out of 100) to trade a market
+MARKET_REFRESH_SECS: int = 1800  # Re-score and refresh markets every 30 min
 
 # ── Scoring Weights (must sum to 100) ─────────────────────────────────────────
-WEIGHT_DAILY_RATE  = 25
-WEIGHT_COMPETITION = 25
-WEIGHT_PRICE_BAL   = 20
-WEIGHT_EXPIRY      = 15
-WEIGHT_SPREAD      = 10
-WEIGHT_LIQUIDITY   = 5
+WEIGHT_DAILY_RATE: int = 25
+WEIGHT_COMPETITION: int = 25
+WEIGHT_PRICE_BAL: int = 20
+WEIGHT_EXPIRY: int = 15
+WEIGHT_SPREAD: int = 10
+WEIGHT_LIQUIDITY: int = 5
 
 # ── Hygiene Filter Thresholds ─────────────────────────────────────────────────
-MIN_DAYS_TO_EXPIRY  = 7      # Skip markets expiring within 7 days
-MIN_YES_PRICE       = 0.05   # Skip if Yes price below 5¢
-MAX_YES_PRICE       = 0.95   # Skip if Yes price above 95¢
-MIN_DAILY_RATE      = 1.0    # Skip if daily reward rate below $1
-MIN_LIQUIDITY       = 1000   # Skip if liquidity below $1000
-MIN_SPREAD_ALLOWED  = 0.01   # Skip if max spread below 1¢
+MIN_DAYS_TO_EXPIRY: int = 7       # Skip markets expiring within 7 days
+MIN_YES_PRICE: float = 0.05      # Skip if Yes price below 5c
+MAX_YES_PRICE: float = 0.95      # Skip if Yes price above 95c
+MIN_DAILY_RATE: float = 1.0      # Skip if daily reward rate below $1
+MIN_LIQUIDITY: int = 1000        # Skip if liquidity below $1000
+MIN_SPREAD_ALLOWED: float = 0.01 # Skip if max spread below 1c
 
 # ── Order Management ──────────────────────────────────────────────────────────
-ORDER_SIZE          = 100     # USDC per order
-MAX_ORDER_SIZE      = 100      # Alias used by market.py hygiene check
-ORDER_REFRESH_SECS  = 30     # Cancel and replace orders every 30 seconds
+ORDER_SIZE: int = 100        # USDC per order
+MAX_ORDER_SIZE: int = 100    # Alias used by market.py hygiene check
+ORDER_REFRESH_SECS: int = 30 # Cancel and replace orders every 30 seconds
 
-# How far inside the max spread to place orders (as a fraction)
-# 0.5 means place orders halfway between midpoint and max spread boundary
-# e.g. if max spread is ±4¢, we place orders ±2¢ from midpoint
-SPREAD_DEPTH        = 0.5
+# ── Orderbook Safety ─────────────────────────────────────────────────────────
+# Maximum spread between best bid and best ask before we consider the book
+# too sparse to trust. Markets with wider spreads are skipped for that cycle.
+MAX_ORDERBOOK_SPREAD: float = 0.10  # 10c — wider than this is too sparse
+
+# Minimum dollar value of existing orders that must sit in front of ours.
+# We walk the orderbook and place our bid below $1000 of other bids,
+# and our ask above $1000 of other asks.
+MIN_LIQUIDITY_BUFFER: float = 1000.0  # $1000 of liquidity buffer
 
 # ── Order Zone Thresholds ─────────────────────────────────────────────────────
-DANGER_ZONE_CENTS   = 0.005  # Cancel immediately if order within 0.5¢ of best price
-DEAD_ZONE_BUFFER    = 0.001  # Extra buffer beyond max spread before declaring dead zone
+DANGER_ZONE_CENTS: float = 0.005  # Cancel if order within 0.5c of best price
+DEAD_ZONE_BUFFER: float = 0.001   # Buffer beyond max spread for dead zone
 
 # ── Position Limits ───────────────────────────────────────────────────────────
-MAX_POSITION_USD    = 100    # Stop quoting a side if position exceeds $100
-RESUME_POSITION_USD = 75     # Resume quoting when position falls back below $75
+MAX_POSITION_USD: int = 100     # Stop quoting a side if position exceeds $100
+RESUME_POSITION_USD: int = 75   # Resume quoting when position falls below $75
 
 # ── Alert Thresholds ──────────────────────────────────────────────────────────
-MAX_ORDER_FAILURES  = 3      # Alert after this many consecutive order failures
+MAX_ORDER_FAILURES: int = 3  # Alert after this many consecutive order failures
+
+# ── Discord Notifications ────────────────────────────────────────────────────
+# Create a webhook in your Discord server:
+#   Server Settings -> Integrations -> Webhooks -> New Webhook
+# Paste the URL into your .env file as DISCORD_WEBHOOK_URL
+DISCORD_WEBHOOK_URL: str | None = os.getenv("DISCORD_WEBHOOK_URL")

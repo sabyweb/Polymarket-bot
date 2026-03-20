@@ -1,3 +1,11 @@
+"""
+Market discovery, filtering, and scoring for the Polymarket bot.
+
+Fetches active reward-bearing markets from the Gamma API, applies hygiene
+filters (expiry, price range, liquidity, spread), scores them, and returns
+the top candidates for the bot to trade.
+"""
+
 import requests
 import json
 import logging
@@ -12,16 +20,20 @@ from config import (
     MIN_LIQUIDITY, MIN_SPREAD_ALLOWED,
     WEIGHT_DAILY_RATE, WEIGHT_COMPETITION,
     WEIGHT_PRICE_BAL, WEIGHT_EXPIRY,
-    WEIGHT_SPREAD, WEIGHT_LIQUIDITY,FUNDER,SIGNATURE_TYPE
+    WEIGHT_SPREAD, WEIGHT_LIQUIDITY,
+    FUNDER, SIGNATURE_TYPE, GAMMA_API,
 )
 
 log = logging.getLogger(__name__)
 
-GAMMA_API = "https://gamma-api.polymarket.com"
 
+# ── Client ───────────────────────────────────────────────────────────────────
+def get_client() -> ClobClient:
+    """Create and return an authenticated ClobClient.
 
-# ── Client ────────────────────────────────────────────────────────────────────
-def get_client():
+    Returns:
+        Configured ClobClient instance.
+    """
     creds = ApiCreds(
         api_key=CLOB_API_KEY,
         api_secret=CLOB_SECRET,
@@ -33,30 +45,35 @@ def get_client():
         chain_id=CHAIN_ID,
         creds=creds,
         signature_type=SIGNATURE_TYPE,
-        funder=FUNDER
+        funder=FUNDER,
     )
 
 
-# ── Fetching ──────────────────────────────────────────────────────────────────
-def fetch_all_rewards_markets():
-    url       = f"{GAMMA_API}/markets"
+# ── Fetching ─────────────────────────────────────────────────────────────────
+def fetch_all_rewards_markets() -> list[dict]:
+    """Paginate through Gamma API and return all markets with active rewards.
+
+    Returns:
+        List of raw market dicts that have a positive daily reward rate.
+    """
+    url = f"{GAMMA_API}/markets"
     page_size = 100
-    offset    = 0
+    offset = 0
     max_offset = 50  # Only scan top 50 markets by volume
-    all_rewards = []
+    all_rewards: list[dict] = []
 
     log.info("Paginating through all Gamma API markets...")
 
     while True:
         params = {
-            "active":          "true",
-            "closed":          "false",
-            "archived":        "false",
+            "active": "true",
+            "closed": "false",
+            "archived": "false",
             "enableOrderBook": "true",
-            "limit":           page_size,
-            "offset":          offset,
-            "order":           "volume24hr",
-            "ascending":       "false"
+            "limit": page_size,
+            "offset": offset,
+            "order": "volume24hr",
+            "ascending": "false",
         }
         try:
             response = requests.get(url, params=params, timeout=10)
@@ -94,8 +111,16 @@ def fetch_all_rewards_markets():
     return all_rewards
 
 
-# ── Parsers ───────────────────────────────────────────────────────────────────
-def parse_yes_price(market):
+# ── Parsers ──────────────────────────────────────────────────────────────────
+def parse_yes_price(market: dict) -> float | None:
+    """Extract the Yes outcome price from a raw market dict.
+
+    Args:
+        market: Raw market dict from the Gamma API.
+
+    Returns:
+        Yes price as a float, or None if unavailable.
+    """
     try:
         prices = json.loads(market.get("outcomePrices", "[]"))
         if prices:
@@ -105,7 +130,15 @@ def parse_yes_price(market):
     return None
 
 
-def parse_days_remaining(market):
+def parse_days_remaining(market: dict) -> float | None:
+    """Calculate days until market expiry.
+
+    Args:
+        market: Raw market dict from the Gamma API.
+
+    Returns:
+        Days remaining as a float, or None if no end date.
+    """
     try:
         end_str = market.get("endDateIso") or market.get("endDate")
         if not end_str:
@@ -118,10 +151,18 @@ def parse_days_remaining(market):
         return None
 
 
-def parse_clob_rewards(market):
-    defaults = {
+def parse_clob_rewards(market: dict) -> dict[str, float]:
+    """Extract CLOB reward parameters from a raw market dict.
+
+    Args:
+        market: Raw market dict from the Gamma API.
+
+    Returns:
+        Dict with keys: daily_rate, min_size, max_spread.
+    """
+    defaults: dict[str, float] = {
         "daily_rate": 0.0,
-        "min_size":   5.0,
+        "min_size": 5.0,
         "max_spread": 0.03,
     }
     try:
@@ -130,14 +171,22 @@ def parse_clob_rewards(market):
             return defaults
         r = clob_rewards[0]
         defaults["daily_rate"] = float(r.get("rewardsDailyRate") or 0)
-        defaults["min_size"]   = float(r.get("rewardsMinSize")   or 5)
+        defaults["min_size"] = float(r.get("rewardsMinSize") or 5)
         defaults["max_spread"] = float(r.get("rewardsMaxSpread") or 0.03)
     except Exception:
         pass
     return defaults
 
 
-def parse_token_ids(market):
+def parse_token_ids(market: dict) -> list[str]:
+    """Extract CLOB token IDs for both outcomes.
+
+    Args:
+        market: Raw market dict from the Gamma API.
+
+    Returns:
+        List of token ID strings (ideally two: Yes and No).
+    """
     try:
         raw = market.get("clobTokenIds", "[]")
         ids = json.loads(raw)
@@ -146,22 +195,47 @@ def parse_token_ids(market):
         return []
 
 
-def parse_liquidity(market):
+def parse_liquidity(market: dict) -> float:
+    """Extract the market's total liquidity in USD.
+
+    Args:
+        market: Raw market dict from the Gamma API.
+
+    Returns:
+        Liquidity value in USD.
+    """
     try:
         return float(market.get("liquidityNum") or 0)
     except Exception:
         return 0.0
 
 
-def parse_volume_24h(market):
+def parse_volume_24h(market: dict) -> float:
+    """Extract 24-hour CLOB volume.
+
+    Args:
+        market: Raw market dict from the Gamma API.
+
+    Returns:
+        24h volume in USD.
+    """
     try:
         return float(market.get("volume24hrClob") or 0)
     except Exception:
         return 0.0
 
 
-# ── Hygiene Checks ────────────────────────────────────────────────────────────
-def hygiene_check(market, rewards):
+# ── Hygiene Checks ───────────────────────────────────────────────────────────
+def hygiene_check(market: dict, rewards: dict) -> tuple[bool, str]:
+    """Apply all pass/fail filters to a market.
+
+    Args:
+        market: Raw market dict from the Gamma API.
+        rewards: Parsed reward parameters from parse_clob_rewards().
+
+    Returns:
+        (True, "OK") if the market passes, or (False, reason) if rejected.
+    """
     # 1. Must have token IDs for both outcomes
     token_ids = parse_token_ids(market)
     if len(token_ids) < 2:
@@ -183,7 +257,7 @@ def hygiene_check(market, rewards):
             return False, f"Price too skewed (Yes={yes_price:.3f})"
 
     # 5. Min shares cost must be within our budget
-    yes_price    = parse_yes_price(market) or 0.50
+    yes_price = parse_yes_price(market) or 0.50
     min_cost_usd = rewards["min_size"] * yes_price
     if min_cost_usd > MAX_ORDER_SIZE:
         return False, (
@@ -203,8 +277,17 @@ def hygiene_check(market, rewards):
     return True, "OK"
 
 
-# ── Scoring ───────────────────────────────────────────────────────────────────
-def score_market(market, rewards):
+# ── Scoring ──────────────────────────────────────────────────────────────────
+def score_market(market: dict, rewards: dict) -> float:
+    """Score a market from 0-100 based on attractiveness for market making.
+
+    Args:
+        market: Raw market dict from the Gamma API.
+        rewards: Parsed reward parameters from parse_clob_rewards().
+
+    Returns:
+        Numeric score (higher is better).
+    """
     score = 0.0
 
     # 1. Daily reward rate
@@ -214,7 +297,7 @@ def score_market(market, rewards):
     # 2. Competition
     try:
         liquidity = parse_liquidity(market)
-        volume    = parse_volume_24h(market)
+        volume = parse_volume_24h(market)
         if volume > 0:
             comp_ratio = liquidity / volume
         else:
@@ -227,7 +310,7 @@ def score_market(market, rewards):
     # 3. Price balance
     yes_price = parse_yes_price(market)
     if yes_price is not None:
-        distance      = abs(yes_price - 0.50)
+        distance = abs(yes_price - 0.50)
         balance_score = max(0, 1.0 - (distance / 0.45) ** 2) * WEIGHT_PRICE_BAL
         score += balance_score
 
@@ -242,39 +325,47 @@ def score_market(market, rewards):
     score += spread_score
 
     # 6. Liquidity
-    liq       = parse_liquidity(market)
+    liq = parse_liquidity(market)
     liq_score = min(liq / 5_000_000.0, 1.0) * WEIGHT_LIQUIDITY
     score += liq_score
 
     return round(score, 2)
 
 
-# ── Main Function ─────────────────────────────────────────────────────────────
-def get_rewards_markets(limit=MAX_MARKETS):
+# ── Main Function ────────────────────────────────────────────────────────────
+def get_rewards_markets(limit: int = MAX_MARKETS) -> list[dict]:
+    """Fetch, filter, score, and return the top markets for trading.
+
+    Args:
+        limit: Maximum number of markets to return.
+
+    Returns:
+        List of market dicts, sorted by score descending.
+    """
     raw_markets = fetch_all_rewards_markets()
 
-    passed   = []
-    rejected = []
+    passed: list[dict] = []
+    rejected: list[tuple[str, str]] = []
 
     for market in raw_markets:
-        rewards    = parse_clob_rewards(market)
+        rewards = parse_clob_rewards(market)
         ok, reason = hygiene_check(market, rewards)
 
         if ok:
             passed.append({
                 "condition_id": market.get("conditionId"),
-                "question":     market.get("question"),
-                "slug":         market.get("slug"),
-                "token_ids":    parse_token_ids(market),
-                "yes_price":    parse_yes_price(market),
-                "daily_rate":   rewards["daily_rate"],
-                "min_size":     rewards["min_size"],
-                "max_spread":   rewards["max_spread"],
-                "tick_size":    float(market.get("orderPriceMinTickSize") or 0.01),
-                "days_left":    parse_days_remaining(market),
-                "liquidity":    parse_liquidity(market),
-                "volume_24h":   parse_volume_24h(market),
-                "score":        score_market(market, rewards),
+                "question": market.get("question"),
+                "slug": market.get("slug"),
+                "token_ids": parse_token_ids(market),
+                "yes_price": parse_yes_price(market),
+                "daily_rate": rewards["daily_rate"],
+                "min_size": rewards["min_size"],
+                "max_spread": rewards["max_spread"],
+                "tick_size": float(market.get("orderPriceMinTickSize") or 0.01),
+                "days_left": parse_days_remaining(market),
+                "liquidity": parse_liquidity(market),
+                "volume_24h": parse_volume_24h(market),
+                "score": score_market(market, rewards),
             })
         else:
             rejected.append((market.get("question", "?")[:50], reason))
@@ -286,31 +377,3 @@ def get_rewards_markets(limit=MAX_MARKETS):
         log.debug(f"  Rejected: {q} — {r}")
 
     return passed[:limit]
-
-
-# ── Standalone Test ───────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s"
-    )
-    markets = get_rewards_markets()
-
-    if not markets:
-        print("\nNo suitable markets found.")
-    else:
-        print(f"\n{'='*60}")
-        print(f"TOP {len(markets)} MARKETS")
-        print(f"{'='*60}\n")
-        for i, m in enumerate(markets, 1):
-            days = f"{m['days_left']:.1f}" if m['days_left'] else "Unknown"
-            print(f"#{i}  {m['question']}")
-            print(f"    Score:       {m['score']}/100")
-            print(f"    Yes Price:   {m['yes_price']}")
-            print(f"    Daily Rate:  ${m['daily_rate']:.2f}/day")
-            print(f"    Min Size:    {m['min_size']} shares")
-            print(f"    Max Spread:  {m['max_spread']*100:.1f}c")
-            print(f"    Tick Size:   {m['tick_size']}")
-            print(f"    Days Left:   {days}")
-            print(f"    Liquidity:   ${m['liquidity']:,.0f}")
-            print()

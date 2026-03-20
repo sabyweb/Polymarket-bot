@@ -1,44 +1,58 @@
+"""
+Core bot orchestration for the Polymarket market-making bot.
+
+Connects to the CLOB API, selects markets, delegates order management
+to OrderManager instances, and handles the main trading loop.
+"""
+
 import time
 import logging
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds
+from py_clob_client.clob_types import ApiCreds, BalanceAllowanceParams, AssetType
 
 from config import (
     HOST, CHAIN_ID, PRIVATE_KEY,
     CLOB_API_KEY, CLOB_SECRET, CLOB_PASS_PHRASE,
     MAX_MARKETS, MIN_SCORE_THRESHOLD,
     MARKET_REFRESH_SECS, ORDER_REFRESH_SECS,
-    ORDER_SIZE, FUNDER, SIGNATURE_TYPE
+    ORDER_SIZE, FUNDER, SIGNATURE_TYPE,
 )
 from market import get_rewards_markets
 from position import PositionTracker
 from orders import OrderManager
 from alerts import (
     setup_logger, alert_bot_restart, alert_no_markets,
-    alert_api_failure, log_cycle_start, log_market_refresh
+    alert_api_failure, log_cycle_start, log_market_refresh,
 )
 
 log = logging.getLogger(__name__)
 
 
 class MarketMakerBot:
-    """
-    Main market making bot.
-    Orchestrates market selection, order management,
-    position tracking and alerting.
+    """Main market-making bot.
+
+    Orchestrates market selection, order management, position tracking,
+    and alerting.
     """
 
-    def __init__(self):
-        self.client              = None
-        self.position_tracker    = PositionTracker()
-        self.order_managers      = {}
-        self.active_markets      = []
-        self.cycle_count         = 0
-        self.last_market_refresh = 0
+    def __init__(self) -> None:
+        self.client: ClobClient | None = None
+        self.position_tracker: PositionTracker = PositionTracker()
+        self.order_managers: dict[str, OrderManager] = {}
+        self.active_markets: list[dict] = []
+        self.cycle_count: int = 0
+        self.last_market_refresh: float = 0
 
-    # ── Client Setup ──────────────────────────────────────────────────────────
-    def connect(self):
-        """Establish connection to Polymarket CLOB API."""
+    # ── Client Setup ─────────────────────────────────────────────────────────
+    def connect(self) -> bool:
+        """Establish connection to Polymarket CLOB API.
+
+        Also performs a balance/allowance pre-flight check so that
+        misconfigured wallets fail fast instead of during live trading.
+
+        Returns:
+            True if connection succeeded, False otherwise.
+        """
         try:
             creds = ApiCreds(
                 api_key=CLOB_API_KEY,
@@ -51,24 +65,36 @@ class MarketMakerBot:
                 chain_id=CHAIN_ID,
                 creds=creds,
                 signature_type=SIGNATURE_TYPE,
-                funder=FUNDER
+                funder=FUNDER,
             )
-            log.info("✅  Connected to Polymarket CLOB API")
+            log.info("Connected to Polymarket CLOB API")
+
+            # Verify balance and allowances before trading
+            try:
+                bal = self.client.get_balance_allowance(
+                    BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+                )
+                log.info(f"Balance/Allowance check: {bal}")
+            except Exception as e:
+                log.warning(f"Could not verify balance/allowance: {e}")
+                log.warning("Run set_allowances.py if you see order failures")
+
             return True
         except Exception as e:
             alert_api_failure(str(e))
             return False
 
-    # ── Market Management ─────────────────────────────────────────────────────
-    def refresh_markets(self):
-        """
-        Fetch, score and select markets to trade.
-        Called every 30 minutes and on bot startup.
+    # ── Market Management ────────────────────────────────────────────────────
+    def refresh_markets(self) -> None:
+        """Fetch, score, and select markets to trade.
+
+        Called every MARKET_REFRESH_SECS and on bot startup.  Adds new
+        high-scoring markets and removes those that dropped out.
         """
         log.info("Refreshing market list...")
 
         new_markets = get_rewards_markets(limit=MAX_MARKETS)
-        eligible    = [m for m in new_markets if m["score"] >= MIN_SCORE_THRESHOLD]
+        eligible = [m for m in new_markets if m["score"] >= MIN_SCORE_THRESHOLD]
 
         if not eligible:
             alert_no_markets()
@@ -77,10 +103,10 @@ class MarketMakerBot:
             return
 
         current_ids = {m["condition_id"] for m in self.active_markets}
-        new_ids     = {m["condition_id"] for m in eligible}
+        new_ids = {m["condition_id"] for m in eligible}
 
         to_remove = current_ids - new_ids
-        to_add    = new_ids - current_ids
+        to_add = new_ids - current_ids
 
         for condition_id in to_remove:
             self._remove_market(condition_id)
@@ -89,15 +115,19 @@ class MarketMakerBot:
             if market["condition_id"] in to_add:
                 self._add_market(market)
 
-        self.active_markets      = eligible
+        self.active_markets = eligible
         self.last_market_refresh = time.time()
 
         log_market_refresh(self.active_markets)
 
-    def _add_market(self, market):
-        """Add a market to the active trading set."""
+    def _add_market(self, market: dict) -> None:
+        """Add a market to the active trading set.
+
+        Args:
+            market: Parsed market dict from get_rewards_markets().
+        """
         condition_id = market["condition_id"]
-        question     = market["question"]
+        question = market["question"]
 
         self.position_tracker.register_market(condition_id, question)
         self.order_managers[condition_id] = OrderManager(
@@ -105,8 +135,12 @@ class MarketMakerBot:
         )
         log.info(f"Added market: {question[:50]} (score={market['score']})")
 
-    def _remove_market(self, condition_id):
-        """Remove a market — cancel all its orders and clean up."""
+    def _remove_market(self, condition_id: str) -> None:
+        """Remove a market — cancel all its orders and clean up.
+
+        Args:
+            condition_id: The market's condition ID.
+        """
         question = "Unknown"
         for m in self.active_markets:
             if m["condition_id"] == condition_id:
@@ -120,12 +154,12 @@ class MarketMakerBot:
         self.position_tracker.remove_market(condition_id)
         log.info(f"Removed market: {question[:50]}")
 
-    # ── Main Loop ─────────────────────────────────────────────────────────────
-    def run(self):
-        """
-        Main bot loop:
-        - Every 30 mins: refresh market list
-        - Every 30s:     run order cycle on all active markets
+    # ── Main Loop ────────────────────────────────────────────────────────────
+    def run(self) -> None:
+        """Main bot loop.
+
+        - Every MARKET_REFRESH_SECS: refresh market list.
+        - Every ORDER_REFRESH_SECS: run order cycle on all active markets.
         """
         log.info("Market Making Bot Starting...")
         log.info(f"    Max markets:      {MAX_MARKETS}")
@@ -142,12 +176,12 @@ class MarketMakerBot:
                 self.cycle_count += 1
                 log_cycle_start(self.cycle_count)
 
-                # ── Market refresh check ───────────────────────────────────
+                # ── Market refresh check ──────────────────────────────────
                 time_since_refresh = time.time() - self.last_market_refresh
                 if time_since_refresh >= MARKET_REFRESH_SECS:
                     self.refresh_markets()
 
-                # ── Run order cycle on each active market ──────────────────
+                # ── Run order cycle on each active market ─────────────────
                 if not self.active_markets:
                     log.info("No active markets — waiting for next refresh...")
                     time.sleep(ORDER_REFRESH_SECS)
@@ -164,11 +198,11 @@ class MarketMakerBot:
                                 f"{market['question'][:40]}: {e}"
                             )
 
-                # ── Print position summary every 10 cycles ─────────────────
+                # ── Print position summary every 10 cycles ────────────────
                 if self.cycle_count % 10 == 0:
                     self.position_tracker.print_summary()
 
-                # ── Wait for next cycle ────────────────────────────────────
+                # ── Wait for next cycle ───────────────────────────────────
                 log.info(f"Sleeping {ORDER_REFRESH_SECS}s until next cycle...")
                 time.sleep(ORDER_REFRESH_SECS)
 
@@ -181,8 +215,8 @@ class MarketMakerBot:
                 log.info("Restarting in 30s...")
                 time.sleep(30)
 
-    # ── Shutdown ──────────────────────────────────────────────────────────────
-    def _shutdown(self):
+    # ── Shutdown ─────────────────────────────────────────────────────────────
+    def _shutdown(self) -> None:
         """Clean shutdown — cancel all orders before exiting."""
         log.info("Shutting down bot...")
         for condition_id, manager in self.order_managers.items():
