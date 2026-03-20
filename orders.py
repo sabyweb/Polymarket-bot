@@ -8,7 +8,7 @@ buffer to minimise adverse fill risk.
 
 import logging
 from py_clob_client.clob_types import OrderArgs
-from py_clob_client.order_builder.constants import BUY, SELL
+from py_clob_client.order_builder.constants import BUY
 from config import (
     ORDER_SIZE, DANGER_ZONE_CENTS, DEAD_ZONE_BUFFER,
     MAX_ORDER_FAILURES, DRY_RUN, MAX_ORDERBOOK_SPREAD,
@@ -56,26 +56,73 @@ class OrderManager:
         return round(rounded, decimal_places)
 
     # ── Order Book ───────────────────────────────────────────────────────────
-    def get_order_book(self) -> object | None:
-        """Fetch the live order book and validate it has a usable spread.
+    def get_order_book(self) -> dict | None:
+        """Fetch and merge the YES + NO order books into one combined view.
+
+        In Neg Risk markets (most Polymarket markets), buying YES at
+        price P is equivalent to selling NO at (1-P).  The Polymarket UI
+        shows a merged view; the raw CLOB API returns separate books.
+
+        This method combines both books so we see the *real* spread:
+        - Combined bids = raw YES bids + derived bids from NO asks
+        - Combined asks = raw YES asks + derived asks from NO bids
 
         Returns:
-            The order_book object if usable, or None if the book is
-            empty, one-sided, or has a spread wider than MAX_ORDERBOOK_SPREAD.
+            A dict with 'bids' and 'asks' lists (each entry is a dict
+            with 'price' and 'size' keys), sorted best-first.
+            Returns None if the book is unusable.
         """
         try:
-            token_id = self.market["token_ids"][0]
-            order_book = self.client.get_order_book(token_id)
+            yes_token = self.market["token_ids"][0]
+            ob_yes = self.client.get_order_book(yes_token)
 
-            if not order_book.bids or not order_book.asks:
+            # Start with raw YES book
+            all_bids: list[tuple[float, float]] = []
+            all_asks: list[tuple[float, float]] = []
+
+            for b in ob_yes.bids:
+                all_bids.append((float(b.price), float(b.size)))
+            for a in ob_yes.asks:
+                all_asks.append((float(a.price), float(a.size)))
+
+            # Merge NO book if available (Neg Risk complement)
+            if len(self.market["token_ids"]) > 1:
+                no_token = self.market["token_ids"][1]
+                ob_no = self.client.get_order_book(no_token)
+
+                # NO asks → derived YES bids (price = 1 - NO_ask_price)
+                for a in ob_no.asks:
+                    derived_price = round(1 - float(a.price), 4)
+                    if derived_price > 0:
+                        all_bids.append((derived_price, float(a.size)))
+
+                # NO bids → derived YES asks (price = 1 - NO_bid_price)
+                for b in ob_no.bids:
+                    derived_price = round(1 - float(b.price), 4)
+                    if derived_price < 1:
+                        all_asks.append((derived_price, float(b.size)))
+
+            # Aggregate by price level (sum sizes at same price)
+            bid_map: dict[float, float] = {}
+            for price, size in all_bids:
+                bid_map[price] = bid_map.get(price, 0) + size
+            ask_map: dict[float, float] = {}
+            for price, size in all_asks:
+                ask_map[price] = ask_map.get(price, 0) + size
+
+            # Sort: bids highest-first, asks lowest-first
+            sorted_bids = sorted(bid_map.items(), key=lambda x: -x[0])
+            sorted_asks = sorted(ask_map.items(), key=lambda x: x[0])
+
+            if not sorted_bids or not sorted_asks:
                 log.warning(
-                    f"Empty orderbook for "
+                    f"Empty combined orderbook for "
                     f"{self.market['question'][:40]} — skipping cycle"
                 )
                 return None
 
-            best_bid = float(order_book.bids[0].price)
-            best_ask = float(order_book.asks[0].price)
+            best_bid = sorted_bids[0][0]
+            best_ask = sorted_asks[0][0]
             spread = best_ask - best_bid
 
             if spread > MAX_ORDERBOOK_SPREAD:
@@ -85,7 +132,19 @@ class OrderManager:
                 )
                 return None
 
-            return order_book
+            # Return as a dict with list-of-dicts structure
+            combined = {
+                "bids": [{"price": p, "size": s} for p, s in sorted_bids],
+                "asks": [{"price": p, "size": s} for p, s in sorted_asks],
+            }
+
+            log.debug(
+                f"Combined book | best_bid={best_bid:.4f} | "
+                f"best_ask={best_ask:.4f} | spread={spread:.4f} | "
+                f"{len(sorted_bids)} bid levels, {len(sorted_asks)} ask levels"
+            )
+
+            return combined
 
         except Exception as e:
             log.error(f"Failed to fetch order book: {e}")
@@ -93,7 +152,7 @@ class OrderManager:
 
     # ── Price Calculation ────────────────────────────────────────────────────
     def calculate_order_prices(
-        self, order_book: object
+        self, order_book: dict
     ) -> tuple[float | None, float | None]:
         """Walk the orderbook to place orders behind a liquidity buffer.
 
@@ -103,7 +162,8 @@ class OrderManager:
         of existing orders must be filled before ours are reached.
 
         Args:
-            order_book: Order book object with .bids and .asks lists.
+            order_book: Dict with 'bids' and 'asks' lists. Each entry is
+                a dict with 'price' and 'size' keys.
 
         Returns:
             (our_bid, our_ask) or (None, None) if conditions are not met.
@@ -112,26 +172,29 @@ class OrderManager:
             tick = self.market.get("tick_size", 0.01)
             max_spread = self.market["max_spread"]
 
-            # Walk bids top-down: accumulate $ volume until buffer met
+            # Walk bids top-down: accumulate $ volume until buffer met.
+            # We join the price level where $1000 of cumulative liquidity
+            # sits at equal-or-better prices.  Orders at the same price
+            # fill FIFO, so existing orders at that level are ahead of us.
             our_bid = None
             cumulative = 0.0
-            for level in order_book.bids:
-                price = float(level.price)
-                size = float(level.size)
+            for level in order_book["bids"]:
+                price = float(level["price"])
+                size = float(level["size"])
                 cumulative += price * size
                 if cumulative >= MIN_LIQUIDITY_BUFFER:
-                    our_bid = self.round_to_tick(price - tick)
+                    our_bid = self.round_to_tick(price)
                     break
 
             # Walk asks bottom-up: accumulate $ volume until buffer met
             our_ask = None
             cumulative = 0.0
-            for level in order_book.asks:
-                price = float(level.price)
-                size = float(level.size)
+            for level in order_book["asks"]:
+                price = float(level["price"])
+                size = float(level["size"])
                 cumulative += price * size
                 if cumulative >= MIN_LIQUIDITY_BUFFER:
-                    our_ask = self.round_to_tick(price + tick)
+                    our_ask = self.round_to_tick(price)
                     break
 
             if our_bid is None or our_ask is None:
@@ -142,8 +205,8 @@ class OrderManager:
                 return None, None
 
             # Verify we are still inside the reward window
-            best_bid = float(order_book.bids[0].price)
-            best_ask = float(order_book.asks[0].price)
+            best_bid = float(order_book["bids"][0]["price"])
+            best_ask = float(order_book["asks"][0]["price"])
             midpoint = (best_bid + best_ask) / 2
 
             if (abs(our_bid - midpoint) > max_spread
@@ -237,44 +300,65 @@ class OrderManager:
         condition_id = self.market["condition_id"]
         question = self.market["question"]
 
-        # Calculate order size in shares
-        yes_price = self.market["yes_price"]
-        if yes_price is None or yes_price <= 0:
+        # In Neg Risk markets:
+        #   YES side → BUY the YES token at our bid price
+        #   NO side  → BUY the NO token at (1 - our ask price)
+        # We never SELL tokens we don't own.
+        if side == "yes":
+            token_id = self.market["token_ids"][0]
+            clob_side = BUY
+            clob_price = price
+        else:
+            token_id = self.market["token_ids"][1]
+            clob_side = BUY
+            clob_price = self.round_to_tick(1 - price)
+
+        # Calculate order size based on actual token cost (clob_price),
+        # not yes_price.  For YES side clob_price == bid price; for NO
+        # side clob_price == (1 - ask_price), which can be very different.
+        if clob_price is None or clob_price <= 0:
             log.warning(
-                f"No valid yes_price for {question[:40]} — "
-                f"cannot calculate order size, skipping"
+                f"Invalid clob_price ({clob_price}) for {side.upper()} "
+                f"on {question[:40]} — skipping"
             )
             return None
 
         min_shares = self.market["min_size"]
-        budget_shares = ORDER_SIZE / yes_price
-        size = size or max(min_shares, budget_shares)
+        budget_shares = ORDER_SIZE / clob_price
+
+        # If the market minimum exceeds our budget, skip
+        if min_shares * clob_price > ORDER_SIZE:
+            log.warning(
+                f"Min order ({min_shares} shares × ${clob_price:.2f} "
+                f"= ${min_shares * clob_price:.0f}) exceeds budget "
+                f"${ORDER_SIZE} — skipping {side.upper()}"
+            )
+            return None
+
+        # Use budget_shares (up to ORDER_SIZE), but at least min_shares
+        if size is None:
+            size = max(min_shares, budget_shares)
         size = round(size, 2)
 
-        # Hard cap — limit cost to ORDER_SIZE * 1.5 USD
-        # e.g. $150 when ORDER_SIZE=$100
-        max_shares = (ORDER_SIZE * 1.5) / yes_price
+        # Hard cap — never exceed ORDER_SIZE USD
+        max_shares = ORDER_SIZE / clob_price
         if size > max_shares:
             log.debug(
                 f"Size capped from {size} to {max_shares:.2f} shares "
-                f"(hard cap at ${ORDER_SIZE * 1.5:.0f})"
+                f"(hard cap at ${ORDER_SIZE})"
             )
             size = round(max_shares, 2)
 
         log.debug(
-            f"Order size | min_shares={min_shares} | "
-            f"budget_shares={budget_shares:.1f} | "
-            f"final_size={size} | "
-            f"est_cost=${size * yes_price:.2f}"
+            f"Order size | {side.upper()} | clob_price={clob_price:.4f} | "
+            f"min_shares={min_shares} | budget_shares={budget_shares:.1f} | "
+            f"final_size={size} | est_cost=${size * clob_price:.2f}"
         )
 
         # Gate: check position limit before placing
         if not self.position_tracker.can_quote(condition_id, side):
             log.debug(f"Quoting halted on {side.upper()} — skipping")
             return None
-
-        token_id = self.market["token_ids"][0]
-        clob_side = BUY if side == "yes" else SELL
 
         # ── Dry Run ──────────────────────────────────────────────────────────
         if DRY_RUN:
@@ -296,7 +380,7 @@ class OrderManager:
         try:
             order_args = OrderArgs(
                 token_id=token_id,
-                price=price,
+                price=clob_price,
                 size=float(size),
                 side=clob_side,
             )
@@ -312,32 +396,31 @@ class OrderManager:
             # The POST response 'orderID' differs from the exchange 'id'.
             # Fetch open orders and find ours by matching asset + price + side.
             exchange_id = self._find_exchange_order_id(
-                token_id, str(price), clob_side
+                token_id, str(clob_price), clob_side
             )
 
             if exchange_id:
                 order_id = exchange_id
+                self.active_orders[order_id] = {
+                    "side": side,
+                    "price": price,
+                    "size": float(size),
+                    "original_size": float(size),
+                }
+                self.failure_counts[side] = 0
+                log_order_placed(side.upper(), price, size, question, order_id)
+                return order_id
             else:
-                # Fallback: use POST orderID (cancel may not work)
-                if isinstance(response, dict):
-                    order_id = response.get("orderID", "unknown")
-                else:
-                    order_id = response.orderID
+                # Do NOT track with POST orderID — it causes false fill alerts.
+                # The order is live on the exchange but we can't reliably track it.
+                # Next cycle will see no active order on this side and place a new one.
                 log.warning(
-                    "Could not find exchange order ID — "
-                    "using POST orderID (cancel may fail)"
+                    f"Could not find exchange order ID for {side.upper()} "
+                    f"at {price:.4f} — order placed but NOT tracked "
+                    f"(avoids false fill alerts)"
                 )
-
-            self.active_orders[order_id] = {
-                "side": side,
-                "price": price,
-                "size": float(size),
-                "original_size": float(size),
-            }
-
-            self.failure_counts[side] = 0
-            log_order_placed(side.upper(), price, size, question, order_id)
-            return order_id
+                self.failure_counts[side] = 0
+                return None
 
         except Exception as e:
             self.failure_counts[side] += 1
@@ -359,7 +442,7 @@ class OrderManager:
         Args:
             token_id: The token/asset ID of the order.
             price: The order price as a string.
-            side: BUY or SELL constant.
+            side: BUY constant (we always buy tokens).
 
         Returns:
             The exchange order ID, or None if not found.
@@ -377,7 +460,7 @@ class OrderManager:
                     continue
                 # Match on asset_id + price + side
                 if (o["asset_id"] == token_id
-                        and o["price"] == price
+                        and abs(float(o["price"]) - float(price)) < 1e-9
                         and o["side"] == side):
                     return o_id
         except Exception as e:
@@ -448,11 +531,15 @@ class OrderManager:
             return
 
         try:
+            # Only consider orders belonging to this market's tokens
+            market_tokens = set(self.market["token_ids"])
             open_orders = self.client.get_orders()
             open_map: dict[str, dict] = {}
             if open_orders:
-                # get_orders() returns a list of dicts with 'id', 'size_matched', etc.
-                open_map = {o["id"]: o for o in open_orders}
+                open_map = {
+                    o["id"]: o for o in open_orders
+                    if o.get("asset_id") in market_tokens
+                }
 
             for oid in list(self.active_orders.keys()):
                 order = self.active_orders[oid]
@@ -537,8 +624,8 @@ class OrderManager:
         if order_book is None:
             return
 
-        best_bid = float(order_book.bids[0].price)
-        best_ask = float(order_book.asks[0].price)
+        best_bid = float(order_book["bids"][0]["price"])
+        best_ask = float(order_book["asks"][0]["price"])
 
         log.info(
             f"Market: {question[:45]} | "
@@ -556,13 +643,27 @@ class OrderManager:
         if our_bid is None:
             return
 
-        # Step 5: Place fresh orders where needed
+        # Step 5: Cancel stale orders whose price has drifted from optimal
+        tick = self.market.get("tick_size", 0.01)
+        for order_id in list(self.active_orders.keys()):
+            order = self.active_orders[order_id]
+            side = order["side"]
+            optimal_price = our_bid if side == "yes" else our_ask
+            if abs(order["price"] - optimal_price) >= tick:
+                log.info(
+                    f"Price moved: {side.upper()} "
+                    f"{order['price']:.4f} -> {optimal_price:.4f} "
+                    f"— refreshing"
+                )
+                self.cancel_order(order_id, reason="price_refresh")
+
+        # Step 6: Place fresh orders where needed
         active_sides = {o["side"] for o in self.active_orders.values()}
         needs_yes = "yes" not in active_sides
         needs_no = "no" not in active_sides
 
         if not needs_yes and not needs_no:
-            log.debug("Both sides active — holding")
+            log.debug("Both sides at optimal prices — holding")
             return
 
         if needs_yes:
