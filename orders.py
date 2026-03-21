@@ -845,6 +845,14 @@ class OrderManager:
                         self.position_tracker.record_fill(
                             self.market["condition_id"], side, filled_usd
                         )
+                        # Place unwind for the partially filled shares
+                        self.place_unwind_order(
+                            side, order["price"], filled_shares
+                        )
+                        # Update remaining — but NEVER touch original_size
+                        # so that if the rest fills fully (order disappears),
+                        # the full-fill handler correctly computes the
+                        # remaining tranche size.
                         self.active_orders[oid]["size"] = remaining
                         self.active_orders[oid]["original_size"] = remaining
 
@@ -921,8 +929,27 @@ class OrderManager:
                                 side, uorder["price"], uorder["size"]
                             )
                     else:
-                        # Order found on exchange — reset unknown counter
+                        # Order found on exchange — check for partial unwind fill
                         uorder["unknown_count"] = 0
+                        exch = full_open_map[oid]
+                        u_orig = float(exch["original_size"])
+                        u_matched = float(exch["size_matched"])
+                        u_remaining = u_orig - u_matched
+                        u_tracked = uorder["size"]
+                        if u_remaining < u_tracked - 0.01:
+                            unwound_shares = u_tracked - u_remaining
+                            unwound_usd = uorder["price"] * unwound_shares
+                            log.info(
+                                f"UNWIND (PARTIAL) | {side.upper()} | "
+                                f"sold={unwound_shares:.2f} shares | "
+                                f"remaining={u_remaining:.2f} | "
+                                f"value=${unwound_usd:.2f} | "
+                                f"market={self.market['question'][:40]}"
+                            )
+                            self.position_tracker.record_unwind(
+                                self.market["condition_id"], side, unwound_usd
+                            )
+                            uorder["size"] = u_remaining
 
         except Exception as e:
             log.error(f"Fill detection error: {e}")

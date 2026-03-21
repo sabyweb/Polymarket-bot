@@ -375,11 +375,10 @@ class MarketMakerBot:
 
     # ── Orphaned Order Cleanup ────────────────────────────────────────────────
     def _cancel_orphaned_orders(self) -> None:
-        """Cancel ALL open orders on the exchange from previous sessions.
+        """Cancel orphaned BUY orders from previous sessions.
 
-        When the bot restarts (crash, deploy, server reboot), in-memory
-        active_orders is empty but old orders may still be live.  This
-        method fetches all open orders and cancels them so we start clean.
+        Preserves SELL orders — those are unwinds protecting open
+        inventory.  The bot will re-adopt them via position tracking.
         """
         try:
             open_orders = self.client.get_orders()
@@ -387,16 +386,29 @@ class MarketMakerBot:
                 log.info("No orphaned orders found — starting clean.")
                 return
 
+            buy_orders = [o for o in open_orders if o.get("side") == "BUY"]
+            sell_orders = [o for o in open_orders if o.get("side") == "SELL"]
+
+            if sell_orders:
+                log.info(
+                    f"Preserving {len(sell_orders)} SELL (unwind) order(s) "
+                    f"from previous session"
+                )
+
+            if not buy_orders:
+                log.info("No orphaned BUY orders to cancel.")
+                return
+
             log.warning(
-                f"Found {len(open_orders)} orphaned order(s) from "
-                f"previous session — cancelling all..."
+                f"Found {len(buy_orders)} orphaned BUY order(s) from "
+                f"previous session — cancelling..."
             )
-            for order in open_orders:
+            for order in buy_orders:
                 try:
                     self.client.cancel(order["id"])
                     log.info(
                         f"Cancelled orphaned order {order['id'][:16]}... "
-                        f"({order.get('side', '?')} @ {order.get('price', '?')})"
+                        f"(BUY @ {order.get('price', '?')})"
                     )
                 except Exception as e:
                     log.error(
