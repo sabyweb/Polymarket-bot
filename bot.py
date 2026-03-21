@@ -163,10 +163,55 @@ class MarketMakerBot:
             if market["condition_id"] in to_add:
                 self._add_market(market)
 
+        # Update score for existing markets (rankings may have shifted)
+        for market in result:
+            cid = market["condition_id"]
+            if cid in current_ids and cid in current_scores:
+                old_score = current_scores[cid]
+                new_score = market["score"]
+                if abs(old_score - new_score) > 1.0:
+                    log.info(
+                        f"Score changed: {market['question'][:40]} | "
+                        f"{old_score:.1f} → {new_score:.1f}"
+                    )
+
         self.active_markets = result
         self.last_market_refresh = time.time()
 
         log_market_refresh(self.active_markets)
+
+        # Send Discord notification when markets change
+        if to_add or to_remove:
+            from alerts import _send_discord
+            changes = []
+            for cid in to_remove:
+                q = "Unknown"
+                for m in self.active_markets:
+                    if m["condition_id"] == cid:
+                        q = m["question"]
+                        break
+                changes.append(f"➖ {q[:50]}")
+            for m in result:
+                if m["condition_id"] in to_add:
+                    changes.append(
+                        f"➕ {m['question'][:50]} (score={m['score']:.1f})"
+                    )
+            _send_discord(
+                "**Market Rotation**",
+                {
+                    "title": "Active Markets Changed",
+                    "description": "\n".join(changes),
+                    "color": 0x9B59B6,
+                    "fields": [
+                        {
+                            "name": f"#{i+1} {m['question'][:45]}",
+                            "value": f"Score: {m['score']:.1f} | ${m['daily_rate']:.0f}/day",
+                            "inline": False,
+                        }
+                        for i, m in enumerate(result)
+                    ],
+                },
+            )
 
     def _add_market(self, market: dict) -> None:
         """Add a market to the active trading set.

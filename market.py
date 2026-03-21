@@ -19,8 +19,7 @@ from config import (
     MIN_YES_PRICE, MAX_YES_PRICE, MIN_DAILY_RATE,
     MIN_LIQUIDITY, MIN_SPREAD_ALLOWED,
     WEIGHT_DAILY_RATE, WEIGHT_COMPETITION,
-    WEIGHT_PRICE_BAL, WEIGHT_EXPIRY,
-    WEIGHT_SPREAD, WEIGHT_LIQUIDITY,
+    WEIGHT_PRICE_BAL, WEIGHT_SPREAD, WEIGHT_LIQUIDITY,
     FUNDER, SIGNATURE_TYPE, GAMMA_API,
 )
 
@@ -302,10 +301,11 @@ def hygiene_check(market: dict, rewards: dict) -> tuple[bool, str]:
     if rewards["daily_rate"] < MIN_DAILY_RATE:
         return False, f"Daily rate too low (${rewards['daily_rate']:.2f})"
 
-    # 3. Must not expire too soon
+    # 3. Must not expire too soon (MIN_DAYS_TO_EXPIRY = 0.5 = 12 hours)
     days_left = parse_days_remaining(market)
     if days_left is not None and days_left < MIN_DAYS_TO_EXPIRY:
-        return False, f"Expiring too soon ({days_left:.1f} days)"
+        hours_left = days_left * 24
+        return False, f"Expiring too soon ({hours_left:.1f}h < {MIN_DAYS_TO_EXPIRY * 24:.0f}h)"
 
     # 4. Price must not be too skewed
     yes_price = parse_yes_price(market)
@@ -340,65 +340,115 @@ def hygiene_check(market: dict, rewards: dict) -> tuple[bool, str]:
     return True, "OK"
 
 
-# ── Scoring ──────────────────────────────────────────────────────────────────
-def score_market(market: dict, rewards: dict) -> float:
-    """Score a market from 0-100 based on attractiveness for market making.
+# ── Rank-Based Percentile Scoring ────────────────────────────────────────────
+def _rank_percentiles(values: list[float], higher_is_better: bool = True) -> list[float]:
+    """Convert raw values to percentile scores (0.0 to 1.0).
+
+    Best market on a component gets 1.0, worst gets 0.0, rest are
+    linearly interpolated.  Ties receive the same (averaged) score.
 
     Args:
-        market: Raw market dict from the Gamma API.
-        rewards: Parsed reward parameters from parse_clob_rewards().
+        values: Raw metric values, one per market.
+        higher_is_better: If True, highest value = rank 1.
 
     Returns:
-        Numeric score (higher is better).
+        List of percentile scores in the same order as input.
     """
-    score = 0.0
+    n = len(values)
+    if n <= 1:
+        return [1.0] * n
 
-    # 1. Daily reward rate
-    rate_score = min(rewards["daily_rate"] / 500.0, 1.0) * WEIGHT_DAILY_RATE
-    score += rate_score
+    indexed = sorted(enumerate(values), key=lambda x: x[1], reverse=higher_is_better)
+    scores = [0.0] * n
+    i = 0
+    while i < n:
+        j = i + 1
+        while j < n and abs(indexed[j][1] - indexed[i][1]) < 1e-9:
+            j += 1
+        avg_rank = sum(range(i, j)) / (j - i)
+        percentile = 1.0 - (avg_rank / (n - 1))
+        for k in range(i, j):
+            scores[indexed[k][0]] = percentile
+        i = j
+    return scores
 
-    # 2. Competition — prefer markets where rewards are high relative
-    #    to existing liquidity (less competition for the reward pool).
-    try:
-        liquidity = parse_liquidity(market)
-        if liquidity > 0:
-            # Higher daily_rate per dollar of liquidity = less competition
-            reward_density = rewards["daily_rate"] / (liquidity / 1000.0)
-            comp_score = min(reward_density / 5.0, 1.0) * WEIGHT_COMPETITION
+
+def score_markets_ranked(markets: list[dict]) -> list[dict]:
+    """Score markets using rank-based percentile scoring.
+
+    Each component ranks all markets against each other.  Best market
+    on a component gets full weight, worst gets 0, rest interpolated.
+    Expiry is NOT scored — it is only a hygiene filter.
+
+    Args:
+        markets: List of parsed market dicts (must have daily_rate,
+                 liquidity, yes_price, max_spread fields).
+
+    Returns:
+        Same list with "score" and "score_breakdown" keys added,
+        sorted by score descending.
+    """
+    n = len(markets)
+    if n == 0:
+        return markets
+
+    # Extract raw component values
+    rates = [m["daily_rate"] for m in markets]
+    densities = []
+    for m in markets:
+        liq = m.get("liquidity", 0)
+        if liq > 0:
+            densities.append(m["daily_rate"] / (liq / 1000.0))
         else:
-            comp_score = float(WEIGHT_COMPETITION)  # No competition
-        score += comp_score
-    except Exception:
-        pass
+            densities.append(0.0)
+    price_dists = [abs((m.get("yes_price") or 0.50) - 0.50) for m in markets]
+    spreads = [m["max_spread"] for m in markets]
+    liqs = [m.get("liquidity", 0) for m in markets]
 
-    # 3. Price balance
-    yes_price = parse_yes_price(market)
-    if yes_price is not None:
-        distance = abs(yes_price - 0.50)
-        balance_score = max(0, 1.0 - (distance / 0.45) ** 2) * WEIGHT_PRICE_BAL
-        score += balance_score
+    # Compute percentile ranks
+    pct_rate = _rank_percentiles(rates, higher_is_better=True)
+    pct_comp = _rank_percentiles(densities, higher_is_better=True)
+    pct_price = _rank_percentiles(price_dists, higher_is_better=False)
+    pct_spread = _rank_percentiles(spreads, higher_is_better=True)
+    pct_liq = _rank_percentiles(liqs, higher_is_better=True)
 
-    # 4. Days remaining
-    days_left = parse_days_remaining(market)
-    if days_left is not None:
-        expiry_score = min(days_left / 60.0, 1.0) * WEIGHT_EXPIRY
-        score += expiry_score
+    for i, m in enumerate(markets):
+        breakdown = {
+            "daily_rate": round(pct_rate[i] * WEIGHT_DAILY_RATE, 2),
+            "competition": round(pct_comp[i] * WEIGHT_COMPETITION, 2),
+            "price_bal": round(pct_price[i] * WEIGHT_PRICE_BAL, 2),
+            "spread": round(pct_spread[i] * WEIGHT_SPREAD, 2),
+            "liquidity": round(pct_liq[i] * WEIGHT_LIQUIDITY, 2),
+        }
+        m["score"] = round(sum(breakdown.values()), 2)
+        m["score_breakdown"] = breakdown
+        m["reward_density"] = round(densities[i], 2)
 
-    # 5. Spread room
-    spread_score = min(rewards["max_spread"] / 0.05, 1.0) * WEIGHT_SPREAD
-    score += spread_score
+    markets.sort(key=lambda x: x["score"], reverse=True)
 
-    # 6. Liquidity
-    liq = parse_liquidity(market)
-    liq_score = min(liq / 5_000_000.0, 1.0) * WEIGHT_LIQUIDITY
-    score += liq_score
+    # Log score breakdowns for visibility
+    for i, m in enumerate(markets[:10], 1):
+        bd = m["score_breakdown"]
+        log.info(
+            f"  #{i} {m['question'][:45]} | "
+            f"score={m['score']:.1f} | "
+            f"rate={bd['daily_rate']:.0f}/{WEIGHT_DAILY_RATE} "
+            f"comp={bd['competition']:.0f}/{WEIGHT_COMPETITION} "
+            f"price={bd['price_bal']:.0f}/{WEIGHT_PRICE_BAL} "
+            f"spread={bd['spread']:.0f}/{WEIGHT_SPREAD} "
+            f"liq={bd['liquidity']:.0f}/{WEIGHT_LIQUIDITY}"
+        )
 
-    return round(score, 2)
+    return markets
 
 
 # ── Main Function ────────────────────────────────────────────────────────────
 def get_rewards_markets(limit: int = MAX_MARKETS) -> list[dict]:
     """Fetch, filter, score, and return the top markets for trading.
+
+    Uses rank-based percentile scoring: all eligible markets are ranked
+    against each other on each component. Expiry is only a hygiene
+    filter (≥ 12 hours), not a scoring factor.
 
     Args:
         limit: Maximum number of markets to return.
@@ -408,63 +458,63 @@ def get_rewards_markets(limit: int = MAX_MARKETS) -> list[dict]:
     """
     raw_markets = fetch_all_rewards_markets()
 
+    # Enrich with real rewards params from CLOB API first
+    # (Gamma API doesn't return min_size or max_spread reliably)
+    clob_rewards = fetch_clob_rewards_params()
+
     passed: list[dict] = []
     rejected: list[tuple[str, str]] = []
 
     for market in raw_markets:
         rewards = parse_clob_rewards(market)
+
+        # Enrich with CLOB params before hygiene check
+        cid = market.get("conditionId", "")
+        if cid in clob_rewards:
+            rewards["min_size"] = clob_rewards[cid]["min_size"]
+            rewards["max_spread"] = clob_rewards[cid]["max_spread"]
+
         ok, reason = hygiene_check(market, rewards)
-
-        if ok:
-            passed.append({
-                "condition_id": market.get("conditionId"),
-                "question": market.get("question"),
-                "slug": market.get("slug"),
-                "token_ids": parse_token_ids(market),
-                "yes_price": parse_yes_price(market),
-                "daily_rate": rewards["daily_rate"],
-                "min_size": rewards["min_size"],
-                "max_spread": rewards["max_spread"],
-                "tick_size": float(market.get("orderPriceMinTickSize") or 0.01),
-                "days_left": parse_days_remaining(market),
-                "liquidity": parse_liquidity(market),
-                "volume_24h": parse_volume_24h(market),
-                "score": score_market(market, rewards),
-            })
-        else:
+        if not ok:
             rejected.append((market.get("question", "?")[:50], reason))
+            continue
 
-    passed.sort(key=lambda x: x["score"], reverse=True)
+        # Post-enrichment validation
+        if rewards["max_spread"] < MIN_SPREAD_ALLOWED:
+            rejected.append((
+                market.get("question", "?")[:50],
+                f"max_spread={rewards['max_spread']:.4f} < {MIN_SPREAD_ALLOWED}",
+            ))
+            continue
+        yes_price = parse_yes_price(market) or 0.50
+        min_cost = rewards["min_size"] * min(yes_price, 1 - yes_price)
+        if min_cost > MAX_ORDER_SIZE:
+            rejected.append((
+                market.get("question", "?")[:50],
+                f"min_cost=${min_cost:.2f} > ${MAX_ORDER_SIZE}",
+            ))
+            continue
+
+        passed.append({
+            "condition_id": cid,
+            "question": market.get("question"),
+            "slug": market.get("slug"),
+            "token_ids": parse_token_ids(market),
+            "yes_price": parse_yes_price(market),
+            "daily_rate": rewards["daily_rate"],
+            "min_size": rewards["min_size"],
+            "max_spread": rewards["max_spread"],
+            "tick_size": float(market.get("orderPriceMinTickSize") or 0.01),
+            "days_left": parse_days_remaining(market),
+            "liquidity": parse_liquidity(market),
+            "volume_24h": parse_volume_24h(market),
+        })
 
     log.info(f"Passed hygiene: {len(passed)} | Rejected: {len(rejected)}")
     for q, r in rejected[:5]:
         log.debug(f"  Rejected: {q} — {r}")
 
-    # Enrich with real rewards params from CLOB API
-    # (Gamma API doesn't return min_size or max_spread reliably)
-    clob_rewards = fetch_clob_rewards_params()
-    enriched: list[dict] = []
-    for market in passed:
-        cid = market["condition_id"]
-        if cid in clob_rewards:
-            market["min_size"] = clob_rewards[cid]["min_size"]
-            market["max_spread"] = clob_rewards[cid]["max_spread"]
+    # Score all eligible markets using rank-based percentile scoring
+    scored = score_markets_ranked(passed)
 
-        # Re-validate after enrichment — spreads or sizes may have changed
-        if market["max_spread"] < MIN_SPREAD_ALLOWED:
-            log.info(
-                f"Rejected post-enrichment: {market['question'][:40]} "
-                f"(max_spread={market['max_spread']:.4f} < {MIN_SPREAD_ALLOWED})"
-            )
-            continue
-        yes_price = market.get("yes_price") or 0.50
-        min_cost = market["min_size"] * min(yes_price, 1 - yes_price)
-        if min_cost > MAX_ORDER_SIZE:
-            log.info(
-                f"Rejected post-enrichment: {market['question'][:40]} "
-                f"(min_cost=${min_cost:.2f} > ${MAX_ORDER_SIZE})"
-            )
-            continue
-        enriched.append(market)
-
-    return enriched[:limit]
+    return scored[:limit]

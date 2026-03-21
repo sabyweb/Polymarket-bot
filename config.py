@@ -35,15 +35,17 @@ HYSTERESIS_SCORE_MARGIN: int = 10  # New market must outscore weakest by this mu
 MARKET_REFRESH_SECS: int = 1800  # Re-score and refresh markets every 30 min
 
 # ── Scoring Weights (must sum to 100) ─────────────────────────────────────────
-WEIGHT_DAILY_RATE: int = 25
-WEIGHT_COMPETITION: int = 25
-WEIGHT_PRICE_BAL: int = 20
-WEIGHT_EXPIRY: int = 15
-WEIGHT_SPREAD: int = 10
-WEIGHT_LIQUIDITY: int = 5
+# Rank-based percentile scoring: each component ranks all eligible markets
+# relative to each other. Best gets full weight, worst gets 0.
+# Expiry is NOT scored — it is only a hygiene filter (≥ 12 hours).
+WEIGHT_DAILY_RATE: int = 28
+WEIGHT_COMPETITION: int = 28
+WEIGHT_PRICE_BAL: int = 24
+WEIGHT_SPREAD: int = 12
+WEIGHT_LIQUIDITY: int = 8
 
 # ── Hygiene Filter Thresholds ─────────────────────────────────────────────────
-MIN_DAYS_TO_EXPIRY: int = 7       # Skip markets expiring within 7 days
+MIN_DAYS_TO_EXPIRY: float = 0.5   # Skip markets expiring within 12 hours
 MIN_YES_PRICE: float = 0.05      # Skip if Yes price below 5c
 MAX_YES_PRICE: float = 0.95      # Skip if Yes price above 95c
 MIN_DAILY_RATE: float = 1.0      # Skip if daily reward rate below $1
