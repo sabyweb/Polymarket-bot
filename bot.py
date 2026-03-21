@@ -5,6 +5,7 @@ Connects to the CLOB API, selects markets, delegates order management
 to OrderManager instances, and handles the main trading loop.
 """
 
+import signal
 import time
 import logging
 from py_clob_client.client import ClobClient
@@ -45,6 +46,7 @@ class MarketMakerBot:
         self.active_markets: list[dict] = []
         self.cycle_count: int = 0
         self.last_market_refresh: float = 0
+        self._shutdown_requested: bool = False
 
     # ── Client Setup ─────────────────────────────────────────────────────────
     def connect(self) -> bool:
@@ -233,6 +235,14 @@ class MarketMakerBot:
         - Every MARKET_REFRESH_SECS: refresh market list.
         - Every ORDER_REFRESH_SECS: run order cycle on all active markets.
         """
+        # Install signal handler so first Ctrl+C triggers clean shutdown
+        def _handle_signal(signum, frame):
+            if not self._shutdown_requested:
+                self._shutdown_requested = True
+                log.info(f"Received SIGINT — shutting down gracefully...")
+
+        signal.signal(signal.SIGINT, _handle_signal)
+
         log.info("Market Making Bot Starting...")
         log.info(f"    Max markets:      {MAX_MARKETS}")
         log.info(f"    Score threshold:  {MIN_SCORE_THRESHOLD}/100")
@@ -246,7 +256,7 @@ class MarketMakerBot:
         # Initial market fetch
         self.refresh_markets()
 
-        while True:
+        while not self._shutdown_requested:
             try:
                 self.cycle_count += 1
                 log_cycle_start(self.cycle_count)
@@ -263,6 +273,8 @@ class MarketMakerBot:
                     continue
 
                 for market in self.active_markets:
+                    if self._shutdown_requested:
+                        break
                     condition_id = market["condition_id"]
                     if condition_id in self.order_managers:
                         try:
@@ -297,18 +309,24 @@ class MarketMakerBot:
                     self.position_tracker.print_summary()
                     alert_positions(self.position_tracker.positions)
 
-                # ── Wait for next cycle ───────────────────────────────────
-                log.info(f"Sleeping {ORDER_REFRESH_SECS}s until next cycle...")
-                time.sleep(ORDER_REFRESH_SECS)
-
-            except KeyboardInterrupt:
-                self._shutdown()
-                break
+                # ── Wait for next cycle (interruptible) ───────────────────
+                if not self._shutdown_requested:
+                    log.info(f"Sleeping {ORDER_REFRESH_SECS}s until next cycle...")
+                    # Sleep in 1s intervals so shutdown is responsive
+                    for _ in range(ORDER_REFRESH_SECS):
+                        if self._shutdown_requested:
+                            break
+                        time.sleep(1)
 
             except Exception as e:
                 alert_bot_restart(str(e))
                 log.info("Restarting in 30s...")
-                time.sleep(30)
+                for _ in range(30):
+                    if self._shutdown_requested:
+                        break
+                    time.sleep(1)
+
+        self._shutdown()
 
     # ── Orphaned Order Cleanup ────────────────────────────────────────────────
     def _cancel_orphaned_orders(self) -> None:

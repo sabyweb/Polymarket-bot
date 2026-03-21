@@ -818,14 +818,19 @@ class OrderManager:
                                     f"{side.upper()}"
                                 )
                         else:
-                            # Definitive non-fill status (CANCELLED, etc.)
-                            log.info(
-                                f"Unwind order {oid[:16]}... removed "
-                                f"(status={status}) — NOT filled | "
-                                f"{side.upper()} | "
-                                f"market={self.market['question'][:40]}"
+                            # Definitive non-fill status (CANCELLED, INVALID, etc.)
+                            # Retry the unwind — the position still needs unwinding
+                            log.warning(
+                                f"Unwind order {oid[:16]}... failed "
+                                f"(status={status}) | {side.upper()} | "
+                                f"market={self.market['question'][:40]} — "
+                                f"retrying unwind"
                             )
                             del self.unwind_orders[oid]
+                            # Re-place the unwind order so inventory isn't stranded
+                            self.place_unwind_order(
+                                side, uorder["price"], uorder["size"]
+                            )
                     else:
                         # Order found on exchange — reset unknown counter
                         uorder["unknown_count"] = 0
@@ -849,6 +854,20 @@ class OrderManager:
 
         # Step 1: Detect fills
         self.detect_fills()
+
+        # Step 1b: Cancel active BUY orders on any halted side
+        #          (prevents position overshoot — existing orders can
+        #           fill AFTER the limit is hit if not cancelled)
+        condition_id = self.market["condition_id"]
+        for oid in list(self.active_orders.keys()):
+            order = self.active_orders[oid]
+            side = order["side"]
+            if not self.position_tracker.can_quote(condition_id, side):
+                log.info(
+                    f"Cancelling {side.upper()} order {oid[:16]}... "
+                    f"(position halted — prevent overshoot)"
+                )
+                self.cancel_order(oid, reason="position_halted")
 
         # Step 2: Fetch and validate order book
         order_book = self.get_order_book()

@@ -62,7 +62,7 @@ def fetch_all_rewards_markets() -> list[dict]:
     url = f"{GAMMA_API}/markets"
     page_size = 100
     offset = 0
-    max_offset = 50  # Only scan top 50 markets by volume
+    max_offset = 500  # Scan top 500 markets by volume
     all_rewards: list[dict] = []
 
     log.info("Paginating through all Gamma API markets...")
