@@ -314,18 +314,17 @@ def hygiene_check(market: dict, rewards: dict) -> tuple[bool, str]:
             return False, f"Price too skewed (Yes={yes_price:.3f})"
 
     # 5. Min shares cost must be within our budget (check BOTH sides)
+    #    Both sides must individually fit within budget since we
+    #    need to quote both to earn rewards.
     yes_price = parse_yes_price(market) or 0.50
     no_price = 1 - yes_price
     yes_cost = rewards["min_size"] * yes_price
     no_cost = rewards["min_size"] * no_price
-    # The cheaper side must fit within budget; otherwise we can't
-    # place even one side.  Both costs are logged for transparency.
-    min_cost_usd = min(yes_cost, no_cost)
     max_cost_usd = max(yes_cost, no_cost)
-    if min_cost_usd > MAX_ORDER_SIZE:
+    if max_cost_usd > MAX_ORDER_SIZE:
         return False, (
-            f"Min cost ${min_cost_usd:.2f}/${max_cost_usd:.2f} "
-            f"(YES/NO, {rewards['min_size']} shares) "
+            f"Order cost YES=${yes_cost:.2f}/NO=${no_cost:.2f} "
+            f"({rewards['min_size']} shares) "
             f"exceeds budget ${MAX_ORDER_SIZE}"
         )
 
@@ -487,11 +486,11 @@ def get_rewards_markets(limit: int = MAX_MARKETS) -> list[dict]:
             ))
             continue
         yes_price = parse_yes_price(market) or 0.50
-        min_cost = rewards["min_size"] * min(yes_price, 1 - yes_price)
-        if min_cost > MAX_ORDER_SIZE:
+        max_side_cost = rewards["min_size"] * max(yes_price, 1 - yes_price)
+        if max_side_cost > MAX_ORDER_SIZE:
             rejected.append((
                 market.get("question", "?")[:50],
-                f"min_cost=${min_cost:.2f} > ${MAX_ORDER_SIZE}",
+                f"max_side_cost=${max_side_cost:.2f} > ${MAX_ORDER_SIZE}",
             ))
             continue
 
