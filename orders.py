@@ -377,7 +377,6 @@ class OrderManager:
                 "size": float(size),
                 "original_size": float(size),
                 "placed_at": _time.time(),
-                "miss_count": 0,
             }
             log.info(
                 f"[DRY RUN] Would place {side.upper()} | "
@@ -417,7 +416,6 @@ class OrderManager:
                     "size": float(size),
                     "original_size": float(size),
                     "placed_at": _time.time(),
-                    "miss_count": 0,
                 }
                 self.failure_counts[side] = 0
                 log_order_placed(side.upper(), price, size, question, order_id)
@@ -553,7 +551,6 @@ class OrderManager:
                     "clob_price": clob_price,
                     "size": float(fill_size),
                     "placed_at": _time.time(),
-                    "miss_count": 0,
                 }
                 log.info(
                     f"UNWIND ORDER PLACED | SELL {side.upper()} | "
@@ -628,13 +625,37 @@ class OrderManager:
         self.active_orders.clear()
 
     # ── Fill Detection ───────────────────────────────────────────────────────
+    def _get_order_status(self, order_id: str) -> str:
+        """Query the exchange for an individual order's status.
+
+        Uses GET /data/order/{order_id} which returns the order with a
+        'status' field: "MATCHED" for fills, "CANCELLED" for cancels, etc.
+
+        Args:
+            order_id: Exchange order identifier.
+
+        Returns:
+            Status string (e.g. "MATCHED", "CANCELLED"), or "UNKNOWN".
+        """
+        try:
+            order_data = self.client.get_order(order_id)
+            if isinstance(order_data, dict):
+                return order_data.get("status", "UNKNOWN")
+            return "UNKNOWN"
+        except Exception as e:
+            log.debug(f"Could not fetch status for order {order_id[:16]}...: {e}")
+            return "UNKNOWN"
+
     def detect_fills(self) -> None:
         """Compare tracked orders against open orders on exchange.
 
-        Detects both full fills (order disappeared) and partial fills
-        (remaining size smaller than original size).  Also tracks
-        unwind (SELL) orders and records inventory reduction.
-        Skipped in dry-run.
+        When an order disappears from get_orders(), we verify its status
+        using get_order(id).  Only orders with status "MATCHED" are
+        treated as fills — everything else (CANCELLED, expired, etc.)
+        is silently removed from tracking.
+
+        Also detects partial fills (remaining size < original) and
+        tracks unwind (SELL) orders.  Skipped in dry-run.
         """
         if DRY_RUN:
             return
@@ -658,84 +679,48 @@ class OrderManager:
                 f"market={self.market['question'][:30]}"
             )
 
-            # Safety: if ALL tracked orders are missing, it's likely
-            # an external cancel (another bot instance, manual cancel),
-            # not simultaneous fills. Clear tracker and skip.
-            now = _time.time()
-            missing = [
-                oid for oid in self.active_orders
-                if oid not in open_map
-                and now - self.active_orders[oid].get("placed_at", 0) >= 90
-            ]
-            eligible_count = sum(
-                1 for o in self.active_orders.values()
-                if now - o.get("placed_at", 0) >= 90
-            )
-            if len(missing) == eligible_count and eligible_count > 1:
-                log.warning(
-                    f"ALL {eligible_count} orders missing from exchange "
-                    f"— likely external cancel, NOT fills. "
-                    f"Clearing tracker for {self.market['question'][:40]}"
-                )
-                self.active_orders.clear()
-                return
-
             for oid in list(self.active_orders.keys()):
                 order = self.active_orders[oid]
                 side = order["side"]
 
-                # Grace period: skip fill detection for orders < 90s old
-                age = now - order.get("placed_at", 0)
-                if age < 90:
-                    log.debug(
-                        f"Skipping fill check for {side.upper()} "
-                        f"order (age={age:.0f}s < 90s)"
-                    )
-                    continue
-
                 if oid not in open_map:
-                    # Order missing from exchange — increment miss counter.
-                    # Only declare a fill after 3 consecutive misses (90s)
-                    # to tolerate transient API hiccups.
-                    order["miss_count"] = order.get("miss_count", 0) + 1
-                    if order["miss_count"] < 3:
+                    # Order gone — check WHY via individual status query
+                    status = self._get_order_status(oid)
+
+                    if status == "MATCHED":
+                        # CONFIRMED fill
+                        filled_usd = order["price"] * order["original_size"]
                         log.info(
-                            f"Order {oid[:16]}... missing from exchange "
-                            f"(miss #{order['miss_count']}/3) — "
-                            f"waiting to confirm | {side.upper()} | "
+                            f"FILL (FULL) | {side.upper()} | "
+                            f"price={order['price']:.4f} | "
+                            f"value=${filled_usd:.2f} | "
                             f"market={self.market['question'][:40]}"
                         )
-                        continue
+                        alert_fill(
+                            fill_type="FULL",
+                            side=side.upper(),
+                            price=order["price"],
+                            filled_shares=order["original_size"],
+                            filled_usd=filled_usd,
+                            market_question=self.market["question"],
+                        )
+                        self.position_tracker.record_fill(
+                            self.market["condition_id"], side, filled_usd
+                        )
+                        self.place_unwind_order(
+                            side, order["price"], order["original_size"]
+                        )
+                    else:
+                        # NOT a fill — cancelled, expired, or unknown
+                        log.info(
+                            f"Order {oid[:16]}... removed (status={status}) "
+                            f"— NOT a fill | {side.upper()} | "
+                            f"market={self.market['question'][:40]}"
+                        )
 
-                    # 3 consecutive misses — confirmed full fill
-                    filled_usd = order["price"] * order["original_size"]
-                    log.info(
-                        f"FILL (FULL) | {side.upper()} | "
-                        f"price={order['price']:.4f} | "
-                        f"value=${filled_usd:.2f} | "
-                        f"market={self.market['question'][:40]}"
-                    )
-                    alert_fill(
-                        fill_type="FULL",
-                        side=side.upper(),
-                        price=order["price"],
-                        filled_shares=order["original_size"],
-                        filled_usd=filled_usd,
-                        market_question=self.market["question"],
-                    )
-                    self.position_tracker.record_fill(
-                        self.market["condition_id"], side, filled_usd
-                    )
-                    # Immediately place SELL order to unwind inventory
-                    self.place_unwind_order(
-                        side, order["price"], order["original_size"]
-                    )
                     del self.active_orders[oid]
                 else:
-                    # Order found on exchange — reset miss counter
-                    order["miss_count"] = 0
-
-                    # Check for partial fill
+                    # Order still on exchange — check for partial fill
                     exchange_order = open_map[oid]
                     orig = float(exchange_order["original_size"])
                     matched = float(exchange_order["size_matched"])
@@ -763,55 +748,48 @@ class OrderManager:
                         self.position_tracker.record_fill(
                             self.market["condition_id"], side, filled_usd
                         )
-                        # Update tracked size to current remaining
                         self.active_orders[oid]["size"] = remaining
                         self.active_orders[oid]["original_size"] = remaining
 
             # ── Check unwind (SELL) orders ────────────────────────────────
             if self.unwind_orders and open_orders is not None:
-                # Build full open_map (unfiltered) for unwind tracking
-                # since unwind orders use the same token IDs
                 full_open_map = {o["id"]: o for o in open_orders}
 
                 for oid in list(self.unwind_orders.keys()):
                     uorder = self.unwind_orders[oid]
                     side = uorder["side"]
-                    age = now - uorder.get("placed_at", 0)
-
-                    if age < 90:
-                        continue
 
                     if oid not in full_open_map:
-                        uorder["miss_count"] = uorder.get("miss_count", 0) + 1
-                        if uorder["miss_count"] < 3:
-                            log.debug(
-                                f"Unwind order {oid[:16]}... missing "
-                                f"(miss #{uorder['miss_count']}/3)"
-                            )
-                            continue
+                        status = self._get_order_status(oid)
 
-                        # Unwind order confirmed filled — inventory offloaded
-                        unwound_usd = uorder["price"] * uorder["size"]
-                        log.info(
-                            f"INVENTORY UNWOUND | {side.upper()} | "
-                            f"price={uorder['price']:.4f} | "
-                            f"size={uorder['size']:.2f} | "
-                            f"value=${unwound_usd:.2f} | "
-                            f"market={self.market['question'][:40]}"
-                        )
-                        alert_unwind(
-                            side=side.upper(),
-                            price=uorder["price"],
-                            size=uorder["size"],
-                            usd_value=unwound_usd,
-                            market_question=self.market["question"],
-                        )
-                        self.position_tracker.record_unwind(
-                            self.market["condition_id"], side, unwound_usd
-                        )
+                        if status == "MATCHED":
+                            unwound_usd = uorder["price"] * uorder["size"]
+                            log.info(
+                                f"INVENTORY UNWOUND | {side.upper()} | "
+                                f"price={uorder['price']:.4f} | "
+                                f"size={uorder['size']:.2f} | "
+                                f"value=${unwound_usd:.2f} | "
+                                f"market={self.market['question'][:40]}"
+                            )
+                            alert_unwind(
+                                side=side.upper(),
+                                price=uorder["price"],
+                                size=uorder["size"],
+                                usd_value=unwound_usd,
+                                market_question=self.market["question"],
+                            )
+                            self.position_tracker.record_unwind(
+                                self.market["condition_id"], side, unwound_usd
+                            )
+                        else:
+                            log.info(
+                                f"Unwind order {oid[:16]}... removed "
+                                f"(status={status}) — NOT filled | "
+                                f"{side.upper()} | "
+                                f"market={self.market['question'][:40]}"
+                            )
+
                         del self.unwind_orders[oid]
-                    else:
-                        uorder["miss_count"] = 0
 
         except Exception as e:
             log.error(f"Fill detection error: {e}")
