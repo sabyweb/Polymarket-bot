@@ -9,7 +9,7 @@ buffer to minimise adverse fill risk.
 import logging
 import time as _time
 from py_clob_client.clob_types import OrderArgs
-from py_clob_client.order_builder.constants import BUY
+from py_clob_client.order_builder.constants import BUY, SELL
 from config import (
     ORDER_SIZE, MAX_ORDER_BUDGET, DANGER_ZONE_CENTS, DEAD_ZONE_BUFFER,
     MAX_ORDER_FAILURES, DRY_RUN, MAX_ORDERBOOK_SPREAD,
@@ -17,7 +17,7 @@ from config import (
 )
 from alerts import (
     alert_order_failure, alert_danger_zone,
-    alert_fill, log_order_placed, log_order_cancelled,
+    alert_fill, alert_unwind, log_order_placed, log_order_cancelled,
 )
 
 log = logging.getLogger(__name__)
@@ -37,6 +37,7 @@ class OrderManager:
         self.market = market
         self.position_tracker = position_tracker
         self.active_orders: dict[str, dict] = {}
+        self.unwind_orders: dict[str, dict] = {}  # SELL orders to offload inventory
         self.failure_counts: dict[str, int] = {"yes": 0, "no": 0}
 
     # ── Tick Size Rounding ───────────────────────────────────────────────────
@@ -493,6 +494,87 @@ class OrderManager:
         no_id = self.place_order("no", our_ask)
         return yes_id, no_id
 
+    # ── Inventory Unwinding ─────────────────────────────────────────────────
+    def place_unwind_order(
+        self, side: str, fill_price: float, fill_size: float
+    ) -> str | None:
+        """Place a SELL limit order to offload filled inventory at acquisition price.
+
+        When a BUY order fills, we hold tokens we don't want. This places
+        a SELL order at the same price to break even. Profit comes from
+        liquidity rewards, not from holding inventory.
+
+        Args:
+            side: "yes" or "no" — which side was filled.
+            fill_price: The YES-equivalent price we paid.
+            fill_size: Number of shares to sell.
+
+        Returns:
+            Exchange order ID of the unwind order, or None on failure.
+        """
+        question = self.market["question"]
+
+        if side == "yes":
+            token_id = self.market["token_ids"][0]
+            clob_price = fill_price
+        else:
+            token_id = self.market["token_ids"][1]
+            clob_price = self.round_to_tick(1 - fill_price)
+
+        if clob_price is None or clob_price <= 0:
+            log.warning(
+                f"Invalid unwind price ({clob_price}) for {side.upper()} "
+                f"on {question[:40]} — skipping unwind"
+            )
+            return None
+
+        try:
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=clob_price,
+                size=float(fill_size),
+                side=SELL,
+            )
+            response = self.client.create_and_post_order(order_args)
+
+            if isinstance(response, dict) and not response.get("success", True):
+                raise Exception(
+                    f"Unwind rejected: {response.get('errorMsg', response)}"
+                )
+
+            exchange_id = self._find_exchange_order_id(
+                token_id, str(clob_price), SELL
+            )
+
+            if exchange_id:
+                self.unwind_orders[exchange_id] = {
+                    "side": side,
+                    "price": fill_price,
+                    "clob_price": clob_price,
+                    "size": float(fill_size),
+                    "placed_at": _time.time(),
+                    "miss_count": 0,
+                }
+                log.info(
+                    f"UNWIND ORDER PLACED | SELL {side.upper()} | "
+                    f"price={clob_price:.4f} | size={fill_size:.2f} | "
+                    f"market={question[:40]} | id={exchange_id}"
+                )
+                return exchange_id
+            else:
+                log.warning(
+                    f"Unwind order placed but could not find exchange ID "
+                    f"for {side.upper()} on {question[:40]}"
+                )
+                return None
+
+        except Exception as e:
+            log.error(
+                f"Failed to place unwind order for {side.upper()} "
+                f"on {question[:40]}: {e}"
+            )
+            return None
+
     # ── Order Cancellation ───────────────────────────────────────────────────
     def cancel_order(self, order_id: str, reason: str = "manual") -> None:
         """Cancel a single order.
@@ -518,26 +600,45 @@ class OrderManager:
         except Exception as e:
             log.error(f"Failed to cancel order {order_id}: {e}")
 
-    def cancel_all(self, reason: str = "refresh") -> None:
+    def cancel_all(
+        self, reason: str = "refresh", include_unwinds: bool = False
+    ) -> None:
         """Cancel all active orders for this market.
 
         Args:
             reason: Human-readable reason for logging.
+            include_unwinds: If True, also cancel unwind (SELL) orders.
+                Only set True on bot shutdown — normally unwind orders
+                should persist until filled.
         """
-        if not self.active_orders:
-            return
         for order_id in list(self.active_orders.keys()):
             self.cancel_order(order_id, reason)
-        log.info(f"Cancelled all for {self.market['question'][:40]}")
+
+        if include_unwinds:
+            for order_id in list(self.unwind_orders.keys()):
+                try:
+                    self.client.cancel(order_id)
+                    log_order_cancelled(order_id, f"unwind-{reason}")
+                except Exception as e:
+                    log.error(f"Failed to cancel unwind order {order_id}: {e}")
+                del self.unwind_orders[order_id]
+
+        if self.active_orders or (include_unwinds and self.unwind_orders):
+            log.info(f"Cancelled all for {self.market['question'][:40]}")
+        self.active_orders.clear()
 
     # ── Fill Detection ───────────────────────────────────────────────────────
     def detect_fills(self) -> None:
         """Compare tracked orders against open orders on exchange.
 
         Detects both full fills (order disappeared) and partial fills
-        (remaining size smaller than original size).  Skipped in dry-run.
+        (remaining size smaller than original size).  Also tracks
+        unwind (SELL) orders and records inventory reduction.
+        Skipped in dry-run.
         """
-        if not self.active_orders or DRY_RUN:
+        if DRY_RUN:
+            return
+        if not self.active_orders and not self.unwind_orders:
             return
 
         try:
@@ -625,6 +726,10 @@ class OrderManager:
                     self.position_tracker.record_fill(
                         self.market["condition_id"], side, filled_usd
                     )
+                    # Immediately place SELL order to unwind inventory
+                    self.place_unwind_order(
+                        side, order["price"], order["original_size"]
+                    )
                     del self.active_orders[oid]
                 else:
                     # Order found on exchange — reset miss counter
@@ -661,6 +766,52 @@ class OrderManager:
                         # Update tracked size to current remaining
                         self.active_orders[oid]["size"] = remaining
                         self.active_orders[oid]["original_size"] = remaining
+
+            # ── Check unwind (SELL) orders ────────────────────────────────
+            if self.unwind_orders and open_orders is not None:
+                # Build full open_map (unfiltered) for unwind tracking
+                # since unwind orders use the same token IDs
+                full_open_map = {o["id"]: o for o in open_orders}
+
+                for oid in list(self.unwind_orders.keys()):
+                    uorder = self.unwind_orders[oid]
+                    side = uorder["side"]
+                    age = now - uorder.get("placed_at", 0)
+
+                    if age < 90:
+                        continue
+
+                    if oid not in full_open_map:
+                        uorder["miss_count"] = uorder.get("miss_count", 0) + 1
+                        if uorder["miss_count"] < 3:
+                            log.debug(
+                                f"Unwind order {oid[:16]}... missing "
+                                f"(miss #{uorder['miss_count']}/3)"
+                            )
+                            continue
+
+                        # Unwind order confirmed filled — inventory offloaded
+                        unwound_usd = uorder["price"] * uorder["size"]
+                        log.info(
+                            f"INVENTORY UNWOUND | {side.upper()} | "
+                            f"price={uorder['price']:.4f} | "
+                            f"size={uorder['size']:.2f} | "
+                            f"value=${unwound_usd:.2f} | "
+                            f"market={self.market['question'][:40]}"
+                        )
+                        alert_unwind(
+                            side=side.upper(),
+                            price=uorder["price"],
+                            size=uorder["size"],
+                            usd_value=unwound_usd,
+                            market_question=self.market["question"],
+                        )
+                        self.position_tracker.record_unwind(
+                            self.market["condition_id"], side, unwound_usd
+                        )
+                        del self.unwind_orders[oid]
+                    else:
+                        uorder["miss_count"] = 0
 
         except Exception as e:
             log.error(f"Fill detection error: {e}")

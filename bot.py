@@ -22,7 +22,8 @@ from position import PositionTracker
 from orders import OrderManager
 from alerts import (
     setup_logger, alert_bot_restart, alert_no_markets,
-    alert_api_failure, log_cycle_start, log_market_refresh,
+    alert_api_failure, alert_positions,
+    log_cycle_start, log_market_refresh,
 )
 
 log = logging.getLogger(__name__)
@@ -204,6 +205,7 @@ class MarketMakerBot:
                 # ── Print position summary every 10 cycles ────────────────
                 if self.cycle_count % 10 == 0:
                     self.position_tracker.print_summary()
+                    alert_positions(self.position_tracker.positions)
 
                 # ── Wait for next cycle ───────────────────────────────────
                 log.info(f"Sleeping {ORDER_REFRESH_SECS}s until next cycle...")
@@ -255,9 +257,9 @@ class MarketMakerBot:
 
     # ── Shutdown ─────────────────────────────────────────────────────────────
     def _shutdown(self) -> None:
-        """Clean shutdown — cancel all orders before exiting."""
+        """Clean shutdown — cancel all orders (including unwinds) before exiting."""
         log.info("Shutting down bot...")
         for condition_id, manager in self.order_managers.items():
-            manager.cancel_all(reason="bot shutdown")
+            manager.cancel_all(reason="bot shutdown", include_unwinds=True)
         self.position_tracker.print_summary()
         log.info("All orders cancelled. Bot stopped cleanly.")

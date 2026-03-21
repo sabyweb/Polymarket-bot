@@ -337,6 +337,78 @@ def alert_fill(
     _write_alert("FILL", msg)
 
 
+def alert_unwind(
+    side: str,
+    price: float,
+    size: float,
+    usd_value: float,
+    market_question: str,
+) -> None:
+    """Send a Discord notification when inventory is successfully unwound.
+
+    Args:
+        side: "YES" or "NO".
+        price: The price at which inventory was sold.
+        size: Number of shares sold.
+        usd_value: Dollar value of the unwind.
+        market_question: Human-readable market name.
+    """
+    embed = {
+        "title": "Inventory Unwound",
+        "description": f"**{side}** position sold at acquisition price",
+        "color": 0x2ECC71,  # Green — position closed
+        "fields": [
+            {"name": "Market", "value": market_question[:80], "inline": False},
+            {"name": "Side", "value": side, "inline": True},
+            {"name": "Price", "value": f"${price:.4f}", "inline": True},
+            {"name": "Value", "value": f"${usd_value:.2f}", "inline": True},
+            {"name": "Shares", "value": f"{size:.2f}", "inline": True},
+        ],
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+    _send_discord(f"**Inventory Unwound** — {side} ${usd_value:.2f}", embed)
+
+    msg = (
+        f"UNWIND | {side} | price={price:.4f} | "
+        f"shares={size:.2f} | value=${usd_value:.2f} | "
+        f"market={market_question[:40]}"
+    )
+    _write_alert("UNWIND", msg)
+
+
+def alert_positions(positions: dict) -> None:
+    """Send a position summary to Discord.
+
+    Args:
+        positions: Dict from PositionTracker.positions keyed by condition_id.
+    """
+    fields = []
+    for cid, pos in positions.items():
+        yes_val = pos.get("yes", 0.0)
+        no_val = pos.get("no", 0.0)
+        if yes_val > 0 or no_val > 0:
+            fields.append({
+                "name": pos.get("question", cid)[:50],
+                "value": f"YES: ${yes_val:.2f} | NO: ${no_val:.2f}",
+                "inline": False,
+            })
+
+    if not fields:
+        fields = [{
+            "name": "No open positions",
+            "value": "All inventory unwound",
+            "inline": False,
+        }]
+
+    embed = {
+        "title": "Current Positions",
+        "color": 0x3498DB,  # Blue — informational
+        "fields": fields,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+    _send_discord("**Position Update**", embed)
+
+
 def alert_bot_crash(error: str) -> None:
     """Send a Discord notification when the bot crashes.
 
