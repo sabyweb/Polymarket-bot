@@ -137,7 +137,12 @@ class MarketMakerBot:
         log.info(f"Added market: {question[:50]} (score={market['score']})")
 
     def _remove_market(self, condition_id: str) -> None:
-        """Remove a market — cancel all its orders and clean up.
+        """Remove a market from the active trading set.
+
+        Cancels active BUY orders but preserves the OrderManager and
+        position tracking if there are pending unwind orders or open
+        positions, so that unwind fills continue to be detected and
+        Discord position reports remain accurate.
 
         Args:
             condition_id: The market's condition ID.
@@ -149,10 +154,31 @@ class MarketMakerBot:
                 break
 
         if condition_id in self.order_managers:
-            self.order_managers[condition_id].cancel_all(reason="market removed")
-            del self.order_managers[condition_id]
+            manager = self.order_managers[condition_id]
+            has_unwinds = bool(manager.unwind_orders)
 
-        self.position_tracker.remove_market(condition_id)
+            # Cancel active BUY orders (stop quoting) but keep unwinds
+            manager.cancel_all(reason="market removed")
+
+            if has_unwinds:
+                log.info(
+                    f"Market removed from active set but keeping "
+                    f"{len(manager.unwind_orders)} unwind order(s) "
+                    f"tracked: {question[:50]}"
+                )
+            else:
+                del self.order_managers[condition_id]
+
+        # Only remove position tracking if position is flat
+        pos = self.position_tracker.positions.get(condition_id)
+        if pos and (pos.get("yes", 0) > 0 or pos.get("no", 0) > 0):
+            log.info(
+                f"Keeping position tracking for {question[:50]} "
+                f"(YES=${pos['yes']:.2f} NO=${pos['no']:.2f})"
+            )
+        else:
+            self.position_tracker.remove_market(condition_id)
+
         log.info(f"Removed market: {question[:50]}")
 
     # ── Main Loop ────────────────────────────────────────────────────────────
@@ -201,6 +227,25 @@ class MarketMakerBot:
                                 f"Cycle error for "
                                 f"{market['question'][:40]}: {e}"
                             )
+
+                # ── Check unwind-only managers (removed markets) ────────
+                active_cids = {m["condition_id"] for m in self.active_markets}
+                for cid in list(self.order_managers.keys()):
+                    if cid not in active_cids:
+                        manager = self.order_managers[cid]
+                        if manager.unwind_orders:
+                            try:
+                                manager.detect_fills()
+                            except Exception as e:
+                                log.error(
+                                    f"Unwind check error for removed market: {e}"
+                                )
+                        else:
+                            # No more unwinds — clean up manager and position
+                            del self.order_managers[cid]
+                            pos = self.position_tracker.positions.get(cid)
+                            if pos and pos.get("yes", 0) <= 0 and pos.get("no", 0) <= 0:
+                                self.position_tracker.remove_market(cid)
 
                 # ── Print position summary every 10 cycles ────────────────
                 if self.cycle_count % 10 == 0:
