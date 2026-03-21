@@ -464,8 +464,8 @@ class OrderManager:
                 return None
             for o in open_orders:
                 o_id = o["id"]
-                # Skip orders we already track
-                if o_id in self.active_orders:
+                # Skip orders we already track (active OR unwind)
+                if o_id in self.active_orders or o_id in self.unwind_orders:
                     continue
                 # Match on asset_id + price + side
                 if (o["asset_id"] == token_id
@@ -688,28 +688,36 @@ class OrderManager:
                     status = self._get_order_status(oid)
 
                     if status == "MATCHED":
-                        # CONFIRMED fill
-                        filled_usd = order["price"] * order["original_size"]
-                        log.info(
-                            f"FILL (FULL) | {side.upper()} | "
-                            f"price={order['price']:.4f} | "
-                            f"value=${filled_usd:.2f} | "
-                            f"market={self.market['question'][:40]}"
-                        )
-                        alert_fill(
-                            fill_type="FULL",
-                            side=side.upper(),
-                            price=order["price"],
-                            filled_shares=order["original_size"],
-                            filled_usd=filled_usd,
-                            market_question=self.market["question"],
-                        )
-                        self.position_tracker.record_fill(
-                            self.market["condition_id"], side, filled_usd
-                        )
-                        self.place_unwind_order(
-                            side, order["price"], order["original_size"]
-                        )
+                        # CONFIRMED fill — isolate so one failure
+                        # doesn't prevent processing remaining fills
+                        try:
+                            filled_usd = order["price"] * order["original_size"]
+                            log.info(
+                                f"FILL (FULL) | {side.upper()} | "
+                                f"price={order['price']:.4f} | "
+                                f"value=${filled_usd:.2f} | "
+                                f"market={self.market['question'][:40]}"
+                            )
+                            alert_fill(
+                                fill_type="FULL",
+                                side=side.upper(),
+                                price=order["price"],
+                                filled_shares=order["original_size"],
+                                filled_usd=filled_usd,
+                                market_question=self.market["question"],
+                            )
+                            self.position_tracker.record_fill(
+                                self.market["condition_id"], side, filled_usd
+                            )
+                            self.place_unwind_order(
+                                side, order["price"], order["original_size"]
+                            )
+                        except Exception as e:
+                            log.error(
+                                f"Error processing fill for {oid[:16]}... "
+                                f"({side.upper()}): {e} — continuing to "
+                                f"next order"
+                            )
                     else:
                         # NOT a fill — cancelled, expired, or unknown
                         log.info(
