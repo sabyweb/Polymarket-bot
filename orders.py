@@ -759,6 +759,15 @@ class OrderManager:
                     uorder = self.unwind_orders[oid]
                     side = uorder["side"]
 
+                    # Grace period: don't check orders < 90s old
+                    age = _time.time() - uorder.get("placed_at", 0)
+                    if age < 90:
+                        log.debug(
+                            f"Skipping unwind check for {oid[:16]}... "
+                            f"(age={age:.0f}s < 90s)"
+                        )
+                        continue
+
                     if oid not in full_open_map:
                         status = self._get_order_status(oid)
 
@@ -781,15 +790,37 @@ class OrderManager:
                             self.position_tracker.record_unwind(
                                 self.market["condition_id"], side, unwound_usd
                             )
+                            del self.unwind_orders[oid]
+                        elif status == "UNKNOWN":
+                            # API error — keep tracking, count consecutive failures
+                            uorder["unknown_count"] = uorder.get("unknown_count", 0) + 1
+                            if uorder["unknown_count"] >= 5:
+                                log.warning(
+                                    f"Unwind order {oid[:16]}... status UNKNOWN "
+                                    f"for {uorder['unknown_count']} consecutive "
+                                    f"checks — removing from tracking | "
+                                    f"{side.upper()} | "
+                                    f"market={self.market['question'][:40]}"
+                                )
+                                del self.unwind_orders[oid]
+                            else:
+                                log.info(
+                                    f"Unwind order {oid[:16]}... status UNKNOWN "
+                                    f"(#{uorder['unknown_count']}/5) — keeping | "
+                                    f"{side.upper()}"
+                                )
                         else:
+                            # Definitive non-fill status (CANCELLED, etc.)
                             log.info(
                                 f"Unwind order {oid[:16]}... removed "
                                 f"(status={status}) — NOT filled | "
                                 f"{side.upper()} | "
                                 f"market={self.market['question'][:40]}"
                             )
-
-                        del self.unwind_orders[oid]
+                            del self.unwind_orders[oid]
+                    else:
+                        # Order found on exchange — reset unknown counter
+                        uorder["unknown_count"] = 0
 
         except Exception as e:
             log.error(f"Fill detection error: {e}")
