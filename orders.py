@@ -38,6 +38,7 @@ class OrderManager:
         self.position_tracker = position_tracker
         self.active_orders: dict[str, dict] = {}
         self.unwind_orders: dict[str, dict] = {}  # SELL orders to offload inventory
+        self.pending_unwinds: list[dict] = []      # Failed unwinds awaiting retry
         self.failure_counts: dict[str, int] = {"yes": 0, "no": 0}
 
     # ── Tick Size Rounding ───────────────────────────────────────────────────
@@ -561,16 +562,95 @@ class OrderManager:
             else:
                 log.warning(
                     f"Unwind order placed but could not find exchange ID "
-                    f"for {side.upper()} on {question[:40]}"
+                    f"for {side.upper()} on {question[:40]} — queuing for retry"
                 )
+                self._queue_pending_unwind(side, fill_price, fill_size)
                 return None
 
         except Exception as e:
             log.error(
                 f"Failed to place unwind order for {side.upper()} "
-                f"on {question[:40]}: {e}"
+                f"on {question[:40]}: {e} — queuing for retry"
             )
+            self._queue_pending_unwind(side, fill_price, fill_size)
             return None
+
+    def _queue_pending_unwind(
+        self, side: str, fill_price: float, fill_size: float
+    ) -> None:
+        """Queue an unwind that failed to place, for retry next cycle.
+
+        Deduplicates: if there's already a pending unwind for the same side,
+        merge the size instead of adding a duplicate entry.
+        """
+        for pending in self.pending_unwinds:
+            if (pending["side"] == side
+                    and abs(pending["fill_price"] - fill_price) < 1e-9):
+                pending["fill_size"] += fill_size
+                log.info(
+                    f"PENDING UNWIND MERGED | {side.upper()} | "
+                    f"total_size={pending['fill_size']:.2f} | "
+                    f"market={self.market['question'][:40]}"
+                )
+                return
+        self.pending_unwinds.append({
+            "side": side,
+            "fill_price": fill_price,
+            "fill_size": fill_size,
+            "queued_at": _time.time(),
+        })
+        log.info(
+            f"PENDING UNWIND QUEUED | {side.upper()} | "
+            f"price={fill_price:.4f} | size={fill_size:.2f} | "
+            f"market={self.market['question'][:40]}"
+        )
+
+    def retry_pending_unwinds(self) -> None:
+        """Attempt to place any queued unwind orders.
+
+        Called at the start of each cycle.  Successfully placed unwinds
+        are removed from the queue; failures stay for the next cycle.
+
+        To avoid circular re-queueing (place_unwind_order adds to
+        pending_unwinds on failure), we snapshot and clear the list
+        first, then attempt each one.  Failures will be re-added
+        by place_unwind_order.
+        """
+        if not self.pending_unwinds:
+            return
+
+        # Snapshot and clear — place_unwind_order will re-queue failures
+        to_retry = self.pending_unwinds[:]
+        self.pending_unwinds.clear()
+
+        for pending in to_retry:
+            side = pending["side"]
+            age_min = (_time.time() - pending["queued_at"]) / 60
+            log.info(
+                f"RETRYING PENDING UNWIND | {side.upper()} | "
+                f"price={pending['fill_price']:.4f} | "
+                f"size={pending['fill_size']:.2f} | "
+                f"queued {age_min:.1f}m ago | "
+                f"market={self.market['question'][:40]}"
+            )
+            self.place_unwind_order(
+                side, pending["fill_price"], pending["fill_size"]
+            )
+
+    def has_pending_unwind(self, side: str) -> bool:
+        """Check if there's a pending (failed) unwind for a given side.
+
+        Used by run_cycle to block new BUY orders when we have inventory
+        that still needs unwinding.
+        """
+        for pending in self.pending_unwinds:
+            if pending["side"] == side:
+                return True
+        # Also check if there's an active unwind order on this side
+        for uorder in self.unwind_orders.values():
+            if uorder["side"] == side:
+                return True
+        return False
 
     # ── Order Cancellation ───────────────────────────────────────────────────
     def cancel_order(self, order_id: str, reason: str = "manual") -> None:
@@ -604,9 +684,9 @@ class OrderManager:
 
         Args:
             reason: Human-readable reason for logging.
-            include_unwinds: If True, also cancel unwind (SELL) orders.
-                Only set True on bot shutdown — normally unwind orders
-                should persist until filled.
+            include_unwinds: If True, also cancel unwind (SELL) orders
+                and clear pending unwinds.  Only set True on bot
+                shutdown — normally unwind orders should persist.
         """
         for order_id in list(self.active_orders.keys()):
             self.cancel_order(order_id, reason)
@@ -619,10 +699,19 @@ class OrderManager:
                 except Exception as e:
                     log.error(f"Failed to cancel unwind order {order_id}: {e}")
                 del self.unwind_orders[order_id]
+            self.pending_unwinds.clear()
 
         if self.active_orders or (include_unwinds and self.unwind_orders):
             log.info(f"Cancelled all for {self.market['question'][:40]}")
         self.active_orders.clear()
+
+    def has_open_obligations(self) -> bool:
+        """Check if this manager has any unwind orders or pending unwinds.
+
+        Used by the bot to decide whether to keep the manager alive
+        when a market is removed from the active set.
+        """
+        return bool(self.unwind_orders) or bool(self.pending_unwinds)
 
     # ── Fill Detection ───────────────────────────────────────────────────────
     def _get_order_status(self, order_id: str) -> str:
@@ -852,6 +941,9 @@ class OrderManager:
         question = self.market["question"]
         log.debug(f"Running cycle for: {question[:50]}")
 
+        # Step 0: Retry any pending unwinds before anything else
+        self.retry_pending_unwinds()
+
         # Step 1: Detect fills
         self.detect_fills()
 
@@ -908,12 +1000,27 @@ class OrderManager:
                 self.cancel_order(order_id, reason="price_refresh")
 
         # Step 6: Place fresh orders where needed
+        #         BLOCK new BUY orders if there's an unwind pending/active
+        #         on that side — we need to sell inventory first, not buy more
         active_sides = {o["side"] for o in self.active_orders.values()}
         needs_yes = "yes" not in active_sides
         needs_no = "no" not in active_sides
 
+        if needs_yes and self.has_pending_unwind("yes"):
+            log.info(
+                f"Blocking YES BUY — unwind pending/active | "
+                f"market={question[:40]}"
+            )
+            needs_yes = False
+        if needs_no and self.has_pending_unwind("no"):
+            log.info(
+                f"Blocking NO BUY — unwind pending/active | "
+                f"market={question[:40]}"
+            )
+            needs_no = False
+
         if not needs_yes and not needs_no:
-            log.debug("Both sides at optimal prices — holding")
+            log.debug("Both sides covered or blocked — holding")
             return
 
         if needs_yes:

@@ -247,15 +247,14 @@ class MarketMakerBot:
 
         if condition_id in self.order_managers:
             manager = self.order_managers[condition_id]
-            has_unwinds = bool(manager.unwind_orders)
-
             # Cancel active BUY orders (stop quoting) but keep unwinds
             manager.cancel_all(reason="market removed")
 
-            if has_unwinds:
+            if manager.has_open_obligations():
                 log.info(
                     f"Market removed from active set but keeping "
-                    f"{len(manager.unwind_orders)} unwind order(s) "
+                    f"{len(manager.unwind_orders)} unwind + "
+                    f"{len(manager.pending_unwinds)} pending "
                     f"tracked: {question[:50]}"
                 )
             else:
@@ -335,8 +334,9 @@ class MarketMakerBot:
                 for cid in list(self.order_managers.keys()):
                     if cid not in active_cids:
                         manager = self.order_managers[cid]
-                        if manager.unwind_orders:
+                        if manager.has_open_obligations():
                             try:
+                                manager.retry_pending_unwinds()
                                 manager.detect_fills()
                             except Exception as e:
                                 log.error(
