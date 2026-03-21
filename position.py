@@ -53,7 +53,24 @@ class PositionTracker:
             log.warning(f"Could not load positions from {POSITIONS_FILE}: {e}")
 
     def _save(self) -> None:
-        """Persist current positions to disk."""
+        """Persist current positions to disk.
+
+        Auto-prunes entries where both sides are below dust threshold
+        ($0.05) and neither side is halted, to prevent stale zero-
+        position entries from accumulating.
+        """
+        # Prune dust/zero positions
+        dust = 0.05
+        to_prune = [
+            cid for cid, pos in self.positions.items()
+            if (pos.get("yes", 0) <= dust
+                and pos.get("no", 0) <= dust
+                and not pos.get("yes_halted", False)
+                and not pos.get("no_halted", False))
+        ]
+        for cid in to_prune:
+            del self.positions[cid]
+
         try:
             with open(POSITIONS_FILE, "w") as f:
                 json.dump(self.positions, f, indent=2)
