@@ -4,25 +4,63 @@ Position tracking for the Polymarket market-making bot.
 Tracks cumulative fill exposure per market and per side (Yes / No).
 Halts quoting on a side when the position limit is breached and
 resumes when the position drops back below a resume threshold.
+
+Positions are persisted to a JSON file so they survive bot restarts.
 """
 
+import json
 import logging
+import os
 from config import MAX_POSITION_USD, RESUME_POSITION_USD
 from alerts import alert_position_limit, log_position_update
 
 log = logging.getLogger(__name__)
+
+POSITIONS_FILE = os.path.join(os.path.dirname(__file__), "positions.json")
 
 
 class PositionTracker:
     """Tracks positions across all active markets.
 
     Each market is keyed by its condition_id and stores per-side
-    USD exposure plus a halted flag.
+    USD exposure plus a halted flag.  State is persisted to disk
+    after every change so positions survive restarts.
     """
 
     def __init__(self) -> None:
         self.positions: dict[str, dict] = {}
+        self._load()
 
+    # ── Persistence ───────────────────────────────────────────────────────────
+    def _load(self) -> None:
+        """Load positions from disk if the file exists."""
+        if not os.path.exists(POSITIONS_FILE):
+            return
+        try:
+            with open(POSITIONS_FILE, "r") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                self.positions = data
+                non_zero = sum(
+                    1 for p in data.values()
+                    if p.get("yes", 0) > 0 or p.get("no", 0) > 0
+                )
+                log.info(
+                    f"Loaded {len(data)} positions from disk "
+                    f"({non_zero} with open exposure)"
+                )
+        except Exception as e:
+            log.warning(f"Could not load positions from {POSITIONS_FILE}: {e}")
+
+    def _save(self) -> None:
+        """Persist current positions to disk."""
+        try:
+            with open(POSITIONS_FILE, "w") as f:
+                json.dump(self.positions, f, indent=2)
+        except Exception as e:
+            log.error(f"Could not save positions to {POSITIONS_FILE}: {e}")
+
+    # ── Public API ────────────────────────────────────────────────────────────
     def register_market(self, condition_id: str, question: str) -> None:
         """Start tracking a new market.
 
@@ -39,6 +77,7 @@ class PositionTracker:
                 "question": question,
             }
             log.debug(f"Registered market: {question[:50]}")
+            self._save()
 
     def remove_market(self, condition_id: str) -> None:
         """Stop tracking a market.
@@ -48,6 +87,7 @@ class PositionTracker:
         """
         if condition_id in self.positions:
             del self.positions[condition_id]
+            self._save()
 
     def record_fill(
         self, condition_id: str, side: str, filled_usd: float
@@ -67,6 +107,7 @@ class PositionTracker:
         pos[side] += filled_usd
         log_position_update(pos["question"], pos["yes"], pos["no"])
         self._check_limit(condition_id, side)
+        self._save()
 
     def record_unwind(
         self, condition_id: str, side: str, unwound_usd: float
@@ -88,6 +129,7 @@ class PositionTracker:
             f"{side.upper()} reduced by ${unwound_usd:.2f} to ${pos[side]:.2f}"
         )
         self._check_resume(condition_id, side)
+        self._save()
 
     def can_quote(self, condition_id: str, side: str) -> bool:
         """Check whether we are allowed to place new orders on a side.
@@ -155,6 +197,7 @@ class PositionTracker:
             self.positions[condition_id]["yes_halted"] = False
             self.positions[condition_id]["no_halted"] = False
             log.info(f"Position reset for: {condition_id}")
+            self._save()
 
     # ── Internal ─────────────────────────────────────────────────────────────
     def _check_limit(self, condition_id: str, side: str) -> None:

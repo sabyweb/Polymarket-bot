@@ -386,7 +386,7 @@ def alert_positions(positions: dict) -> None:
     for cid, pos in positions.items():
         yes_val = pos.get("yes", 0.0)
         no_val = pos.get("no", 0.0)
-        if yes_val > 0 or no_val > 0:
+        if yes_val > 0.05 or no_val > 0.05:  # Ignore dust < $0.05
             fields.append({
                 "name": pos.get("question", cid)[:50],
                 "value": f"YES: ${yes_val:.2f} | NO: ${no_val:.2f}",

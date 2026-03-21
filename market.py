@@ -357,15 +357,16 @@ def score_market(market: dict, rewards: dict) -> float:
     rate_score = min(rewards["daily_rate"] / 500.0, 1.0) * WEIGHT_DAILY_RATE
     score += rate_score
 
-    # 2. Competition
+    # 2. Competition — prefer markets where rewards are high relative
+    #    to existing liquidity (less competition for the reward pool).
     try:
         liquidity = parse_liquidity(market)
-        volume = parse_volume_24h(market)
-        if volume > 0:
-            comp_ratio = liquidity / volume
+        if liquidity > 0:
+            # Higher daily_rate per dollar of liquidity = less competition
+            reward_density = rewards["daily_rate"] / (liquidity / 1000.0)
+            comp_score = min(reward_density / 5.0, 1.0) * WEIGHT_COMPETITION
         else:
-            comp_ratio = 10.0
-        comp_score = max(0, 1.0 - min(comp_ratio / 10.0, 1.0)) * WEIGHT_COMPETITION
+            comp_score = float(WEIGHT_COMPETITION)  # No competition
         score += comp_score
     except Exception:
         pass
@@ -440,12 +441,30 @@ def get_rewards_markets(limit: int = MAX_MARKETS) -> list[dict]:
         log.debug(f"  Rejected: {q} — {r}")
 
     # Enrich with real rewards params from CLOB API
-    # (Gamma API doesn't return min_size or max_spread)
+    # (Gamma API doesn't return min_size or max_spread reliably)
     clob_rewards = fetch_clob_rewards_params()
+    enriched: list[dict] = []
     for market in passed:
         cid = market["condition_id"]
         if cid in clob_rewards:
             market["min_size"] = clob_rewards[cid]["min_size"]
             market["max_spread"] = clob_rewards[cid]["max_spread"]
 
-    return passed[:limit]
+        # Re-validate after enrichment — spreads or sizes may have changed
+        if market["max_spread"] < MIN_SPREAD_ALLOWED:
+            log.info(
+                f"Rejected post-enrichment: {market['question'][:40]} "
+                f"(max_spread={market['max_spread']:.4f} < {MIN_SPREAD_ALLOWED})"
+            )
+            continue
+        yes_price = market.get("yes_price") or 0.50
+        min_cost = market["min_size"] * min(yes_price, 1 - yes_price)
+        if min_cost > MAX_ORDER_SIZE:
+            log.info(
+                f"Rejected post-enrichment: {market['question'][:40]} "
+                f"(min_cost=${min_cost:.2f} > ${MAX_ORDER_SIZE})"
+            )
+            continue
+        enriched.append(market)
+
+    return enriched[:limit]

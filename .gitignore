@@ -7,6 +7,9 @@ generate_keys.py
 # Logs
 logs/
 
+# Runtime state
+positions.json
+
 # Python
 venv/
 __pycache__/

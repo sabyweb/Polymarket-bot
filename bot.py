@@ -16,10 +16,12 @@ from config import (
     MAX_MARKETS, MIN_SCORE_THRESHOLD,
     MARKET_REFRESH_SECS, ORDER_REFRESH_SECS,
     ORDER_SIZE, FUNDER, SIGNATURE_TYPE,
+    HYSTERESIS_SCORE_MARGIN,
 )
 from market import get_rewards_markets
 from position import PositionTracker
 from orders import OrderManager
+from rate_limiter import RateLimitedClient
 from alerts import (
     setup_logger, alert_bot_restart, alert_no_markets,
     alert_api_failure, alert_positions,
@@ -60,7 +62,7 @@ class MarketMakerBot:
                 api_secret=CLOB_SECRET,
                 api_passphrase=CLOB_PASS_PHRASE,
             )
-            self.client = ClobClient(
+            raw_client = ClobClient(
                 HOST,
                 key=PRIVATE_KEY,
                 chain_id=CHAIN_ID,
@@ -68,7 +70,8 @@ class MarketMakerBot:
                 signature_type=SIGNATURE_TYPE,
                 funder=FUNDER,
             )
-            log.info("Connected to Polymarket CLOB API")
+            self.client = RateLimitedClient(raw_client)
+            log.info("Connected to Polymarket CLOB API (rate-limited)")
 
             # Verify balance and allowances before trading
             try:
@@ -89,34 +92,76 @@ class MarketMakerBot:
     def refresh_markets(self) -> None:
         """Fetch, score, and select markets to trade.
 
-        Called every MARKET_REFRESH_SECS and on bot startup.  Adds new
-        high-scoring markets and removes those that dropped out.
+        Called every MARKET_REFRESH_SECS and on bot startup.  Uses
+        hysteresis to avoid thrashing: a current market is only replaced
+        if a new candidate outscores it by HYSTERESIS_SCORE_MARGIN points.
         """
         log.info("Refreshing market list...")
 
-        new_markets = get_rewards_markets(limit=MAX_MARKETS)
-        eligible = [m for m in new_markets if m["score"] >= MIN_SCORE_THRESHOLD]
+        # Fetch more candidates than needed so we can compare
+        new_markets = get_rewards_markets(limit=MAX_MARKETS * 3)
+        candidates = [m for m in new_markets if m["score"] >= MIN_SCORE_THRESHOLD]
 
-        if not eligible:
+        if not candidates:
             alert_no_markets()
             if self.active_markets:
                 log.info("Keeping existing markets until eligible ones are found.")
             return
 
         current_ids = {m["condition_id"] for m in self.active_markets}
-        new_ids = {m["condition_id"] for m in eligible}
+        current_scores = {
+            m["condition_id"]: m["score"] for m in self.active_markets
+        }
 
-        to_remove = current_ids - new_ids
-        to_add = new_ids - current_ids
+        # Build the new active set with hysteresis:
+        # 1. Keep current markets that still pass threshold
+        # 2. Only swap in a new market if it beats a current one by margin
+        kept = [m for m in candidates if m["condition_id"] in current_ids]
+        new_only = [m for m in candidates if m["condition_id"] not in current_ids]
+
+        # Start with kept markets, then fill remaining slots from new candidates
+        result = list(kept)
+        remaining_slots = MAX_MARKETS - len(result)
+
+        if remaining_slots > 0 and new_only:
+            # If we have fewer markets than MAX, just add the best new ones
+            if len(kept) < len(current_ids):
+                # Some current markets dropped below threshold — fill freely
+                result.extend(new_only[:remaining_slots])
+            else:
+                # All current markets still valid — only swap if new one
+                # significantly outscores the weakest current market
+                if result:
+                    weakest_score = min(m["score"] for m in result)
+                else:
+                    weakest_score = 0
+
+                for candidate in new_only[:remaining_slots]:
+                    if candidate["score"] > weakest_score + HYSTERESIS_SCORE_MARGIN:
+                        result.append(candidate)
+                    else:
+                        log.debug(
+                            f"Skipping {candidate['question'][:30]} "
+                            f"(score={candidate['score']:.1f}, needs "
+                            f">{weakest_score + HYSTERESIS_SCORE_MARGIN:.1f})"
+                        )
+
+        # Cap at MAX_MARKETS, keeping highest scores
+        result.sort(key=lambda x: x["score"], reverse=True)
+        result = result[:MAX_MARKETS]
+
+        new_result_ids = {m["condition_id"] for m in result}
+        to_remove = current_ids - new_result_ids
+        to_add = new_result_ids - current_ids
 
         for condition_id in to_remove:
             self._remove_market(condition_id)
 
-        for market in eligible:
+        for market in result:
             if market["condition_id"] in to_add:
                 self._add_market(market)
 
-        self.active_markets = eligible
+        self.active_markets = result
         self.last_market_refresh = time.time()
 
         log_market_refresh(self.active_markets)
@@ -169,9 +214,9 @@ class MarketMakerBot:
             else:
                 del self.order_managers[condition_id]
 
-        # Only remove position tracking if position is flat
+        # Only remove position tracking if position is flat (ignore dust < $0.05)
         pos = self.position_tracker.positions.get(condition_id)
-        if pos and (pos.get("yes", 0) > 0 or pos.get("no", 0) > 0):
+        if pos and (pos.get("yes", 0) > 0.05 or pos.get("no", 0) > 0.05):
             log.info(
                 f"Keeping position tracking for {question[:50]} "
                 f"(YES=${pos['yes']:.2f} NO=${pos['no']:.2f})"
@@ -244,7 +289,7 @@ class MarketMakerBot:
                             # No more unwinds — clean up manager and position
                             del self.order_managers[cid]
                             pos = self.position_tracker.positions.get(cid)
-                            if pos and pos.get("yes", 0) <= 0 and pos.get("no", 0) <= 0:
+                            if pos and pos.get("yes", 0) <= 0.05 and pos.get("no", 0) <= 0.05:
                                 self.position_tracker.remove_market(cid)
 
                 # ── Print position summary every 10 cycles ────────────────
