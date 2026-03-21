@@ -30,7 +30,7 @@ GAMMA_API: str = "https://gamma-api.polymarket.com"
 
 # ── Market Selection ──────────────────────────────────────────────────────────
 MAX_MARKETS: int = 3          # Maximum number of markets to trade at once
-MIN_SCORE_THRESHOLD: int = 45 # Minimum score (out of 100) to trade a market
+MIN_SCORE_THRESHOLD: int = 60 # Minimum score (out of 100) to trade a market
 HYSTERESIS_SCORE_MARGIN: int = 10  # New market must outscore weakest by this much to swap in
 MARKET_REFRESH_SECS: int = 1800  # Re-score and refresh markets every 30 min
 
