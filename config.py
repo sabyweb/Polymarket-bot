@@ -38,11 +38,11 @@ MARKET_REFRESH_SECS: int = 1800  # Re-score and refresh markets every 30 min
 # Rank-based percentile scoring: each component ranks all eligible markets
 # relative to each other. Best gets full weight, worst gets 0.
 # Expiry is NOT scored — it is only a hygiene filter (≥ 12 hours).
-WEIGHT_DAILY_RATE: int = 28
+WEIGHT_DAILY_RATE: int = 30
 WEIGHT_COMPETITION: int = 28
 WEIGHT_PRICE_BAL: int = 24
-WEIGHT_SPREAD: int = 12
-WEIGHT_LIQUIDITY: int = 8
+WEIGHT_SPREAD: int = 8
+WEIGHT_LIQUIDITY: int = 10
 
 # ── Hygiene Filter Thresholds ─────────────────────────────────────────────────
 MIN_DAYS_TO_EXPIRY: float = 0.5   # Skip markets expiring within 12 hours
