@@ -13,7 +13,8 @@ from py_clob_client.order_builder.constants import BUY, SELL
 from config import (
     ORDER_SIZE, MAX_ORDER_BUDGET, DANGER_ZONE_CENTS, DEAD_ZONE_BUFFER,
     MAX_ORDER_FAILURES, DRY_RUN, MAX_ORDERBOOK_SPREAD,
-    MIN_LIQUIDITY_BUFFER,
+    MIN_LIQUIDITY_BUFFER, MIN_UNWIND_SIZE, MAX_UNWIND_RETRIES,
+    MAX_UNWIND_AGE_SECS,
 )
 from alerts import (
     alert_order_failure, alert_danger_zone,
@@ -42,6 +43,8 @@ class OrderManager:
         self.failure_counts: dict[str, int] = {"yes": 0, "no": 0}
         self._balance_cache: float | None = None
         self._balance_cache_time: float = 0
+        self._current_retry_count: int = 0
+        self._current_queued_at: float | None = None
 
     # ── Tick Size Rounding ───────────────────────────────────────────────────
     def round_to_tick(self, price: float) -> float:
@@ -605,7 +608,11 @@ class OrderManager:
                     f"Unwind order placed but could not find exchange ID "
                     f"for {side.upper()} on {question[:40]} — queuing for retry"
                 )
-                self._queue_pending_unwind(side, fill_price, fill_size)
+                self._queue_pending_unwind(
+                    side, fill_price, fill_size,
+                    retry_count=getattr(self, "_current_retry_count", 0),
+                    queued_at=getattr(self, "_current_queued_at", None),
+                )
                 return None
 
         except Exception as e:
@@ -613,21 +620,62 @@ class OrderManager:
                 f"Failed to place unwind order for {side.upper()} "
                 f"on {question[:40]}: {e} — queuing for retry"
             )
-            self._queue_pending_unwind(side, fill_price, fill_size)
+            self._queue_pending_unwind(
+                side, fill_price, fill_size,
+                retry_count=getattr(self, "_current_retry_count", 0),
+                queued_at=getattr(self, "_current_queued_at", None),
+            )
             return None
 
     def _queue_pending_unwind(
-        self, side: str, fill_price: float, fill_size: float
+        self, side: str, fill_price: float, fill_size: float,
+        retry_count: int = 0, queued_at: float | None = None,
     ) -> None:
         """Queue an unwind that failed to place, for retry next cycle.
 
+        Drops dust fills below MIN_UNWIND_SIZE.
+        Drops unwinds that have exceeded MAX_UNWIND_RETRIES or MAX_UNWIND_AGE_SECS.
         Deduplicates: if there's already a pending unwind for the same side,
         merge the size instead of adding a duplicate entry.
         """
+        # Drop dust — below exchange minimum
+        if fill_size < MIN_UNWIND_SIZE:
+            log.info(
+                f"DROPPING DUST UNWIND | {side.upper()} | "
+                f"size={fill_size:.2f} < {MIN_UNWIND_SIZE} min | "
+                f"market={self.market['question'][:40]}"
+            )
+            return
+
+        now = _time.time()
+        first_queued = queued_at or now
+
+        # Drop if exceeded max retries
+        if retry_count >= MAX_UNWIND_RETRIES:
+            log.warning(
+                f"ABANDONING UNWIND after {retry_count} retries | "
+                f"{side.upper()} | size={fill_size:.2f} | "
+                f"market={self.market['question'][:40]}"
+            )
+            return
+
+        # Drop if exceeded max age
+        age_secs = now - first_queued
+        if age_secs > MAX_UNWIND_AGE_SECS:
+            log.warning(
+                f"ABANDONING UNWIND after {age_secs / 60:.1f}m | "
+                f"{side.upper()} | size={fill_size:.2f} | "
+                f"market={self.market['question'][:40]}"
+            )
+            return
+
         for pending in self.pending_unwinds:
             if (pending["side"] == side
                     and abs(pending["fill_price"] - fill_price) < 1e-9):
                 pending["fill_size"] += fill_size
+                pending["retry_count"] = max(
+                    pending["retry_count"], retry_count
+                )
                 log.info(
                     f"PENDING UNWIND MERGED | {side.upper()} | "
                     f"total_size={pending['fill_size']:.2f} | "
@@ -638,11 +686,13 @@ class OrderManager:
             "side": side,
             "fill_price": fill_price,
             "fill_size": fill_size,
-            "queued_at": _time.time(),
+            "queued_at": first_queued,
+            "retry_count": retry_count,
         })
         log.info(
             f"PENDING UNWIND QUEUED | {side.upper()} | "
             f"price={fill_price:.4f} | size={fill_size:.2f} | "
+            f"retry={retry_count} | "
             f"market={self.market['question'][:40]}"
         )
 
@@ -655,30 +705,63 @@ class OrderManager:
         To avoid circular re-queueing (place_unwind_order adds to
         pending_unwinds on failure), we snapshot and clear the list
         first, then attempt each one.  Failures will be re-added
-        by place_unwind_order.
+        by _queue_pending_unwind (which checks dust/retry/age limits).
         """
         if not self.pending_unwinds:
             return
 
-        # Snapshot and clear — place_unwind_order will re-queue failures
+        # Snapshot and clear — _queue_pending_unwind will re-queue failures
+        # (with incremented retry count) only if within limits
         to_retry = self.pending_unwinds[:]
         self.pending_unwinds.clear()
 
         for pending in to_retry:
             side = pending["side"]
+            retry_count = pending.get("retry_count", 0) + 1
             age_min = (_time.time() - pending["queued_at"]) / 60
+
+            # Check limits before even attempting
+            if pending["fill_size"] < MIN_UNWIND_SIZE:
+                log.info(
+                    f"DROPPING DUST UNWIND | {side.upper()} | "
+                    f"size={pending['fill_size']:.2f} | "
+                    f"market={self.market['question'][:40]}"
+                )
+                continue
+            if retry_count > MAX_UNWIND_RETRIES:
+                log.warning(
+                    f"ABANDONING UNWIND after {retry_count} retries | "
+                    f"{side.upper()} | size={pending['fill_size']:.2f} | "
+                    f"market={self.market['question'][:40]}"
+                )
+                continue
+            if age_min * 60 > MAX_UNWIND_AGE_SECS:
+                log.warning(
+                    f"ABANDONING UNWIND after {age_min:.1f}m | "
+                    f"{side.upper()} | size={pending['fill_size']:.2f} | "
+                    f"market={self.market['question'][:40]}"
+                )
+                continue
+
             log.info(
                 f"RETRYING PENDING UNWIND | {side.upper()} | "
                 f"price={pending['fill_price']:.4f} | "
                 f"size={pending['fill_size']:.2f} | "
+                f"retry={retry_count}/{MAX_UNWIND_RETRIES} | "
                 f"queued {age_min:.1f}m ago | "
                 f"market={self.market['question'][:40]}"
             )
             # Cancel BUY orders on this side to free collateral
             self._cancel_buy_orders_for_side(side)
+            # Stash retry metadata so place_unwind_order -> _queue_pending_unwind
+            # preserves it on failure
+            self._current_retry_count = retry_count
+            self._current_queued_at = pending["queued_at"]
             self.place_unwind_order(
                 side, pending["fill_price"], pending["fill_size"]
             )
+            self._current_retry_count = 0
+            self._current_queued_at = None
 
     def has_pending_unwind(self, side: str) -> bool:
         """Check if there's a pending (failed) unwind for a given side.

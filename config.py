@@ -79,6 +79,11 @@ RESUME_POSITION_USD: int = 75   # Resume quoting when position falls below $75
 # ── Alert Thresholds ──────────────────────────────────────────────────────────
 MAX_ORDER_FAILURES: int = 3  # Alert after this many consecutive order failures
 
+# ── Unwind Settings ─────────────────────────────────────────────────────────
+MIN_UNWIND_SIZE: float = 1.0      # Drop unwinds below this many shares (dust)
+MAX_UNWIND_RETRIES: int = 10      # Give up after this many failed retry attempts
+MAX_UNWIND_AGE_SECS: int = 1800   # Give up after 30 minutes of retrying
+
 # ── Discord Notifications ────────────────────────────────────────────────────
 # Create a webhook in your Discord server:
 #   Server Settings -> Integrations -> Webhooks -> New Webhook
