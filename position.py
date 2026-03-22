@@ -113,7 +113,8 @@ class PositionTracker:
             self._save()
 
     def record_fill(
-        self, condition_id: str, side: str, shares: float, price: float
+        self, condition_id: str, side: str, shares: float, price: float,
+        question: str = "",
     ) -> None:
         """Record a fill and check whether the position limit is breached.
 
@@ -125,10 +126,15 @@ class PositionTracker:
             side: "yes" or "no".
             shares: Number of shares filled.
             price: Price per share.
+            question: Market name (used for auto-registration if needed).
         """
         if condition_id not in self.positions:
-            log.warning(f"Fill for unregistered market: {condition_id}")
-            return
+            # Auto-register — fills can arrive for markets that were
+            # pruned on restart or removed from the active set while
+            # their BUY orders were still live on the exchange.
+            name = question or f"unknown-{condition_id[:12]}"
+            log.warning(f"Auto-registering market on fill: {name}")
+            self.register_market(condition_id, name)
         pos = self.positions[condition_id]
         key = side.lower()
 

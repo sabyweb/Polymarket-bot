@@ -821,7 +821,8 @@ class OrderManager:
                             )
                             self.position_tracker.record_fill(
                                 self.market["condition_id"], side,
-                                filled_shares, order["price"]
+                                filled_shares, order["price"],
+                                question=self.market["question"],
                             )
                         except Exception as e:
                             log.error(
@@ -866,7 +867,8 @@ class OrderManager:
                         )
                         self.position_tracker.record_fill(
                             self.market["condition_id"], side,
-                            filled_shares, order["price"]
+                            filled_shares, order["price"],
+                            question=self.market["question"],
                         )
                         # Update tracked size so next partial detection
                         # only captures the NEW delta, not the same fill.
