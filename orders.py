@@ -40,6 +40,8 @@ class OrderManager:
         self.unwind_orders: dict[str, dict] = {}  # SELL orders to offload inventory
         self.pending_unwinds: list[dict] = []      # Failed unwinds awaiting retry
         self.failure_counts: dict[str, int] = {"yes": 0, "no": 0}
+        self._balance_cache: float | None = None
+        self._balance_cache_time: float = 0
 
     # ── Tick Size Rounding ───────────────────────────────────────────────────
     def round_to_tick(self, price: float) -> float:
@@ -57,6 +59,33 @@ class OrderManager:
         rounded = round(round(price / tick) * tick, 10)
         decimal_places = len(str(tick).rstrip("0").split(".")[-1])
         return round(rounded, decimal_places)
+
+    # ── Balance Cache ─────────────────────────────────────────────────────────
+    def _get_cached_balance(self) -> float | None:
+        """Return available USDC balance, cached for 60 seconds.
+
+        Avoids hitting the balance API on every order attempt.
+        Returns None if the balance cannot be fetched (don't block on error).
+        """
+        now = _time.time()
+        if now - self._balance_cache_time < 60:
+            return self._balance_cache
+
+        try:
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            bal = self.client.get_balance_allowance(
+                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            )
+            self._balance_cache = float(bal.get("balance", 0)) / 1e6  # USDC has 6 decimals
+            self._balance_cache_time = now
+            return self._balance_cache
+        except Exception:
+            # Don't block order placement if balance check fails
+            return None
+
+    def invalidate_balance_cache(self) -> None:
+        """Force a fresh balance check on next call."""
+        self._balance_cache_time = 0
 
     # ── Order Book ───────────────────────────────────────────────────────────
     def get_order_book(self) -> dict | None:
@@ -369,6 +398,17 @@ class OrderManager:
             log.debug(f"Quoting halted on {side.upper()} — skipping")
             return None
 
+        # Gate: check USDC balance before placing — avoid doomed API calls.
+        # Uses cached balance (refreshed once per cycle) to avoid extra API hits.
+        available = self._get_cached_balance()
+        if available is not None and est_cost > available:
+            log.warning(
+                f"Insufficient balance: need ${est_cost:.2f} but only "
+                f"${available:.2f} available — skipping {side.upper()} on "
+                f"{question[:40]}"
+            )
+            return None
+
         # ── Dry Run ──────────────────────────────────────────────────────────
         if DRY_RUN:
             dry_id = f"DRY-{side.upper()}-{int(price * 10000)}"
@@ -419,6 +459,7 @@ class OrderManager:
                     "placed_at": _time.time(),
                 }
                 self.failure_counts[side] = 0
+                self.invalidate_balance_cache()  # Balance changed
                 log_order_placed(side.upper(), price, size, question, order_id)
                 return order_id
             else:
@@ -633,6 +674,8 @@ class OrderManager:
                 f"queued {age_min:.1f}m ago | "
                 f"market={self.market['question'][:40]}"
             )
+            # Cancel BUY orders on this side to free collateral
+            self._cancel_buy_orders_for_side(side)
             self.place_unwind_order(
                 side, pending["fill_price"], pending["fill_size"]
             )
@@ -674,6 +717,7 @@ class OrderManager:
             log_order_cancelled(order_id, reason)
             if order_id in self.active_orders:
                 del self.active_orders[order_id]
+            self.invalidate_balance_cache()  # Collateral freed
         except Exception as e:
             log.error(f"Failed to cancel order {order_id}: {e}")
 
@@ -704,6 +748,32 @@ class OrderManager:
         if self.active_orders or (include_unwinds and self.unwind_orders):
             log.info(f"Cancelled all for {self.market['question'][:40]}")
         self.active_orders.clear()
+
+    def _cancel_buy_orders_for_side(self, side: str) -> None:
+        """Cancel all active BUY orders on the given side.
+
+        Called before placing a SELL (unwind) order so that collateral
+        locked by open BUY orders is freed.  Without this, the exchange
+        rejects SELL orders with 'not enough balance / allowance'.
+
+        Args:
+            side: "yes" or "no" — cancel BUY orders on this side.
+        """
+        cancelled = 0
+        for oid in list(self.active_orders.keys()):
+            order = self.active_orders[oid]
+            if order["side"] == side:
+                log.info(
+                    f"Cancelling {side.upper()} BUY to free collateral "
+                    f"for unwind | id={oid[:16]}..."
+                )
+                self.cancel_order(oid, reason="free_collateral_for_unwind")
+                cancelled += 1
+        if cancelled:
+            log.info(
+                f"Freed collateral: cancelled {cancelled} {side.upper()} "
+                f"BUY order(s) | market={self.market['question'][:40]}"
+            )
 
     def has_open_obligations(self) -> bool:
         """Check if this manager has any unwind orders or pending unwinds.
@@ -798,6 +868,9 @@ class OrderManager:
                             self.position_tracker.record_fill(
                                 self.market["condition_id"], side, filled_usd
                             )
+                            # Cancel any remaining BUY orders on this side
+                            # to free collateral for the SELL unwind
+                            self._cancel_buy_orders_for_side(side)
                             self.place_unwind_order(
                                 side, order["price"], order["original_size"]
                             )
@@ -845,14 +918,15 @@ class OrderManager:
                         self.position_tracker.record_fill(
                             self.market["condition_id"], side, filled_usd
                         )
+                        # Cancel any BUY order on this side to free
+                        # collateral BEFORE placing the SELL unwind.
+                        self._cancel_buy_orders_for_side(side)
                         # Place unwind for the partially filled shares
                         self.place_unwind_order(
                             side, order["price"], filled_shares
                         )
-                        # Update remaining — but NEVER touch original_size
-                        # so that if the rest fills fully (order disappears),
-                        # the full-fill handler correctly computes the
-                        # remaining tranche size.
+                        # Update tracked size so next partial detection
+                        # only captures the NEW delta, not the same fill.
                         self.active_orders[oid]["size"] = remaining
                         self.active_orders[oid]["original_size"] = remaining
 
