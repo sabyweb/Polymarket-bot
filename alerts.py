@@ -49,6 +49,12 @@ def setup_logger() -> logging.Logger:
     logger.addHandler(console)
     logger.addHandler(file_handler)
 
+    # Silence noisy HTTP/2 frame-level debug logging from httpx/httpcore/h2.
+    # These generate thousands of lines per cycle (header encoding, TLS
+    # handshakes, frame decoding) and bloat the log file to 100+ MB.
+    for noisy in ("httpx", "httpcore", "h2", "hpack", "urllib3"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
     return logger
 
 
