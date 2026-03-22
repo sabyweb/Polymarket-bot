@@ -253,8 +253,7 @@ class MarketMakerBot:
             if manager.has_open_obligations():
                 log.info(
                     f"Market removed from active set but keeping "
-                    f"{len(manager.unwind_orders)} unwind + "
-                    f"{len(manager.pending_unwinds)} pending "
+                    f"{len(manager.unwind_orders)} unwind order(s) "
                     f"tracked: {question[:50]}"
                 )
             else:
@@ -336,8 +335,8 @@ class MarketMakerBot:
                         manager = self.order_managers[cid]
                         if manager.has_open_obligations():
                             try:
-                                manager.retry_pending_unwinds()
                                 manager.detect_fills()
+                                manager.reconcile_unwinds()
                             except Exception as e:
                                 log.error(
                                     f"Unwind check error for removed market: {e}"

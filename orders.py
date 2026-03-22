@@ -13,8 +13,7 @@ from py_clob_client.order_builder.constants import BUY, SELL
 from config import (
     ORDER_SIZE, MAX_ORDER_BUDGET, DANGER_ZONE_CENTS, DEAD_ZONE_BUFFER,
     MAX_ORDER_FAILURES, DRY_RUN, MAX_ORDERBOOK_SPREAD,
-    MIN_LIQUIDITY_BUFFER, MIN_UNWIND_SIZE, MAX_UNWIND_RETRIES,
-    MAX_UNWIND_AGE_SECS,
+    MIN_LIQUIDITY_BUFFER, MIN_UNWIND_SHARES,
 )
 from alerts import (
     alert_order_failure, alert_danger_zone,
@@ -39,12 +38,9 @@ class OrderManager:
         self.position_tracker = position_tracker
         self.active_orders: dict[str, dict] = {}
         self.unwind_orders: dict[str, dict] = {}  # SELL orders to offload inventory
-        self.pending_unwinds: list[dict] = []      # Failed unwinds awaiting retry
         self.failure_counts: dict[str, int] = {"yes": 0, "no": 0}
         self._balance_cache: float | None = None
         self._balance_cache_time: float = 0
-        self._current_retry_count: int = 0
-        self._current_queued_at: float | None = None
 
     # ── Tick Size Rounding ───────────────────────────────────────────────────
     def round_to_tick(self, price: float) -> float:
@@ -597,6 +593,7 @@ class OrderManager:
                     "size": float(fill_size),
                     "placed_at": _time.time(),
                 }
+
                 log.info(
                     f"UNWIND ORDER PLACED | SELL {side.upper()} | "
                     f"price={clob_price:.4f} | size={fill_size:.2f} | "
@@ -606,177 +603,70 @@ class OrderManager:
             else:
                 log.warning(
                     f"Unwind order placed but could not find exchange ID "
-                    f"for {side.upper()} on {question[:40]} — queuing for retry"
-                )
-                self._queue_pending_unwind(
-                    side, fill_price, fill_size,
-                    retry_count=getattr(self, "_current_retry_count", 0),
-                    queued_at=getattr(self, "_current_queued_at", None),
+                    f"for {side.upper()} on {question[:40]} — "
+                    f"will be reconciled next cycle"
                 )
                 return None
 
         except Exception as e:
             log.error(
                 f"Failed to place unwind order for {side.upper()} "
-                f"on {question[:40]}: {e} — queuing for retry"
-            )
-            self._queue_pending_unwind(
-                side, fill_price, fill_size,
-                retry_count=getattr(self, "_current_retry_count", 0),
-                queued_at=getattr(self, "_current_queued_at", None),
+                f"on {question[:40]}: {e}"
             )
             return None
 
-    def _queue_pending_unwind(
-        self, side: str, fill_price: float, fill_size: float,
-        retry_count: int = 0, queued_at: float | None = None,
-    ) -> None:
-        """Queue an unwind that failed to place, for retry next cycle.
+    def reconcile_unwinds(self) -> None:
+        """Position-based unwind reconciliation.
 
-        Drops dust fills below MIN_UNWIND_SIZE.
-        Drops unwinds that have exceeded MAX_UNWIND_RETRIES or MAX_UNWIND_AGE_SECS.
-        Deduplicates: if there's already a pending unwind for the same side,
-        merge the size instead of adding a duplicate entry.
+        Each cycle, for each side with inventory:
+        1. Get total position (shares) from position tracker
+        2. Sum sizes of all active unwind orders for this side
+        3. If unhedged > MIN_UNWIND_SHARES: place ONE unwind order
         """
-        # Drop dust — below exchange minimum
-        if fill_size < MIN_UNWIND_SIZE:
-            log.info(
-                f"DROPPING DUST UNWIND | {side.upper()} | "
-                f"size={fill_size:.2f} < {MIN_UNWIND_SIZE} min | "
-                f"market={self.market['question'][:40]}"
-            )
-            return
+        condition_id = self.market["condition_id"]
 
-        now = _time.time()
-        first_queued = queued_at or now
+        for side in ("yes", "no"):
+            position_shares = self.position_tracker.get_shares(condition_id, side)
+            avg_price = self.position_tracker.get_avg_price(condition_id, side)
 
-        # Drop if exceeded max retries
-        if retry_count >= MAX_UNWIND_RETRIES:
-            log.warning(
-                f"ABANDONING UNWIND after {retry_count} retries | "
-                f"{side.upper()} | size={fill_size:.2f} | "
-                f"market={self.market['question'][:40]}"
-            )
-            return
+            if position_shares < MIN_UNWIND_SHARES or avg_price <= 0:
+                continue  # No meaningful position to unwind
 
-        # Drop if exceeded max age
-        age_secs = now - first_queued
-        if age_secs > MAX_UNWIND_AGE_SECS:
-            log.warning(
-                f"ABANDONING UNWIND after {age_secs / 60:.1f}m | "
-                f"{side.upper()} | size={fill_size:.2f} | "
-                f"market={self.market['question'][:40]}"
-            )
-            return
+            # Sum shares covered by existing unwind orders
+            covered_shares = 0.0
+            for uorder in self.unwind_orders.values():
+                if uorder["side"] == side:
+                    covered_shares += uorder["size"]
 
-        for pending in self.pending_unwinds:
-            if (pending["side"] == side
-                    and abs(pending["fill_price"] - fill_price) < 1e-9):
-                pending["fill_size"] += fill_size
-                pending["retry_count"] = max(
-                    pending["retry_count"], retry_count
-                )
-                log.info(
-                    f"PENDING UNWIND MERGED | {side.upper()} | "
-                    f"total_size={pending['fill_size']:.2f} | "
-                    f"market={self.market['question'][:40]}"
-                )
-                return
-        self.pending_unwinds.append({
-            "side": side,
-            "fill_price": fill_price,
-            "fill_size": fill_size,
-            "queued_at": first_queued,
-            "retry_count": retry_count,
-        })
-        log.info(
-            f"PENDING UNWIND QUEUED | {side.upper()} | "
-            f"price={fill_price:.4f} | size={fill_size:.2f} | "
-            f"retry={retry_count} | "
-            f"market={self.market['question'][:40]}"
-        )
+            unhedged = position_shares - covered_shares
 
-    def retry_pending_unwinds(self) -> None:
-        """Attempt to place any queued unwind orders.
-
-        Called at the start of each cycle.  Successfully placed unwinds
-        are removed from the queue; failures stay for the next cycle.
-
-        To avoid circular re-queueing (place_unwind_order adds to
-        pending_unwinds on failure), we snapshot and clear the list
-        first, then attempt each one.  Failures will be re-added
-        by _queue_pending_unwind (which checks dust/retry/age limits).
-        """
-        if not self.pending_unwinds:
-            return
-
-        # Snapshot and clear — _queue_pending_unwind will re-queue failures
-        # (with incremented retry count) only if within limits
-        to_retry = self.pending_unwinds[:]
-        self.pending_unwinds.clear()
-
-        for pending in to_retry:
-            side = pending["side"]
-            retry_count = pending.get("retry_count", 0) + 1
-            age_min = (_time.time() - pending["queued_at"]) / 60
-
-            # Check limits before even attempting
-            if pending["fill_size"] < MIN_UNWIND_SIZE:
-                log.info(
-                    f"DROPPING DUST UNWIND | {side.upper()} | "
-                    f"size={pending['fill_size']:.2f} | "
-                    f"market={self.market['question'][:40]}"
-                )
-                continue
-            if retry_count > MAX_UNWIND_RETRIES:
-                log.warning(
-                    f"ABANDONING UNWIND after {retry_count} retries | "
-                    f"{side.upper()} | size={pending['fill_size']:.2f} | "
-                    f"market={self.market['question'][:40]}"
-                )
-                continue
-            if age_min * 60 > MAX_UNWIND_AGE_SECS:
-                log.warning(
-                    f"ABANDONING UNWIND after {age_min:.1f}m | "
-                    f"{side.upper()} | size={pending['fill_size']:.2f} | "
-                    f"market={self.market['question'][:40]}"
-                )
-                continue
+            if unhedged < MIN_UNWIND_SHARES:
+                continue  # Fully covered or dust
 
             log.info(
-                f"RETRYING PENDING UNWIND | {side.upper()} | "
-                f"price={pending['fill_price']:.4f} | "
-                f"size={pending['fill_size']:.2f} | "
-                f"retry={retry_count}/{MAX_UNWIND_RETRIES} | "
-                f"queued {age_min:.1f}m ago | "
+                f"UNWIND RECONCILIATION | {side.upper()} | "
+                f"position={position_shares:.2f} | covered={covered_shares:.2f} | "
+                f"unhedged={unhedged:.2f} | avg_price={avg_price:.4f} | "
                 f"market={self.market['question'][:40]}"
             )
-            # Cancel BUY orders on this side to free collateral
-            self._cancel_buy_orders_for_side(side)
-            # Stash retry metadata so place_unwind_order -> _queue_pending_unwind
-            # preserves it on failure
-            self._current_retry_count = retry_count
-            self._current_queued_at = pending["queued_at"]
-            self.place_unwind_order(
-                side, pending["fill_price"], pending["fill_size"]
-            )
-            self._current_retry_count = 0
-            self._current_queued_at = None
 
-    def has_pending_unwind(self, side: str) -> bool:
-        """Check if there's a pending (failed) unwind for a given side.
+            # Place unwind for the unhedged portion
+            self.place_unwind_order(side, avg_price, unhedged)
+
+    def has_unhedged_position(self, side: str) -> bool:
+        """Check if there's unhedged inventory on a side.
 
         Used by run_cycle to block new BUY orders when we have inventory
         that still needs unwinding.
         """
-        for pending in self.pending_unwinds:
-            if pending["side"] == side:
-                return True
-        # Also check if there's an active unwind order on this side
-        for uorder in self.unwind_orders.values():
-            if uorder["side"] == side:
-                return True
-        return False
+        condition_id = self.market["condition_id"]
+        position_shares = self.position_tracker.get_shares(condition_id, side)
+        if position_shares < MIN_UNWIND_SHARES:
+            return False
+        covered = sum(
+            u["size"] for u in self.unwind_orders.values() if u["side"] == side
+        )
+        return (position_shares - covered) >= MIN_UNWIND_SHARES
 
     # ── Order Cancellation ───────────────────────────────────────────────────
     def cancel_order(self, order_id: str, reason: str = "manual") -> None:
@@ -826,45 +716,24 @@ class OrderManager:
                 except Exception as e:
                     log.error(f"Failed to cancel unwind order {order_id}: {e}")
                 del self.unwind_orders[order_id]
-            self.pending_unwinds.clear()
 
         if self.active_orders or (include_unwinds and self.unwind_orders):
             log.info(f"Cancelled all for {self.market['question'][:40]}")
         self.active_orders.clear()
 
-    def _cancel_buy_orders_for_side(self, side: str) -> None:
-        """Cancel all active BUY orders on the given side.
-
-        Called before placing a SELL (unwind) order so that collateral
-        locked by open BUY orders is freed.  Without this, the exchange
-        rejects SELL orders with 'not enough balance / allowance'.
-
-        Args:
-            side: "yes" or "no" — cancel BUY orders on this side.
-        """
-        cancelled = 0
-        for oid in list(self.active_orders.keys()):
-            order = self.active_orders[oid]
-            if order["side"] == side:
-                log.info(
-                    f"Cancelling {side.upper()} BUY to free collateral "
-                    f"for unwind | id={oid[:16]}..."
-                )
-                self.cancel_order(oid, reason="free_collateral_for_unwind")
-                cancelled += 1
-        if cancelled:
-            log.info(
-                f"Freed collateral: cancelled {cancelled} {side.upper()} "
-                f"BUY order(s) | market={self.market['question'][:40]}"
-            )
-
     def has_open_obligations(self) -> bool:
-        """Check if this manager has any unwind orders or pending unwinds.
+        """Check if this manager has unwind orders or unhedged position.
 
         Used by the bot to decide whether to keep the manager alive
         when a market is removed from the active set.
         """
-        return bool(self.unwind_orders) or bool(self.pending_unwinds)
+        if self.unwind_orders:
+            return True
+        condition_id = self.market["condition_id"]
+        for side in ("yes", "no"):
+            if self.position_tracker.get_shares(condition_id, side) >= MIN_UNWIND_SHARES:
+                return True
+        return False
 
     # ── Fill Detection ───────────────────────────────────────────────────────
     def _get_order_status(self, order_id: str) -> str:
@@ -930,13 +799,15 @@ class OrderManager:
                     status = self._get_order_status(oid)
 
                     if status == "MATCHED":
-                        # CONFIRMED fill — isolate so one failure
-                        # doesn't prevent processing remaining fills
+                        # CONFIRMED fill — record position only;
+                        # reconcile_unwinds() handles unwind placement
                         try:
-                            filled_usd = order["price"] * order["original_size"]
+                            filled_shares = order["original_size"]
+                            filled_usd = order["price"] * filled_shares
                             log.info(
                                 f"FILL (FULL) | {side.upper()} | "
                                 f"price={order['price']:.4f} | "
+                                f"shares={filled_shares:.2f} | "
                                 f"value=${filled_usd:.2f} | "
                                 f"market={self.market['question'][:40]}"
                             )
@@ -944,18 +815,13 @@ class OrderManager:
                                 fill_type="FULL",
                                 side=side.upper(),
                                 price=order["price"],
-                                filled_shares=order["original_size"],
+                                filled_shares=filled_shares,
                                 filled_usd=filled_usd,
                                 market_question=self.market["question"],
                             )
                             self.position_tracker.record_fill(
-                                self.market["condition_id"], side, filled_usd
-                            )
-                            # Cancel any remaining BUY orders on this side
-                            # to free collateral for the SELL unwind
-                            self._cancel_buy_orders_for_side(side)
-                            self.place_unwind_order(
-                                side, order["price"], order["original_size"]
+                                self.market["condition_id"], side,
+                                filled_shares, order["price"]
                             )
                         except Exception as e:
                             log.error(
@@ -999,14 +865,8 @@ class OrderManager:
                             remaining_shares=remaining,
                         )
                         self.position_tracker.record_fill(
-                            self.market["condition_id"], side, filled_usd
-                        )
-                        # Cancel any BUY order on this side to free
-                        # collateral BEFORE placing the SELL unwind.
-                        self._cancel_buy_orders_for_side(side)
-                        # Place unwind for the partially filled shares
-                        self.place_unwind_order(
-                            side, order["price"], filled_shares
+                            self.market["condition_id"], side,
+                            filled_shares, order["price"]
                         )
                         # Update tracked size so next partial detection
                         # only captures the NEW delta, not the same fill.
@@ -1034,23 +894,25 @@ class OrderManager:
                         status = self._get_order_status(oid)
 
                         if status == "MATCHED":
-                            unwound_usd = uorder["price"] * uorder["size"]
+                            unwound_shares = uorder["size"]
+                            unwound_usd = uorder["price"] * unwound_shares
                             log.info(
                                 f"INVENTORY UNWOUND | {side.upper()} | "
                                 f"price={uorder['price']:.4f} | "
-                                f"size={uorder['size']:.2f} | "
+                                f"size={unwound_shares:.2f} | "
                                 f"value=${unwound_usd:.2f} | "
                                 f"market={self.market['question'][:40]}"
                             )
                             alert_unwind(
                                 side=side.upper(),
                                 price=uorder["price"],
-                                size=uorder["size"],
+                                size=unwound_shares,
                                 usd_value=unwound_usd,
                                 market_question=self.market["question"],
                             )
                             self.position_tracker.record_unwind(
-                                self.market["condition_id"], side, unwound_usd
+                                self.market["condition_id"], side,
+                                unwound_shares, uorder["price"]
                             )
                             del self.unwind_orders[oid]
                         elif status == "UNKNOWN":
@@ -1073,18 +935,14 @@ class OrderManager:
                                 )
                         else:
                             # Definitive non-fill status (CANCELLED, INVALID, etc.)
-                            # Retry the unwind — the position still needs unwinding
+                            # reconcile_unwinds will handle replacement next cycle
                             log.warning(
-                                f"Unwind order {oid[:16]}... failed "
+                                f"Unwind order {oid[:16]}... gone "
                                 f"(status={status}) | {side.upper()} | "
                                 f"market={self.market['question'][:40]} — "
-                                f"retrying unwind"
+                                f"will be reconciled next cycle"
                             )
                             del self.unwind_orders[oid]
-                            # Re-place the unwind order so inventory isn't stranded
-                            self.place_unwind_order(
-                                side, uorder["price"], uorder["size"]
-                            )
                     else:
                         # Order found on exchange — check for partial unwind fill
                         uorder["unknown_count"] = 0
@@ -1104,7 +962,8 @@ class OrderManager:
                                 f"market={self.market['question'][:40]}"
                             )
                             self.position_tracker.record_unwind(
-                                self.market["condition_id"], side, unwound_usd
+                                self.market["condition_id"], side,
+                                unwound_shares, uorder["price"]
                             )
                             uorder["size"] = u_remaining
 
@@ -1125,13 +984,13 @@ class OrderManager:
         question = self.market["question"]
         log.debug(f"Running cycle for: {question[:50]}")
 
-        # Step 0: Retry any pending unwinds before anything else
-        self.retry_pending_unwinds()
-
-        # Step 1: Detect fills
+        # Step 1: Detect fills (record-only, no unwind placement)
         self.detect_fills()
 
-        # Step 1b: Cancel active BUY orders on any halted side
+        # Step 1b: Reconcile unwinds (position-based)
+        self.reconcile_unwinds()
+
+        # Step 1c: Cancel active BUY orders on any halted side
         #          (prevents position overshoot — existing orders can
         #           fill AFTER the limit is hit if not cancelled)
         condition_id = self.market["condition_id"]
@@ -1190,15 +1049,15 @@ class OrderManager:
         needs_yes = "yes" not in active_sides
         needs_no = "no" not in active_sides
 
-        if needs_yes and self.has_pending_unwind("yes"):
+        if needs_yes and self.has_unhedged_position("yes"):
             log.info(
-                f"Blocking YES BUY — unwind pending/active | "
+                f"Blocking YES BUY — unhedged position | "
                 f"market={question[:40]}"
             )
             needs_yes = False
-        if needs_no and self.has_pending_unwind("no"):
+        if needs_no and self.has_unhedged_position("no"):
             log.info(
-                f"Blocking NO BUY — unwind pending/active | "
+                f"Blocking NO BUY — unhedged position | "
                 f"market={question[:40]}"
             )
             needs_no = False

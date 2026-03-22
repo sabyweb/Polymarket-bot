@@ -65,6 +65,8 @@ class PositionTracker:
             cid for cid, pos in self.positions.items()
             if (pos.get("yes", 0) <= dust
                 and pos.get("no", 0) <= dust
+                and pos.get("yes_shares", 0) <= 0
+                and pos.get("no_shares", 0) <= 0
                 and not pos.get("yes_halted", False)
                 and not pos.get("no_halted", False))
         ]
@@ -89,6 +91,10 @@ class PositionTracker:
             self.positions[condition_id] = {
                 "yes": 0.0,
                 "no": 0.0,
+                "yes_shares": 0.0,
+                "no_shares": 0.0,
+                "yes_avg_price": 0.0,
+                "no_avg_price": 0.0,
                 "yes_halted": False,
                 "no_halted": False,
                 "question": question,
@@ -107,45 +113,75 @@ class PositionTracker:
             self._save()
 
     def record_fill(
-        self, condition_id: str, side: str, filled_usd: float
+        self, condition_id: str, side: str, shares: float, price: float
     ) -> None:
         """Record a fill and check whether the position limit is breached.
+
+        Tracks both USD exposure (for halt logic) and shares + VWAP
+        (for position-based unwind reconciliation).
 
         Args:
             condition_id: Unique market identifier.
             side: "yes" or "no".
-            filled_usd: Dollar value of the fill.
+            shares: Number of shares filled.
+            price: Price per share.
         """
         if condition_id not in self.positions:
             log.warning(f"Fill for unregistered market: {condition_id}")
             return
         pos = self.positions[condition_id]
-        side = side.lower()
-        pos[side] += filled_usd
+        key = side.lower()
+
+        # Update shares and VWAP
+        old_shares = pos.get(f"{key}_shares", 0.0)
+        old_avg = pos.get(f"{key}_avg_price", 0.0)
+        new_shares = old_shares + shares
+        if new_shares > 0:
+            new_avg = ((old_avg * old_shares) + (price * shares)) / new_shares
+        else:
+            new_avg = 0.0
+        pos[f"{key}_shares"] = new_shares
+        pos[f"{key}_avg_price"] = round(new_avg, 6)
+
+        # Keep USD tracking for halt logic
+        filled_usd = shares * price
+        pos[key] += filled_usd
+
         log_position_update(pos["question"], pos["yes"], pos["no"])
-        self._check_limit(condition_id, side)
+        self._check_limit(condition_id, key)
         self._save()
 
     def record_unwind(
-        self, condition_id: str, side: str, unwound_usd: float
+        self, condition_id: str, side: str, shares: float, price: float
     ) -> None:
-        """Record a position reduction (e.g. from an opposing fill).
+        """Record a position reduction (e.g. from an unwind SELL fill).
 
         Args:
             condition_id: Unique market identifier.
             side: "yes" or "no".
-            unwound_usd: Dollar value of the reduction.
+            shares: Number of shares unwound.
+            price: Price per share.
         """
         if condition_id not in self.positions:
             return
         pos = self.positions[condition_id]
-        side = side.lower()
-        pos[side] = max(0.0, pos[side] - unwound_usd)
+        key = side.lower()
+
+        # Reduce shares
+        pos[f"{key}_shares"] = max(0.0, pos.get(f"{key}_shares", 0.0) - shares)
+        if pos[f"{key}_shares"] <= 0:
+            pos[f"{key}_avg_price"] = 0.0
+
+        # Reduce USD exposure
+        unwound_usd = shares * price
+        pos[key] = max(0.0, pos[key] - unwound_usd)
+
         log.info(
             f"Position unwound | {pos['question'][:40]} | "
-            f"{side.upper()} reduced by ${unwound_usd:.2f} to ${pos[side]:.2f}"
+            f"{key.upper()} reduced by {shares:.2f} shares (${unwound_usd:.2f}) "
+            f"to {pos.get(f'{key}_shares', 0):.2f} shares (${pos[key]:.2f})"
         )
-        self._check_resume(condition_id, side)
+        self._check_resume(condition_id, key)
         self._save()
 
     def can_quote(self, condition_id: str, side: str) -> bool:
@@ -177,6 +213,34 @@ class PositionTracker:
         if condition_id not in self.positions:
             return 0.0
         return self.positions[condition_id].get(side.lower(), 0.0)
+
+    def get_shares(self, condition_id: str, side: str) -> float:
+        """Get current share count for one side.
+
+        Args:
+            condition_id: Unique market identifier.
+            side: "yes" or "no".
+
+        Returns:
+            Number of shares held.
+        """
+        if condition_id not in self.positions:
+            return 0.0
+        return self.positions[condition_id].get(f"{side.lower()}_shares", 0.0)
+
+    def get_avg_price(self, condition_id: str, side: str) -> float:
+        """Get volume-weighted average price for one side.
+
+        Args:
+            condition_id: Unique market identifier.
+            side: "yes" or "no".
+
+        Returns:
+            VWAP of the position.
+        """
+        if condition_id not in self.positions:
+            return 0.0
+        return self.positions[condition_id].get(f"{side.lower()}_avg_price", 0.0)
 
     def get_all_positions(self) -> dict[str, dict]:
         """Return a shallow copy of all tracked positions.
@@ -211,6 +275,10 @@ class PositionTracker:
         if condition_id in self.positions:
             self.positions[condition_id]["yes"] = 0.0
             self.positions[condition_id]["no"] = 0.0
+            self.positions[condition_id]["yes_shares"] = 0.0
+            self.positions[condition_id]["no_shares"] = 0.0
+            self.positions[condition_id]["yes_avg_price"] = 0.0
+            self.positions[condition_id]["no_avg_price"] = 0.0
             self.positions[condition_id]["yes_halted"] = False
             self.positions[condition_id]["no_halted"] = False
             log.info(f"Position reset for: {condition_id}")
@@ -245,7 +313,7 @@ class PositionTracker:
             no_h = " [HALTED]" if pos["no_halted"] else ""
             log.info(
                 f"  {pos['question'][:45]} | "
-                f"YES=${pos['yes']:.2f}{yes_h} | "
-                f"NO=${pos['no']:.2f}{no_h}"
+                f"YES=${pos['yes']:.2f} ({pos.get('yes_shares', 0):.1f} shares){yes_h} | "
+                f"NO=${pos['no']:.2f} ({pos.get('no_shares', 0):.1f} shares){no_h}"
             )
         log.info("-" * 50)
