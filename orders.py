@@ -11,7 +11,8 @@ import time as _time
 from py_clob_client.clob_types import OrderArgs, BalanceAllowanceParams, AssetType
 from py_clob_client.order_builder.constants import BUY, SELL
 from config import (
-    ORDER_SIZE, MAX_ORDER_BUDGET, DANGER_ZONE_CENTS, DEAD_ZONE_BUFFER,
+    ORDER_SIZE, MAX_ORDER_BUDGET, ORDER_REFRESH_SECS,
+    DANGER_ZONE_CENTS, DEAD_ZONE_BUFFER,
     MAX_ORDER_FAILURES, DRY_RUN, MAX_ORDERBOOK_SPREAD,
     MIN_LIQUIDITY_BUFFER, MIN_UNWIND_SHARES,
 )
@@ -23,6 +24,79 @@ from alerts import (
 log = logging.getLogger(__name__)
 
 
+class BalanceGate:
+    """Shared USDC balance tracker across all OrderManagers.
+
+    Solves the problem where each manager independently queries the total
+    USDC balance without knowing about collateral locked by other managers'
+    orders.  When any manager gets a "not enough balance / allowance"
+    rejection from the exchange, the gate is marked depleted and all
+    managers skip order placement until collateral is freed (order cancel)
+    or the next refresh window.
+    """
+
+    def __init__(self, client: object) -> None:
+        self._client = client
+        self._raw_balance: float | None = None
+        self._cache_time: float = 0
+        self._depleted_until: float = 0  # timestamp — skip orders until then
+
+    def get_balance(self) -> float | None:
+        """Return cached USDC balance, refreshed every 60 seconds."""
+        now = _time.time()
+        if now - self._cache_time < 60:
+            return self._raw_balance
+        try:
+            bal = self._client.get_balance_allowance(
+                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            )
+            self._raw_balance = float(bal.get("balance", 0)) / 1e6
+            self._cache_time = now
+            return self._raw_balance
+        except Exception:
+            return None
+
+    def can_afford(self, est_cost: float) -> bool:
+        """Check if we likely have enough balance for this order.
+
+        Returns True if we can't determine (don't block on errors).
+        Returns False if balance is known to be insufficient or
+        we're in a depleted cooldown from a recent exchange rejection.
+        """
+        now = _time.time()
+        if now < self._depleted_until:
+            return False
+        balance = self.get_balance()
+        if balance is None:
+            return True  # Don't block on API errors
+        return est_cost <= balance
+
+    def mark_depleted(self, cooldown_secs: float = 30.0) -> None:
+        """Mark balance as depleted — skip all order attempts for cooldown.
+
+        Called when the exchange rejects with 'not enough balance / allowance'.
+        All managers sharing this gate will skip orders until cooldown expires
+        or invalidate() is called.
+        """
+        self._depleted_until = _time.time() + cooldown_secs
+        log.info(
+            f"Balance gate DEPLETED — skipping new orders for "
+            f"{cooldown_secs:.0f}s"
+        )
+
+    def invalidate(self) -> None:
+        """Force a fresh balance check and clear depleted state.
+
+        Called when collateral is freed (order cancelled/filled).
+        """
+        self._cache_time = 0
+        self._depleted_until = 0
+
+    @property
+    def is_depleted(self) -> bool:
+        return _time.time() < self._depleted_until
+
+
 class OrderManager:
     """Manages order lifecycle for a single market.
 
@@ -30,12 +104,17 @@ class OrderManager:
         client: Authenticated ClobClient instance.
         market: Dict of market metadata (condition_id, token_ids, etc.).
         position_tracker: PositionTracker instance for fill accounting.
+        balance_gate: Shared BalanceGate for cross-manager balance awareness.
     """
 
-    def __init__(self, client: object, market: dict, position_tracker: object) -> None:
+    def __init__(
+        self, client: object, market: dict, position_tracker: object,
+        balance_gate: "BalanceGate | None" = None,
+    ) -> None:
         self.client = client
         self.market = market
         self.position_tracker = position_tracker
+        self.balance_gate = balance_gate
         self.active_orders: dict[str, dict] = {}
         self.unwind_orders: dict[str, dict] = {}  # SELL orders to offload inventory
         self.failure_counts: dict[str, int] = {"yes": 0, "no": 0}
@@ -85,6 +164,8 @@ class OrderManager:
     def invalidate_balance_cache(self) -> None:
         """Force a fresh balance check on next call."""
         self._balance_cache_time = 0
+        if self.balance_gate:
+            self.balance_gate.invalidate()
 
     # ── Token Balance Verification ────────────────────────────────────────────
     def verify_token_balance(self, side: str) -> float:
@@ -431,15 +512,30 @@ class OrderManager:
             return None
 
         # Gate: check USDC balance before placing — avoid doomed API calls.
-        # Uses cached balance (refreshed once per cycle) to avoid extra API hits.
-        available = self._get_cached_balance()
-        if available is not None and est_cost > available:
-            log.warning(
-                f"Insufficient balance: need ${est_cost:.2f} but only "
-                f"${available:.2f} available — skipping {side.upper()} on "
-                f"{question[:40]}"
-            )
-            return None
+        # Uses shared BalanceGate if available (cross-manager awareness),
+        # falls back to per-manager cache otherwise.
+        if self.balance_gate:
+            if not self.balance_gate.can_afford(est_cost):
+                if self.balance_gate.is_depleted:
+                    log.debug(
+                        f"Balance gate depleted — skipping {side.upper()} on "
+                        f"{question[:40]}"
+                    )
+                else:
+                    log.warning(
+                        f"Insufficient balance for ${est_cost:.2f} — "
+                        f"skipping {side.upper()} on {question[:40]}"
+                    )
+                return None
+        else:
+            available = self._get_cached_balance()
+            if available is not None and est_cost > available:
+                log.warning(
+                    f"Insufficient balance: need ${est_cost:.2f} but only "
+                    f"${available:.2f} available — skipping {side.upper()} on "
+                    f"{question[:40]}"
+                )
+                return None
 
         # ── Dry Run ──────────────────────────────────────────────────────────
         if DRY_RUN:
@@ -508,6 +604,15 @@ class OrderManager:
 
         except Exception as e:
             self.failure_counts[side] += 1
+            error_str = str(e).lower()
+
+            # If the exchange says "not enough balance", mark the shared
+            # gate as depleted so ALL managers skip orders this cycle
+            # instead of each one hammering the API with doomed requests.
+            if "not enough balance" in error_str or "allowance" in error_str:
+                if self.balance_gate:
+                    self.balance_gate.mark_depleted(cooldown_secs=ORDER_REFRESH_SECS)
+
             alert_order_failure(
                 question, side.upper(), str(e),
                 self.failure_counts[side],

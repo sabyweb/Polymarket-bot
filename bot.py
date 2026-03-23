@@ -21,7 +21,7 @@ from config import (
 )
 from market import get_rewards_markets
 from position import PositionTracker
-from orders import OrderManager
+from orders import OrderManager, BalanceGate
 from rate_limiter import RateLimitedClient
 from alerts import (
     setup_logger, alert_bot_restart, alert_no_markets,
@@ -42,6 +42,7 @@ class MarketMakerBot:
     def __init__(self) -> None:
         self.client: ClobClient | None = None
         self.position_tracker: PositionTracker = PositionTracker()
+        self.balance_gate: BalanceGate | None = None
         self.order_managers: dict[str, OrderManager] = {}
         self.active_markets: list[dict] = []
         self.cycle_count: int = 0
@@ -75,6 +76,7 @@ class MarketMakerBot:
                 funder=FUNDER,
             )
             self.client = RateLimitedClient(raw_client)
+            self.balance_gate = BalanceGate(self.client)
             log.info("Connected to Polymarket CLOB API (rate-limited)")
 
             # Verify balance and allowances before trading
@@ -226,7 +228,8 @@ class MarketMakerBot:
 
         self.position_tracker.register_market(condition_id, question)
         self.order_managers[condition_id] = OrderManager(
-            self.client, market, self.position_tracker
+            self.client, market, self.position_tracker,
+            balance_gate=self.balance_gate,
         )
         log.info(f"Added market: {question[:50]} (score={market['score']})")
 
