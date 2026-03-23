@@ -7,6 +7,7 @@ quick incident review.
 """
 
 import logging
+import logging.handlers
 import os
 import requests
 from datetime import datetime
@@ -22,10 +23,11 @@ log = logging.getLogger(__name__)
 
 
 def setup_logger() -> logging.Logger:
-    """Configure the root logger with console and file handlers.
+    """Configure the root logger with console and rotating file handlers.
 
     Console handler outputs INFO and above.
-    File handler captures everything from DEBUG upwards.
+    File handler captures everything from DEBUG upwards with automatic
+    rotation: 10 MB per file, 5 backups kept (50 MB total max).
 
     Returns:
         The configured root logger.
@@ -42,7 +44,10 @@ def setup_logger() -> logging.Logger:
     console.setLevel(logging.INFO)
     console.setFormatter(formatter)
 
-    file_handler = logging.FileHandler(LOG_FILE)
+    # Rotating file handler: 10 MB per file, keep 5 backups (50 MB total)
+    file_handler = logging.handlers.RotatingFileHandler(
+        LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5,
+    )
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(formatter)
 
@@ -413,6 +418,34 @@ def alert_positions(positions: dict) -> None:
         "timestamp": datetime.utcnow().isoformat(),
     }
     _send_discord("**Position Update**", embed)
+
+
+def alert_heartbeat_failure(last_success_secs_ago: float) -> None:
+    """Send a Discord alert when no cycle has completed recently.
+
+    This catches silent failures — e.g. the bot is running but all API
+    calls return empty data, no markets pass hygiene, etc.
+
+    Args:
+        last_success_secs_ago: Seconds since the last successful cycle.
+    """
+    minutes = last_success_secs_ago / 60
+    embed = {
+        "title": "Heartbeat Missing",
+        "description": (
+            f"No successful trading cycle has completed in "
+            f"**{minutes:.0f} minutes**.\n\n"
+            f"The bot may be stuck, all markets may be failing hygiene, "
+            f"or API calls may be timing out."
+        ),
+        "color": 0xFF6600,  # Orange — warning
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+    _send_discord("**HEARTBEAT ALERT** — bot may be stalled", embed)
+
+    msg = f"HEARTBEAT MISSING | No cycle completed in {minutes:.0f} minutes"
+    log.warning(msg)
+    _write_alert("HEARTBEAT", msg)
 
 
 def alert_bot_crash(error: str) -> None:

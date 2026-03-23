@@ -84,8 +84,35 @@ MAX_ORDER_FAILURES: int = 3  # Alert after this many consecutive order failures
 # unwind orders each cycle. No retry queue needed.
 MIN_UNWIND_SHARES: float = 1.0   # Ignore positions below this many shares
 
+# ── Heartbeat ────────────────────────────────────────────────────────────────
+# Alert if no successful cycle completes within this many seconds.
+# Catches silent failures (empty API responses, 0 eligible markets, etc.)
+HEARTBEAT_TIMEOUT_SECS: int = 300  # 5 minutes
+
 # ── Discord Notifications ────────────────────────────────────────────────────
 # Create a webhook in your Discord server:
 #   Server Settings -> Integrations -> Webhooks -> New Webhook
 # Paste the URL into your .env file as DISCORD_WEBHOOK_URL
 DISCORD_WEBHOOK_URL: str | None = os.getenv("DISCORD_WEBHOOK_URL")
+
+
+# ── Credential Validation ───────────────────────────────────────────────────
+def validate_credentials() -> None:
+    """Fail fast if any required credential is missing or empty.
+
+    Called at startup before any API connections are attempted.
+    Raises SystemExit with a clear message telling the user exactly
+    what is missing.
+    """
+    required = {
+        "PRIVATE_KEY": PRIVATE_KEY,
+        "CLOB_API_KEY": CLOB_API_KEY,
+        "CLOB_SECRET": CLOB_SECRET,
+        "CLOB_PASS_PHRASE": CLOB_PASS_PHRASE,
+    }
+    missing = [name for name, val in required.items() if not val]
+    if missing:
+        raise SystemExit(
+            f"FATAL: Missing required credentials in .env: {', '.join(missing)}\n"
+            f"Copy .env.example to .env and fill in all fields."
+        )

@@ -17,7 +17,7 @@ from config import (
     MAX_MARKETS, MIN_SCORE_THRESHOLD,
     MARKET_REFRESH_SECS, ORDER_REFRESH_SECS,
     ORDER_SIZE, FUNDER, SIGNATURE_TYPE,
-    HYSTERESIS_SCORE_MARGIN,
+    HYSTERESIS_SCORE_MARGIN, HEARTBEAT_TIMEOUT_SECS,
 )
 from market import get_rewards_markets
 from position import PositionTracker
@@ -25,7 +25,7 @@ from orders import OrderManager
 from rate_limiter import RateLimitedClient
 from alerts import (
     setup_logger, alert_bot_restart, alert_no_markets,
-    alert_api_failure, alert_positions,
+    alert_api_failure, alert_positions, alert_heartbeat_failure,
     log_cycle_start, log_market_refresh,
 )
 
@@ -47,6 +47,8 @@ class MarketMakerBot:
         self.cycle_count: int = 0
         self.last_market_refresh: float = 0
         self._shutdown_requested: bool = False
+        self._last_successful_cycle: float = time.time()
+        self._heartbeat_alerted: bool = False
 
     # ── Client Setup ─────────────────────────────────────────────────────────
     def connect(self) -> bool:
@@ -296,6 +298,9 @@ class MarketMakerBot:
         # Cancel any orphaned orders from previous sessions
         self._cancel_orphaned_orders()
 
+        # Verify positions from disk against actual exchange balances
+        self._verify_positions_on_startup()
+
         # Initial market fetch
         self.refresh_markets()
 
@@ -303,6 +308,12 @@ class MarketMakerBot:
             try:
                 self.cycle_count += 1
                 log_cycle_start(self.cycle_count)
+
+                # ── Heartbeat check ─────────────────────────────────────
+                since_last = time.time() - self._last_successful_cycle
+                if since_last > HEARTBEAT_TIMEOUT_SECS and not self._heartbeat_alerted:
+                    alert_heartbeat_failure(since_last)
+                    self._heartbeat_alerted = True
 
                 # ── Market refresh check ──────────────────────────────────
                 time_since_refresh = time.time() - self.last_market_refresh
@@ -348,6 +359,10 @@ class MarketMakerBot:
                             if pos and pos.get("yes", 0) <= 0.05 and pos.get("no", 0) <= 0.05:
                                 self.position_tracker.remove_market(cid)
 
+                # Mark cycle as successful (for heartbeat monitoring)
+                self._last_successful_cycle = time.time()
+                self._heartbeat_alerted = False
+
                 # ── Print position summary every 10 cycles ────────────────
                 if self.cycle_count % 10 == 0:
                     self.position_tracker.print_summary()
@@ -371,6 +386,124 @@ class MarketMakerBot:
                     time.sleep(1)
 
         self._shutdown()
+
+    # ── Startup Position Verification ─────────────────────────────────────────
+    def _verify_positions_on_startup(self) -> None:
+        """Cross-check positions.json against actual exchange token balances.
+
+        If the tracker says we hold tokens but the exchange says we don't
+        (e.g. user manually closed positions), reset the stale entries.
+        This prevents phantom unwind attempts on bot restart.
+        """
+        positions = self.position_tracker.get_all_positions()
+        if not positions:
+            return
+
+        log.info(f"Verifying {len(positions)} position(s) against exchange...")
+
+        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+
+        # We need token IDs to check balances — fetch from rewards/market data
+        # For positions loaded from disk, we may not have token_ids yet.
+        # Use the Gamma API to look them up.
+        stale_cids = []
+
+        for cid, pos in positions.items():
+            has_position = False
+            for side_key in ("yes", "no"):
+                shares = pos.get(f"{side_key}_shares", 0.0)
+                if shares >= 1.0:
+                    has_position = True
+                    break
+
+            if not has_position:
+                continue
+
+            # Try to get token IDs for this market
+            try:
+                token_ids = self._get_token_ids_for_condition(cid)
+                if not token_ids:
+                    log.warning(
+                        f"Could not find token IDs for {pos.get('question', cid[:16])} "
+                        f"— skipping verification"
+                    )
+                    continue
+
+                for side_key, token_idx in [("yes", 0), ("no", 1)]:
+                    tracked_shares = pos.get(f"{side_key}_shares", 0.0)
+                    if tracked_shares < 1.0:
+                        continue
+
+                    try:
+                        bal = self.client.get_balance_allowance(
+                            BalanceAllowanceParams(
+                                asset_type=AssetType.CONDITIONAL,
+                                token_id=token_ids[token_idx],
+                            )
+                        )
+                        actual = float(bal.get("balance", 0)) / 1e6
+                    except Exception as e:
+                        log.warning(f"Balance check failed for {side_key.upper()}: {e}")
+                        continue
+
+                    if actual < 1.0 and tracked_shares >= 1.0:
+                        log.warning(
+                            f"STALE POSITION | {pos.get('question', cid[:16])[:40]} | "
+                            f"{side_key.upper()} tracker={tracked_shares:.2f} "
+                            f"actual={actual:.2f} → resetting"
+                        )
+                        self.position_tracker.reset_side(cid, side_key)
+                    elif abs(actual - tracked_shares) > 1.0:
+                        log.warning(
+                            f"POSITION MISMATCH | {pos.get('question', cid[:16])[:40]} | "
+                            f"{side_key.upper()} tracker={tracked_shares:.2f} "
+                            f"actual={actual:.2f} → correcting"
+                        )
+                        self.position_tracker.set_shares(cid, side_key, actual)
+                    else:
+                        log.info(
+                            f"Position verified | {pos.get('question', cid[:16])[:40]} | "
+                            f"{side_key.upper()} {tracked_shares:.2f} shares ✓"
+                        )
+            except Exception as e:
+                log.warning(f"Could not verify position {cid[:16]}: {e}")
+
+        log.info("Position verification complete.")
+
+    def _get_token_ids_for_condition(self, condition_id: str) -> list[str] | None:
+        """Look up YES/NO token IDs for a condition_id via the Gamma API.
+
+        Returns:
+            List of [yes_token_id, no_token_id] or None on failure.
+        """
+        try:
+            import requests
+            resp = requests.get(
+                "https://gamma-api.polymarket.com/markets",
+                params={"condition_id": condition_id},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            markets = resp.json()
+            if markets and len(markets) > 0:
+                market = markets[0]
+                tokens = market.get("tokens", [])
+                if len(tokens) >= 2:
+                    yes_token = next(
+                        (t["token_id"] for t in tokens
+                         if t.get("outcome", "").lower() == "yes"),
+                        tokens[0]["token_id"],
+                    )
+                    no_token = next(
+                        (t["token_id"] for t in tokens
+                         if t.get("outcome", "").lower() == "no"),
+                        tokens[1]["token_id"],
+                    )
+                    return [yes_token, no_token]
+            return None
+        except Exception as e:
+            log.warning(f"Gamma API lookup failed for {condition_id[:16]}: {e}")
+            return None
 
     # ── Orphaned Order Cleanup ────────────────────────────────────────────────
     def _cancel_orphaned_orders(self) -> None:

@@ -8,7 +8,7 @@ buffer to minimise adverse fill risk.
 
 import logging
 import time as _time
-from py_clob_client.clob_types import OrderArgs
+from py_clob_client.clob_types import OrderArgs, BalanceAllowanceParams, AssetType
 from py_clob_client.order_builder.constants import BUY, SELL
 from config import (
     ORDER_SIZE, MAX_ORDER_BUDGET, DANGER_ZONE_CENTS, DEAD_ZONE_BUFFER,
@@ -85,6 +85,39 @@ class OrderManager:
     def invalidate_balance_cache(self) -> None:
         """Force a fresh balance check on next call."""
         self._balance_cache_time = 0
+
+    # ── Token Balance Verification ────────────────────────────────────────────
+    def verify_token_balance(self, side: str) -> float:
+        """Query actual on-exchange token balance for a side.
+
+        Uses the CONDITIONAL asset type to check how many tokens
+        we actually hold, regardless of what positions.json says.
+
+        Args:
+            side: "yes" or "no".
+
+        Returns:
+            Actual token balance (in shares), or -1 if the check fails
+            (so we don't block operations on API errors).
+        """
+        try:
+            token_id = self.market["token_ids"][0 if side == "yes" else 1]
+            bal = self.client.get_balance_allowance(
+                BalanceAllowanceParams(
+                    asset_type=AssetType.CONDITIONAL,
+                    token_id=token_id,
+                )
+            )
+            raw_balance = float(bal.get("balance", 0))
+            # Conditional tokens use 6 decimal places (like USDC)
+            actual_shares = raw_balance / 1e6
+            return actual_shares
+        except Exception as e:
+            log.warning(
+                f"Could not verify {side.upper()} token balance for "
+                f"{self.market['question'][:40]}: {e}"
+            )
+            return -1  # Unknown — don't block
 
     # ── Order Book ───────────────────────────────────────────────────────────
     def get_order_book(self) -> dict | None:
@@ -616,12 +649,16 @@ class OrderManager:
             return None
 
     def reconcile_unwinds(self) -> None:
-        """Position-based unwind reconciliation.
+        """Position-based unwind reconciliation with exchange verification.
 
         Each cycle, for each side with inventory:
         1. Get total position (shares) from position tracker
-        2. Sum sizes of all active unwind orders for this side
-        3. If unhedged > MIN_UNWIND_SHARES: place ONE unwind order
+        2. Verify against actual token balance on exchange
+        3. Sum sizes of all active unwind orders for this side
+        4. If unhedged > MIN_UNWIND_SHARES: place ONE unwind order
+
+        If the tracker says we hold tokens but the exchange says we don't,
+        the tracker is corrected (stale data from manual closes, etc.).
         """
         condition_id = self.market["condition_id"]
 
@@ -631,6 +668,35 @@ class OrderManager:
 
             if position_shares < MIN_UNWIND_SHARES or avg_price <= 0:
                 continue  # No meaningful position to unwind
+
+            # CRITICAL: Verify actual token balance before trying to sell
+            actual_balance = self.verify_token_balance(side)
+            if actual_balance >= 0:  # -1 means check failed, don't block
+                if actual_balance < MIN_UNWIND_SHARES:
+                    # Tracker says we have shares, exchange says we don't
+                    # → stale data (manual close, external sale, etc.)
+                    log.warning(
+                        f"POSITION CORRECTION | {side.upper()} | "
+                        f"tracker={position_shares:.2f} shares | "
+                        f"actual={actual_balance:.2f} shares | "
+                        f"Resetting stale position | "
+                        f"market={self.market['question'][:40]}"
+                    )
+                    self.position_tracker.reset_side(condition_id, side)
+                    continue
+                elif actual_balance < position_shares - 0.5:
+                    # Partial mismatch — trust the exchange, correct tracker
+                    log.warning(
+                        f"POSITION ADJUSTMENT | {side.upper()} | "
+                        f"tracker={position_shares:.2f} | "
+                        f"actual={actual_balance:.2f} | "
+                        f"Correcting to match exchange | "
+                        f"market={self.market['question'][:40]}"
+                    )
+                    position_shares = actual_balance
+                    self.position_tracker.set_shares(
+                        condition_id, side, actual_balance
+                    )
 
             # Sum shares covered by existing unwind orders
             covered_shares = 0.0
@@ -647,6 +713,7 @@ class OrderManager:
                 f"UNWIND RECONCILIATION | {side.upper()} | "
                 f"position={position_shares:.2f} | covered={covered_shares:.2f} | "
                 f"unhedged={unhedged:.2f} | avg_price={avg_price:.4f} | "
+                f"actual_balance={actual_balance:.2f} | "
                 f"market={self.market['question'][:40]}"
             )
 

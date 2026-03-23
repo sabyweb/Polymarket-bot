@@ -11,6 +11,7 @@ Positions are persisted to a JSON file so they survive bot restarts.
 import json
 import logging
 import os
+import tempfile
 from config import MAX_POSITION_USD, RESUME_POSITION_USD
 from alerts import alert_position_limit, log_position_update
 
@@ -53,29 +54,38 @@ class PositionTracker:
             log.warning(f"Could not load positions from {POSITIONS_FILE}: {e}")
 
     def _save(self) -> None:
-        """Persist current positions to disk.
+        """Persist current positions to disk atomically, pruning zero entries.
 
-        Auto-prunes entries where both sides are below dust threshold
-        ($0.05) and neither side is halted, to prevent stale zero-
-        position entries from accumulating.
+        Uses write-to-temp-file + rename to prevent data corruption if the
+        process is killed mid-write (e.g. OOM kill, power loss).
         """
-        # Prune dust/zero positions
-        dust = 0.05
-        to_prune = [
-            cid for cid, pos in self.positions.items()
-            if (pos.get("yes", 0) <= dust
-                and pos.get("no", 0) <= dust
-                and pos.get("yes_shares", 0) <= 0
-                and pos.get("no_shares", 0) <= 0
-                and not pos.get("yes_halted", False)
-                and not pos.get("no_halted", False))
-        ]
-        for cid in to_prune:
-            del self.positions[cid]
-
         try:
-            with open(POSITIONS_FILE, "w") as f:
-                json.dump(self.positions, f, indent=2)
+            # Prune entries where both sides are zero (no position, no halt)
+            pruned = {
+                cid: pos for cid, pos in self.positions.items()
+                if (
+                    pos.get("yes", 0) > 0.01
+                    or pos.get("no", 0) > 0.01
+                    or pos.get("yes_shares", 0) >= 1.0
+                    or pos.get("no_shares", 0) >= 1.0
+                    or pos.get("yes_halted", False)
+                    or pos.get("no_halted", False)
+                )
+            }
+            # Atomic write: write to temp file, then rename (rename is atomic on POSIX)
+            dir_name = os.path.dirname(POSITIONS_FILE) or "."
+            fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(pruned, f, indent=2)
+                os.replace(tmp_path, POSITIONS_FILE)
+            except Exception:
+                # Clean up temp file if rename failed
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
         except Exception as e:
             log.error(f"Could not save positions to {POSITIONS_FILE}: {e}")
 
@@ -289,6 +299,53 @@ class PositionTracker:
             self.positions[condition_id]["no_halted"] = False
             log.info(f"Position reset for: {condition_id}")
             self._save()
+
+    def reset_side(self, condition_id: str, side: str) -> None:
+        """Reset position data for one side of a market.
+
+        Used when exchange verification shows stale data (e.g. user
+        manually closed a position outside the bot).
+
+        Args:
+            condition_id: Unique market identifier.
+            side: "yes" or "no".
+        """
+        if condition_id not in self.positions:
+            return
+        key = side.lower()
+        pos = self.positions[condition_id]
+        pos[key] = 0.0
+        pos[f"{key}_shares"] = 0.0
+        pos[f"{key}_avg_price"] = 0.0
+        pos[f"{key}_halted"] = False
+        question = pos.get("question", condition_id[:16])
+        log.info(f"Position side reset | {question[:40]} | {side.upper()} zeroed")
+        self._save()
+
+    def set_shares(self, condition_id: str, side: str, shares: float) -> None:
+        """Set share count to a specific value (for exchange corrections).
+
+        Args:
+            condition_id: Unique market identifier.
+            side: "yes" or "no".
+            shares: Corrected share count from exchange.
+        """
+        if condition_id not in self.positions:
+            return
+        key = side.lower()
+        pos = self.positions[condition_id]
+        old_shares = pos.get(f"{key}_shares", 0.0)
+        pos[f"{key}_shares"] = shares
+        # Adjust USD proportionally
+        if old_shares > 0:
+            ratio = shares / old_shares
+            pos[key] = pos.get(key, 0.0) * ratio
+        question = pos.get("question", condition_id[:16])
+        log.info(
+            f"Position corrected | {question[:40]} | {side.upper()} "
+            f"{old_shares:.2f} → {shares:.2f} shares"
+        )
+        self._save()
 
     # ── Internal ─────────────────────────────────────────────────────────────
     def _check_limit(self, condition_id: str, side: str) -> None:

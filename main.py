@@ -32,6 +32,10 @@ def main() -> None:
     global _bot
     setup_logger()
 
+    # Fail fast if credentials are missing
+    from config import validate_credentials
+    validate_credentials()
+
     # Register signal handlers for graceful cloud shutdown
     signal.signal(signal.SIGTERM, _signal_handler)
     signal.signal(signal.SIGINT, _signal_handler)
