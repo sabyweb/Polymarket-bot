@@ -120,6 +120,9 @@ class OrderManager:
         self.failure_counts: dict[str, int] = {"yes": 0, "no": 0}
         self._balance_cache: float | None = None
         self._balance_cache_time: float = 0
+        # Short-lived cache for token balances (avoids hitting API
+        # multiple times per cycle for the same token)
+        self._token_balance_cache: dict[str, tuple[float, float]] = {}  # side → (balance, timestamp)
 
     # ── Tick Size Rounding ───────────────────────────────────────────────────
     def round_to_tick(self, price: float) -> float:
@@ -173,6 +176,8 @@ class OrderManager:
 
         Uses the CONDITIONAL asset type to check how many tokens
         we actually hold, regardless of what positions.json says.
+        Results are cached for 15 seconds to avoid duplicate API calls
+        within the same cycle (reconcile_unwinds + has_unhedged_position).
 
         Args:
             side: "yes" or "no".
@@ -181,6 +186,13 @@ class OrderManager:
             Actual token balance (in shares), or -1 if the check fails
             (so we don't block operations on API errors).
         """
+        # Check short-lived cache first
+        now = _time.time()
+        if side in self._token_balance_cache:
+            cached_bal, cached_at = self._token_balance_cache[side]
+            if now - cached_at < 15:  # 15-second cache
+                return cached_bal
+
         try:
             token_id = self.market["token_ids"][0 if side == "yes" else 1]
             bal = self.client.get_balance_allowance(
@@ -192,6 +204,7 @@ class OrderManager:
             raw_balance = float(bal.get("balance", 0))
             # Conditional tokens use 6 decimal places (like USDC)
             actual_shares = raw_balance / 1e6
+            self._token_balance_cache[side] = (actual_shares, now)
             return actual_shares
         except Exception as e:
             log.warning(
@@ -756,52 +769,113 @@ class OrderManager:
     def reconcile_unwinds(self) -> None:
         """Position-based unwind reconciliation with exchange verification.
 
-        Each cycle, for each side with inventory:
-        1. Get total position (shares) from position tracker
-        2. Verify against actual token balance on exchange
-        3. Sum sizes of all active unwind orders for this side
-        4. If unhedged > MIN_UNWIND_SHARES: place ONE unwind order
+        Each cycle, for each side:
+        1. ALWAYS check actual token balance on exchange (catches untracked fills)
+        2. Sync tracker with exchange reality
+        3. Check for merge opportunity (both YES and NO held)
+        4. Sum sizes of all active unwind orders for this side
+        5. If unhedged > MIN_UNWIND_SHARES: place ONE unwind order
 
-        If the tracker says we hold tokens but the exchange says we don't,
-        the tracker is corrected (stale data from manual closes, etc.).
+        Key improvement: even when the tracker shows 0 shares, we verify
+        against the exchange. This catches fills from orders where
+        _find_exchange_order_id failed (order placed but not tracked).
         """
         condition_id = self.market["condition_id"]
+        actual_balances: dict[str, float] = {}
 
+        # ── Phase 1: Verify actual balances for BOTH sides ────────────────
+        for side in ("yes", "no"):
+            position_shares = self.position_tracker.get_shares(condition_id, side)
+            actual_balance = self.verify_token_balance(side)
+            actual_balances[side] = actual_balance
+
+            if actual_balance < 0:
+                # API check failed — use tracker as-is, don't block
+                continue
+
+            if actual_balance >= MIN_UNWIND_SHARES and position_shares < MIN_UNWIND_SHARES:
+                # DISCOVERY: Exchange has tokens the tracker doesn't know about.
+                # This happens when _find_exchange_order_id fails and the fill
+                # is never recorded. Use current market price as estimate.
+                yes_price = self.market.get("yes_price") or 0.50
+                est_price = yes_price if side == "yes" else (1 - yes_price)
+                log.warning(
+                    f"UNTRACKED POSITION DISCOVERED | {side.upper()} | "
+                    f"tracker={position_shares:.2f} | "
+                    f"actual={actual_balance:.2f} shares | "
+                    f"est_price={est_price:.4f} | "
+                    f"market={self.market['question'][:40]}"
+                )
+                self.position_tracker.record_fill(
+                    condition_id, side, actual_balance, est_price,
+                    question=self.market["question"],
+                )
+
+            elif actual_balance < MIN_UNWIND_SHARES and position_shares >= MIN_UNWIND_SHARES:
+                # Tracker says we have shares, exchange says we don't
+                # → stale data (manual close, external sale, etc.)
+                log.warning(
+                    f"POSITION CORRECTION | {side.upper()} | "
+                    f"tracker={position_shares:.2f} shares | "
+                    f"actual={actual_balance:.2f} shares | "
+                    f"Resetting stale position | "
+                    f"market={self.market['question'][:40]}"
+                )
+                self.position_tracker.reset_side(condition_id, side)
+
+            elif (actual_balance >= MIN_UNWIND_SHARES
+                  and abs(actual_balance - position_shares) > 0.5):
+                # Mismatch — trust the exchange, correct tracker
+                log.warning(
+                    f"POSITION ADJUSTMENT | {side.upper()} | "
+                    f"tracker={position_shares:.2f} | "
+                    f"actual={actual_balance:.2f} | "
+                    f"Correcting to match exchange | "
+                    f"market={self.market['question'][:40]}"
+                )
+                self.position_tracker.set_shares(
+                    condition_id, side, actual_balance
+                )
+
+        # ── Phase 2: Check for merge opportunity ──────────────────────────
+        # If we hold both YES and NO, merging min(yes, no) pairs returns
+        # $1 per pair as USDC — far more capital-efficient than selling both.
+        yes_shares = self.position_tracker.get_shares(condition_id, "yes")
+        no_shares = self.position_tracker.get_shares(condition_id, "no")
+        if yes_shares >= MIN_UNWIND_SHARES and no_shares >= MIN_UNWIND_SHARES:
+            mergeable = min(yes_shares, no_shares)
+            freed_usd = mergeable  # Each YES+NO pair = $1
+            log.info(
+                f"MERGE OPPORTUNITY | "
+                f"YES={yes_shares:.2f} | NO={no_shares:.2f} | "
+                f"mergeable={mergeable:.2f} pairs | "
+                f"would_free=${freed_usd:.2f} USDC | "
+                f"market={self.market['question'][:40]}"
+            )
+            # Attempt automatic merge
+            merged = self._try_merge_positions(condition_id, mergeable)
+            if merged:
+                # Merge succeeded — reduce both sides in tracker
+                self.position_tracker.record_unwind(
+                    condition_id, "yes", mergeable,
+                    self.position_tracker.get_avg_price(condition_id, "yes"),
+                )
+                self.position_tracker.record_unwind(
+                    condition_id, "no", mergeable,
+                    self.position_tracker.get_avg_price(condition_id, "no"),
+                )
+                self.invalidate_balance_cache()
+                # Re-read shares after merge
+                yes_shares = self.position_tracker.get_shares(condition_id, "yes")
+                no_shares = self.position_tracker.get_shares(condition_id, "no")
+
+        # ── Phase 3: Place unwind orders for remaining inventory ──────────
         for side in ("yes", "no"):
             position_shares = self.position_tracker.get_shares(condition_id, side)
             avg_price = self.position_tracker.get_avg_price(condition_id, side)
 
             if position_shares < MIN_UNWIND_SHARES or avg_price <= 0:
-                continue  # No meaningful position to unwind
-
-            # CRITICAL: Verify actual token balance before trying to sell
-            actual_balance = self.verify_token_balance(side)
-            if actual_balance >= 0:  # -1 means check failed, don't block
-                if actual_balance < MIN_UNWIND_SHARES:
-                    # Tracker says we have shares, exchange says we don't
-                    # → stale data (manual close, external sale, etc.)
-                    log.warning(
-                        f"POSITION CORRECTION | {side.upper()} | "
-                        f"tracker={position_shares:.2f} shares | "
-                        f"actual={actual_balance:.2f} shares | "
-                        f"Resetting stale position | "
-                        f"market={self.market['question'][:40]}"
-                    )
-                    self.position_tracker.reset_side(condition_id, side)
-                    continue
-                elif actual_balance < position_shares - 0.5:
-                    # Partial mismatch — trust the exchange, correct tracker
-                    log.warning(
-                        f"POSITION ADJUSTMENT | {side.upper()} | "
-                        f"tracker={position_shares:.2f} | "
-                        f"actual={actual_balance:.2f} | "
-                        f"Correcting to match exchange | "
-                        f"market={self.market['question'][:40]}"
-                    )
-                    position_shares = actual_balance
-                    self.position_tracker.set_shares(
-                        condition_id, side, actual_balance
-                    )
+                continue
 
             # Sum shares covered by existing unwind orders
             covered_shares = 0.0
@@ -814,27 +888,105 @@ class OrderManager:
             if unhedged < MIN_UNWIND_SHARES:
                 continue  # Fully covered or dust
 
+            actual = actual_balances.get(side, -1)
             log.info(
                 f"UNWIND RECONCILIATION | {side.upper()} | "
                 f"position={position_shares:.2f} | covered={covered_shares:.2f} | "
                 f"unhedged={unhedged:.2f} | avg_price={avg_price:.4f} | "
-                f"actual_balance={actual_balance:.2f} | "
+                f"actual_balance={actual:.2f} | "
                 f"market={self.market['question'][:40]}"
             )
 
             # Place unwind for the unhedged portion
             self.place_unwind_order(side, avg_price, unhedged)
 
+    def _try_merge_positions(
+        self, condition_id: str, amount: float
+    ) -> bool:
+        """Attempt to merge YES+NO token pairs back into USDC.
+
+        On Polymarket, each YES+NO pair = $1 USDC. Merging avoids the
+        need to sell both sides separately (which requires counterparties
+        and leaves capital locked in open orders).
+
+        Uses the CLOB API's merge endpoint if available, otherwise
+        logs the opportunity for manual action.
+
+        Args:
+            condition_id: Market condition ID.
+            amount: Number of pairs to merge (shares).
+
+        Returns:
+            True if merge succeeded, False otherwise.
+        """
+        question = self.market["question"]
+        try:
+            # The py_clob_client doesn't expose merge directly.
+            # Try calling it — if the method exists, use it.
+            if hasattr(self.client, 'merge_positions'):
+                result = self.client.merge_positions(
+                    condition_id=condition_id,
+                    amount=amount,
+                )
+                log.info(
+                    f"MERGE SUCCESS | {amount:.2f} pairs merged | "
+                    f"freed=${amount:.2f} USDC | "
+                    f"market={question[:40]} | result={result}"
+                )
+                return True
+
+            # Fallback: try the underlying client if wrapped
+            inner = getattr(self.client, '_client', None)
+            if inner and hasattr(inner, 'merge_positions'):
+                result = inner.merge_positions(
+                    condition_id=condition_id,
+                    amount=amount,
+                )
+                log.info(
+                    f"MERGE SUCCESS | {amount:.2f} pairs merged | "
+                    f"freed=${amount:.2f} USDC | "
+                    f"market={question[:40]} | result={result}"
+                )
+                return True
+
+            # No merge API available — log for manual action
+            log.warning(
+                f"MERGE NEEDED (manual) | {amount:.2f} YES+NO pairs | "
+                f"would free ${amount:.2f} USDC | "
+                f"market={question[:40]} | "
+                f"Use Polymarket UI to merge positions"
+            )
+            return False
+
+        except Exception as e:
+            log.error(
+                f"Merge failed for {question[:40]}: {e} — "
+                f"falling back to individual SELL orders"
+            )
+            return False
+
     def has_unhedged_position(self, side: str) -> bool:
         """Check if there's unhedged inventory on a side.
 
         Used by run_cycle to block new BUY orders when we have inventory
-        that still needs unwinding.
+        that still needs unwinding.  Also checks actual exchange balance
+        when the tracker shows 0, catching fills from untracked orders.
         """
         condition_id = self.market["condition_id"]
         position_shares = self.position_tracker.get_shares(condition_id, side)
+
+        # If tracker shows nothing, do a quick exchange check
+        # to catch fills from orders that weren't tracked
         if position_shares < MIN_UNWIND_SHARES:
+            actual = self.verify_token_balance(side)
+            if actual >= MIN_UNWIND_SHARES:
+                log.info(
+                    f"Blocking {side.upper()} BUY — exchange shows "
+                    f"{actual:.2f} untracked shares"
+                )
+                return True
             return False
+
         covered = sum(
             u["size"] for u in self.unwind_orders.values() if u["side"] == side
         )
