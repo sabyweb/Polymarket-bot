@@ -584,33 +584,45 @@ class OrderManager:
                         f"Order rejected: {response.get('errorMsg', response)}"
                     )
 
-            # The POST response 'orderID' differs from the exchange 'id'.
-            # Fetch open orders and find ours by matching asset + price + side.
+            # Extract POST response orderID as fallback identifier
+            post_order_id = None
+            if isinstance(response, dict):
+                post_order_id = response.get("orderID")
+
+            # Try to find the exchange-assigned order ID by matching
+            # asset + price + side in the open orders list.
             exchange_id = self._find_exchange_order_id(
                 token_id, str(clob_price), clob_side
             )
 
-            if exchange_id:
-                order_id = exchange_id
+            # Use exchange ID if found, otherwise fall back to POST orderID.
+            # An untracked order is the worst outcome — it can get filled
+            # without the bot ever knowing, leaving inventory with no SELL.
+            order_id = exchange_id or post_order_id
+
+            if order_id:
                 self.active_orders[order_id] = {
                     "side": side,
                     "price": price,
                     "size": float(size),
                     "original_size": float(size),
                     "placed_at": _time.time(),
+                    "from_post_response": exchange_id is None,
                 }
                 self.failure_counts[side] = 0
-                self.invalidate_balance_cache()  # Balance changed
+                self.invalidate_balance_cache()
+                if exchange_id is None:
+                    log.warning(
+                        f"Tracking {side.upper()} order via POST orderID "
+                        f"(exchange lookup failed) — id={order_id[:16]}..."
+                    )
                 log_order_placed(side.upper(), price, size, question, order_id)
                 return order_id
             else:
-                # Do NOT track with POST orderID — it causes false fill alerts.
-                # The order is live on the exchange but we can't reliably track it.
-                # Next cycle will see no active order on this side and place a new one.
-                log.warning(
-                    f"Could not find exchange order ID for {side.upper()} "
-                    f"at {price:.4f} — order placed but NOT tracked "
-                    f"(avoids false fill alerts)"
+                log.error(
+                    f"Order placed but BOTH exchange lookup AND POST response "
+                    f"returned no ID for {side.upper()} at {price:.4f} on "
+                    f"{question[:40]} — order is UNTRACKED"
                 )
                 self.failure_counts[side] = 0
                 return None
@@ -637,35 +649,40 @@ class OrderManager:
     ) -> str | None:
         """Fetch open orders and find the exchange ID for a just-placed order.
 
-        The POST response 'orderID' is not the same as the exchange 'id'
-        used for cancellation and tracking.  This method matches by
-        asset_id, price, and side to find the correct exchange ID.
+        Retries twice with increasing delays to handle exchange propagation
+        lag.  Uses tick-sized tolerance for price matching to avoid floating
+        point mismatches.
 
         Args:
             token_id: The token/asset ID of the order.
             price: The order price as a string.
-            side: BUY constant (we always buy tokens).
+            side: BUY or SELL constant.
 
         Returns:
             The exchange order ID, or None if not found.
         """
-        _time.sleep(0.5)  # Brief pause to let the exchange register the order
-        try:
-            open_orders = self.client.get_orders()
-            if not open_orders:
-                return None
-            for o in open_orders:
-                o_id = o["id"]
-                # Skip orders we already track (active OR unwind)
-                if o_id in self.active_orders or o_id in self.unwind_orders:
+        tick = self.market.get("tick_size", 0.01)
+        price_tolerance = float(tick) / 2  # Half a tick
+
+        for attempt, delay in enumerate([0.5, 1.5, 3.0]):
+            _time.sleep(delay)
+            try:
+                open_orders = self.client.get_orders()
+                if not open_orders:
                     continue
-                # Match on asset_id + price + side
-                if (o["asset_id"] == token_id
-                        and abs(float(o["price"]) - float(price)) < 1e-9
-                        and o["side"] == side):
-                    return o_id
-        except Exception as e:
-            log.debug(f"Could not fetch exchange order ID: {e}")
+                for o in open_orders:
+                    o_id = o["id"]
+                    if o_id in self.active_orders or o_id in self.unwind_orders:
+                        continue
+                    if (o["asset_id"] == token_id
+                            and abs(float(o["price"]) - float(price)) < price_tolerance
+                            and o["side"] == side):
+                        return o_id
+            except Exception as e:
+                log.debug(
+                    f"Exchange order lookup attempt {attempt + 1}/3 failed: {e}"
+                )
+
         return None
 
     def place_both_sides(
@@ -718,6 +735,34 @@ class OrderManager:
             )
             return None
 
+        # Pre-flight: verify we actually hold the tokens before attempting SELL.
+        # This catches stale tracker data and helps diagnose approval issues.
+        actual_balance = self.verify_token_balance(side)
+        if actual_balance >= 0 and actual_balance < fill_size - 0.5:
+            log.warning(
+                f"SELL PRE-FLIGHT FAILED | {side.upper()} | "
+                f"want_to_sell={fill_size:.2f} | "
+                f"actual_balance={actual_balance:.2f} | "
+                f"market={question[:40]} — "
+                f"reducing sell size to actual balance"
+            )
+            if actual_balance < MIN_UNWIND_SHARES:
+                log.info(
+                    f"Actual balance too small to unwind ({actual_balance:.2f}) "
+                    f"— skipping SELL"
+                )
+                return None
+            fill_size = actual_balance
+
+        log.info(
+            f"SELL PRE-FLIGHT | {side.upper()} | "
+            f"token_id={token_id[:16]}... | "
+            f"actual_balance={actual_balance:.2f} | "
+            f"sell_size={fill_size:.2f} | "
+            f"clob_price={clob_price:.4f} | "
+            f"market={question[:40]}"
+        )
+
         try:
             order_args = OrderArgs(
                 token_id=token_id,
@@ -732,30 +777,43 @@ class OrderManager:
                     f"Unwind rejected: {response.get('errorMsg', response)}"
                 )
 
+            # Extract POST orderID as fallback
+            post_order_id = None
+            if isinstance(response, dict):
+                post_order_id = response.get("orderID")
+
             exchange_id = self._find_exchange_order_id(
                 token_id, str(clob_price), SELL
             )
 
-            if exchange_id:
-                self.unwind_orders[exchange_id] = {
+            order_id = exchange_id or post_order_id
+
+            if order_id:
+                self.unwind_orders[order_id] = {
                     "side": side,
                     "price": fill_price,
                     "clob_price": clob_price,
                     "size": float(fill_size),
                     "placed_at": _time.time(),
+                    "from_post_response": exchange_id is None,
                 }
 
+                if exchange_id is None:
+                    log.warning(
+                        f"Tracking unwind via POST orderID "
+                        f"(exchange lookup failed) — id={order_id[:16]}..."
+                    )
                 log.info(
                     f"UNWIND ORDER PLACED | SELL {side.upper()} | "
                     f"price={clob_price:.4f} | size={fill_size:.2f} | "
-                    f"market={question[:40]} | id={exchange_id}"
+                    f"market={question[:40]} | id={order_id}"
                 )
-                return exchange_id
+                return order_id
             else:
-                log.warning(
-                    f"Unwind order placed but could not find exchange ID "
-                    f"for {side.upper()} on {question[:40]} — "
-                    f"will be reconciled next cycle"
+                log.error(
+                    f"Unwind order placed but BOTH exchange lookup AND POST "
+                    f"response returned no ID for {side.upper()} on "
+                    f"{question[:40]} — will be reconciled next cycle"
                 )
                 return None
 
