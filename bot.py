@@ -473,6 +473,70 @@ class MarketMakerBot:
 
         log.info("Position verification complete.")
 
+        # Create unwind-only OrderManagers for positions that aren't in the
+        # active market set.  Without this, positions from previous sessions
+        # that aren't re-selected sit in the wallet with no sell orders.
+        self._create_unwind_managers_for_orphaned_positions()
+
+    def _create_unwind_managers_for_orphaned_positions(self) -> None:
+        """Create OrderManagers for positions loaded from disk that have no manager.
+
+        After a restart, positions.json may contain markets that aren't in the
+        active set.  Without a manager, reconcile_unwinds() never runs and
+        SELL orders are never placed.
+        """
+        positions = self.position_tracker.get_all_positions()
+        if not positions:
+            return
+
+        for cid, pos in positions.items():
+            # Skip if already managed
+            if cid in self.order_managers:
+                continue
+
+            # Check if there's a meaningful position
+            yes_shares = pos.get("yes_shares", 0.0)
+            no_shares = pos.get("no_shares", 0.0)
+            if yes_shares < 1.0 and no_shares < 1.0:
+                continue
+
+            # Look up market data to build a minimal market dict
+            token_ids = self._get_token_ids_for_condition(cid)
+            if not token_ids:
+                log.warning(
+                    f"Cannot create unwind manager for "
+                    f"{pos.get('question', cid[:16])[:40]} — no token IDs"
+                )
+                continue
+
+            # Build a minimal market dict for the OrderManager
+            question = pos.get("question", f"unknown-{cid[:12]}")
+            yes_price = None
+            if yes_shares > 0 and pos.get("yes_avg_price", 0) > 0:
+                yes_price = pos["yes_avg_price"]
+            elif no_shares > 0 and pos.get("no_avg_price", 0) > 0:
+                yes_price = 1 - pos["no_avg_price"]
+
+            minimal_market = {
+                "condition_id": cid,
+                "question": question,
+                "token_ids": token_ids,
+                "yes_price": yes_price or 0.50,
+                "daily_rate": 0,
+                "min_size": 1.0,
+                "max_spread": 0.10,
+                "tick_size": 0.01,
+            }
+
+            self.order_managers[cid] = OrderManager(
+                self.client, minimal_market, self.position_tracker,
+                balance_gate=self.balance_gate,
+            )
+            log.info(
+                f"Created unwind-only manager for orphaned position: "
+                f"{question[:40]} | YES={yes_shares:.1f} NO={no_shares:.1f}"
+            )
+
     def _get_token_ids_for_condition(self, condition_id: str) -> list[str] | None:
         """Look up YES/NO token IDs for a condition_id via the Gamma API.
 
