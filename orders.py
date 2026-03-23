@@ -869,7 +869,11 @@ class OrderManager:
                 yes_shares = self.position_tracker.get_shares(condition_id, "yes")
                 no_shares = self.position_tracker.get_shares(condition_id, "no")
 
-        # ── Phase 3: Place unwind orders for remaining inventory ──────────
+        # ── Phase 3: Consolidate & place unwind orders ─────────────────────
+        # When multiple fills happen at different prices, old SELL orders
+        # sit at individual fill prices. The correct unwind price is the
+        # VWAP avg_price. Cancel stale-priced unwinds and replace with one
+        # consolidated order at the current VWAP.
         for side in ("yes", "no"):
             position_shares = self.position_tracker.get_shares(condition_id, side)
             avg_price = self.position_tracker.get_avg_price(condition_id, side)
@@ -877,11 +881,44 @@ class OrderManager:
             if position_shares < MIN_UNWIND_SHARES or avg_price <= 0:
                 continue
 
-            # Sum shares covered by existing unwind orders
+            # Check if any existing unwind orders are at a stale price
+            # (i.e., placed at an old fill price, not the current VWAP)
+            tick = self.market.get("tick_size", 0.01)
+            stale_orders: list[str] = []
             covered_shares = 0.0
-            for uorder in self.unwind_orders.values():
+            for oid, uorder in self.unwind_orders.items():
                 if uorder["side"] == side:
                     covered_shares += uorder["size"]
+                    if abs(uorder["price"] - avg_price) >= tick:
+                        stale_orders.append(oid)
+
+            # If we have stale-priced unwind orders, cancel them all and
+            # replace with one consolidated order at the current VWAP
+            if stale_orders:
+                stale_shares = sum(
+                    self.unwind_orders[oid]["size"] for oid in stale_orders
+                )
+                stale_prices = [
+                    f"{self.unwind_orders[oid]['price']:.4f}"
+                    for oid in stale_orders
+                ]
+                log.info(
+                    f"UNWIND CONSOLIDATION | {side.upper()} | "
+                    f"cancelling {len(stale_orders)} stale unwind(s) at "
+                    f"prices [{', '.join(stale_prices)}] | "
+                    f"new VWAP={avg_price:.4f} | "
+                    f"market={self.market['question'][:40]}"
+                )
+                for oid in stale_orders:
+                    self.cancel_order(oid, reason="vwap_consolidation")
+                    if oid in self.unwind_orders:
+                        del self.unwind_orders[oid]
+
+                # Recalculate covered after cancellations
+                covered_shares = 0.0
+                for uorder in self.unwind_orders.values():
+                    if uorder["side"] == side:
+                        covered_shares += uorder["size"]
 
             unhedged = position_shares - covered_shares
 
@@ -897,7 +934,7 @@ class OrderManager:
                 f"market={self.market['question'][:40]}"
             )
 
-            # Place unwind for the unhedged portion
+            # Place ONE consolidated unwind at the VWAP
             self.place_unwind_order(side, avg_price, unhedged)
 
     def _try_merge_positions(
