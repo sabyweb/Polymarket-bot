@@ -256,6 +256,9 @@ class MarketMakerBot:
                 f"to new manager for {question[:40]}"
             )
 
+        # Adopt any SELL orders from previous sessions
+        self._adopt_sells_for_manager(condition_id)
+
         log.info(f"Added market: {question[:50]} (score={market['score']})")
 
     def _remove_market(self, condition_id: str) -> None:
@@ -627,6 +630,7 @@ class MarketMakerBot:
                     self.client, market_data, self.position_tracker,
                     balance_gate=self.balance_gate,
                 )
+                self._adopt_sells_for_manager(cid)
                 log.info(
                     f"Created unwind manager from rewards data: "
                     f"{pos.get('question', cid[:16])[:40]} | "
@@ -664,18 +668,86 @@ class MarketMakerBot:
                 self.client, minimal_market, self.position_tracker,
                 balance_gate=self.balance_gate,
             )
+            self._adopt_sells_for_manager(cid)
             log.info(
                 f"Created unwind manager from Gamma API: "
                 f"{question[:40]} | YES={yes_shares:.1f} NO={no_shares:.1f}"
             )
 
+    def _adopt_sells_for_manager(self, condition_id: str) -> None:
+        """Inject previously-session SELL orders into a manager's unwind_orders.
+
+        Called after creating an OrderManager so it knows about existing
+        sell orders on the exchange. Without this, reconcile_unwinds
+        would try to place duplicate sells that get rejected.
+        """
+        adopted_sells = getattr(self, '_adopted_sells', [])
+        if not adopted_sells:
+            return
+
+        manager = self.order_managers.get(condition_id)
+        if not manager:
+            return
+
+        market_tokens = set(manager.market.get("token_ids", []))
+        if not market_tokens:
+            return
+
+        for sell in adopted_sells:
+            asset_id = sell.get("asset_id", "")
+            if asset_id not in market_tokens:
+                continue
+            if sell["id"] in manager.unwind_orders:
+                continue
+
+            # Determine side from token_id
+            token_ids = manager.market["token_ids"]
+            if asset_id == token_ids[0]:
+                side = "yes"
+            elif asset_id == token_ids[1]:
+                side = "no"
+            else:
+                continue
+
+            original = float(sell.get("original_size", 0))
+            matched = float(sell.get("size_matched", 0))
+            remaining = original - matched
+            clob_price = float(sell.get("price", 0))
+
+            if remaining < 1.0:
+                continue
+
+            # Reconstruct the avg_price (YES-equivalent) for tracking
+            avg_price = manager.position_tracker.get_avg_price(condition_id, side)
+            if avg_price <= 0:
+                avg_price = clob_price if side == "yes" else (1 - clob_price)
+
+            manager.unwind_orders[sell["id"]] = {
+                "side": side,
+                "price": avg_price,
+                "clob_price": clob_price,
+                "size": remaining,
+                "placed_at": time.time(),
+                "created_at": time.time(),  # treat as fresh for decay
+                "base_clob_price": clob_price,
+                "from_post_response": False,
+            }
+            log.info(
+                f"ADOPTED SELL from previous session | "
+                f"{side.upper()} | price={clob_price:.4f} | "
+                f"remaining={remaining:.1f} shares | "
+                f"market={manager.market['question'][:40]}"
+            )
+
     # ── Orphaned Order Cleanup ────────────────────────────────────────────────
     def _cancel_orphaned_orders(self) -> None:
-        """Cancel orphaned BUY orders from previous sessions.
+        """Cancel orphaned BUY orders and adopt SELL orders from previous sessions.
 
-        Preserves SELL orders — those are unwinds protecting open
-        inventory.  The bot will re-adopt them via position tracking.
+        SELL orders are unwinds protecting open inventory. We store them
+        in self._adopted_sells so that OrderManagers can adopt them into
+        their unwind_orders dict, preventing duplicate sell attempts.
         """
+        self._adopted_sells: list[dict] = []
         try:
             open_orders = self.client.get_orders()
             if not open_orders:
@@ -686,10 +758,16 @@ class MarketMakerBot:
             sell_orders = [o for o in open_orders if o.get("side") == "SELL"]
 
             if sell_orders:
-                log.info(
-                    f"Preserving {len(sell_orders)} SELL (unwind) order(s) "
-                    f"from previous session"
-                )
+                self._adopted_sells = sell_orders
+                for s in sell_orders:
+                    remaining = float(s.get("original_size", 0)) - float(s.get("size_matched", 0))
+                    log.info(
+                        f"ADOPTING SELL from previous session | "
+                        f"id={s['id'][:16]}... | "
+                        f"token={s.get('asset_id', '?')[:16]}... | "
+                        f"price={s.get('price', '?')} | "
+                        f"remaining={remaining:.1f} shares"
+                    )
 
             if not buy_orders:
                 log.info("No orphaned BUY orders to cancel.")
