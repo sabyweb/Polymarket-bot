@@ -50,6 +50,7 @@ class MarketMakerBot:
         self._shutdown_requested: bool = False
         self._last_successful_cycle: float = time.time()
         self._heartbeat_alerted: bool = False
+        self._last_reconcile: float = 0  # Periodic exchange reconciliation
 
     # ── Client Setup ─────────────────────────────────────────────────────────
     def connect(self) -> bool:
@@ -400,6 +401,14 @@ class MarketMakerBot:
                     self.position_tracker.print_summary()
                     alert_positions(self.position_tracker.positions)
 
+                # ── Periodic exchange reconciliation (every 5 min) ────────
+                # Catches state drift: missed fills, failed cancels,
+                # external trades, etc. The startup verification runs once;
+                # this runs continuously to keep state honest.
+                if time.time() - self._last_reconcile >= 300:
+                    self._reconcile_with_exchange()
+                    self._last_reconcile = time.time()
+
                 # ── Wait for next cycle (interruptible) ───────────────────
                 if not self._shutdown_requested:
                     log.info(f"Sleeping {ORDER_REFRESH_SECS}s until next cycle...")
@@ -501,6 +510,77 @@ class MarketMakerBot:
                 log.warning(f"Could not verify position {cid[:16]}: {e}")
 
         log.info("Position verification complete.")
+
+    def _reconcile_with_exchange(self) -> None:
+        """Periodic reconciliation: compare tracked positions vs exchange.
+
+        Runs every 5 minutes during normal operation (not just at startup).
+        Catches mid-session drift: missed fills, failed cancels, external
+        trades, or any other source of state divergence.
+
+        Unlike _verify_positions_on_startup (which runs once), this is
+        lightweight — it only checks markets that have an active manager
+        with token_ids already available.
+        """
+        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+
+        corrections = 0
+        for cid, manager in self.order_managers.items():
+            token_ids = manager.market.get("token_ids", [])
+            if len(token_ids) < 2:
+                continue
+
+            for side_key, token_idx in [("yes", 0), ("no", 1)]:
+                tracked = self.position_tracker.get_shares(cid, side_key)
+
+                try:
+                    bal = self.client.get_balance_allowance(
+                        BalanceAllowanceParams(
+                            asset_type=AssetType.CONDITIONAL,
+                            token_id=token_ids[token_idx],
+                        )
+                    )
+                    actual = float(bal.get("balance", 0)) / 1e6
+                except Exception:
+                    continue  # Skip on API error — don't block
+
+                # Only correct significant mismatches (> 1 share)
+                if abs(actual - tracked) <= 1.0:
+                    continue
+
+                question = manager.market.get("question", cid[:16])[:40]
+
+                if actual < 1.0 and tracked >= 1.0:
+                    log.warning(
+                        f"RECONCILE | {question} | {side_key.upper()} "
+                        f"tracker={tracked:.2f} actual={actual:.2f} -> resetting"
+                    )
+                    self.position_tracker.reset_side(cid, side_key)
+                    corrections += 1
+                elif actual >= 1.0 and tracked < 1.0:
+                    # Discovered tokens we don't know about
+                    yes_price = manager.market.get("yes_price") or 0.50
+                    log.warning(
+                        f"RECONCILE | {question} | {side_key.upper()} "
+                        f"tracker={tracked:.2f} actual={actual:.2f} -> recording"
+                    )
+                    self.position_tracker.record_fill(
+                        cid, side_key, actual, yes_price,
+                        question=manager.market.get("question", ""),
+                    )
+                    corrections += 1
+                else:
+                    log.warning(
+                        f"RECONCILE | {question} | {side_key.upper()} "
+                        f"tracker={tracked:.2f} actual={actual:.2f} -> correcting"
+                    )
+                    self.position_tracker.set_shares(cid, side_key, actual)
+                    corrections += 1
+
+        if corrections > 0:
+            log.info(f"Reconciliation complete: {corrections} correction(s)")
+        else:
+            log.debug("Reconciliation complete: no drift detected")
 
         # Create unwind-only OrderManagers for positions that aren't in the
         # active market set.  Without this, positions from previous sessions

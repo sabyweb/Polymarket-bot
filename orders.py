@@ -25,6 +25,7 @@ from alerts import (
     alert_fill, alert_unwind, alert_merge_needed,
     log_order_placed, log_order_cancelled,
 )
+from price import to_clob, to_yes_equiv
 
 log = logging.getLogger(__name__)
 
@@ -152,7 +153,8 @@ class OrderManager:
         ask = getattr(self, "_cached_best_ask", 1)
         if side == "yes":
             return bid
-        return max(MIN_SELL_PRICE, round(1 - ask, 4))
+        # NO market bid = complement of YES best ask
+        return max(MIN_SELL_PRICE, round(to_clob(ask, "no"), 4))
 
     def refresh_cached_book(self) -> None:
         """Fetch order book and update cached bid/ask for decay calculations.
@@ -321,15 +323,15 @@ class OrderManager:
                 no_token = self.market["token_ids"][1]
                 ob_no = self.client.get_order_book(no_token)
 
-                # NO asks → derived YES bids (price = 1 - NO_ask_price)
+                # NO asks → derived YES bids (NO CLOB price → YES-equiv)
                 for a in ob_no.asks:
-                    derived_price = round(1 - float(a.price), 4)
+                    derived_price = round(to_yes_equiv(float(a.price), "no"), 4)
                     if derived_price > 0:
                         all_bids.append((derived_price, float(a.size)))
 
-                # NO bids → derived YES asks (price = 1 - NO_bid_price)
+                # NO bids → derived YES asks (NO CLOB price → YES-equiv)
                 for b in ob_no.bids:
-                    derived_price = round(1 - float(b.price), 4)
+                    derived_price = round(to_yes_equiv(float(b.price), "no"), 4)
                     if derived_price < 1:
                         all_asks.append((derived_price, float(b.size)))
 
@@ -542,7 +544,7 @@ class OrderManager:
         else:
             token_id = self.market["token_ids"][1]
             clob_side = BUY
-            clob_price = self.round_to_tick(1 - price)
+            clob_price = self.round_to_tick(to_clob(price, "no"))
 
         # Calculate order size based on actual token cost (clob_price),
         # not yes_price.  For YES side clob_price == bid price; for NO
@@ -815,7 +817,7 @@ class OrderManager:
             clob_price = self.round_down_to_tick(fill_price)
         else:
             token_id = self.market["token_ids"][1]
-            clob_price = self.round_down_to_tick(1 - fill_price)
+            clob_price = self.round_down_to_tick(to_clob(fill_price, "no"))
 
         if clob_price is None or clob_price <= 0:
             log.warning(
@@ -883,7 +885,7 @@ class OrderManager:
                 if side == "yes":
                     base = self.round_down_to_tick(fill_price)
                 else:
-                    base = self.round_down_to_tick(1 - fill_price)
+                    base = self.round_down_to_tick(to_clob(fill_price, "no"))
 
                 self.unwind_orders[order_id] = {
                     "side": side,
@@ -961,7 +963,7 @@ class OrderManager:
                         if side == "yes":
                             base = self.round_down_to_tick(fill_price)
                         else:
-                            base = self.round_down_to_tick(1 - fill_price)
+                            base = self.round_down_to_tick(to_clob(fill_price, "no"))
                         self.unwind_orders[order_id] = {
                             "side": side,
                             "price": fill_price,
@@ -1009,7 +1011,7 @@ class OrderManager:
                             if side == "yes":
                                 base = self.round_down_to_tick(fill_price)
                             else:
-                                base = self.round_down_to_tick(1 - fill_price)
+                                base = self.round_down_to_tick(to_clob(fill_price, "no"))
                             self.unwind_orders[order_id] = {
                                 "side": side,
                                 "price": fill_price,
@@ -1165,10 +1167,7 @@ class OrderManager:
             tick = self.market.get("tick_size", 0.01)
 
             # Calculate current base clob price from VWAP
-            if side == "yes":
-                vwap_clob = self.round_down_to_tick(avg_price)
-            else:
-                vwap_clob = self.round_down_to_tick(1 - avg_price)
+            vwap_clob = self.round_down_to_tick(to_clob(avg_price, side))
 
             # Check existing unwind orders — are they at the right price?
             stale_orders: list[str] = []
@@ -1336,13 +1335,12 @@ class OrderManager:
                 continue
 
             # Calculate our cost and current market value per share
+            our_cost = self.round_down_to_tick(to_clob(avg_price, side))
             if side == "yes":
-                our_cost = self.round_down_to_tick(avg_price)
                 market_bid = best_bid  # what we'd get selling YES
             else:
-                our_cost = self.round_down_to_tick(1 - avg_price)
-                # NO token value ≈ 1 - best_ask (complement of YES ask)
-                market_bid = max(MIN_SELL_PRICE, round(1 - best_ask, 4))
+                # NO token value ≈ complement of YES ask
+                market_bid = max(MIN_SELL_PRICE, round(to_clob(best_ask, "no"), 4))
 
             if our_cost <= 0:
                 continue
@@ -1642,10 +1640,7 @@ class OrderManager:
                             filled_shares = order["original_size"]
                             # order["price"] is YES-equivalent for BOTH sides.
                             # Actual cost: YES = price, NO = 1-price (CLOB cost).
-                            clob_cost = (
-                                order["price"] if side == "yes"
-                                else (1 - order["price"])
-                            )
+                            clob_cost = to_clob(order["price"], side)
                             filled_usd = clob_cost * filled_shares
                             log.info(
                                 f"FILL (FULL) | {side.upper()} | "
@@ -1692,11 +1687,7 @@ class OrderManager:
                     if remaining < original:
                         filled_shares = original - remaining
                         # order["price"] is YES-equivalent for BOTH sides.
-                        # Actual cost: YES = price, NO = 1-price (CLOB cost).
-                        clob_cost = (
-                            order["price"] if side == "yes"
-                            else (1 - order["price"])
-                        )
+                        clob_cost = to_clob(order["price"], side)
                         filled_usd = clob_cost * filled_shares
                         log.info(
                             f"FILL (PARTIAL) | {side.upper()} | "
@@ -1749,10 +1740,7 @@ class OrderManager:
                         if status == "MATCHED":
                             unwound_shares = uorder["size"]
                             # uorder["price"] is YES-equivalent; show actual CLOB price
-                            clob_sell = (
-                                uorder["price"] if side == "yes"
-                                else (1 - uorder["price"])
-                            )
+                            clob_sell = to_clob(uorder["price"], side)
                             unwound_usd = clob_sell * unwound_shares
                             log.info(
                                 f"INVENTORY UNWOUND | {side.upper()} | "
@@ -1811,10 +1799,7 @@ class OrderManager:
                         u_tracked = uorder["size"]
                         if u_remaining < u_tracked - 0.01:
                             unwound_shares = u_tracked - u_remaining
-                            clob_sell = (
-                                uorder["price"] if side == "yes"
-                                else (1 - uorder["price"])
-                            )
+                            clob_sell = to_clob(uorder["price"], side)
                             unwound_usd = clob_sell * unwound_shares
                             log.info(
                                 f"UNWIND (PARTIAL) | {side.upper()} | "

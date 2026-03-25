@@ -1,11 +1,18 @@
 """
+DEPRECATED — replaced by state.py (PositionStore).
+
+This module is kept only for backward compatibility with test_state.py
+(the original test suite). All production code now uses:
+
+    from state import PositionStore as PositionTracker
+
+The key difference: state.py derives USD from shares * clob_cost
+(a @property, never stored), eliminating the entire class of
+wrong-USD bugs that this module suffered from.
+
+Original description:
 Position tracking for the Polymarket market-making bot.
-
 Tracks cumulative fill exposure per market and per side (Yes / No).
-Halts quoting on a side when the position limit is breached and
-resumes when the position drops back below a resume threshold.
-
-Positions are persisted to a JSON file so they survive bot restarts.
 """
 
 import json

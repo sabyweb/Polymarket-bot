@@ -552,6 +552,71 @@ finally:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# TEST 18: price.py helpers — to_clob / to_yes_equiv / clob_cost
+# ═════════════════════════════════════════════════════════════════════════════
+print("\n=== TEST 18: price.py Helpers ===")
+
+from price import to_clob, to_yes_equiv, clob_cost as price_clob_cost
+
+# to_clob: YES-equiv → CLOB
+check("to_clob(0.30, 'yes') = 0.30",
+      abs(to_clob(0.30, "yes") - 0.30) < 0.001,
+      f"got {to_clob(0.30, 'yes')}")
+check("to_clob(0.60, 'no') = 0.40",
+      abs(to_clob(0.60, "no") - 0.40) < 0.001,
+      f"got {to_clob(0.60, 'no')}")
+check("to_clob(0.27, 'no') = 0.73",
+      abs(to_clob(0.27, "no") - 0.73) < 0.001,
+      f"got {to_clob(0.27, 'no')}")
+
+# to_yes_equiv: CLOB → YES-equiv
+check("to_yes_equiv(0.30, 'yes') = 0.30",
+      abs(to_yes_equiv(0.30, "yes") - 0.30) < 0.001,
+      f"got {to_yes_equiv(0.30, 'yes')}")
+check("to_yes_equiv(0.40, 'no') = 0.60",
+      abs(to_yes_equiv(0.40, "no") - 0.60) < 0.001,
+      f"got {to_yes_equiv(0.40, 'no')}")
+
+# Roundtrip: to_clob(to_yes_equiv(x)) == x
+for side in ("yes", "no"):
+    for p in (0.10, 0.25, 0.50, 0.73, 0.95):
+        rt = to_clob(to_yes_equiv(p, side), side)
+        check(f"Roundtrip {side} {p}: to_clob(to_yes_equiv({p})) = {p}",
+              abs(rt - p) < 0.0001,
+              f"got {rt}")
+
+# clob_cost: USD calculation
+check("clob_cost(0.30, 'yes', 100) = $30",
+      abs(price_clob_cost(0.30, "yes", 100) - 30.0) < 0.01,
+      f"got ${price_clob_cost(0.30, 'yes', 100):.2f}")
+check("clob_cost(0.60, 'no', 200) = $80",
+      abs(price_clob_cost(0.60, "no", 200) - 80.0) < 0.01,
+      f"got ${price_clob_cost(0.60, 'no', 200):.2f}")
+
+# Validation: out-of-range prices
+try:
+    to_clob(1.5, "yes")
+    check("to_clob(1.5) raises ValueError", False, "no exception raised")
+except ValueError:
+    check("to_clob(1.5) raises ValueError", True)
+
+try:
+    to_clob(-0.1, "no")
+    check("to_clob(-0.1) raises ValueError", False, "no exception raised")
+except ValueError:
+    check("to_clob(-0.1) raises ValueError", True)
+
+# Consistency: price.to_clob matches SidePosition.clob_cost
+for side in ("yes", "no"):
+    for avg in (0.10, 0.30, 0.60, 0.90):
+        sp = SidePosition(side, shares=100.0, avg_price=avg)
+        helper_result = to_clob(avg, side)
+        check(f"to_clob({avg}, '{side}') == SidePosition.clob_cost",
+              abs(helper_result - sp.clob_cost) < 0.0001,
+              f"helper={helper_result}, sp={sp.clob_cost}")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Results
 # ═════════════════════════════════════════════════════════════════════════════
 print(f"\n{'=' * 60}")
