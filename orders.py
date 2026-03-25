@@ -154,6 +154,26 @@ class OrderManager:
             return bid
         return max(MIN_SELL_PRICE, round(1 - ask, 4))
 
+    def refresh_cached_book(self) -> None:
+        """Fetch order book and update cached bid/ask for decay calculations.
+
+        Used for unwind-only markets that don't go through run_cycle()
+        (which normally fetches the book). Without this, _last_market_bid()
+        returns defaults (bid=0, ask=1) causing wrong acceleration.
+        """
+        try:
+            book = self.client.get_order_book(
+                self.market["condition_id"]
+            )
+            if book.get("bids") and book.get("asks"):
+                self._cached_best_bid = float(book["bids"][0]["price"])
+                self._cached_best_ask = float(book["asks"][0]["price"])
+        except Exception as e:
+            log.warning(
+                f"Could not refresh book for unwind market "
+                f"{self.market.get('question', '?')[:30]}: {e}"
+            )
+
     def round_down_to_tick(self, price: float) -> float:
         """Round a price DOWN to the nearest valid tick (floor).
 
@@ -1050,8 +1070,16 @@ class OrderManager:
                 # DISCOVERY: Exchange has tokens the tracker doesn't know about.
                 # This happens when _find_exchange_order_id fails and the fill
                 # is never recorded. Use current market price as estimate.
+                #
+                # IMPORTANT: avg_price must always be stored as YES-equivalent
+                # because reconcile_unwinds computes the CLOB sell price via:
+                #   YES → sell at avg_price
+                #   NO  → sell at (1 - avg_price)
+                # Using `yes_price` for both sides keeps the convention consistent
+                # with how detect_fills records prices (order["price"] = YES-side
+                # price for both YES and NO orders).
                 yes_price = self.market.get("yes_price") or 0.50
-                est_price = yes_price if side == "yes" else (1 - yes_price)
+                est_price = yes_price  # Always YES-equivalent for both sides
                 log.warning(
                     f"UNTRACKED POSITION DISCOVERED | {side.upper()} | "
                     f"tracker={position_shares:.2f} | "
@@ -1186,6 +1214,23 @@ class OrderManager:
                     )
                     stale_orders.append(oid)
 
+            # Log when sell order is held (not yet stale) for visibility
+            if not stale_orders and covered_shares >= MIN_UNWIND_SHARES:
+                for oid, uorder in self.unwind_orders.items():
+                    if uorder["side"] != side:
+                        continue
+                    _elapsed = now - uorder.get("created_at", now)
+                    _next = UNWIND_DECAY_INTERVAL_SECS - (
+                        _elapsed % UNWIND_DECAY_INTERVAL_SECS
+                    )
+                    log.info(
+                        f"UNWIND HOLD | {side.upper()} | "
+                        f"price={uorder.get('clob_price', 0):.4f} | "
+                        f"age={_elapsed/60:.1f}min | "
+                        f"next_decay_in={_next:.0f}s | "
+                        f"market={self.market['question'][:40]}"
+                    )
+
             # Capture oldest created_at from stale orders BEFORE deleting
             # so we can preserve the decay clock on the replacement order.
             oldest_created = now
@@ -1205,10 +1250,18 @@ class OrderManager:
                     f"[{', '.join(stale_prices)}] | "
                     f"market={self.market['question'][:40]}"
                 )
+                cancelled_oids = []
                 for oid in stale_orders:
-                    self.cancel_order(oid, reason="decay_refresh")
-                    if oid in self.unwind_orders:
-                        del self.unwind_orders[oid]
+                    if self.cancel_order(oid, reason="decay_refresh"):
+                        if oid in self.unwind_orders:
+                            del self.unwind_orders[oid]
+                        cancelled_oids.append(oid)
+                    else:
+                        log.warning(
+                            f"Stale unwind cancel failed for {oid[:16]}... — "
+                            f"keeping in tracker for retry next cycle"
+                        )
+                stale_orders = cancelled_oids  # Only count successfully cancelled
 
                 # Recalculate covered after cancellations
                 covered_shares = 0.0
@@ -1321,10 +1374,23 @@ class OrderManager:
             )
 
             # Cancel existing unwinds for this side — replacing with market sell
+            all_cancelled = True
             for oid in list(self.unwind_orders.keys()):
                 if self.unwind_orders[oid]["side"] == side:
-                    self.cancel_order(oid, reason="stop_loss")
-                    del self.unwind_orders[oid]
+                    if self.cancel_order(oid, reason="stop_loss"):
+                        del self.unwind_orders[oid]
+                    else:
+                        all_cancelled = False
+                        log.warning(
+                            f"Stop-loss cancel failed for {oid[:16]}... — "
+                            f"tokens may still be committed"
+                        )
+
+            if not all_cancelled:
+                log.warning(
+                    f"Skipping stop-loss sell — old orders still live on exchange"
+                )
+                continue
 
             self.place_unwind_order(
                 side, avg_price, position_shares,
@@ -1432,12 +1498,15 @@ class OrderManager:
         return (position_shares - covered) >= MIN_UNWIND_SHARES
 
     # ── Order Cancellation ───────────────────────────────────────────────────
-    def cancel_order(self, order_id: str, reason: str = "manual") -> None:
+    def cancel_order(self, order_id: str, reason: str = "manual") -> bool:
         """Cancel a single order.
 
         Args:
             order_id: Exchange order identifier.
             reason: Human-readable cancellation reason for logging.
+
+        Returns:
+            True if the cancel succeeded (or dry-run), False on failure.
         """
         if DRY_RUN:
             log.info(
@@ -1446,7 +1515,7 @@ class OrderManager:
             )
             if order_id in self.active_orders:
                 del self.active_orders[order_id]
-            return
+            return True
 
         try:
             self.client.cancel(order_id)
@@ -1454,8 +1523,10 @@ class OrderManager:
             if order_id in self.active_orders:
                 del self.active_orders[order_id]
             self.invalidate_balance_cache()  # Collateral freed
+            return True
         except Exception as e:
             log.error(f"Failed to cancel order {order_id}: {e}")
+            return False
 
     def cancel_all(
         self, reason: str = "refresh", include_unwinds: bool = False
@@ -1476,9 +1547,12 @@ class OrderManager:
                 try:
                     self.client.cancel(order_id)
                     log_order_cancelled(order_id, f"unwind-{reason}")
+                    del self.unwind_orders[order_id]
                 except Exception as e:
-                    log.error(f"Failed to cancel unwind order {order_id}: {e}")
-                del self.unwind_orders[order_id]
+                    log.error(
+                        f"Failed to cancel unwind order {order_id}: {e} "
+                        f"— keeping in tracker for retry"
+                    )
 
         if self.active_orders or (include_unwinds and self.unwind_orders):
             log.info(f"Cancelled all for {self.market['question'][:40]}")
@@ -1566,10 +1640,16 @@ class OrderManager:
                         # reconcile_unwinds() handles unwind placement
                         try:
                             filled_shares = order["original_size"]
-                            filled_usd = order["price"] * filled_shares
+                            # order["price"] is YES-equivalent for BOTH sides.
+                            # Actual cost: YES = price, NO = 1-price (CLOB cost).
+                            clob_cost = (
+                                order["price"] if side == "yes"
+                                else (1 - order["price"])
+                            )
+                            filled_usd = clob_cost * filled_shares
                             log.info(
                                 f"FILL (FULL) | {side.upper()} | "
-                                f"price={order['price']:.4f} | "
+                                f"price={clob_cost:.4f} | "
                                 f"shares={filled_shares:.2f} | "
                                 f"value=${filled_usd:.2f} | "
                                 f"market={self.market['question'][:40]}"
@@ -1577,7 +1657,7 @@ class OrderManager:
                             alert_fill(
                                 fill_type="FULL",
                                 side=side.upper(),
-                                price=order["price"],
+                                price=clob_cost,
                                 filled_shares=filled_shares,
                                 filled_usd=filled_usd,
                                 market_question=self.market["question"],
@@ -1611,7 +1691,13 @@ class OrderManager:
                     original = order["original_size"]
                     if remaining < original:
                         filled_shares = original - remaining
-                        filled_usd = order["price"] * filled_shares
+                        # order["price"] is YES-equivalent for BOTH sides.
+                        # Actual cost: YES = price, NO = 1-price (CLOB cost).
+                        clob_cost = (
+                            order["price"] if side == "yes"
+                            else (1 - order["price"])
+                        )
+                        filled_usd = clob_cost * filled_shares
                         log.info(
                             f"FILL (PARTIAL) | {side.upper()} | "
                             f"filled={filled_shares:.2f} shares | "
@@ -1622,7 +1708,7 @@ class OrderManager:
                         alert_fill(
                             fill_type="PARTIAL",
                             side=side.upper(),
-                            price=order["price"],
+                            price=clob_cost,
                             filled_shares=filled_shares,
                             filled_usd=filled_usd,
                             market_question=self.market["question"],
@@ -1635,6 +1721,8 @@ class OrderManager:
                         )
                         # Update tracked size so next partial detection
                         # only captures the NEW delta, not the same fill.
+                        # Keep original_size as the LAST known baseline
+                        # for delta calculation.
                         self.active_orders[oid]["size"] = remaining
                         self.active_orders[oid]["original_size"] = remaining
 
@@ -1660,17 +1748,22 @@ class OrderManager:
 
                         if status == "MATCHED":
                             unwound_shares = uorder["size"]
-                            unwound_usd = uorder["price"] * unwound_shares
+                            # uorder["price"] is YES-equivalent; show actual CLOB price
+                            clob_sell = (
+                                uorder["price"] if side == "yes"
+                                else (1 - uorder["price"])
+                            )
+                            unwound_usd = clob_sell * unwound_shares
                             log.info(
                                 f"INVENTORY UNWOUND | {side.upper()} | "
-                                f"price={uorder['price']:.4f} | "
+                                f"price={clob_sell:.4f} | "
                                 f"size={unwound_shares:.2f} | "
                                 f"value=${unwound_usd:.2f} | "
                                 f"market={self.market['question'][:40]}"
                             )
                             alert_unwind(
                                 side=side.upper(),
-                                price=uorder["price"],
+                                price=clob_sell,
                                 size=unwound_shares,
                                 usd_value=unwound_usd,
                                 market_question=self.market["question"],
@@ -1718,7 +1811,11 @@ class OrderManager:
                         u_tracked = uorder["size"]
                         if u_remaining < u_tracked - 0.01:
                             unwound_shares = u_tracked - u_remaining
-                            unwound_usd = uorder["price"] * unwound_shares
+                            clob_sell = (
+                                uorder["price"] if side == "yes"
+                                else (1 - uorder["price"])
+                            )
+                            unwound_usd = clob_sell * unwound_shares
                             log.info(
                                 f"UNWIND (PARTIAL) | {side.upper()} | "
                                 f"sold={unwound_shares:.2f} shares | "
@@ -1767,7 +1864,11 @@ class OrderManager:
                     f"Cancelling {side.upper()} order {oid[:16]}... "
                     f"(position halted — prevent overshoot)"
                 )
-                self.cancel_order(oid, reason="position_halted")
+                if not self.cancel_order(oid, reason="position_halted"):
+                    log.warning(
+                        f"Failed to cancel halted {side.upper()} order "
+                        f"{oid[:16]}... — will retry next cycle"
+                    )
 
         # Step 2: Fetch and validate order book
         order_book = self.get_order_book()
@@ -1791,7 +1892,11 @@ class OrderManager:
         for order_id in list(self.active_orders.keys()):
             zone = self.check_order_zone(order_id, best_bid, best_ask)
             if zone in ("DANGER", "DEAD"):
-                self.cancel_order(order_id, reason=zone.lower())
+                if not self.cancel_order(order_id, reason=zone.lower()):
+                    log.warning(
+                        f"Failed to cancel {zone} order {order_id[:16]}... "
+                        f"— will retry next cycle"
+                    )
 
         # Step 4: Calculate prices using liquidity buffer
         our_bid, our_ask = self.calculate_order_prices(order_book)
@@ -1810,7 +1915,11 @@ class OrderManager:
                     f"{order['price']:.4f} -> {optimal_price:.4f} "
                     f"— refreshing"
                 )
-                self.cancel_order(order_id, reason="price_refresh")
+                if not self.cancel_order(order_id, reason="price_refresh"):
+                    log.warning(
+                        f"Failed to cancel stale {side.upper()} order "
+                        f"{order_id[:16]}... — will retry next cycle"
+                    )
 
         # Step 6: Place fresh orders where needed
         #         BLOCK new BUY orders if there's an unwind pending/active

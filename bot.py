@@ -326,6 +326,9 @@ class MarketMakerBot:
         # Cancel any orphaned orders from previous sessions
         self._cancel_orphaned_orders()
 
+        # Fix legacy USD values (NO-side was computed with wrong formula)
+        self.position_tracker.recalculate_usd()
+
         # Verify positions from disk against actual exchange balances
         self._verify_positions_on_startup()
 
@@ -374,6 +377,7 @@ class MarketMakerBot:
                         manager = self.order_managers[cid]
                         if manager.has_open_obligations():
                             try:
+                                manager.refresh_cached_book()
                                 manager.detect_fills()
                                 manager.reconcile_unwinds()
                             except Exception as e:
@@ -665,7 +669,6 @@ class MarketMakerBot:
                 self.client, minimal_market, self.position_tracker,
                 balance_gate=self.balance_gate,
             )
-            self._adopt_sells_for_manager(cid)
             log.info(
                 f"Created unwind manager from Gamma API: "
                 f"{question[:40]} | YES={yes_shares:.1f} NO={no_shares:.1f}"

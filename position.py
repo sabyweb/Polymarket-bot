@@ -159,8 +159,11 @@ class PositionTracker:
         pos[f"{key}_shares"] = new_shares
         pos[f"{key}_avg_price"] = round(new_avg, 6)
 
-        # Keep USD tracking for halt logic
-        filled_usd = shares * price
+        # Keep USD tracking for halt logic.
+        # price is stored as YES-equivalent for VWAP, but USD exposure
+        # should reflect actual CLOB cost: YES = price, NO = 1 - price.
+        clob_cost = price if key == "yes" else (1 - price)
+        filled_usd = shares * clob_cost
         pos[key] += filled_usd
 
         log_position_update(pos["question"], pos["yes"], pos["no"])
@@ -188,8 +191,11 @@ class PositionTracker:
         if pos[f"{key}_shares"] <= 0:
             pos[f"{key}_avg_price"] = 0.0
 
-        # Reduce USD exposure
-        unwound_usd = shares * price
+        # Reduce USD exposure.
+        # price is YES-equivalent (same convention as record_fill).
+        # Use actual CLOB cost for consistent USD tracking.
+        clob_cost = price if key == "yes" else (1 - price)
+        unwound_usd = shares * clob_cost
         pos[key] = max(0.0, pos[key] - unwound_usd)
 
         log.info(
@@ -281,6 +287,39 @@ class PositionTracker:
         return self.positions[condition_id].get(
             f"{side.lower()}_halted", False
         )
+
+    def recalculate_usd(self) -> None:
+        """Recalculate USD exposure from shares and avg_price.
+
+        Fixes legacy data where NO-side USD was incorrectly computed
+        using YES-equivalent price instead of actual CLOB cost.
+        Called once on startup.
+        """
+        changed = False
+        for cid, pos in self.positions.items():
+            for key in ("yes", "no"):
+                shares = pos.get(f"{key}_shares", 0.0)
+                avg = pos.get(f"{key}_avg_price", 0.0)
+                if shares < 1.0 or avg <= 0:
+                    continue
+                # avg_price is YES-equivalent; actual CLOB cost:
+                clob_cost = avg if key == "yes" else (1 - avg)
+                correct_usd = round(shares * clob_cost, 2)
+                current_usd = pos.get(key, 0.0)
+                if abs(correct_usd - current_usd) > 1.0:
+                    log.warning(
+                        f"USD CORRECTION | {pos.get('question', cid[:16])[:40]} | "
+                        f"{key.upper()} | was=${current_usd:.2f} → "
+                        f"corrected=${correct_usd:.2f} "
+                        f"({shares:.1f} shares × {clob_cost:.4f})"
+                    )
+                    pos[key] = correct_usd
+                    changed = True
+                    # Re-check halts with corrected USD
+                    self._check_limit(cid, key)
+                    self._check_resume(cid, key)
+        if changed:
+            self._save()
 
     def reset_market(self, condition_id: str) -> None:
         """Reset all position data for a market.
