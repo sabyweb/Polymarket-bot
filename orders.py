@@ -16,7 +16,9 @@ from config import (
     MAX_ORDER_FAILURES, DRY_RUN, MAX_ORDERBOOK_SPREAD,
     MIN_LIQUIDITY_BUFFER, MIN_UNWIND_SHARES,
     UNWIND_DECAY_INTERVAL_SECS, UNWIND_DECAY_TICKS,
-    MIN_SELL_PRICE, STOP_LOSS_PCT, MIN_STOP_LOSS_USD,
+    MIN_SELL_PRICE, STOP_LOSS_PCT, MIN_STOP_LOSS_USD, STOP_LOSS_MIN_PRICE,
+    UNWIND_ACCEL_LOSS_PCT, UNWIND_ACCEL_MULTIPLIER,
+    CHEAP_TOKEN_THRESHOLD, CHEAP_TOKEN_SCALE,
 )
 from alerts import (
     alert_order_failure, alert_danger_zone,
@@ -142,6 +144,14 @@ class OrderManager:
         rounded = round(round(price / tick) * tick, 10)
         decimal_places = len(str(tick).rstrip("0").split(".")[-1])
         return round(rounded, decimal_places)
+
+    def _last_market_bid(self, side: str) -> float:
+        """Return the last known market bid for the given side."""
+        bid = getattr(self, "_cached_best_bid", 0)
+        ask = getattr(self, "_cached_best_ask", 1)
+        if side == "yes":
+            return bid
+        return max(MIN_SELL_PRICE, round(1 - ask, 4))
 
     def round_down_to_tick(self, price: float) -> float:
         """Round a price DOWN to the nearest valid tick (floor).
@@ -524,7 +534,11 @@ class OrderManager:
             return None
 
         min_shares = self.market["min_size"]
-        budget_shares = ORDER_SIZE / clob_price
+        # Scale down order size for cheap tokens to limit adverse selection damage
+        effective_order_size = ORDER_SIZE
+        if clob_price < CHEAP_TOKEN_THRESHOLD:
+            effective_order_size = ORDER_SIZE * CHEAP_TOKEN_SCALE
+        budget_shares = effective_order_size / clob_price
         min_cost = min_shares * clob_price
 
         # If the rewards minimum exceeds our hard cap, skip this side
@@ -557,8 +571,8 @@ class OrderManager:
             f"Order size | {side.upper()} | clob_price={clob_price:.4f} | "
             f"min_shares={min_shares} | budget_shares={budget_shares:.1f} | "
             f"final_size={size} | est_cost=${est_cost:.2f}"
-            + (f" (above target ${ORDER_SIZE}, needed for rewards min)"
-               if est_cost > ORDER_SIZE else "")
+            + (f" (above target ${effective_order_size:.0f}, needed for rewards min)"
+               if est_cost > effective_order_size else "")
         )
 
         # Gate: check position limit before placing
@@ -1085,12 +1099,18 @@ class OrderManager:
                     continue
                 covered_shares += uorder["size"]
 
-                # Calculate expected decayed price for this order
+                # Calculate expected decayed price for this order.
+                # Accelerate when position is significantly underwater.
                 base = uorder.get("base_clob_price", uorder.get("clob_price", vwap_clob))
                 created = uorder.get("created_at", uorder.get("placed_at", now))
                 elapsed = now - created
+                check_ticks = UNWIND_DECAY_TICKS
+                if vwap_clob > 0:
+                    cur_loss = (vwap_clob - self._last_market_bid(side)) / vwap_clob
+                    if cur_loss >= UNWIND_ACCEL_LOSS_PCT:
+                        check_ticks = UNWIND_DECAY_TICKS * UNWIND_ACCEL_MULTIPLIER
                 decay_intervals = int(elapsed // UNWIND_DECAY_INTERVAL_SECS)
-                decay_amount = decay_intervals * UNWIND_DECAY_TICKS * tick
+                decay_amount = decay_intervals * check_ticks * tick
                 expected_clob = max(MIN_SELL_PRICE, base - decay_amount)
 
                 # Also check if VWAP changed (new fills shifted the average)
@@ -1161,10 +1181,18 @@ class OrderManager:
                     c = uorder.get("created_at", now)
                     carry_created = min(carry_created, c)
 
-            # Calculate decay from the carried creation time
+            # Calculate decay from the carried creation time.
+            # Accelerate decay when the position is significantly underwater
+            # to clear bad inventory faster without the sharp loss of stop-loss.
+            decay_ticks = UNWIND_DECAY_TICKS
+            if vwap_clob > 0:
+                current_loss = (vwap_clob - self._last_market_bid(side)) / vwap_clob
+                if current_loss >= UNWIND_ACCEL_LOSS_PCT:
+                    decay_ticks = UNWIND_DECAY_TICKS * UNWIND_ACCEL_MULTIPLIER
+
             elapsed = now - carry_created
             decay_intervals = int(elapsed // UNWIND_DECAY_INTERVAL_SECS)
-            decay_amount = decay_intervals * UNWIND_DECAY_TICKS * tick
+            decay_amount = decay_intervals * decay_ticks * tick
             decayed_clob = max(MIN_SELL_PRICE, vwap_clob - decay_amount)
 
             log.info(
@@ -1217,6 +1245,11 @@ class OrderManager:
 
             unrealized_loss_pct = (our_cost - market_bid) / our_cost
             unrealized_loss_usd = (our_cost - market_bid) * position_shares
+
+            # Skip stop-loss on cheap tokens — decay handles them better
+            # because small absolute price moves cause huge % swings
+            if our_cost < STOP_LOSS_MIN_PRICE:
+                continue
 
             if unrealized_loss_pct < STOP_LOSS_PCT or unrealized_loss_usd < MIN_STOP_LOSS_USD:
                 continue
@@ -1684,6 +1717,8 @@ class OrderManager:
 
         best_bid = float(order_book["bids"][0]["price"])
         best_ask = float(order_book["asks"][0]["price"])
+        self._cached_best_bid = best_bid
+        self._cached_best_ask = best_ask
 
         log.info(
             f"Market: {question[:45]} | "

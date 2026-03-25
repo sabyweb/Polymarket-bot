@@ -23,8 +23,13 @@ CYCLE_SECS = 30
 DECAY_INTERVAL_SECS = 600
 DECAY_TICKS = 1
 STOP_LOSS_PCT = 0.20
-MIN_STOP_LOSS_USD = 50.0  # AND absolute loss must exceed $50
+MIN_STOP_LOSS_USD = 50.0   # AND absolute loss must exceed $50
+STOP_LOSS_MIN_PRICE = 0.20 # Skip stop-loss on tokens under 20c
 MIN_SELL_PRICE = 0.01
+ACCEL_LOSS_PCT = 0.10      # Accelerate decay when loss > 10%
+ACCEL_MULTIPLIER = 3       # 3x decay speed when accelerated
+CHEAP_THRESHOLD = 0.25     # Tokens under 25c get 50% order size
+CHEAP_SCALE = 0.50
 TICK = 0.01
 BUFFER_OFFSET = 0.02  # our orders land ~2c behind best
 MIN_SHARES = 200
@@ -210,7 +215,8 @@ class SimOrderManager:
             if clob_price <= 0.01 or clob_price >= 0.99:
                 continue
 
-            size = max(MIN_SHARES, ORDER_SIZE / clob_price)
+            eff_order = ORDER_SIZE * CHEAP_SCALE if clob_price < CHEAP_THRESHOLD else ORDER_SIZE
+            size = max(MIN_SHARES, eff_order / clob_price)
             size = min(size, MAX_ORDER_BUDGET / clob_price)
             est_cost = size * clob_price
 
@@ -322,10 +328,15 @@ class SimOrderManager:
                     continue
                 covered += order.size
 
-                # Calculate expected decayed price
+                # Calculate expected decayed price (accelerated if underwater)
+                dt = DECAY_TICKS
+                if vwap_clob > 0:
+                    mbid = self.market.best_bid if side == "yes" else max(MIN_SELL_PRICE, round(1 - self.market.best_ask, 4))
+                    if (vwap_clob - mbid) / vwap_clob >= ACCEL_LOSS_PCT:
+                        dt = DECAY_TICKS * ACCEL_MULTIPLIER
                 elapsed_secs = (cycle - order.created_at) * CYCLE_SECS
                 decay_intervals = int(elapsed_secs // DECAY_INTERVAL_SECS)
-                decay_amount = decay_intervals * DECAY_TICKS * TICK
+                decay_amount = decay_intervals * dt * TICK
                 expected = max(MIN_SELL_PRICE, order.base_clob_price - decay_amount)
 
                 # Check if VWAP shifted
@@ -357,9 +368,15 @@ class SimOrderManager:
                 if s.side == side:
                     carry_created = min(carry_created, s.created_at)
 
+            # Accelerated decay when underwater
+            dt2 = DECAY_TICKS
+            if vwap_clob > 0:
+                mbid2 = self.market.best_bid if side == "yes" else max(MIN_SELL_PRICE, round(1 - self.market.best_ask, 4))
+                if (vwap_clob - mbid2) / vwap_clob >= ACCEL_LOSS_PCT:
+                    dt2 = DECAY_TICKS * ACCEL_MULTIPLIER
             elapsed_secs = (cycle - carry_created) * CYCLE_SECS
             decay_intervals = int(elapsed_secs // DECAY_INTERVAL_SECS)
-            decay_amount = decay_intervals * DECAY_TICKS * TICK
+            decay_amount = decay_intervals * dt2 * TICK
             decayed = max(MIN_SELL_PRICE, vwap_clob - decay_amount)
 
             self.sell_orders.append(SellOrder(
@@ -386,6 +403,10 @@ class SimOrderManager:
                 market_bid = max(MIN_SELL_PRICE, round(1 - self.market.best_ask, 4))
 
             if our_cost <= 0:
+                continue
+
+            # Skip stop-loss on cheap tokens — let decay handle
+            if our_cost < STOP_LOSS_MIN_PRICE:
                 continue
 
             loss_pct = (our_cost - market_bid) / our_cost

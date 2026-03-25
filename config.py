@@ -55,6 +55,8 @@ MIN_SPREAD_ALLOWED: float = 0.01 # Skip if max spread below 1c
 # ── Order Management ──────────────────────────────────────────────────────────
 ORDER_SIZE: int = 500        # Preferred USDC per order (target budget)
 MAX_ORDER_BUDGET: int = 1000 # Hard cap — never spend more than this per order
+CHEAP_TOKEN_THRESHOLD: float = 0.25  # Tokens under 25c get reduced order size
+CHEAP_TOKEN_SCALE: float = 0.50     # Scale order size to 50% for cheap tokens
 MAX_ORDER_SIZE: int = MAX_ORDER_BUDGET  # Alias used by market.py hygiene check
 ORDER_REFRESH_SECS: int = 30 # Cancel and replace orders every 30 seconds
 
@@ -89,6 +91,8 @@ MIN_UNWIND_SHARES: float = 1.0   # Ignore positions below this many shares
 # inventory forever, the sell price decays by 1 tick per interval.
 UNWIND_DECAY_INTERVAL_SECS: int = 600   # Lower sell by 1 tick every 10 minutes
 UNWIND_DECAY_TICKS: int = 1             # Ticks to drop per interval
+UNWIND_ACCEL_LOSS_PCT: float = 0.10     # Accelerate decay when loss exceeds 10%
+UNWIND_ACCEL_MULTIPLIER: int = 3        # 3x decay speed when accelerated
 MIN_SELL_PRICE: float = 0.01            # Never sell below 1 cent
 
 # ── Stop-Loss ───────────────────────────────────────────────────────────────
@@ -96,6 +100,7 @@ MIN_SELL_PRICE: float = 0.01            # Never sell below 1 cent
 # sell at the current market bid to prevent further damage.
 STOP_LOSS_PCT: float = 0.20        # 20% unrealized loss → dump at market
 MIN_STOP_LOSS_USD: float = 50.0    # AND absolute loss must exceed $50
+STOP_LOSS_MIN_PRICE: float = 0.20  # Skip stop-loss on tokens under 20c (let decay handle)
 
 # ── Heartbeat ────────────────────────────────────────────────────────────────
 # Alert if no successful cycle completes within this many seconds.
