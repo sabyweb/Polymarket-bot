@@ -79,15 +79,19 @@ class MarketMakerBot:
             self.balance_gate = BalanceGate(self.client)
             log.info("Connected to Polymarket CLOB API (rate-limited)")
 
-            # Verify balance and allowances before trading
+            # Set COLLATERAL (USDC) allowance at startup.
+            # CONDITIONAL (ERC1155) allowances require a token_id and are
+            # set per-token in OrderManager.ensure_sell_allowance().
             try:
+                self.client.update_balance_allowance(
+                    BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+                )
                 bal = self.client.get_balance_allowance(
                     BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
                 )
-                log.info(f"Balance/Allowance check: {bal}")
+                log.info(f"Allowance set — COLLATERAL (USDC): {bal}")
             except Exception as e:
-                log.warning(f"Could not verify balance/allowance: {e}")
-                log.warning("Run set_allowances.py if you see order failures")
+                log.warning(f"Could not set COLLATERAL allowance: {e}")
 
             return True
         except Exception as e:
@@ -184,6 +188,10 @@ class MarketMakerBot:
 
         log_market_refresh(self.active_markets)
 
+        # Create unwind managers for orphaned positions using token data
+        # from the candidates we just fetched (avoids Gamma API lookup).
+        self._ensure_unwind_managers(new_markets)
+
         # Send Discord notification when markets change
         if to_add or to_remove:
             from alerts import _send_discord
@@ -220,17 +228,34 @@ class MarketMakerBot:
     def _add_market(self, market: dict) -> None:
         """Add a market to the active trading set.
 
+        If an unwind-only manager already exists (e.g. from startup
+        orphaned-position recovery), preserve its tracked unwind orders
+        by transferring them to the new full manager.
+
         Args:
             market: Parsed market dict from get_rewards_markets().
         """
         condition_id = market["condition_id"]
         question = market["question"]
 
+        # Preserve unwind orders from any existing manager
+        existing_unwinds: dict = {}
+        if condition_id in self.order_managers:
+            existing_unwinds = self.order_managers[condition_id].unwind_orders.copy()
+
         self.position_tracker.register_market(condition_id, question)
         self.order_managers[condition_id] = OrderManager(
             self.client, market, self.position_tracker,
             balance_gate=self.balance_gate,
         )
+
+        if existing_unwinds:
+            self.order_managers[condition_id].unwind_orders = existing_unwinds
+            log.info(
+                f"Transferred {len(existing_unwinds)} unwind order(s) "
+                f"to new manager for {question[:40]}"
+            )
+
         log.info(f"Added market: {question[:50]} (score={market['score']})")
 
     def _remove_market(self, condition_id: str) -> None:
@@ -571,6 +596,78 @@ class MarketMakerBot:
         except Exception as e:
             log.warning(f"Gamma API lookup failed for {condition_id[:16]}: {e}")
             return None
+
+    def _ensure_unwind_managers(self, fetched_markets: list[dict]) -> None:
+        """Create unwind managers for positions that have no manager.
+
+        Uses token data from the rewards markets we already fetched,
+        avoiding a separate Gamma API lookup (which can fail for some
+        condition_ids).  Called after each refresh_markets().
+        """
+        positions = self.position_tracker.get_all_positions()
+        if not positions:
+            return
+
+        # Build a lookup from condition_id to market data
+        market_lookup = {m["condition_id"]: m for m in fetched_markets}
+
+        for cid, pos in positions.items():
+            if cid in self.order_managers:
+                continue
+
+            yes_shares = pos.get("yes_shares", 0.0)
+            no_shares = pos.get("no_shares", 0.0)
+            if yes_shares < 1.0 and no_shares < 1.0:
+                continue
+
+            # Try to find this market in the fetched data
+            market_data = market_lookup.get(cid)
+            if market_data and market_data.get("token_ids"):
+                self.order_managers[cid] = OrderManager(
+                    self.client, market_data, self.position_tracker,
+                    balance_gate=self.balance_gate,
+                )
+                log.info(
+                    f"Created unwind manager from rewards data: "
+                    f"{pos.get('question', cid[:16])[:40]} | "
+                    f"YES={yes_shares:.1f} NO={no_shares:.1f}"
+                )
+                continue
+
+            # Fallback: try Gamma API
+            token_ids = self._get_token_ids_for_condition(cid)
+            if not token_ids:
+                log.warning(
+                    f"Cannot create unwind manager for "
+                    f"{pos.get('question', cid[:16])[:40]} — no token IDs"
+                )
+                continue
+
+            question = pos.get("question", f"unknown-{cid[:12]}")
+            yes_price = None
+            if yes_shares > 0 and pos.get("yes_avg_price", 0) > 0:
+                yes_price = pos["yes_avg_price"]
+            elif no_shares > 0 and pos.get("no_avg_price", 0) > 0:
+                yes_price = 1 - pos["no_avg_price"]
+
+            minimal_market = {
+                "condition_id": cid,
+                "question": question,
+                "token_ids": token_ids,
+                "yes_price": yes_price or 0.50,
+                "daily_rate": 0,
+                "min_size": 1.0,
+                "max_spread": 0.10,
+                "tick_size": 0.01,
+            }
+            self.order_managers[cid] = OrderManager(
+                self.client, minimal_market, self.position_tracker,
+                balance_gate=self.balance_gate,
+            )
+            log.info(
+                f"Created unwind manager from Gamma API: "
+                f"{question[:40]} | YES={yes_shares:.1f} NO={no_shares:.1f}"
+            )
 
     # ── Orphaned Order Cleanup ────────────────────────────────────────────────
     def _cancel_orphaned_orders(self) -> None:

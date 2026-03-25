@@ -31,7 +31,7 @@ class RateLimitedClient:
     _RATE_LIMITED_METHODS = {
         "get_order_book", "get_orders", "get_order",
         "create_and_post_order", "cancel",
-        "get_balance_allowance",
+        "get_balance_allowance", "update_balance_allowance",
     }
 
     def __init__(self, client: object) -> None:

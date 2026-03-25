@@ -15,6 +15,8 @@ from config import (
     DANGER_ZONE_CENTS, DEAD_ZONE_BUFFER,
     MAX_ORDER_FAILURES, DRY_RUN, MAX_ORDERBOOK_SPREAD,
     MIN_LIQUIDITY_BUFFER, MIN_UNWIND_SHARES,
+    UNWIND_DECAY_INTERVAL_SECS, UNWIND_DECAY_TICKS,
+    MIN_SELL_PRICE, STOP_LOSS_PCT, MIN_STOP_LOSS_USD,
 )
 from alerts import (
     alert_order_failure, alert_danger_zone,
@@ -141,6 +143,21 @@ class OrderManager:
         decimal_places = len(str(tick).rstrip("0").split(".")[-1])
         return round(rounded, decimal_places)
 
+    def round_down_to_tick(self, price: float) -> float:
+        """Round a price DOWN to the nearest valid tick (floor).
+
+        Used for SELL unwind orders so we don't overprice relative to
+        the acquisition cost.  E.g. acquired at 0.235 on a 0.01 tick
+        → SELL at 0.23 (not 0.24).
+        """
+        import math
+        tick = self.market.get("tick_size", 0.01)
+        if tick <= 0:
+            tick = 0.01
+        decimal_places = len(str(tick).rstrip("0").split(".")[-1])
+        floored = math.floor(price / tick) * tick
+        return round(floored, decimal_places)
+
     # ── Balance Cache ─────────────────────────────────────────────────────────
     def _get_cached_balance(self) -> float | None:
         """Return available USDC balance, cached for 60 seconds.
@@ -202,9 +219,34 @@ class OrderManager:
                 )
             )
             raw_balance = float(bal.get("balance", 0))
+            raw_allowance = float(bal.get("allowance", 0))
             # Conditional tokens use 6 decimal places (like USDC)
             actual_shares = raw_balance / 1e6
+            actual_allowance = raw_allowance / 1e6
             self._token_balance_cache[side] = (actual_shares, now)
+
+            if actual_shares > 0 and actual_allowance < actual_shares:
+                log.warning(
+                    f"TOKEN ALLOWANCE LOW | {side.upper()} | "
+                    f"balance={actual_shares:.2f} | "
+                    f"allowance={actual_allowance:.2f} | "
+                    f"market={self.market['question'][:40]} — "
+                    f"auto-setting CONDITIONAL allowance for token"
+                )
+                try:
+                    self.client.update_balance_allowance(
+                        BalanceAllowanceParams(
+                            asset_type=AssetType.CONDITIONAL,
+                            token_id=token_id,
+                        )
+                    )
+                    log.info(
+                        f"CONDITIONAL allowance updated for "
+                        f"{side.upper()} token {token_id[:16]}..."
+                    )
+                except Exception as ae:
+                    log.error(f"Failed to auto-set CONDITIONAL allowance: {ae}")
+
             return actual_shares
         except Exception as e:
             log.warning(
@@ -703,30 +745,42 @@ class OrderManager:
 
     # ── Inventory Unwinding ─────────────────────────────────────────────────
     def place_unwind_order(
-        self, side: str, fill_price: float, fill_size: float
+        self, side: str, fill_price: float, fill_size: float,
+        clob_price_override: float | None = None,
+        created_at_override: float | None = None,
     ) -> str | None:
-        """Place a SELL limit order to offload filled inventory at acquisition price.
+        """Place a SELL limit order to offload filled inventory.
 
         When a BUY order fills, we hold tokens we don't want. This places
-        a SELL order at the same price to break even. Profit comes from
-        liquidity rewards, not from holding inventory.
+        a SELL order to unwind the position. The sell price starts at
+        acquisition cost (VWAP) and decays over time to ensure the sell
+        eventually fills.
 
         Args:
             side: "yes" or "no" — which side was filled.
-            fill_price: The YES-equivalent price we paid.
+            fill_price: The YES-equivalent price we paid (VWAP).
             fill_size: Number of shares to sell.
+            clob_price_override: If set, use this as the CLOB sell price
+                instead of computing from fill_price. Used for decayed
+                and stop-loss sells.
 
         Returns:
             Exchange order ID of the unwind order, or None on failure.
         """
         question = self.market["question"]
 
-        if side == "yes":
+        if clob_price_override is not None:
+            clob_price = clob_price_override
+            if side == "yes":
+                token_id = self.market["token_ids"][0]
+            else:
+                token_id = self.market["token_ids"][1]
+        elif side == "yes":
             token_id = self.market["token_ids"][0]
-            clob_price = fill_price
+            clob_price = self.round_down_to_tick(fill_price)
         else:
             token_id = self.market["token_ids"][1]
-            clob_price = self.round_to_tick(1 - fill_price)
+            clob_price = self.round_down_to_tick(1 - fill_price)
 
         if clob_price is None or clob_price <= 0:
             log.warning(
@@ -789,12 +843,21 @@ class OrderManager:
             order_id = exchange_id or post_order_id
 
             if order_id:
+                # base_clob_price: the VWAP-based sell price (before decay).
+                # Used to calculate how much the price has decayed.
+                if side == "yes":
+                    base = self.round_down_to_tick(fill_price)
+                else:
+                    base = self.round_down_to_tick(1 - fill_price)
+
                 self.unwind_orders[order_id] = {
                     "side": side,
                     "price": fill_price,
                     "clob_price": clob_price,
                     "size": float(fill_size),
                     "placed_at": _time.time(),
+                    "created_at": created_at_override or _time.time(),
+                    "base_clob_price": base,
                     "from_post_response": exchange_id is None,
                 }
 
@@ -818,10 +881,77 @@ class OrderManager:
                 return None
 
         except Exception as e:
-            log.error(
-                f"Failed to place unwind order for {side.upper()} "
-                f"on {question[:40]}: {e}"
-            )
+            error_msg = str(e).lower()
+            if "not enough balance" in error_msg or "allowance" in error_msg:
+                log.warning(
+                    f"SELL rejected (balance/allowance) for {side.upper()} "
+                    f"on {question[:40]} — attempting to fix CONDITIONAL allowance"
+                )
+                try:
+                    self.client.update_balance_allowance(
+                        BalanceAllowanceParams(
+                            asset_type=AssetType.CONDITIONAL,
+                            token_id=token_id,
+                        )
+                    )
+                    log.info(
+                        f"CONDITIONAL allowance updated for token "
+                        f"{token_id[:16]}... — retrying SELL order"
+                    )
+                    # Retry once after fixing allowance
+                    order_args = OrderArgs(
+                        token_id=token_id,
+                        price=clob_price,
+                        size=float(fill_size),
+                        side=SELL,
+                    )
+                    response = self.client.create_and_post_order(order_args)
+
+                    if isinstance(response, dict) and not response.get("success", True):
+                        raise Exception(
+                            f"Retry rejected: {response.get('errorMsg', response)}"
+                        )
+
+                    post_order_id = None
+                    if isinstance(response, dict):
+                        post_order_id = response.get("orderID")
+
+                    exchange_id = self._find_exchange_order_id(
+                        token_id, str(clob_price), SELL
+                    )
+                    order_id = exchange_id or post_order_id
+                    if order_id:
+                        if side == "yes":
+                            base = self.round_down_to_tick(fill_price)
+                        else:
+                            base = self.round_down_to_tick(1 - fill_price)
+                        self.unwind_orders[order_id] = {
+                            "side": side,
+                            "price": fill_price,
+                            "clob_price": clob_price,
+                            "size": float(fill_size),
+                            "placed_at": _time.time(),
+                            "created_at": created_at_override or _time.time(),
+                            "base_clob_price": base,
+                            "from_post_response": exchange_id is None,
+                        }
+                        log.info(
+                            f"UNWIND ORDER PLACED (after allowance fix) | "
+                            f"SELL {side.upper()} | price={clob_price:.4f} | "
+                            f"size={fill_size:.2f} | market={question[:40]} | "
+                            f"id={order_id}"
+                        )
+                        return order_id
+                except Exception as retry_err:
+                    log.error(
+                        f"SELL retry also failed for {side.upper()} "
+                        f"on {question[:40]}: {retry_err}"
+                    )
+            else:
+                log.error(
+                    f"Failed to place unwind order for {side.upper()} "
+                    f"on {question[:40]}: {e}"
+                )
             return None
 
     def reconcile_unwinds(self) -> None:
@@ -927,11 +1057,11 @@ class OrderManager:
                 yes_shares = self.position_tracker.get_shares(condition_id, "yes")
                 no_shares = self.position_tracker.get_shares(condition_id, "no")
 
-        # ── Phase 3: Consolidate & place unwind orders ─────────────────────
-        # When multiple fills happen at different prices, old SELL orders
-        # sit at individual fill prices. The correct unwind price is the
-        # VWAP avg_price. Cancel stale-priced unwinds and replace with one
-        # consolidated order at the current VWAP.
+        # ── Phase 3: Consolidate & place unwind orders (with decay) ────────
+        # Sell orders start at VWAP acquisition cost. Over time, the sell
+        # price decays by 1 tick per UNWIND_DECAY_INTERVAL_SECS to ensure
+        # positions eventually unwind rather than sitting forever.
+        now = _time.time()
         for side in ("yes", "no"):
             position_shares = self.position_tracker.get_shares(condition_id, side)
             avg_price = self.position_tracker.get_avg_price(condition_id, side)
@@ -939,36 +1069,73 @@ class OrderManager:
             if position_shares < MIN_UNWIND_SHARES or avg_price <= 0:
                 continue
 
-            # Check if any existing unwind orders are at a stale price
-            # (i.e., placed at an old fill price, not the current VWAP)
             tick = self.market.get("tick_size", 0.01)
+
+            # Calculate current base clob price from VWAP
+            if side == "yes":
+                vwap_clob = self.round_down_to_tick(avg_price)
+            else:
+                vwap_clob = self.round_down_to_tick(1 - avg_price)
+
+            # Check existing unwind orders — are they at the right price?
             stale_orders: list[str] = []
             covered_shares = 0.0
             for oid, uorder in self.unwind_orders.items():
-                if uorder["side"] == side:
-                    covered_shares += uorder["size"]
-                    if abs(uorder["price"] - avg_price) >= tick:
-                        stale_orders.append(oid)
+                if uorder["side"] != side:
+                    continue
+                covered_shares += uorder["size"]
 
-            # If we have stale-priced unwind orders, cancel them all and
-            # replace with one consolidated order at the current VWAP
+                # Calculate expected decayed price for this order
+                base = uorder.get("base_clob_price", uorder.get("clob_price", vwap_clob))
+                created = uorder.get("created_at", uorder.get("placed_at", now))
+                elapsed = now - created
+                decay_intervals = int(elapsed // UNWIND_DECAY_INTERVAL_SECS)
+                decay_amount = decay_intervals * UNWIND_DECAY_TICKS * tick
+                expected_clob = max(MIN_SELL_PRICE, base - decay_amount)
+
+                # Also check if VWAP changed (new fills shifted the average)
+                if abs(base - vwap_clob) >= tick:
+                    # VWAP changed — need to rebase
+                    log.info(
+                        f"VWAP shifted | {side.upper()} | "
+                        f"old_base={base:.4f} → new_vwap={vwap_clob:.4f} | "
+                        f"market={self.market['question'][:40]}"
+                    )
+                    stale_orders.append(oid)
+                elif uorder.get("clob_price", 0) > expected_clob + tick * 0.5:
+                    # Price needs to decay further (only lower, never raise).
+                    # This preserves stop-loss sells which are already below
+                    # the decayed price.
+                    log.info(
+                        f"PRICE DECAY | {side.upper()} | "
+                        f"current={uorder.get('clob_price', 0):.4f} → "
+                        f"decayed={expected_clob:.4f} | "
+                        f"age={elapsed/60:.0f}min | "
+                        f"market={self.market['question'][:40]}"
+                    )
+                    stale_orders.append(oid)
+
+            # Capture oldest created_at from stale orders BEFORE deleting
+            # so we can preserve the decay clock on the replacement order.
+            oldest_created = now
             if stale_orders:
-                stale_shares = sum(
-                    self.unwind_orders[oid]["size"] for oid in stale_orders
-                )
+                for oid in stale_orders:
+                    uo = self.unwind_orders.get(oid, {})
+                    c = uo.get("created_at", uo.get("placed_at", now))
+                    oldest_created = min(oldest_created, c)
+
                 stale_prices = [
-                    f"{self.unwind_orders[oid]['price']:.4f}"
+                    f"{self.unwind_orders[oid].get('clob_price', 0):.4f}"
                     for oid in stale_orders
                 ]
                 log.info(
-                    f"UNWIND CONSOLIDATION | {side.upper()} | "
-                    f"cancelling {len(stale_orders)} stale unwind(s) at "
-                    f"prices [{', '.join(stale_prices)}] | "
-                    f"new VWAP={avg_price:.4f} | "
+                    f"UNWIND REFRESH | {side.upper()} | "
+                    f"cancelling {len(stale_orders)} order(s) at "
+                    f"[{', '.join(stale_prices)}] | "
                     f"market={self.market['question'][:40]}"
                 )
                 for oid in stale_orders:
-                    self.cancel_order(oid, reason="vwap_consolidation")
+                    self.cancel_order(oid, reason="decay_refresh")
                     if oid in self.unwind_orders:
                         del self.unwind_orders[oid]
 
@@ -979,21 +1146,106 @@ class OrderManager:
                         covered_shares += uorder["size"]
 
             unhedged = position_shares - covered_shares
-
             if unhedged < MIN_UNWIND_SHARES:
-                continue  # Fully covered or dust
+                continue  # Fully covered
 
             actual = actual_balances.get(side, -1)
+
+            # Determine the created_at for the replacement order:
+            # 1. If we cancelled stale orders, carry forward their oldest created_at
+            # 2. If there are other unwinds on this side, use oldest of those
+            # 3. Otherwise this is a new position — start fresh
+            carry_created = oldest_created
+            for uorder in self.unwind_orders.values():
+                if uorder["side"] == side:
+                    c = uorder.get("created_at", now)
+                    carry_created = min(carry_created, c)
+
+            # Calculate decay from the carried creation time
+            elapsed = now - carry_created
+            decay_intervals = int(elapsed // UNWIND_DECAY_INTERVAL_SECS)
+            decay_amount = decay_intervals * UNWIND_DECAY_TICKS * tick
+            decayed_clob = max(MIN_SELL_PRICE, vwap_clob - decay_amount)
+
             log.info(
                 f"UNWIND RECONCILIATION | {side.upper()} | "
                 f"position={position_shares:.2f} | covered={covered_shares:.2f} | "
-                f"unhedged={unhedged:.2f} | avg_price={avg_price:.4f} | "
+                f"unhedged={unhedged:.2f} | vwap={avg_price:.4f} | "
+                f"sell_price={decayed_clob:.4f} | "
+                f"decay={decay_intervals} intervals ({elapsed/60:.0f}min) | "
                 f"actual_balance={actual:.2f} | "
                 f"market={self.market['question'][:40]}"
             )
 
-            # Place ONE consolidated unwind at the VWAP
-            self.place_unwind_order(side, avg_price, unhedged)
+            self.place_unwind_order(
+                side, avg_price, unhedged,
+                clob_price_override=decayed_clob,
+                created_at_override=carry_created,
+            )
+
+    def check_stop_loss(self, best_bid: float, best_ask: float) -> None:
+        """Check if any position has breached the stop-loss threshold.
+
+        If unrealized loss >= STOP_LOSS_PCT, cancel existing unwind orders
+        for that side and place an immediate sell at the current market bid.
+
+        Args:
+            best_bid: Current best YES bid price.
+            best_ask: Current best YES ask price.
+        """
+        condition_id = self.market["condition_id"]
+        tick = self.market.get("tick_size", 0.01)
+
+        for side in ("yes", "no"):
+            position_shares = self.position_tracker.get_shares(condition_id, side)
+            avg_price = self.position_tracker.get_avg_price(condition_id, side)
+
+            if position_shares < MIN_UNWIND_SHARES or avg_price <= 0:
+                continue
+
+            # Calculate our cost and current market value per share
+            if side == "yes":
+                our_cost = self.round_down_to_tick(avg_price)
+                market_bid = best_bid  # what we'd get selling YES
+            else:
+                our_cost = self.round_down_to_tick(1 - avg_price)
+                # NO token value ≈ 1 - best_ask (complement of YES ask)
+                market_bid = max(MIN_SELL_PRICE, round(1 - best_ask, 4))
+
+            if our_cost <= 0:
+                continue
+
+            unrealized_loss_pct = (our_cost - market_bid) / our_cost
+            unrealized_loss_usd = (our_cost - market_bid) * position_shares
+
+            if unrealized_loss_pct < STOP_LOSS_PCT or unrealized_loss_usd < MIN_STOP_LOSS_USD:
+                continue
+
+            # ── STOP-LOSS TRIGGERED ──────────────────────────────────
+            # Sell at market to prevent further damage
+            sell_price = self.round_down_to_tick(market_bid)
+            if sell_price < MIN_SELL_PRICE:
+                sell_price = MIN_SELL_PRICE
+
+            log.warning(
+                f"STOP-LOSS TRIGGERED | {side.upper()} | "
+                f"cost={our_cost:.4f} | market={market_bid:.4f} | "
+                f"loss={unrealized_loss_pct:.1%} / ${unrealized_loss_usd:.0f} "
+                f"(threshold={STOP_LOSS_PCT:.0%} AND ${MIN_STOP_LOSS_USD:.0f}) | "
+                f"selling {position_shares:.2f} shares @ {sell_price:.4f} | "
+                f"market={self.market['question'][:40]}"
+            )
+
+            # Cancel existing unwinds for this side — replacing with market sell
+            for oid in list(self.unwind_orders.keys()):
+                if self.unwind_orders[oid]["side"] == side:
+                    self.cancel_order(oid, reason="stop_loss")
+                    del self.unwind_orders[oid]
+
+            self.place_unwind_order(
+                side, avg_price, position_shares,
+                clob_price_override=sell_price,
+            )
 
     def _try_merge_positions(
         self, condition_id: str, amount: float
@@ -1437,6 +1689,9 @@ class OrderManager:
             f"Market: {question[:45]} | "
             f"bid={best_bid:.4f} | ask={best_ask:.4f}"
         )
+
+        # Step 2b: Stop-loss check — sell at market if loss exceeds threshold
+        self.check_stop_loss(best_bid, best_ask)
 
         # Step 3: Check zones and cancel bad orders
         for order_id in list(self.active_orders.keys()):

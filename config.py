@@ -29,7 +29,7 @@ CHAIN_ID: int = 137  # Polygon mainnet
 GAMMA_API: str = "https://gamma-api.polymarket.com"
 
 # ── Market Selection ──────────────────────────────────────────────────────────
-MAX_MARKETS: int = 3          # Maximum number of markets to trade at once
+MAX_MARKETS: int = 4          # Maximum number of markets to trade at once
 MIN_SCORE_THRESHOLD: int = 60 # Minimum score (out of 100) to trade a market
 HYSTERESIS_SCORE_MARGIN: int = 10  # New market must outscore weakest by this much to swap in
 MARKET_REFRESH_SECS: int = 1800  # Re-score and refresh markets every 30 min
@@ -53,8 +53,8 @@ MIN_LIQUIDITY: int = 1000        # Skip if liquidity below $1000
 MIN_SPREAD_ALLOWED: float = 0.01 # Skip if max spread below 1c
 
 # ── Order Management ──────────────────────────────────────────────────────────
-ORDER_SIZE: int = 100        # Preferred USDC per order (target budget)
-MAX_ORDER_BUDGET: int = 500  # Hard cap — never spend more than this per order
+ORDER_SIZE: int = 500        # Preferred USDC per order (target budget)
+MAX_ORDER_BUDGET: int = 1000 # Hard cap — never spend more than this per order
 MAX_ORDER_SIZE: int = MAX_ORDER_BUDGET  # Alias used by market.py hygiene check
 ORDER_REFRESH_SECS: int = 30 # Cancel and replace orders every 30 seconds
 
@@ -73,8 +73,8 @@ DANGER_ZONE_CENTS: float = 0.005  # Cancel if order within 0.5c of best price
 DEAD_ZONE_BUFFER: float = 0.001   # Buffer beyond max spread for dead zone
 
 # ── Position Limits ───────────────────────────────────────────────────────────
-MAX_POSITION_USD: int = 100     # Stop quoting a side if position exceeds $100
-RESUME_POSITION_USD: int = 75   # Resume quoting when position falls below $75
+MAX_POSITION_USD: int = 500     # Stop quoting a side if position exceeds $500
+RESUME_POSITION_USD: int = 400  # Resume quoting when position falls below $400
 
 # ── Alert Thresholds ──────────────────────────────────────────────────────────
 MAX_ORDER_FAILURES: int = 3  # Alert after this many consecutive order failures
@@ -83,6 +83,19 @@ MAX_ORDER_FAILURES: int = 3  # Alert after this many consecutive order failures
 # Position-based: reconcile_unwinds() checks total position vs covered
 # unwind orders each cycle. No retry queue needed.
 MIN_UNWIND_SHARES: float = 1.0   # Ignore positions below this many shares
+
+# ── Sell Price Decay ────────────────────────────────────────────────────────
+# Sell orders start at acquisition cost (VWAP). To avoid holding depreciating
+# inventory forever, the sell price decays by 1 tick per interval.
+UNWIND_DECAY_INTERVAL_SECS: int = 600   # Lower sell by 1 tick every 10 minutes
+UNWIND_DECAY_TICKS: int = 1             # Ticks to drop per interval
+MIN_SELL_PRICE: float = 0.01            # Never sell below 1 cent
+
+# ── Stop-Loss ───────────────────────────────────────────────────────────────
+# If unrealized loss on a position exceeds this threshold, immediately
+# sell at the current market bid to prevent further damage.
+STOP_LOSS_PCT: float = 0.20        # 20% unrealized loss → dump at market
+MIN_STOP_LOSS_USD: float = 50.0    # AND absolute loss must exceed $50
 
 # ── Heartbeat ────────────────────────────────────────────────────────────────
 # Alert if no successful cycle completes within this many seconds.
