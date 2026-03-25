@@ -29,32 +29,32 @@ CHAIN_ID: int = 137  # Polygon mainnet
 GAMMA_API: str = "https://gamma-api.polymarket.com"
 
 # ── Market Selection ──────────────────────────────────────────────────────────
-MAX_MARKETS: int = 4          # Maximum number of markets to trade at once
+MAX_MARKETS: int = 3          # Focus on fewer, higher-quality markets
 MIN_SCORE_THRESHOLD: int = 60 # Minimum score (out of 100) to trade a market
 HYSTERESIS_SCORE_MARGIN: int = 10  # New market must outscore weakest by this much to swap in
 MARKET_REFRESH_SECS: int = 1800  # Re-score and refresh markets every 30 min
 
 # ── Scoring Weights (must sum to 100) ─────────────────────────────────────────
-# Rank-based percentile scoring: each component ranks all eligible markets
-# relative to each other. Best gets full weight, worst gets 0.
+# Heavily weight reward rate and competition (reward density).
+# Price balance demoted — balanced markets are most competitive/least rewarding.
 # Expiry is NOT scored — it is only a hygiene filter (≥ 12 hours).
-WEIGHT_DAILY_RATE: int = 30
-WEIGHT_COMPETITION: int = 28
-WEIGHT_PRICE_BAL: int = 24
-WEIGHT_SPREAD: int = 8
+WEIGHT_DAILY_RATE: int = 35
+WEIGHT_COMPETITION: int = 35
+WEIGHT_PRICE_BAL: int = 10
+WEIGHT_SPREAD: int = 10
 WEIGHT_LIQUIDITY: int = 10
 
 # ── Hygiene Filter Thresholds ─────────────────────────────────────────────────
 MIN_DAYS_TO_EXPIRY: float = 0.5   # Skip markets expiring within 12 hours
 MIN_YES_PRICE: float = 0.05      # Skip if Yes price below 5c
 MAX_YES_PRICE: float = 0.95      # Skip if Yes price above 95c
-MIN_DAILY_RATE: float = 1.0      # Skip if daily reward rate below $1
+MIN_DAILY_RATE: float = 5.0      # Skip if daily reward rate below $5
 MIN_LIQUIDITY: int = 1000        # Skip if liquidity below $1000
 MIN_SPREAD_ALLOWED: float = 0.01 # Skip if max spread below 1c
 
 # ── Order Management ──────────────────────────────────────────────────────────
-ORDER_SIZE: int = 500        # Preferred USDC per order (target budget)
-MAX_ORDER_BUDGET: int = 1000 # Hard cap — never spend more than this per order
+ORDER_SIZE: int = 250        # Reduced from $500 — limits adverse selection damage
+MAX_ORDER_BUDGET: int = 750  # Hard cap — allows sports markets with high min_size
 CHEAP_TOKEN_THRESHOLD: float = 0.25  # Tokens under 25c get reduced order size
 CHEAP_TOKEN_SCALE: float = 0.50     # Scale order size to 50% for cheap tokens
 MAX_ORDER_SIZE: int = MAX_ORDER_BUDGET  # Alias used by market.py hygiene check
@@ -66,17 +66,16 @@ ORDER_REFRESH_SECS: int = 30 # Cancel and replace orders every 30 seconds
 MAX_ORDERBOOK_SPREAD: float = 0.10  # 10c — wider than this is too sparse
 
 # Minimum dollar value of existing orders that must sit in front of ours.
-# We walk the orderbook and place our bid below $1000 of other bids,
-# and our ask above $1000 of other asks.
-MIN_LIQUIDITY_BUFFER: float = 1000.0  # $1000 of liquidity buffer
+# Higher buffer = orders placed further back = less adverse selection.
+MIN_LIQUIDITY_BUFFER: float = 2000.0  # $2000 of liquidity buffer (was $1000)
 
 # ── Order Zone Thresholds ─────────────────────────────────────────────────────
 DANGER_ZONE_CENTS: float = 0.005  # Cancel if order within 0.5c of best price
 DEAD_ZONE_BUFFER: float = 0.001   # Buffer beyond max spread for dead zone
 
 # ── Position Limits ───────────────────────────────────────────────────────────
-MAX_POSITION_USD: int = 500     # Stop quoting a side if position exceeds $500
-RESUME_POSITION_USD: int = 400  # Resume quoting when position falls below $400
+MAX_POSITION_USD: int = 400     # Stop quoting a side if position exceeds $400
+RESUME_POSITION_USD: int = 300  # Resume quoting when position falls below $300
 
 # ── Alert Thresholds ──────────────────────────────────────────────────────────
 MAX_ORDER_FAILURES: int = 3  # Alert after this many consecutive order failures
@@ -89,10 +88,11 @@ MIN_UNWIND_SHARES: float = 1.0   # Ignore positions below this many shares
 # ── Sell Price Decay ────────────────────────────────────────────────────────
 # Sell orders start at acquisition cost (VWAP). To avoid holding depreciating
 # inventory forever, the sell price decays by 1 tick per interval.
-UNWIND_DECAY_INTERVAL_SECS: int = 600   # Lower sell by 1 tick every 10 minutes
+# With 300s interval: 1c drop every 5 min = 12c/hour normal, 60c/hour accelerated.
+UNWIND_DECAY_INTERVAL_SECS: int = 300   # Lower sell by 1 tick every 5 min (was 10)
 UNWIND_DECAY_TICKS: int = 1             # Ticks to drop per interval
-UNWIND_ACCEL_LOSS_PCT: float = 0.10     # Accelerate decay when loss exceeds 10%
-UNWIND_ACCEL_MULTIPLIER: int = 3        # 3x decay speed when accelerated
+UNWIND_ACCEL_LOSS_PCT: float = 0.08     # Accelerate decay when loss exceeds 8% (was 10%)
+UNWIND_ACCEL_MULTIPLIER: int = 5        # 5x decay speed when accelerated (was 3x)
 MIN_SELL_PRICE: float = 0.01            # Never sell below 1 cent
 
 # ── Stop-Loss ───────────────────────────────────────────────────────────────

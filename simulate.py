@@ -14,24 +14,24 @@ import math
 import random
 from dataclasses import dataclass, field
 
-# ── Config (mirrors config.py) ──────────────────────────────────────────────
-ORDER_SIZE = 500
-MAX_ORDER_BUDGET = 1000
-MAX_POSITION_USD = 500
-RESUME_POSITION_USD = 400
+# ── Config (mirrors config.py — updated 2026-03-25) ─────────────────────────
+ORDER_SIZE = 250           # Reduced from $500
+MAX_ORDER_BUDGET = 750     # Allows sports markets with high min_size
+MAX_POSITION_USD = 400     # Reduced from $500
+RESUME_POSITION_USD = 300  # Reduced from $400
 CYCLE_SECS = 30
-DECAY_INTERVAL_SECS = 600
+DECAY_INTERVAL_SECS = 300  # Every 5 min (was 10)
 DECAY_TICKS = 1
 STOP_LOSS_PCT = 0.20
 MIN_STOP_LOSS_USD = 50.0   # AND absolute loss must exceed $50
 STOP_LOSS_MIN_PRICE = 0.20 # Skip stop-loss on tokens under 20c
 MIN_SELL_PRICE = 0.01
-ACCEL_LOSS_PCT = 0.10      # Accelerate decay when loss > 10%
-ACCEL_MULTIPLIER = 3       # 3x decay speed when accelerated
+ACCEL_LOSS_PCT = 0.08      # Accelerate decay when loss > 8% (was 10%)
+ACCEL_MULTIPLIER = 5       # 5x decay speed when accelerated (was 3x)
 CHEAP_THRESHOLD = 0.25     # Tokens under 25c get 50% order size
 CHEAP_SCALE = 0.50
 TICK = 0.01
-BUFFER_OFFSET = 0.02  # our orders land ~2c behind best
+BUFFER_OFFSET = 0.03       # ~3c behind best (was 2c, wider buffer)
 MIN_SHARES = 200
 
 
@@ -204,6 +204,11 @@ class SimOrderManager:
             if pos.shares >= 1 and not any(
                 s.side == side for s in self.sell_orders
             ):
+                continue
+            # Soft guard: block both sides only when holding dual positions
+            opposite = "no" if side == "yes" else "yes"
+            opp_pos = self.get_pos(opposite)
+            if pos.shares >= 1 and opp_pos.shares >= 1:
                 continue
 
             # Calculate price and size

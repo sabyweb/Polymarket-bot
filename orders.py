@@ -22,7 +22,8 @@ from config import (
 )
 from alerts import (
     alert_order_failure, alert_danger_zone,
-    alert_fill, alert_unwind, log_order_placed, log_order_cancelled,
+    alert_fill, alert_unwind, alert_merge_needed,
+    log_order_placed, log_order_cancelled,
 )
 
 log = logging.getLogger(__name__)
@@ -1329,7 +1330,15 @@ class OrderManager:
                 )
                 return True
 
-            # No merge API available — log for manual action
+            # No merge API available — alert user for manual action.
+            # Throttle alerts to once per 30 minutes per market.
+            now = _time.time()
+            last_alert = getattr(self, '_last_merge_alert', 0)
+            if now - last_alert > 1800:
+                self._last_merge_alert = now
+                yes_shares = self.position_tracker.get_shares(condition_id, "yes")
+                no_shares = self.position_tracker.get_shares(condition_id, "no")
+                alert_merge_needed(question, yes_shares, no_shares, amount, amount)
             log.warning(
                 f"MERGE NEEDED (manual) | {amount:.2f} YES+NO pairs | "
                 f"would free ${amount:.2f} USDC | "
@@ -1772,6 +1781,31 @@ class OrderManager:
                 f"market={question[:40]}"
             )
             needs_no = False
+
+        # ── Soft opposite-side guard ──────────────────────────────────
+        # Market makers quote both sides — that's fundamental. But if we
+        # already hold LARGE inventory on one side AND the opposite side,
+        # we're accumulating unmergeable dual positions. Only block when
+        # BOTH sides have significant inventory (merge-deadlock scenario).
+        yes_inv = self.position_tracker.get_shares(condition_id, "yes")
+        no_inv = self.position_tracker.get_shares(condition_id, "no")
+        if yes_inv >= MIN_UNWIND_SHARES and no_inv >= MIN_UNWIND_SHARES:
+            # Already holding both sides — stop adding to either until
+            # one side is unwound or positions are merged.
+            if needs_yes:
+                log.info(
+                    f"Blocking YES BUY — dual position "
+                    f"(YES={yes_inv:.0f}, NO={no_inv:.0f}) | "
+                    f"market={question[:40]}"
+                )
+                needs_yes = False
+            if needs_no:
+                log.info(
+                    f"Blocking NO BUY — dual position "
+                    f"(YES={yes_inv:.0f}, NO={no_inv:.0f}) | "
+                    f"market={question[:40]}"
+                )
+                needs_no = False
 
         if not needs_yes and not needs_no:
             log.debug("Both sides covered or blocked — holding")

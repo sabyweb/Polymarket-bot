@@ -420,6 +420,45 @@ def alert_positions(positions: dict) -> None:
     _send_discord("**Position Update**", embed)
 
 
+def alert_merge_needed(
+    market_question: str, yes_shares: float, no_shares: float,
+    mergeable: float, freed_usd: float,
+) -> None:
+    """Send urgent Discord alert when YES+NO positions need manual merge.
+
+    Args:
+        market_question: Human-readable market name.
+        yes_shares: YES shares held.
+        no_shares: NO shares held.
+        mergeable: Number of pairs that can be merged.
+        freed_usd: USDC that would be freed by merging.
+    """
+    embed = {
+        "title": "MERGE NEEDED — Capital Locked",
+        "description": (
+            f"Holding **both** YES and NO on the same market.\n"
+            f"Merge via Polymarket UI to free **${freed_usd:.0f} USDC**.\n\n"
+            f"**Market:** {market_question}\n"
+            f"**YES:** {yes_shares:.1f} shares\n"
+            f"**NO:** {no_shares:.1f} shares\n"
+            f"**Mergeable pairs:** {mergeable:.1f}\n\n"
+            f"Go to [Polymarket Portfolio](https://polymarket.com/portfolio) → "
+            f"find this market → click **Merge Positions**"
+        ),
+        "color": 0xFF0000,  # Red — urgent
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+    _send_discord("**ACTION REQUIRED** — merge positions to free capital", embed)
+
+    msg = (
+        f"MERGE NEEDED | {market_question[:40]} | "
+        f"YES={yes_shares:.1f} NO={no_shares:.1f} | "
+        f"mergeable={mergeable:.1f} | would_free=${freed_usd:.0f}"
+    )
+    log.warning(msg)
+    _write_alert("MERGE", msg)
+
+
 def alert_heartbeat_failure(last_success_secs_ago: float) -> None:
     """Send a Discord alert when no cycle has completed recently.
 
