@@ -20,7 +20,7 @@ from config import (
     HYSTERESIS_SCORE_MARGIN, HEARTBEAT_TIMEOUT_SECS,
 )
 from market import get_rewards_markets
-from position import PositionTracker
+from state import PositionStore as PositionTracker
 from orders import OrderManager, BalanceGate
 from rate_limiter import RateLimitedClient
 from alerts import (

@@ -84,16 +84,18 @@ check("NO sell at actual cost (40c)", no_sell_clob == 0.40,
 # ═══════════════════════════════════════════════════════════════════════════════
 print("\n=== TEST 2: USD Tracking ===")
 
+import position as _position_module
 from position import PositionTracker
 
-# Use temp file for positions.json
+# Redirect positions.json to a temp file so tests don't overwrite real data
+_original_positions_file = _position_module.POSITIONS_FILE
 with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
     json.dump({}, f)
     tmp_path = f.name
+_position_module.POSITIONS_FILE = tmp_path
 
 try:
     tracker = PositionTracker()
-    tracker._path = tmp_path
     tracker.positions = {}
 
     CID = "test-market-001"
@@ -277,6 +279,7 @@ try:
 
 finally:
     os.unlink(tmp_path)
+    _position_module.POSITIONS_FILE = _original_positions_file
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
