@@ -289,10 +289,12 @@ class PositionTracker:
         )
 
     def recalculate_usd(self) -> None:
-        """Recalculate USD exposure from shares and avg_price.
+        """Recalculate USD exposure and re-check all position limits.
 
         Fixes legacy data where NO-side USD was incorrectly computed
         using YES-equivalent price instead of actual CLOB cost.
+        Also ensures halt flags are consistent with current USD values
+        (catches cases where positions.json was loaded with stale halts).
         Called once on startup.
         """
         changed = False
@@ -315,9 +317,12 @@ class PositionTracker:
                     )
                     pos[key] = correct_usd
                     changed = True
-                    # Re-check halts with corrected USD
-                    self._check_limit(cid, key)
-                    self._check_resume(cid, key)
+
+                # ALWAYS re-check limits — catches stale halt flags
+                # loaded from positions.json (e.g. halt never set because
+                # _check_limit only runs on new fills, not on load).
+                self._check_limit(cid, key)
+                self._check_resume(cid, key)
         if changed:
             self._save()
 
