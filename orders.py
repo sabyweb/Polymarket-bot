@@ -911,8 +911,10 @@ class OrderManager:
                     )
                     log.info(
                         f"CONDITIONAL allowance updated for token "
-                        f"{token_id[:16]}... — retrying SELL order"
+                        f"{token_id[:16]}... — waiting for confirmation then retrying"
                     )
+                    # Wait for the allowance tx to confirm on-chain
+                    _time.sleep(5)
                     # Retry once after fixing allowance
                     order_args = OrderArgs(
                         token_id=token_id,
@@ -958,10 +960,58 @@ class OrderManager:
                         )
                         return order_id
                 except Exception as retry_err:
-                    log.error(
-                        f"SELL retry also failed for {side.upper()} "
-                        f"on {question[:40]}: {retry_err}"
+                    log.warning(
+                        f"SELL retry #1 failed for {side.upper()} "
+                        f"on {question[:40]}: {retry_err} — waiting 10s for retry #2"
                     )
+                    # Second retry with longer wait
+                    try:
+                        _time.sleep(10)
+                        order_args = OrderArgs(
+                            token_id=token_id,
+                            price=clob_price,
+                            size=float(fill_size),
+                            side=SELL,
+                        )
+                        response = self.client.create_and_post_order(order_args)
+                        if isinstance(response, dict) and not response.get("success", True):
+                            raise Exception(
+                                f"Retry #2 rejected: {response.get('errorMsg', response)}"
+                            )
+                        post_order_id = None
+                        if isinstance(response, dict):
+                            post_order_id = response.get("orderID")
+                        exchange_id = self._find_exchange_order_id(
+                            token_id, str(clob_price), SELL
+                        )
+                        order_id = exchange_id or post_order_id
+                        if order_id:
+                            if side == "yes":
+                                base = self.round_down_to_tick(fill_price)
+                            else:
+                                base = self.round_down_to_tick(1 - fill_price)
+                            self.unwind_orders[order_id] = {
+                                "side": side,
+                                "price": fill_price,
+                                "clob_price": clob_price,
+                                "size": float(fill_size),
+                                "placed_at": _time.time(),
+                                "created_at": created_at_override or _time.time(),
+                                "base_clob_price": base,
+                                "from_post_response": exchange_id is None,
+                            }
+                            log.info(
+                                f"UNWIND ORDER PLACED (retry #2) | "
+                                f"SELL {side.upper()} | price={clob_price:.4f} | "
+                                f"size={fill_size:.2f} | market={question[:40]} | "
+                                f"id={order_id}"
+                            )
+                            return order_id
+                    except Exception as retry2_err:
+                        log.error(
+                            f"SELL retry #2 also failed for {side.upper()} "
+                            f"on {question[:40]}: {retry2_err}"
+                        )
             else:
                 log.error(
                     f"Failed to place unwind order for {side.upper()} "
