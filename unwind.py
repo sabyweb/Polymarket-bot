@@ -17,6 +17,7 @@ from config import (
     UNWIND_ACCEL_TIERS,
     UNWIND_AGE_ACCEL_HOURS, UNWIND_AGE_ACCEL_TICKS,
     UNWIND_AGE_MAX_HOURS, UNWIND_AGE_MAX_TICKS,
+    REWARD_LOSS_BUDGET_PCT,
 )
 from alerts import alert_unwind, alert_merge_needed
 from price import to_clob
@@ -27,6 +28,29 @@ log = logging.getLogger(__name__)
 
 class UnwindMixin:
     """Mixin providing inventory unwinding methods for OrderManager."""
+
+    def _get_reward_rate(self) -> float:
+        """Get estimated hourly reward rate for this market.
+
+        Used by reward-offset unwind pricing to bound decay losses
+        to a fraction of earned rewards.
+
+        Returns:
+            Estimated $/hour reward rate, or 0.0 if unknown.
+        """
+        tracker = getattr(self, "_reward_tracker", None)
+        if not tracker:
+            return 0.0
+        cid = self.market["condition_id"]
+        stats = tracker.markets.get(cid)
+        if not stats:
+            return 0.0
+        snapshots = getattr(stats, "reward_snapshots", [])
+        if not snapshots:
+            return 0.0
+        # Use the most recent hourly snapshot
+        latest = snapshots[-1] if snapshots else {}
+        return latest.get("est_hourly", 0.0)
 
     def place_unwind_order(
         self, side: str, fill_price: float, fill_size: float,
@@ -503,6 +527,11 @@ class UnwindMixin:
             # Check existing unwind orders — are they at the right price?
             stale_orders: list[str] = []
             covered_shares = 0.0
+
+            # Reward-offset floor: never lose more than REWARD_LOSS_BUDGET_PCT
+            # of the rewards earned while holding this position.
+            reward_rate = self._get_reward_rate()
+
             for oid, uorder in self.unwind_orders.items():
                 if uorder.side != side:
                     continue
@@ -514,7 +543,19 @@ class UnwindMixin:
                 check_ticks = self._tiered_decay_ticks(vwap_clob, side, created_at=created)
                 decay_intervals = int(elapsed // UNWIND_DECAY_INTERVAL_SECS)
                 decay_amount = decay_intervals * check_ticks * tick
-                expected_clob = max(MIN_SELL_PRICE, base - decay_amount)
+
+                # Reward-offset: compute max acceptable loss per share
+                # based on rewards earned during hold time
+                reward_floor = MIN_SELL_PRICE
+                if reward_rate > 0 and position_shares > 0:
+                    reward_budget = (
+                        reward_rate * (elapsed / 3600)
+                        * REWARD_LOSS_BUDGET_PCT
+                    )
+                    max_loss_per_share = reward_budget / position_shares
+                    reward_floor = max(MIN_SELL_PRICE, vwap_clob - max_loss_per_share)
+
+                expected_clob = max(reward_floor, base - decay_amount)
 
                 if abs(base - vwap_clob) >= tick:
                     log.info(

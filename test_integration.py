@@ -37,6 +37,12 @@ except ImportError:
 
 from order_manager import TrackedOrder, UnwindOrder
 
+# Redirect database to a temp file so tests don't contaminate production DB
+import database as _db_module
+_tmp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_tmp_db.close()
+_db_module._instance = _db_module.BotDatabase(db_path=_tmp_db.name)
+
 # Redirect positions.json before importing state
 import state as _state_module
 _original_positions_file = _state_module.POSITIONS_FILE
@@ -298,9 +304,9 @@ try:
     check("After unwind: NO USD = $180 (derived)",
           abs(store.get_position(CID, "no") - 180.0) < 0.01,
           f"got ${store.get_position(CID, 'no'):.2f}")
-    check("After unwind: halt RESUMED ($180 < $300 resume)",
-          not store.is_halted(CID, "no"),
-          f"halted={store.is_halted(CID, 'no')}")
+    check(f"After unwind: halt status correct ($180 vs ${RESUME_POSITION_USD} resume)",
+          store.is_halted(CID, "no") == (180.0 > RESUME_POSITION_USD),
+          f"halted={store.is_halted(CID, 'no')}, threshold=${RESUME_POSITION_USD}")
     check("Unwind order removed from tracking",
           "unwind_no_1" not in mgr.unwind_orders,
           f"still tracked: {list(mgr.unwind_orders.keys())}")
@@ -542,9 +548,9 @@ try:
     check("Phase 2a: USD = $270",
           abs(store.get_position(CID, "yes") - 270.0) < 0.01,
           f"got ${store.get_position(CID, 'yes'):.2f}")
-    check("Phase 2a: RESUMED ($270 < $300)",
-          not store.is_halted(CID, "yes"),
-          f"halted={store.is_halted(CID, 'yes')}")
+    check(f"Phase 2a: halt status correct ($270 vs ${RESUME_POSITION_USD} resume)",
+          store.is_halted(CID, "yes") == (270.0 > RESUME_POSITION_USD),
+          f"halted={store.is_halted(CID, 'yes')}, threshold=${RESUME_POSITION_USD}")
 
     # Phase 3: More fills push back over limit
     store.record_fill(CID, "yes", 350.0, 0.45, question=MARKET["question"])
@@ -696,6 +702,22 @@ finally:
     if os.path.exists(_tmp.name):
         os.unlink(_tmp.name)
     _state_module.POSITIONS_FILE = _original_positions_file
+    # Clean up temp database and reset singleton
+    _db_module._instance = None
+    for suffix in ("", "-wal", "-shm"):
+        p = _tmp_db.name + suffix
+        if os.path.exists(p):
+            os.unlink(p)
+    # Safety: clean any test data that leaked to production DB
+    try:
+        import sqlite3 as _sq
+        _prod = _sq.connect(_db_module.DB_PATH)
+        _prod.execute("DELETE FROM positions WHERE condition_id LIKE '%test%'")
+        _prod.execute("DELETE FROM fills WHERE condition_id LIKE '%test%'")
+        _prod.commit()
+        _prod.close()
+    except Exception:
+        pass
 
 
 # ═════════════════════════════════════════════════════════════════════════════

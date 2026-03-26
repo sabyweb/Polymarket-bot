@@ -18,6 +18,7 @@ from config import (
     MAX_MARKETS, MAX_ORDER_SIZE, MIN_DAYS_TO_EXPIRY,
     MIN_YES_PRICE, MAX_YES_PRICE, MIN_DAILY_RATE,
     MIN_LIQUIDITY, MIN_SPREAD_ALLOWED,
+    MAX_VOLUME_TO_REWARD_RATIO,
     WEIGHT_REWARD_EFFICIENCY, WEIGHT_COMPETITION,
     WEIGHT_FILL_SAFETY, WEIGHT_UNWIND_ABILITY,
     WEIGHT_DAILY_RATE, WEIGHT_SPREAD,
@@ -344,6 +345,17 @@ def hygiene_check(market: dict, rewards: dict) -> tuple[bool, str]:
     vol_24h = parse_volume_24h(market)
     if vol_24h < 500:
         return False, f"24h volume too low (${vol_24h:.0f})"
+
+    # 9. Volume-to-reward ratio filter (reward farming: avoid fill-heavy markets)
+    # High volume relative to reward rate = orders get picked off constantly
+    # Illinois ($7500/day, low volume) → good. Crude Oil ($500/day, huge volume) → bad.
+    if rewards["daily_rate"] > 0:
+        vol_reward_ratio = vol_24h / rewards["daily_rate"]
+        if vol_reward_ratio > MAX_VOLUME_TO_REWARD_RATIO:
+            return False, (
+                f"Too fill-heavy (vol/reward={vol_reward_ratio:.0f}x, "
+                f"max={MAX_VOLUME_TO_REWARD_RATIO:.0f}x)"
+            )
 
     return True, "OK"
 

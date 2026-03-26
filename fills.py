@@ -311,16 +311,17 @@ class FillsMixin:
                                 usd_value=unwound_usd,
                                 market_question=self.market["question"],
                             )
-                            self.position_tracker.record_unwind(
-                                self.market["condition_id"], uorder.side,
-                                unwound_shares, uorder.price
-                            )
-                            # Record sell fill to reward tracker with VWAP cost
+                            # Compute VWAP cost BEFORE record_unwind (which may zero avg_price)
                             cid = self.market["condition_id"]
                             avg_p = self.position_tracker.get_avg_price(cid, uorder.side)
                             vwap_cost = 0.0
                             if avg_p > 0:
                                 vwap_cost = to_clob(avg_p, uorder.side) * unwound_shares
+                            self.position_tracker.record_unwind(
+                                self.market["condition_id"], uorder.side,
+                                unwound_shares, uorder.price
+                            )
+                            # Record sell fill to reward tracker with VWAP cost
                             if self._reward_tracker:
                                 self._reward_tracker.record_sell_fill(
                                     cid, unwound_shares, unwound_usd,
@@ -382,9 +383,36 @@ class FillsMixin:
                                 f"value=${unwound_usd:.2f} | "
                                 f"market={self.market['question'][:40]}"
                             )
+                            # Compute VWAP cost BEFORE record_unwind (which may zero avg_price)
+                            cid = self.market["condition_id"]
+                            avg_p = self.position_tracker.get_avg_price(
+                                cid, uorder.side
+                            )
+                            vwap_cost = 0.0
+                            if avg_p > 0:
+                                vwap_cost = (
+                                    to_clob(avg_p, uorder.side)
+                                    * unwound_shares
+                                )
                             self.position_tracker.record_unwind(
                                 self.market["condition_id"], uorder.side,
                                 unwound_shares, uorder.price
+                            )
+                            # Record to reward tracker (was missing — Bug #1)
+                            if self._reward_tracker:
+                                self._reward_tracker.record_sell_fill(
+                                    cid, unwound_shares, unwound_usd,
+                                    vwap_cost_usd=vwap_cost,
+                                )
+                            # Record to history database (was missing — Bug #1)
+                            get_db().log_unwind(
+                                condition_id=cid,
+                                question=self.market["question"],
+                                side=uorder.side,
+                                shares=unwound_shares,
+                                sell_price=clob_sell,
+                                usd_value=unwound_usd,
+                                vwap_cost=vwap_cost,
                             )
                             uorder.size = u_remaining
 

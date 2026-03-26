@@ -209,14 +209,23 @@ class PositionStore:
     # ── Persistence (A3: SQLite primary, JSON fallback for migration) ──────
 
     def _load(self) -> None:
-        """Load positions: try SQLite first, fall back to JSON for migration."""
+        """Load positions: try SQLite first, fall back to JSON for migration.
+
+        Filters out test entries (condition_id containing 'test') so that
+        test-suite data in the DB doesn't block the JSON migration path.
+        """
         from database import get_db
         db = get_db()
 
-        # Try SQLite first
+        # Try SQLite first — filter out test entries
         data = db.load_all_positions()
-        if data:
-            self._populate_from_dict(data)
+        real_data = {
+            cid: pos for cid, pos in data.items()
+            if "test" not in cid.lower()
+        } if data else {}
+
+        if real_data:
+            self._populate_from_dict(real_data)
             non_zero = sum(
                 1 for m in self._markets.values()
                 if not m["yes"].is_empty or not m["no"].is_empty
@@ -225,9 +234,19 @@ class PositionStore:
                 f"Loaded {len(self._markets)} positions from SQLite "
                 f"({non_zero} with open exposure)"
             )
+            # Also merge in any JSON positions not yet in SQLite
+            self._merge_json_if_needed()
             return
 
         # Fall back to JSON (migration path)
+        self._migrate_from_json()
+
+    def _merge_json_if_needed(self) -> None:
+        """Merge positions from JSON that aren't already in SQLite.
+
+        Handles the case where SQLite has some markets but JSON has others
+        that were never migrated (e.g., due to test data blocking migration).
+        """
         if not os.path.exists(POSITIONS_FILE):
             return
         try:
@@ -236,7 +255,69 @@ class PositionStore:
             if not isinstance(json_data, dict):
                 return
 
-            self._populate_from_dict(json_data)
+            merged_count = 0
+            for cid, pos in json_data.items():
+                if "test" in cid.lower():
+                    continue
+                if cid in self._markets:
+                    continue  # Already have this market from SQLite
+                # New market from JSON not in SQLite — add it
+                question = pos.get("question", f"unknown-{cid[:12]}")
+                yes = SidePosition(
+                    side="yes",
+                    shares=pos.get("yes_shares", 0.0),
+                    avg_price=pos.get("yes_avg_price", 0.0),
+                    halted=pos.get("yes_halted", False),
+                )
+                no = SidePosition(
+                    side="no",
+                    shares=pos.get("no_shares", 0.0),
+                    avg_price=pos.get("no_avg_price", 0.0),
+                    halted=pos.get("no_halted", False),
+                )
+                if not yes.is_empty or not no.is_empty:
+                    self._markets[cid] = {
+                        "question": question,
+                        "yes": yes,
+                        "no": no,
+                    }
+                    merged_count += 1
+                    log.info(
+                        f"Merged from JSON: {question[:40]} | "
+                        f"YES={yes.shares:.1f} NO={no.shares:.1f}"
+                    )
+
+            if merged_count > 0:
+                self._save()
+                log.info(f"Merged {merged_count} position(s) from JSON → SQLite")
+
+            # Rename JSON to .migrated now that everything is in SQLite
+            try:
+                migrated = POSITIONS_FILE + ".migrated"
+                os.rename(POSITIONS_FILE, migrated)
+                log.info(f"Renamed {POSITIONS_FILE} → {migrated}")
+            except OSError as rename_err:
+                log.warning(f"Could not rename positions.json: {rename_err}")
+
+        except Exception as e:
+            log.warning(f"Could not merge positions from JSON: {e}")
+
+    def _migrate_from_json(self) -> None:
+        """Full migration from JSON when SQLite has no real data."""
+        if not os.path.exists(POSITIONS_FILE):
+            return
+        try:
+            with open(POSITIONS_FILE, "r") as f:
+                json_data = json.load(f)
+            if not isinstance(json_data, dict):
+                return
+
+            # Filter out test entries from JSON too
+            clean_data = {
+                cid: pos for cid, pos in json_data.items()
+                if "test" not in cid.lower()
+            }
+            self._populate_from_dict(clean_data)
             non_zero = sum(
                 1 for m in self._markets.values()
                 if not m["yes"].is_empty or not m["no"].is_empty

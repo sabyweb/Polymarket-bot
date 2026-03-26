@@ -44,10 +44,10 @@ MARKET_REFRESH_SECS: int = 1800  # Re-score and refresh markets every 30 min
 # Price balance REMOVED — skewed markets often have less competition and
 # are more capital-efficient for reward capture.
 # Expiry is NOT scored — it is only a hygiene filter (≥ 12 hours).
-WEIGHT_REWARD_EFFICIENCY: int = 25  # Estimated reward per $ of capital deployed
-WEIGHT_COMPETITION: int = 25        # Capture rate (our share of pool)
-WEIGHT_FILL_SAFETY: int = 15        # Lower volume = fewer fills = less adverse selection
-WEIGHT_UNWIND_ABILITY: int = 15     # Bid depth — can we get out?
+WEIGHT_REWARD_EFFICIENCY: int = 30  # Estimated reward per $ of capital deployed
+WEIGHT_COMPETITION: int = 15        # Capture rate (our share of pool)
+WEIGHT_FILL_SAFETY: int = 25        # Lower volume = fewer fills = less adverse selection ← KEY
+WEIGHT_UNWIND_ABILITY: int = 10     # Bid depth — can we get out?
 WEIGHT_DAILY_RATE: int = 10         # Raw pool size (tiebreaker, not primary)
 WEIGHT_SPREAD: int = 10             # Wider reward window = easier to stay inside
 
@@ -58,9 +58,10 @@ MAX_YES_PRICE: float = 0.95      # Skip if Yes price above 95c
 MIN_DAILY_RATE: float = 5.0      # Skip if daily reward rate below $5
 MIN_LIQUIDITY: int = 1000        # Skip if liquidity below $1000
 MIN_SPREAD_ALLOWED: float = 0.01 # Skip if max spread below 1c
+MAX_VOLUME_TO_REWARD_RATIO: float = 20.0  # Skip if 24h_volume / daily_rate > 20 (too fill-heavy)
 
 # ── Order Management ──────────────────────────────────────────────────────────
-ORDER_SIZE: int = 250        # Reduced from $500 — limits adverse selection damage
+ORDER_SIZE: int = 150        # Reward farming: smaller fills = less trapped capital
 MAX_ORDER_BUDGET: int = 750  # Hard cap — allows sports markets with high min_size
 CHEAP_TOKEN_THRESHOLD: float = 0.25  # Tokens under 25c get reduced order size
 CHEAP_TOKEN_SCALE: float = 0.50     # Scale order size to 50% for cheap tokens
@@ -92,12 +93,12 @@ POST_FILL_COOLDOWN_SECS: int = 90      # Widen for 90s after fill (~3 cycles)
 POST_FILL_WIDEN_TICKS: int = 3         # Extra ticks to push bid away on filled side
 
 # ── Order Zone Thresholds ─────────────────────────────────────────────────────
-DANGER_ZONE_CENTS: float = 0.005  # Cancel if order within 0.5c of best price
+DANGER_ZONE_CENTS: float = 0.01   # Cancel if order within 1c of best price (wider = fewer instant fills)
 DEAD_ZONE_BUFFER: float = 0.001   # Buffer beyond max spread for dead zone
 
 # ── Position Limits ───────────────────────────────────────────────────────────
-MAX_POSITION_USD: int = 400     # Stop quoting a side if position exceeds $400
-RESUME_POSITION_USD: int = 300  # Resume quoting when position falls below $300
+MAX_POSITION_USD: int = 200     # Stop quoting early — trapped capital earns no rewards
+RESUME_POSITION_USD: int = 125  # Resume quoting when position falls below $125
 
 # ── Alert Thresholds ──────────────────────────────────────────────────────────
 MAX_ORDER_FAILURES: int = 3  # Alert after this many consecutive order failures
@@ -119,11 +120,17 @@ UNWIND_DECAY_TICKS: int = 1             # Ticks to drop per interval
 # Tier 2: 10-15% loss → 3x decay (3c/5min = 36c/hr)
 # Tier 3: >15% loss → 4x decay (4c/5min = 48c/hr) — still no panic
 UNWIND_ACCEL_TIERS: list = [
-    (0.05, 2),   # 5% loss → 2x
-    (0.10, 3),   # 10% loss → 3x
-    (0.15, 4),   # 15% loss → 4x (max — no 5x panic)
+    (0.03, 2),   # 3% loss → 2x (trigger earlier for reward farming)
+    (0.06, 3),   # 6% loss → 3x
+    (0.10, 4),   # 10% loss → 4x (max — no 5x panic)
 ]
 MIN_SELL_PRICE: float = 0.01            # Never sell below 1 cent
+
+# ── Reward-Offset Unwind Budget ───────────────────────────────────────────
+# Decay is bounded: never lose more than this fraction of rewards earned
+# while holding the position. E.g., 0.50 = allow up to 50% of earned rewards
+# as unwind loss. Ensures every position is NET profitable after rewards.
+REWARD_LOSS_BUDGET_PCT: float = 0.50
 
 # ── Position Age Acceleration ────────────────────────────────────────────
 # Capital trapped in a position for >24h earns zero rewards and blocks
@@ -136,8 +143,8 @@ UNWIND_AGE_MAX_TICKS: int = 4          # Extra ticks after max age
 # ── Stop-Loss ───────────────────────────────────────────────────────────────
 # If unrealized loss on a position exceeds this threshold, immediately
 # sell at the current market bid to prevent further damage.
-STOP_LOSS_PCT: float = 0.25        # 25% unrealized loss → dump at market (was 20%)
-MIN_STOP_LOSS_USD: float = 75.0    # AND absolute loss must exceed $75 (was $50)
+STOP_LOSS_PCT: float = 0.15        # 15% unrealized loss → dump at market (reward-first: cut early)
+MIN_STOP_LOSS_USD: float = 40.0    # AND absolute loss must exceed $40 (tighter for smaller positions)
 STOP_LOSS_MIN_PRICE: float = 0.20  # Skip stop-loss on tokens under 20c (let decay handle)
 
 # ── Market Depth Filter ─────────────────────────────────────────────────────
@@ -167,8 +174,8 @@ VOL_WIDEN_MAX_TICKS: int = 3       # Cap: never widen more than 3 ticks from co-
 # Volatile, thin, low-reward markets get smaller orders.
 # The result is clamped to [DYNAMIC_SIZE_MIN, DYNAMIC_SIZE_MAX].
 DYNAMIC_SIZING_ENABLED: bool = True
-DYNAMIC_SIZE_MIN: int = 100          # Never size below $100
-DYNAMIC_SIZE_MAX: int = 500          # Never size above $500
+DYNAMIC_SIZE_MIN: int = 100          # Floor — must meet min_size for reward eligibility
+DYNAMIC_SIZE_MAX: int = 250          # Cap per-order budget — limits fill damage
 # Weights for the sizing score (0-1 each, then combined):
 # reward_eff: higher reward per $ deployed → size up
 # stability: low volatility → size up
