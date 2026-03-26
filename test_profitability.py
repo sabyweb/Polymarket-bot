@@ -72,7 +72,7 @@ from config import (
 
 check("Spread pricing enabled", USE_SPREAD_PRICING is True)
 check("Edge pct = 0.70", SPREAD_EDGE_PCT == 0.70)
-check("Min edge ticks = 2", MIN_EDGE_TICKS == 2)
+check("Min edge ticks = 1", MIN_EDGE_TICKS == 1)
 check("Inventory skew enabled", INVENTORY_SKEW_ENABLED is True)
 check("Skew threshold = $50", INVENTORY_SKEW_THRESHOLD == 50.0)
 check("Skew ticks = 2", INVENTORY_SKEW_TICKS == 2)
@@ -84,36 +84,48 @@ check("Min bid depth = $500", MIN_BID_DEPTH_USD == 500.0)
 # ═══════════════════════════════════════════════════════════════════════════════
 print("\n=== TEST 3: Spread-Relative Price Math ===")
 
-# Simulate the core calculation
-midpoint = 0.50
+# Simulate the NEW pricing: place MIN_EDGE_TICKS behind best bid/ask,
+# clamped to reward window
+best_bid = 0.49
+best_ask = 0.51
+midpoint = (best_bid + best_ask) / 2  # 0.50
 max_spread = 0.04  # 4 cents
 tick = 0.01
 
-# Core formula: place at SPREAD_EDGE_PCT of max_spread from mid
-edge_offset = max_spread * SPREAD_EDGE_PCT  # 0.04 * 0.70 = 0.028
-our_bid = round(round((midpoint - edge_offset) / tick) * tick, 2)
-our_ask = round(round((midpoint + edge_offset) / tick) * tick, 2)
+# New formula: place MIN_EDGE_TICKS behind best bid/ask
+min_gap = MIN_EDGE_TICKS * tick  # 1 * 0.01 = 0.01
+our_bid = round(round((best_bid - min_gap) / tick) * tick, 2)  # 0.49 - 0.01 = 0.48
+our_ask = round(round((best_ask + min_gap) / tick) * tick, 2)  # 0.51 + 0.01 = 0.52
+
+# Clamp to reward window
+reward_floor = round(round((midpoint - max_spread) / tick) * tick, 2)
+reward_ceil = round(round((midpoint + max_spread) / tick) * tick, 2)
+our_bid = max(our_bid, reward_floor)
+our_ask = min(our_ask, reward_ceil)
 
 check("Bid is below midpoint", our_bid < midpoint)
 check("Ask is above midpoint", our_ask > midpoint)
 check("Bid inside reward window", abs(our_bid - midpoint) <= max_spread)
 check("Ask inside reward window", abs(our_ask - midpoint) <= max_spread)
-check("Spread captures value", our_ask - our_bid > 0.04,
-      f"spread={our_ask - our_bid:.4f}")
+check("Bid = best_bid - 1 tick", our_bid == 0.48, f"bid={our_bid}")
+check("Ask = best_ask + 1 tick", our_ask == 0.52, f"ask={our_ask}")
 
-# With a 50/50 market at 4c max_spread, bid should be ~0.47, ask ~0.53
-check("Bid near 0.47", abs(our_bid - 0.47) <= 0.01, f"bid={our_bid}")
-check("Ask near 0.53", abs(our_ask - 0.53) <= 0.01, f"ask={our_ask}")
+# Test with tight market (1c spread) and wide reward window (5c)
+# This was the bug: old code placed at midpoint ± 0.035, pushing 3-4 ticks away
+best_bid_tight = 0.58
+best_ask_tight = 0.59
+mid_tight = (best_bid_tight + best_ask_tight) / 2  # 0.585
+max_spread_wide = 0.05
+our_bid_t = round(round((best_bid_tight - min_gap) / tick) * tick, 2)  # 0.57
+our_ask_t = round(round((best_ask_tight + min_gap) / tick) * tick, 2)  # 0.60
+reward_floor_t = round(round((mid_tight - max_spread_wide) / tick) * tick, 2)
+reward_ceil_t = round(round((mid_tight + max_spread_wide) / tick) * tick, 2)
+our_bid_t = max(our_bid_t, reward_floor_t)
+our_ask_t = min(our_ask_t, reward_ceil_t)
 
-# Test with skewed market
-midpoint_skewed = 0.75
-edge_offset = max_spread * SPREAD_EDGE_PCT
-bid_skewed = round(round((midpoint_skewed - edge_offset) / tick) * tick, 2)
-ask_skewed = round(round((midpoint_skewed + edge_offset) / tick) * tick, 2)
-
-check("Skewed bid inside window", abs(bid_skewed - midpoint_skewed) <= max_spread)
-check("Skewed ask inside window", abs(ask_skewed - midpoint_skewed) <= max_spread)
-check("Skewed bid captures spread", ask_skewed - bid_skewed > 0.04)
+check("Tight market bid = 0.57 (1 behind best)", our_bid_t == 0.57, f"bid={our_bid_t}")
+check("Tight market ask = 0.60 (1 behind best)", our_ask_t == 0.60, f"ask={our_ask_t}")
+check("Tight: bid NOT at old 0.55", our_bid_t != 0.55, "fixed old bug")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

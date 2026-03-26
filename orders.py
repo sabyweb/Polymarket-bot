@@ -138,6 +138,8 @@ class OrderManager:
         self._token_balance_cache: dict[str, tuple[float, float]] = {}  # side → (balance, timestamp)
         # Post-fill cooldown: track last BUY fill time per side
         self._last_fill_time: dict[str, float] = {"yes": 0.0, "no": 0.0}
+        # Reward tracker callback — set by the bot to record fill events
+        self._reward_tracker: object | None = None
 
     # ── Tick Size Rounding ───────────────────────────────────────────────────
     def round_to_tick(self, price: float) -> float:
@@ -493,12 +495,14 @@ class OrderManager:
     ) -> tuple[float | None, float | None]:
         """Spread-relative pricing: place orders inside the reward window.
 
-        Strategy: our bid = midpoint - (max_spread * SPREAD_EDGE_PCT)
-                  our ask = midpoint + (max_spread * SPREAD_EDGE_PCT)
+        Strategy: place just behind the best bid/ask by MIN_EDGE_TICKS,
+        then clamp to stay inside the reward window.  This keeps us near
+        the top of the book (maximising reward share and fill probability)
+        while avoiding being the very first order (adverse selection).
 
-        This earns rewards (inside max_spread) while capturing spread
-        and staying far enough from the midpoint to avoid being adversely
-        selected on every small price move.
+        The old approach (midpoint ± max_spread * 0.70) pushed orders too
+        far from the action when the market spread was tighter than the
+        reward window, resulting in 3-4 tick gaps from best bid/ask.
 
         Also checks bid-side depth — if the book is too thin to unwind,
         we skip this market for this cycle.
@@ -518,37 +522,39 @@ class OrderManager:
             )
             return None, None
 
-        # Core calculation: place at SPREAD_EDGE_PCT of max_spread from mid
-        edge_offset = max_spread * SPREAD_EDGE_PCT
-        our_bid = self.round_to_tick(midpoint - edge_offset)
-        our_ask = self.round_to_tick(midpoint + edge_offset)
-
-        # Enforce minimum distance from best bid/ask (avoid being first in line)
+        # Core calculation: place MIN_EDGE_TICKS behind best bid/ask
+        # This keeps us near top-of-book for maximum reward share.
         min_gap = MIN_EDGE_TICKS * tick
-        if our_bid > best_bid - min_gap:
-            our_bid = self.round_to_tick(best_bid - min_gap)
-        if our_ask < best_ask + min_gap:
-            our_ask = self.round_to_tick(best_ask + min_gap)
+        our_bid = self.round_to_tick(best_bid - min_gap)
+        our_ask = self.round_to_tick(best_ask + min_gap)
 
-        # Verify still inside reward window
-        if abs(our_bid - midpoint) > max_spread:
+        # Clamp to stay inside the reward window (midpoint ± max_spread)
+        reward_floor = self.round_to_tick(midpoint - max_spread)
+        reward_ceil = self.round_to_tick(midpoint + max_spread)
+        our_bid = max(our_bid, reward_floor)
+        our_ask = min(our_ask, reward_ceil)
+
+        # Verify still inside reward window after rounding
+        if abs(our_bid - midpoint) > max_spread + tick * 0.5:
             log.warning(
                 f"Bid would fall outside reward window "
                 f"(bid={our_bid:.4f}, mid={midpoint:.4f}, max_spread={max_spread}) "
-                f"for {question[:40]} — skipping bid"
+                f"for {question[:40]} — skipping"
             )
             return None, None
-        if abs(our_ask - midpoint) > max_spread:
+        if abs(our_ask - midpoint) > max_spread + tick * 0.5:
             log.warning(
                 f"Ask would fall outside reward window "
                 f"(ask={our_ask:.4f}, mid={midpoint:.4f}, max_spread={max_spread}) "
-                f"for {question[:40]} — skipping ask"
+                f"for {question[:40]} — skipping"
             )
             return None, None
 
         log.debug(
-            f"Spread pricing | mid={midpoint:.4f} | edge={edge_offset:.4f} | "
-            f"bid={our_bid:.4f} | ask={our_ask:.4f} | "
+            f"Spread pricing | mid={midpoint:.4f} | "
+            f"bid={our_bid:.4f} (best-{MIN_EDGE_TICKS}t) | "
+            f"ask={our_ask:.4f} (best+{MIN_EDGE_TICKS}t) | "
+            f"reward_window=[{reward_floor:.4f}, {reward_ceil:.4f}] | "
             f"bid_depth=${bid_depth:.0f}"
         )
         return our_bid, our_ask
@@ -875,6 +881,10 @@ class OrderManager:
                 }
                 self.failure_counts[side] = 0
                 self.invalidate_balance_cache()
+                if self._reward_tracker:
+                    self._reward_tracker.record_order_placed(
+                        self.market["condition_id"]
+                    )
                 if exchange_id is None:
                     log.warning(
                         f"Tracking {side.upper()} order via POST orderID "
@@ -1636,6 +1646,11 @@ class OrderManager:
                 side, avg_price, position_shares,
                 clob_price_override=sell_price,
             )
+            # Record stop-loss event
+            if self._reward_tracker and unrealized_loss_usd > 0:
+                self._reward_tracker.record_stop_loss(
+                    condition_id, unrealized_loss_usd
+                )
 
     def _try_merge_positions(
         self, condition_id: str, amount: float
@@ -1763,6 +1778,10 @@ class OrderManager:
             if order_id in self.active_orders:
                 del self.active_orders[order_id]
             self.invalidate_balance_cache()  # Collateral freed
+            if self._reward_tracker:
+                self._reward_tracker.record_order_cancelled(
+                    self.market["condition_id"], reason
+                )
             return True
         except Exception as e:
             log.error(f"Failed to cancel order {order_id}: {e}")
@@ -1905,6 +1924,12 @@ class OrderManager:
                                 question=self.market["question"],
                             )
                             self._last_fill_time[side] = _time.time()
+                            # Record to reward tracker
+                            if self._reward_tracker:
+                                self._reward_tracker.record_buy_fill(
+                                    self.market["condition_id"],
+                                    filled_shares, filled_usd,
+                                )
                         except Exception as e:
                             log.error(
                                 f"Error processing fill for {oid[:16]}... "
@@ -1954,6 +1979,12 @@ class OrderManager:
                             question=self.market["question"],
                         )
                         self._last_fill_time[side] = _time.time()
+                        # Record to reward tracker
+                        if self._reward_tracker:
+                            self._reward_tracker.record_buy_fill(
+                                self.market["condition_id"],
+                                filled_shares, filled_usd,
+                            )
                         # Update tracked size so next partial detection
                         # only captures the NEW delta, not the same fill.
                         # Keep original_size as the LAST known baseline
@@ -2004,6 +2035,17 @@ class OrderManager:
                                 self.market["condition_id"], side,
                                 unwound_shares, uorder["price"]
                             )
+                            # Record sell fill to reward tracker with VWAP cost
+                            if self._reward_tracker:
+                                cid = self.market["condition_id"]
+                                avg_p = self.position_tracker.get_avg_price(cid, side)
+                                vwap_cost = 0.0
+                                if avg_p > 0:
+                                    vwap_cost = to_clob(avg_p, side) * unwound_shares
+                                self._reward_tracker.record_sell_fill(
+                                    cid, unwound_shares, unwound_usd,
+                                    vwap_cost_usd=vwap_cost,
+                                )
                             del self.unwind_orders[oid]
                         elif status == "UNKNOWN":
                             # API error — keep tracking, count consecutive failures

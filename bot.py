@@ -25,6 +25,7 @@ from state import PositionStore as PositionTracker
 from orders import OrderManager, BalanceGate
 from rate_limiter import RateLimitedClient
 from arbitrage import ArbitrageScanner
+from reward_tracker import RewardTracker
 from alerts import (
     setup_logger, alert_bot_restart, alert_no_markets,
     alert_api_failure, alert_positions, alert_heartbeat_failure,
@@ -56,6 +57,7 @@ class MarketMakerBot:
         self._arb_scanner: ArbitrageScanner | None = None
         self._last_arb_scan: float = 0
         self._last_reward_log: float = 0
+        self.reward_tracker: RewardTracker = RewardTracker()
 
     # ── Client Setup ─────────────────────────────────────────────────────────
     def connect(self) -> bool:
@@ -255,6 +257,15 @@ class MarketMakerBot:
             self.client, market, self.position_tracker,
             balance_gate=self.balance_gate,
         )
+        self.order_managers[condition_id]._reward_tracker = self.reward_tracker
+
+        # Register in reward tracker
+        self.reward_tracker.get_or_create(
+            condition_id=condition_id,
+            question=question,
+            daily_rate=market.get("daily_rate", 0),
+            max_spread=market.get("max_spread", 0),
+        )
 
         if existing_unwinds:
             self.order_managers[condition_id].unwind_orders = existing_unwinds
@@ -369,13 +380,17 @@ class MarketMakerBot:
                         break
                     condition_id = market["condition_id"]
                     if condition_id in self.order_managers:
+                        manager = self.order_managers[condition_id]
                         try:
-                            self.order_managers[condition_id].run_cycle()
+                            manager.run_cycle()
                         except Exception as e:
                             log.error(
                                 f"Cycle error for "
                                 f"{market['question'][:40]}: {e}"
                             )
+
+                        # ── Record per-market stats for reward tracking ───
+                        self._record_cycle_stats(condition_id, market, manager)
 
                 # ── Check unwind-only managers (removed markets) ────────
                 active_cids = {m["condition_id"] for m in self.active_markets}
@@ -429,12 +444,16 @@ class MarketMakerBot:
                     self._last_arb_scan = time.time()
 
                 # ── Reward earnings log (every hour) ────────────────────
-                if time.time() - self._last_reward_log >= REWARD_LOG_INTERVAL_SECS:
-                    try:
-                        self._log_reward_earnings()
-                    except Exception as e:
-                        log.debug(f"Reward log error: {e}")
-                    self._last_reward_log = time.time()
+                try:
+                    self.reward_tracker.maybe_log_hourly(self.active_markets)
+                except Exception as e:
+                    log.debug(f"Reward log error: {e}")
+
+                # ── Daily performance report (every 24 hours) ─────────
+                try:
+                    self.reward_tracker.maybe_generate_daily_report()
+                except Exception as e:
+                    log.debug(f"Daily report error: {e}")
 
                 # ── Wait for next cycle (interruptible) ───────────────────
                 if not self._shutdown_requested:
@@ -668,6 +687,7 @@ class MarketMakerBot:
                 self.client, minimal_market, self.position_tracker,
                 balance_gate=self.balance_gate,
             )
+            self.order_managers[cid]._reward_tracker = self.reward_tracker
             log.info(
                 f"Created unwind-only manager for orphaned position: "
                 f"{question[:40]} | YES={yes_shares:.1f} NO={no_shares:.1f}"
@@ -738,6 +758,7 @@ class MarketMakerBot:
                     self.client, market_data, self.position_tracker,
                     balance_gate=self.balance_gate,
                 )
+                self.order_managers[cid]._reward_tracker = self.reward_tracker
 
                 log.info(
                     f"Created unwind manager from rewards data: "
@@ -776,6 +797,7 @@ class MarketMakerBot:
                 self.client, minimal_market, self.position_tracker,
                 balance_gate=self.balance_gate,
             )
+            self.order_managers[cid]._reward_tracker = self.reward_tracker
             log.info(
                 f"Created unwind manager from Gamma API: "
                 f"{question[:40]} | YES={yes_shares:.1f} NO={no_shares:.1f}"
@@ -823,6 +845,59 @@ class MarketMakerBot:
             log.warning("Old orders may still be live — check Polymarket UI")
 
     # ── Reward Earnings Tracking ─────────────────────────────────────────────
+    def _record_cycle_stats(self, condition_id: str, market: dict,
+                             manager: "OrderManager") -> None:
+        """Record per-market stats for the reward tracker after each cycle."""
+        try:
+            stats = self.reward_tracker.get_or_create(
+                condition_id=condition_id,
+                question=market.get("question", ""),
+                daily_rate=market.get("daily_rate", 0),
+                max_spread=market.get("max_spread", 0),
+            )
+
+            # Which sides have live orders?
+            active_sides = {o["side"] for o in manager.active_orders.values()}
+            has_yes = "yes" in active_sides
+            has_no = "no" in active_sides
+
+            # Current bid/ask prices from our orders
+            bid_price = 0.0
+            ask_price = 0.0
+            for o in manager.active_orders.values():
+                if o["side"] == "yes":
+                    bid_price = o["price"]
+                elif o["side"] == "no":
+                    ask_price = o["price"]
+
+            # Inventory on this market
+            yes_usd = self.position_tracker.get_position(condition_id, "yes")
+            no_usd = self.position_tracker.get_position(condition_id, "no")
+            inventory_usd = yes_usd + no_usd
+
+            # Cooldown / skew state
+            import time as _t
+            from config import POST_FILL_COOLDOWN_SECS, INVENTORY_SKEW_THRESHOLD
+            cooldown_active = (
+                _t.time() - manager._last_fill_time.get("yes", 0) < POST_FILL_COOLDOWN_SECS
+                or _t.time() - manager._last_fill_time.get("no", 0) < POST_FILL_COOLDOWN_SECS
+            )
+            skew_active = inventory_usd > INVENTORY_SKEW_THRESHOLD
+
+            self.reward_tracker.record_cycle(
+                condition_id=condition_id,
+                has_yes_order=has_yes,
+                has_no_order=has_no,
+                bid_price=bid_price,
+                ask_price=ask_price,
+                inventory_usd=inventory_usd,
+                cooldown_active=cooldown_active,
+                skew_active=skew_active,
+                cycle_duration_secs=ORDER_REFRESH_SECS,
+            )
+        except Exception as e:
+            log.debug(f"Reward stat recording error: {e}")
+
     def _log_reward_earnings(self) -> None:
         """Query and log estimated reward earnings for visibility.
 

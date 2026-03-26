@@ -77,7 +77,7 @@ MIN_LIQUIDITY_BUFFER: float = 2000.0  # $2000 of liquidity buffer (was $1000)
 # midpoint to the reward boundary → sits inside the window, earns rewards,
 # and captures more spread than hiding behind $2K of volume.
 SPREAD_EDGE_PCT: float = 0.70   # Place orders at 70% of max_spread from mid
-MIN_EDGE_TICKS: int = 2         # At minimum, stay 2 ticks from best bid/ask
+MIN_EDGE_TICKS: int = 1         # Stay 1 tick behind best bid/ask (tight but inside reward window)
 USE_SPREAD_PRICING: bool = True  # Toggle: True = spread-relative, False = old buffer
 MIN_PRICE_DRIFT_TICKS: int = 2  # Only cancel+replace when price drifts by 2+ ticks
                                  # Keeps orders alive through small oscillations → more reward time
