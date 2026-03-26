@@ -522,11 +522,25 @@ class OrderManager:
             )
             return None, None
 
-        # Core calculation: place MIN_EDGE_TICKS behind best bid/ask
-        # This keeps us near top-of-book for maximum reward share.
-        min_gap = MIN_EDGE_TICKS * tick
-        our_bid = self.round_to_tick(best_bid - min_gap)
-        our_ask = self.round_to_tick(best_ask + min_gap)
+        # Smart placement: if best bid/ask level has ≥$1000 of depth,
+        # join at that price (co-best) — we're shielded by queue priority.
+        # Otherwise, place MIN_EDGE_TICKS behind to avoid being first.
+        bid_top_depth = float(order_book["bids"][0]["price"]) * float(order_book["bids"][0]["size"])
+        ask_top_depth = float(order_book["asks"][0]["price"]) * float(order_book["asks"][0]["size"])
+
+        CO_BEST_DEPTH_THRESHOLD = 1000.0  # Join best price if ≥$1K shields us
+
+        if bid_top_depth >= CO_BEST_DEPTH_THRESHOLD:
+            our_bid = best_bid  # Join at best bid — $1K+ ahead of us in queue
+        else:
+            min_gap = MIN_EDGE_TICKS * tick
+            our_bid = self.round_to_tick(best_bid - min_gap)
+
+        if ask_top_depth >= CO_BEST_DEPTH_THRESHOLD:
+            our_ask = best_ask  # Join at best ask — $1K+ ahead of us in queue
+        else:
+            min_gap = MIN_EDGE_TICKS * tick
+            our_ask = self.round_to_tick(best_ask + min_gap)
 
         # Clamp to stay inside the reward window (midpoint ± max_spread)
         reward_floor = self.round_to_tick(midpoint - max_spread)
@@ -2198,9 +2212,56 @@ class OrderManager:
         # Step 6: Place fresh orders where needed
         #         BLOCK new BUY orders if there's an unwind pending/active
         #         on that side — we need to sell inventory first, not buy more
+        #
+        # Guard against duplicate orders: if we think a side is empty but
+        # the exchange actually has our orders (tracking drift), re-sync
+        # instead of placing duplicates.
         active_sides = {o["side"] for o in self.active_orders.values()}
         needs_yes = "yes" not in active_sides
         needs_no = "no" not in active_sides
+
+        if needs_yes or needs_no:
+            # Quick check: are there orders on the exchange we're not tracking?
+            try:
+                market_tokens = set(self.market["token_ids"])
+                exchange_orders = self.client.get_orders()
+                if exchange_orders:
+                    for o in exchange_orders:
+                        if o.get("asset_id") not in market_tokens:
+                            continue
+                        oid = o["id"]
+                        if oid in self.active_orders or oid in self.unwind_orders:
+                            continue
+                        # Found an untracked order on the exchange for our market
+                        o_side = o.get("side", "")
+                        o_price = float(o.get("price", 0))
+                        o_size = float(o.get("original_size", o.get("size", 0)))
+                        # Map CLOB side to our side
+                        yes_token = self.market["token_ids"][0]
+                        if o.get("asset_id") == yes_token:
+                            mapped_side = "yes" if o_side == "BUY" else "yes"
+                        else:
+                            mapped_side = "no" if o_side == "BUY" else "no"
+
+                        log.warning(
+                            f"RESYNC | Found untracked {mapped_side.upper()} order "
+                            f"on exchange: {oid[:16]}... @ {o_price:.4f} / "
+                            f"{o_size:.1f} shares — adopting into tracker"
+                        )
+                        self.active_orders[oid] = {
+                            "side": mapped_side,
+                            "price": o_price,
+                            "size": o_size,
+                            "original_size": o_size,
+                            "placed_at": _time.time(),
+                            "from_post_response": False,
+                        }
+                        if mapped_side in ("yes", "no"):
+                            active_sides.add(mapped_side)
+                    needs_yes = "yes" not in active_sides
+                    needs_no = "no" not in active_sides
+            except Exception as e:
+                log.debug(f"Resync check failed: {e}")
 
         if needs_yes and self.has_unhedged_position("yes"):
             log.info(
