@@ -60,17 +60,15 @@ check("25% loss → 4x (capped)", compute_tier(0.25) == 4)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TEST 2: Spread-Relative Pricing Config
+# TEST 2: Co-Best Pricing Config
 # ═══════════════════════════════════════════════════════════════════════════════
-print("\n=== TEST 2: Spread Pricing Config ===")
+print("\n=== TEST 2: Co-Best Pricing Config ===")
 
 from config import (
-    USE_SPREAD_PRICING,
     INVENTORY_SKEW_ENABLED, INVENTORY_SKEW_TICKS, INVENTORY_SKEW_THRESHOLD,
     MIN_BID_DEPTH_USD,
 )
 
-check("Spread pricing enabled", USE_SPREAD_PRICING is True)
 check("Inventory skew enabled", INVENTORY_SKEW_ENABLED is True)
 check("Skew threshold = $50", INVENTORY_SKEW_THRESHOLD == 50.0)
 check("Skew ticks = 2", INVENTORY_SKEW_TICKS == 2)
@@ -331,20 +329,36 @@ check("Min stop-loss $75 (not $50)", MIN_STOP_LOSS_USD == 75.0)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TEST 10: Old Buffer Still Works When Toggled
+# TEST 10: Core Pricing Methods Exist
 # ═══════════════════════════════════════════════════════════════════════════════
-print("\n=== TEST 10: Buffer Pricing Fallback ===")
+print("\n=== TEST 10: Core Pricing Methods ===")
 
-# Verify the old strategy still exists and is reachable
-import orders
-check("_liquidity_buffer_prices exists",
-      hasattr(orders.OrderManager, '_liquidity_buffer_prices'))
-check("_spread_relative_prices exists",
-      hasattr(orders.OrderManager, '_spread_relative_prices'))
-check("_apply_inventory_skew exists",
-      hasattr(orders.OrderManager, '_apply_inventory_skew'))
-check("_tiered_decay_ticks exists",
-      hasattr(orders.OrderManager, '_tiered_decay_ticks'))
+try:
+    import orders
+    check("_spread_relative_prices exists",
+          hasattr(orders.OrderManager, '_spread_relative_prices'))
+    check("_apply_inventory_skew exists",
+          hasattr(orders.OrderManager, '_apply_inventory_skew'))
+    check("_tiered_decay_ticks exists",
+          hasattr(orders.OrderManager, '_tiered_decay_ticks'))
+    check("_liquidity_buffer_prices removed",
+          not hasattr(orders.OrderManager, '_liquidity_buffer_prices'))
+    check("_find_exchange_order_id removed",
+          not hasattr(orders.OrderManager, '_find_exchange_order_id'))
+except ImportError:
+    # py_clob_client not installed in test environment — verify via source.
+    # After the god-class split, methods live in separate mixin files.
+    import ast
+    all_methods = set()
+    for src_file in ["order_manager.py", "pricing.py", "placement.py", "fills.py", "unwind.py"]:
+        with open(src_file) as f:
+            tree = ast.parse(f.read())
+        all_methods |= {node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
+    check("_spread_relative_prices exists", "_spread_relative_prices" in all_methods)
+    check("_apply_inventory_skew exists", "_apply_inventory_skew" in all_methods)
+    check("_tiered_decay_ticks exists", "_tiered_decay_ticks" in all_methods)
+    check("_liquidity_buffer_prices removed", "_liquidity_buffer_prices" not in all_methods)
+    check("_find_exchange_order_id removed", "_find_exchange_order_id" not in all_methods)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

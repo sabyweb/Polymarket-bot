@@ -14,7 +14,7 @@ Public API is identical to PositionTracker so migration is a one-line import swa
 import json
 import logging
 import os
-import tempfile
+import threading
 from config import MAX_POSITION_USD, RESUME_POSITION_USD
 from alerts import alert_position_limit, log_position_update
 
@@ -185,6 +185,7 @@ class PositionStore:
     def __init__(self) -> None:
         # {condition_id: {"question": str, "yes": SidePosition, "no": SidePosition}}
         self._markets: dict[str, dict] = {}
+        self._lock = threading.Lock()  # Thread safety for concurrent market cycles
         self._load()
 
     # ── Internal accessors ───────────────────────────────────────────────────
@@ -205,57 +206,86 @@ class PositionStore:
             self.register_market(condition_id, name)
         return self._markets[condition_id][side.lower()]
 
-    # ── Persistence ──────────────────────────────────────────────────────────
+    # ── Persistence (A3: SQLite primary, JSON fallback for migration) ──────
 
     def _load(self) -> None:
-        """Load positions from disk, supporting both old and new formats."""
-        if not os.path.exists(POSITIONS_FILE):
-            return
-        try:
-            with open(POSITIONS_FILE, "r") as f:
-                data = json.load(f)
-            if not isinstance(data, dict):
-                return
+        """Load positions: try SQLite first, fall back to JSON for migration."""
+        from database import get_db
+        db = get_db()
 
-            for cid, pos in data.items():
-                question = pos.get("question", f"unknown-{cid[:12]}")
-                yes = SidePosition(
-                    side="yes",
-                    shares=pos.get("yes_shares", 0.0),
-                    avg_price=pos.get("yes_avg_price", 0.0),
-                    halted=pos.get("yes_halted", False),
-                )
-                no = SidePosition(
-                    side="no",
-                    shares=pos.get("no_shares", 0.0),
-                    avg_price=pos.get("no_avg_price", 0.0),
-                    halted=pos.get("no_halted", False),
-                )
-                self._markets[cid] = {
-                    "question": question,
-                    "yes": yes,
-                    "no": no,
-                }
-
+        # Try SQLite first
+        data = db.load_all_positions()
+        if data:
+            self._populate_from_dict(data)
             non_zero = sum(
                 1 for m in self._markets.values()
                 if not m["yes"].is_empty or not m["no"].is_empty
             )
             log.info(
-                f"Loaded {len(self._markets)} positions from disk "
+                f"Loaded {len(self._markets)} positions from SQLite "
                 f"({non_zero} with open exposure)"
             )
+            return
+
+        # Fall back to JSON (migration path)
+        if not os.path.exists(POSITIONS_FILE):
+            return
+        try:
+            with open(POSITIONS_FILE, "r") as f:
+                json_data = json.load(f)
+            if not isinstance(json_data, dict):
+                return
+
+            self._populate_from_dict(json_data)
+            non_zero = sum(
+                1 for m in self._markets.values()
+                if not m["yes"].is_empty or not m["no"].is_empty
+            )
+            log.info(
+                f"Migrated {len(self._markets)} positions from JSON to SQLite "
+                f"({non_zero} with open exposure)"
+            )
+            # Save to SQLite immediately
+            self._save()
+            # Rename old JSON so it doesn't get loaded again
+            try:
+                migrated = POSITIONS_FILE + ".migrated"
+                os.rename(POSITIONS_FILE, migrated)
+                log.info(f"Renamed {POSITIONS_FILE} → {migrated}")
+            except OSError as rename_err:
+                log.warning(f"Could not rename positions.json: {rename_err}")
+
         except Exception as e:
             log.warning(f"Could not load positions from {POSITIONS_FILE}: {e}")
 
-    def _save(self) -> None:
-        """Persist current positions to disk atomically, pruning empty entries.
+    def _populate_from_dict(self, data: dict) -> None:
+        """Populate _markets from a flat position dict (JSON or SQLite format)."""
+        for cid, pos in data.items():
+            question = pos.get("question", f"unknown-{cid[:12]}")
+            yes = SidePosition(
+                side="yes",
+                shares=pos.get("yes_shares", 0.0),
+                avg_price=pos.get("yes_avg_price", 0.0),
+                halted=pos.get("yes_halted", False),
+            )
+            no = SidePosition(
+                side="no",
+                shares=pos.get("no_shares", 0.0),
+                avg_price=pos.get("no_avg_price", 0.0),
+                halted=pos.get("no_halted", False),
+            )
+            self._markets[cid] = {
+                "question": question,
+                "yes": yes,
+                "no": no,
+            }
 
-        Format is backward-compatible with the old positions.json:
-        flat keys (yes_shares, no_shares, etc.) plus derived USD fields
-        for observability. The 'yes' and 'no' top-level USD fields are
-        written for debugging but IGNORED on load (USD is always derived).
+    def _save(self) -> None:
+        """Persist current positions to SQLite (A3).
+
+        Thread-safe: called within self._lock from all mutation methods.
         """
+        from database import get_db
         try:
             pruned = {}
             for cid, market in self._markets.items():
@@ -268,32 +298,18 @@ class PositionStore:
                     continue
 
                 pruned[cid] = {
-                    "yes": round(yes.usd, 2),        # Derived — for debugging only
-                    "no": round(no.usd, 2),           # Derived — for debugging only
+                    "question": market["question"],
                     "yes_shares": yes.shares,
                     "no_shares": no.shares,
                     "yes_avg_price": yes.avg_price,
                     "no_avg_price": no.avg_price,
                     "yes_halted": yes.halted,
                     "no_halted": no.halted,
-                    "question": market["question"],
                 }
 
-            # Atomic write
-            dir_name = os.path.dirname(POSITIONS_FILE) or "."
-            fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
-            try:
-                with os.fdopen(fd, "w") as f:
-                    json.dump(pruned, f, indent=2)
-                os.replace(tmp_path, POSITIONS_FILE)
-            except Exception:
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
-                raise
+            get_db().save_all_positions(pruned)
         except Exception as e:
-            log.error(f"Could not save positions to {POSITIONS_FILE}: {e}")
+            log.error(f"Could not save positions to SQLite: {e}")
 
     # ── Public API (identical to PositionTracker) ────────────────────────────
 
@@ -320,6 +336,8 @@ class PositionStore:
     ) -> None:
         """Record a BUY fill and check position limits.
 
+        Thread-safe: acquires self._lock for the duration.
+
         Args:
             condition_id: Unique market identifier.
             side: "yes" or "no".
@@ -327,31 +345,34 @@ class PositionStore:
             price: Fill price in YES-equivalent terms.
             question: Market name (for auto-registration).
         """
-        sp = self._get_or_create_side(condition_id, side, question)
-        filled_usd = sp.record_fill(shares, price)
+        with self._lock:
+            sp = self._get_or_create_side(condition_id, side, question)
+            filled_usd = sp.record_fill(shares, price)
 
-        question_str = self._markets[condition_id]["question"]
-        yes_usd = self._markets[condition_id]["yes"].usd
-        no_usd = self._markets[condition_id]["no"].usd
-        log_position_update(question_str, yes_usd, no_usd)
+            question_str = self._markets[condition_id]["question"]
+            yes_usd = self._markets[condition_id]["yes"].usd
+            no_usd = self._markets[condition_id]["no"].usd
+            log_position_update(question_str, yes_usd, no_usd)
 
-        # Check limits and alert if halt state changed
-        if sp.check_limits():
-            if sp.halted:
-                alert_position_limit(question_str, side.upper(), sp.usd)
-            else:
-                log.info(
-                    f"QUOTING RESUMED | {question_str[:40]} | "
-                    f"{side.upper()} back to ${sp.usd:.2f}"
-                )
+            # Check limits and alert if halt state changed
+            if sp.check_limits():
+                if sp.halted:
+                    alert_position_limit(question_str, side.upper(), sp.usd)
+                else:
+                    log.info(
+                        f"QUOTING RESUMED | {question_str[:40]} | "
+                        f"{side.upper()} back to ${sp.usd:.2f}"
+                    )
 
-        self._save()
+            self._save()
 
     def record_unwind(
         self, condition_id: str, side: str, shares: float,
         price: float = 0.0,
     ) -> None:
         """Record a position reduction (SELL fill or merge).
+
+        Thread-safe: acquires self._lock for the duration.
 
         Args:
             condition_id: Unique market identifier.
@@ -360,28 +381,29 @@ class PositionStore:
             price: IGNORED — kept for backward compatibility.
                    USD is derived from remaining shares, not accumulated.
         """
-        sp = self._get_side(condition_id, side)
-        if sp is None:
-            return
+        with self._lock:
+            sp = self._get_side(condition_id, side)
+            if sp is None:
+                return
 
-        sp.record_unwind(shares)
+            sp.record_unwind(shares)
 
-        question = self._markets[condition_id]["question"]
-        log.info(
-            f"Position unwound | {question[:40]} | "
-            f"{side.upper()} reduced by {shares:.2f} shares "
-            f"to {sp.shares:.2f} shares (${sp.usd:.2f})"
-        )
+            question = self._markets[condition_id]["question"]
+            log.info(
+                f"Position unwound | {question[:40]} | "
+                f"{side.upper()} reduced by {shares:.2f} shares "
+                f"to {sp.shares:.2f} shares (${sp.usd:.2f})"
+            )
 
-        # Check if we can resume quoting
-        if sp.check_limits():
-            if not sp.halted:
-                log.info(
-                    f"QUOTING RESUMED | {question[:40]} | "
-                    f"{side.upper()} back to ${sp.usd:.2f}"
-                )
+            # Check if we can resume quoting
+            if sp.check_limits():
+                if not sp.halted:
+                    log.info(
+                        f"QUOTING RESUMED | {question[:40]} | "
+                        f"{side.upper()} back to ${sp.usd:.2f}"
+                    )
 
-        self._save()
+            self._save()
 
     def can_quote(self, condition_id: str, side: str) -> bool:
         """Check whether we are allowed to place new BUY orders on a side."""
@@ -481,33 +503,33 @@ class PositionStore:
         self._save()
 
     def reset_side(self, condition_id: str, side: str) -> None:
-        """Reset position data for one side of a market."""
-        sp = self._get_side(condition_id, side)
-        if sp is None:
-            return
-        question = self._markets[condition_id]["question"]
-        sp.reset()
-        log.info(f"Position side reset | {question[:40]} | {side.upper()} zeroed")
-        self._save()
+        """Reset position data for one side of a market. Thread-safe."""
+        with self._lock:
+            sp = self._get_side(condition_id, side)
+            if sp is None:
+                return
+            question = self._markets[condition_id]["question"]
+            sp.reset()
+            log.info(f"Position side reset | {question[:40]} | {side.upper()} zeroed")
+            self._save()
 
     def set_shares(self, condition_id: str, side: str, shares: float) -> None:
         """Set share count to match exchange reality.
 
-        Unlike the old system which adjusted USD proportionally,
-        the new system derives USD automatically from the corrected
-        share count. No proportional adjustment needed.
+        Thread-safe: acquires self._lock for the duration.
         """
-        sp = self._get_side(condition_id, side)
-        if sp is None:
-            return
-        old_shares = sp.shares
-        sp.correct_to_exchange(shares)
-        question = self._markets[condition_id]["question"]
-        log.info(
-            f"Position corrected | {question[:40]} | {side.upper()} "
-            f"{old_shares:.2f} -> {shares:.2f} shares"
-        )
-        self._save()
+        with self._lock:
+            sp = self._get_side(condition_id, side)
+            if sp is None:
+                return
+            old_shares = sp.shares
+            sp.correct_to_exchange(shares)
+            question = self._markets[condition_id]["question"]
+            log.info(
+                f"Position corrected | {question[:40]} | {side.upper()} "
+                f"{old_shares:.2f} -> {shares:.2f} shares"
+            )
+            self._save()
 
     def print_summary(self) -> None:
         """Log a summary of all tracked positions."""

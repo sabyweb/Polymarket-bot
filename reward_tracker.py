@@ -21,6 +21,7 @@ from config import (
     DISCORD_WEBHOOK_URL,
     REWARD_LOG_INTERVAL_SECS,
 )
+from database import get_db
 
 log = logging.getLogger(__name__)
 
@@ -66,9 +67,17 @@ class MarketStats:
     unwind_loss_usd: float = 0.0       # Loss from selling below VWAP
     stop_loss_usd: float = 0.0         # Loss from stop-loss sells
 
-    # Reward estimates
-    est_reward_usd: float = 0.0        # Running estimated reward earnings
+    # Reward estimates (Q-score based)
+    est_reward_usd: float = 0.0        # Running estimated reward earnings (Q-score model)
+    est_reward_old: float = 0.0        # Legacy flat-share estimate (for comparison)
+    actual_reward_usd: float = 0.0     # Actual rewards from API (when available)
+    last_actual_query: float = 0.0     # Timestamp of last actual reward query
     reward_snapshots: list = field(default_factory=list)  # hourly snapshots
+
+    # Q-score tracking (per-cycle accumulation)
+    total_q_score: float = 0.0         # Our cumulative Q-score contribution
+    total_market_q: float = 0.0        # Estimated total market Q-score
+    q_score_samples: int = 0           # Number of Q-score measurements
 
     # Pricing stats
     avg_bid_price: float = 0.0
@@ -84,6 +93,11 @@ class MarketStats:
     # Cooldowns & skew
     cooldown_cycles: int = 0       # Cycles where post-fill cooldown was active
     skew_cycles: int = 0           # Cycles where inventory skew was applied
+
+    # M3: Fill quality tracking
+    total_slippage: float = 0.0    # Sum of slippage across all fills (>0 = adverse)
+    adverse_fills: int = 0         # Number of fills with positive slippage
+    favourable_fills: int = 0      # Number of fills with negative slippage
 
     def time_on_book_hours(self) -> float:
         return self.time_on_book_secs / 3600
@@ -124,6 +138,59 @@ class MarketStats:
 # ─────────────────────────────────────────────────────────────────────────────
 # RewardTracker: central stats collection and reporting
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Q-Score Calculation (matches Polymarket's actual formula)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Single-sided penalty factor: single-sided orders score at 1/c of two-sided.
+# Polymarket uses c = 3.0 as of 2024.
+SINGLE_SIDE_PENALTY: float = 3.0
+
+
+def q_score_order(
+    max_spread: float, distance_from_mid: float, size_shares: float,
+) -> float:
+    """Calculate Q-score for a single order using Polymarket's formula.
+
+    S(v, s) = ((v - s) / v)² × b
+
+    Args:
+        max_spread: Maximum reward spread from midpoint (e.g. 0.04 for 4c).
+        distance_from_mid: |our_price - midpoint| in price units.
+        size_shares: Order size in shares.
+
+    Returns:
+        Q-score contribution for this order.  0 if outside reward window.
+    """
+    if max_spread <= 0 or distance_from_mid >= max_spread or size_shares <= 0:
+        return 0.0
+    ratio = (max_spread - distance_from_mid) / max_spread
+    return ratio * ratio * size_shares
+
+
+def estimate_market_q(
+    order_book: dict, max_spread: float, midpoint: float,
+) -> float:
+    """Estimate total market Q-score from the visible order book.
+
+    Sums Q-score for all bids and asks within the reward window.
+    This is a lower bound (some makers may have hidden orders),
+    but it's the best we can do without privileged data.
+    """
+    total_q = 0.0
+    for level in order_book.get("bids", []):
+        price = float(level.get("price", 0))
+        size = float(level.get("size", 0))
+        dist = abs(price - midpoint)
+        total_q += q_score_order(max_spread, dist, size)
+    for level in order_book.get("asks", []):
+        price = float(level.get("price", 0))
+        size = float(level.get("size", 0))
+        dist = abs(price - midpoint)
+        total_q += q_score_order(max_spread, dist, size)
+    return total_q
+
 
 class RewardTracker:
     """Collects per-market performance data and generates periodic reports."""
@@ -169,8 +236,15 @@ class RewardTracker:
         cooldown_active: bool = False,
         skew_active: bool = False,
         cycle_duration_secs: float = 30.0,
+        midpoint: float = 0.0,
+        bid_size: float = 0.0,
+        ask_size: float = 0.0,
+        order_book: dict | None = None,
     ) -> None:
-        """Record stats for one order cycle on a market."""
+        """Record stats for one order cycle on a market.
+
+        Now includes Q-score calculation using Polymarket's actual formula.
+        """
         stats = self.markets.get(condition_id)
         if not stats:
             return
@@ -205,6 +279,35 @@ class RewardTracker:
         if skew_active:
             stats.skew_cycles += 1
 
+        # ── Q-Score calculation ───────────────────────────────────────
+        # Calculate our Q-score for this cycle based on actual order
+        # positions relative to midpoint.  This is far more accurate
+        # than the old flat 10% assumption.
+        if stats.max_spread > 0 and midpoint > 0:
+            our_q = 0.0
+            if bid_price > 0 and bid_size > 0:
+                bid_dist = abs(bid_price - midpoint)
+                our_q += q_score_order(stats.max_spread, bid_dist, bid_size)
+            if ask_price > 0 and ask_size > 0:
+                ask_dist = abs(ask_price - midpoint)
+                our_q += q_score_order(stats.max_spread, ask_dist, ask_size)
+
+            # Apply single-sided penalty (Polymarket penalizes 1/3)
+            if (has_yes_order and not has_no_order) or (has_no_order and not has_yes_order):
+                our_q /= SINGLE_SIDE_PENALTY
+
+            # Estimate total market Q from visible order book
+            market_q = 0.0
+            if order_book:
+                market_q = estimate_market_q(
+                    order_book, stats.max_spread, midpoint
+                )
+
+            if our_q > 0:
+                stats.total_q_score += our_q
+                stats.total_market_q += max(market_q, our_q)
+                stats.q_score_samples += 1
+
     def record_order_placed(self, condition_id: str) -> None:
         stats = self.markets.get(condition_id)
         if stats:
@@ -223,6 +326,24 @@ class RewardTracker:
             stats.buy_fills += 1
             stats.buy_fill_shares += shares
             stats.buy_fill_usd += usd
+
+    def record_fill_quality(
+        self, condition_id: str, slippage: float,
+    ) -> None:
+        """Record fill quality metric for M3 tracking.
+
+        Args:
+            condition_id: Market condition ID.
+            slippage: Fill price minus midpoint. Positive = adverse.
+        """
+        stats = self.markets.get(condition_id)
+        if not stats:
+            return
+        stats.total_slippage += slippage
+        if slippage > 0:
+            stats.adverse_fills += 1
+        else:
+            stats.favourable_fills += 1
 
     def record_sell_fill(self, condition_id: str, shares: float, usd: float,
                          vwap_cost_usd: float = 0.0) -> None:
@@ -261,6 +382,102 @@ class RewardTracker:
                 s for s in stats.reward_snapshots if s["timestamp"] > cutoff
             ]
 
+    def record_actual_rewards(self, total_earned: float,
+                              per_market: dict[str, float] | None = None) -> None:
+        """Record actual rewards queried from the API.
+
+        Args:
+            total_earned: Total rewards earned across all markets.
+            per_market: Optional {condition_id: earned_amount} breakdown.
+        """
+        if per_market:
+            for cid, earned in per_market.items():
+                stats = self.markets.get(cid)
+                if stats:
+                    stats.actual_reward_usd = earned
+                    stats.last_actual_query = time.time()
+
+        # Log aggregate comparison to database
+        total_est = sum(s.est_reward_usd for s in self.markets.values())
+        total_old = sum(s.est_reward_old for s in self.markets.values())
+        total_q = sum(s.total_q_score for s in self.markets.values())
+        total_mkt_q = sum(s.total_market_q for s in self.markets.values())
+        q_share = total_q / total_mkt_q if total_mkt_q > 0 else 0
+
+        get_db().log_reward_comparison(
+            condition_id="",  # aggregate
+            q_score_est=total_est, legacy_est=total_old,
+            actual_earned=total_earned, q_share_pct=q_share,
+            our_q_score=total_q, market_q_score=total_mkt_q,
+        )
+        # Per-market comparisons
+        if per_market:
+            for cid, earned in per_market.items():
+                stats = self.markets.get(cid)
+                if stats:
+                    mq = stats.total_market_q
+                    qs = stats.total_q_score / mq if mq > 0 else 0
+                    get_db().log_reward_comparison(
+                        condition_id=cid,
+                        q_score_est=stats.est_reward_usd,
+                        legacy_est=stats.est_reward_old,
+                        actual_earned=earned, q_share_pct=qs,
+                        our_q_score=stats.total_q_score,
+                        market_q_score=mq,
+                    )
+
+        if total_earned > 0 and total_est > 0:
+            variance_pct = (total_est - total_earned) / total_earned * 100
+            log.info(
+                f"REWARD VARIANCE | estimated=${total_est:.2f} | "
+                f"actual=${total_earned:.2f} | "
+                f"variance={variance_pct:+.1f}%"
+            )
+            if abs(variance_pct) > 30:
+                log.warning(
+                    f"Reward estimate is {abs(variance_pct):.0f}% off from actual — "
+                    f"model may need recalibration"
+                )
+
+            # Per-market comparison if available
+            if per_market:
+                for cid, actual in per_market.items():
+                    stats = self.markets.get(cid)
+                    if stats and actual > 0:
+                        est = stats.est_reward_usd
+                        var = (est - actual) / actual * 100 if actual > 0 else 0
+                        log.info(
+                            f"  {stats.question[:40]:<40} | "
+                            f"est=${est:.2f} | actual=${actual:.2f} | "
+                            f"Δ={var:+.1f}%"
+                        )
+
+    def get_reward_accuracy(self) -> dict:
+        """Return accuracy metrics comparing Q-score vs legacy vs actual.
+
+        Useful for analyzing which model is more accurate.
+        """
+        result = {
+            "q_score_total": sum(s.est_reward_usd for s in self.markets.values()),
+            "legacy_total": sum(s.est_reward_old for s in self.markets.values()),
+            "actual_total": sum(s.actual_reward_usd for s in self.markets.values()),
+            "per_market": {},
+        }
+        for cid, stats in self.markets.items():
+            if stats.actual_reward_usd > 0:
+                q_err = abs(stats.est_reward_usd - stats.actual_reward_usd)
+                old_err = abs(stats.est_reward_old - stats.actual_reward_usd)
+                result["per_market"][cid] = {
+                    "question": stats.question[:40],
+                    "q_score_est": stats.est_reward_usd,
+                    "legacy_est": stats.est_reward_old,
+                    "actual": stats.actual_reward_usd,
+                    "q_score_error": q_err,
+                    "legacy_error": old_err,
+                    "q_score_better": q_err < old_err,
+                }
+        return result
+
     # ── Hourly logging ───────────────────────────────────────────────────────
 
     def maybe_log_hourly(self, active_markets: list[dict]) -> bool:
@@ -278,13 +495,15 @@ class RewardTracker:
         return True
 
     def _log_hourly_report(self, active_markets: list[dict]) -> None:
-        """Log per-market reward estimates and performance for the last hour."""
+        """Log per-market reward estimates using Q-score model + legacy comparison."""
         log.info("=" * 70)
         log.info("HOURLY REWARD REPORT")
         log.info("=" * 70)
 
-        total_est_hourly = 0.0
-        total_est_daily = 0.0
+        total_q_hourly = 0.0
+        total_q_daily = 0.0
+        total_old_hourly = 0.0
+        total_old_daily = 0.0
 
         for m in active_markets:
             cid = m.get("condition_id", "")
@@ -292,38 +511,59 @@ class RewardTracker:
             if not stats:
                 continue
 
-            # Estimate our reward share based on uptime
             pool_daily = stats.daily_rate
             uptime = stats.uptime_pct() / 100
             both_sides = stats.both_sides_pct() / 100
 
-            # Reward share model:
-            # - Base: ~10% of pool (one of ~10 makers)
-            # - Multiplied by uptime (% of time with orders)
-            # - Bonus for quoting both sides (Polymarket weights this)
-            est_share_pct = 0.10 * uptime * (0.5 + 0.5 * both_sides)
-            est_hourly = pool_daily * est_share_pct / 24
-            est_daily = pool_daily * est_share_pct
+            # ── Q-Score model (accurate) ──────────────────────────────
+            # Our share = our_Q / total_market_Q (measured from order book)
+            q_share_pct = 0.0
+            if stats.total_market_q > 0 and stats.q_score_samples > 0:
+                q_share_pct = stats.total_q_score / stats.total_market_q
+            q_est_hourly = pool_daily * q_share_pct * uptime / 24
+            q_est_daily = pool_daily * q_share_pct * uptime
 
-            total_est_hourly += est_hourly
-            total_est_daily += est_daily
+            total_q_hourly += q_est_hourly
+            total_q_daily += q_est_daily
 
-            # Record this snapshot
-            self.record_reward_estimate(cid, est_hourly)
+            # Record Q-score estimate
+            self.record_reward_estimate(cid, q_est_hourly)
+
+            # ── Legacy flat-share model (for comparison) ──────────────
+            old_share = 0.10 * uptime * (0.5 + 0.5 * both_sides)
+            old_hourly = pool_daily * old_share / 24
+            old_daily = pool_daily * old_share
+            total_old_hourly += old_hourly
+            total_old_daily += old_daily
+            stats.est_reward_old += old_hourly
+
+            # ── Variance logging ──────────────────────────────────────
+            variance = ""
+            if old_hourly > 0:
+                diff_pct = (q_est_hourly - old_hourly) / old_hourly * 100
+                variance = f" | Δ={diff_pct:+.0f}%"
 
             log.info(
-                f"  {stats.question[:45]:<45} | "
-                f"pool=${pool_daily:>7.0f}/day | "
-                f"est=${est_hourly:>5.2f}/hr (${est_daily:>6.2f}/day) | "
-                f"uptime={stats.uptime_pct():>5.1f}% | "
-                f"both_sides={stats.both_sides_pct():>5.1f}% | "
-                f"fills={stats.buy_fills}B/{stats.sell_fills}S | "
-                f"cycles={stats.total_cycles}"
+                f"  {stats.question[:40]:<40} | "
+                f"pool=${pool_daily:>6.0f}/d | "
+                f"Q=${q_est_hourly:>5.2f}/hr (${q_est_daily:>5.2f}/d) | "
+                f"old=${old_hourly:>5.2f}/hr | "
+                f"Q_share={q_share_pct:>5.1%} | "
+                f"uptime={stats.uptime_pct():>4.0f}% | "
+                f"both={stats.both_sides_pct():>4.0f}%{variance}"
             )
 
-        log.info(f"  {'TOTAL':<45} | "
-                 f"{'':>15} | "
-                 f"est=${total_est_hourly:>5.2f}/hr (${total_est_daily:>6.2f}/day)")
+        log.info(
+            f"  {'TOTAL (Q-score)':<40} | "
+            f"{'':>13} | "
+            f"Q=${total_q_hourly:>5.2f}/hr (${total_q_daily:>5.2f}/d) | "
+            f"old=${total_old_hourly:>5.2f}/hr"
+        )
+        if total_old_hourly > 0:
+            total_diff = (total_q_hourly - total_old_hourly) / total_old_hourly * 100
+            log.info(
+                f"  Model comparison: Q-score is {total_diff:+.1f}% vs flat 10% model"
+            )
         log.info("=" * 70)
 
     # ── Daily report ─────────────────────────────────────────────────────────
@@ -492,6 +732,84 @@ class RewardTracker:
                     f"captured={capture_rate:.1f}% of pool"
                 )
 
+        # ── Section 7: Model Accuracy Comparison ──────────────────────
+        accuracy = self.get_reward_accuracy()
+        if accuracy["actual_total"] > 0:
+            log.info("")
+            log.info("─── REWARD MODEL ACCURACY (vs actual) ───")
+            q_total = accuracy["q_score_total"]
+            old_total = accuracy["legacy_total"]
+            actual = accuracy["actual_total"]
+            q_err_pct = (q_total - actual) / actual * 100 if actual else 0
+            old_err_pct = (old_total - actual) / actual * 100 if actual else 0
+            log.info(
+                f"  Q-Score model:  ${q_total:>8.2f} (Δ={q_err_pct:+.1f}% from actual)"
+            )
+            log.info(
+                f"  Legacy model:   ${old_total:>8.2f} (Δ={old_err_pct:+.1f}% from actual)"
+            )
+            log.info(
+                f"  Actual earned:  ${actual:>8.2f}"
+            )
+            better = "Q-Score" if abs(q_err_pct) < abs(old_err_pct) else "Legacy"
+            log.info(f"  Winner: {better} model")
+
+            for cid, data in accuracy["per_market"].items():
+                marker = "✓" if data["q_score_better"] else "✗"
+                log.info(
+                    f"    {marker} {data['question']:<40} | "
+                    f"Q=${data['q_score_est']:.2f} | "
+                    f"old=${data['legacy_est']:.2f} | "
+                    f"actual=${data['actual']:.2f}"
+                )
+
+        # ── Section 8: Fill Quality (M3) ────────────────────────────────
+        fills_with_quality = [
+            s for s in sorted_markets
+            if s.adverse_fills + s.favourable_fills > 0
+        ]
+        if fills_with_quality:
+            log.info("")
+            log.info("─── FILL QUALITY (M3) ───")
+            log.info(f"  {'Market':<45} {'Fills':>6} {'Adv':>5} {'Fav':>5} "
+                     f"{'Adv%':>6} {'AvgSlip':>9}")
+            log.info("  " + "─" * 80)
+
+            total_adv = 0
+            total_fav = 0
+            total_slip = 0.0
+            total_qual_fills = 0
+            for stats in fills_with_quality:
+                n_fills = stats.adverse_fills + stats.favourable_fills
+                total_adv += stats.adverse_fills
+                total_fav += stats.favourable_fills
+                total_slip += stats.total_slippage
+                total_qual_fills += n_fills
+                avg_slip = stats.total_slippage / n_fills if n_fills > 0 else 0
+                adv_pct = stats.adverse_fills / n_fills * 100 if n_fills > 0 else 0
+                log.info(
+                    f"  {stats.question[:45]:<45} "
+                    f"{n_fills:>6} {stats.adverse_fills:>5} "
+                    f"{stats.favourable_fills:>5} "
+                    f"{adv_pct:>5.1f}% "
+                    f"{avg_slip:>+8.4f}"
+                )
+
+            if total_qual_fills > 0:
+                agg_adv_pct = total_adv / total_qual_fills * 100
+                agg_avg_slip = total_slip / total_qual_fills
+                log.info("  " + "─" * 80)
+                log.info(
+                    f"  {'TOTALS':<45} "
+                    f"{total_qual_fills:>6} {total_adv:>5} {total_fav:>5} "
+                    f"{agg_adv_pct:>5.1f}% {agg_avg_slip:>+8.4f}"
+                )
+                if agg_adv_pct > 60:
+                    log.warning(
+                        f"  ⚠ High adverse fill rate ({agg_adv_pct:.0f}%) — "
+                        f"consider widening spreads or reducing size"
+                    )
+
         log.info("")
         log.info("=" * 80)
         log.info("  END OF DAILY REPORT")
@@ -539,30 +857,42 @@ class RewardTracker:
         except Exception as e:
             log.debug(f"Could not send daily report to Discord: {e}")
 
-    # ── Persistence ──────────────────────────────────────────────────────────
+    # ── Persistence (A3: SQLite primary, JSON fallback for migration) ──────
 
     def _save(self) -> None:
-        """Save tracker state to disk."""
+        """Save tracker state to SQLite."""
         try:
-            data = {
-                "bot_start": self._bot_start,
-                "last_hourly_log": self._last_hourly_log,
-                "last_daily_report": self._last_daily_report,
-                "markets": {},
-            }
-            for cid, stats in self.markets.items():
-                d = asdict(stats)
-                data["markets"][cid] = d
-
-            tmp = TRACKER_FILE + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(data, f, indent=2)
-            os.replace(tmp, TRACKER_FILE)
+            db = get_db()
+            db.save_reward_state(
+                self._bot_start, self._last_hourly_log, self._last_daily_report,
+            )
+            db.save_all_reward_stats(self.markets)
         except Exception as e:
             log.warning(f"Could not save reward tracker: {e}")
 
     def _load(self) -> None:
-        """Load tracker state from disk if available."""
+        """Load tracker state: try SQLite first, fall back to JSON for migration."""
+        db = get_db()
+
+        # Try SQLite first
+        state = db.load_reward_state()
+        stats_data = db.load_all_reward_stats()
+
+        if state or stats_data:
+            if state:
+                self._bot_start = state.get("bot_start", self._bot_start)
+                self._last_hourly_log = state.get("last_hourly_log", self._last_hourly_log)
+                self._last_daily_report = state.get("last_daily_report", self._last_daily_report)
+            for cid, d in stats_data.items():
+                stats = MarketStats()
+                for key, val in d.items():
+                    if hasattr(stats, key):
+                        setattr(stats, key, val)
+                self.markets[cid] = stats
+            log.info(f"Loaded reward tracker: {len(self.markets)} markets from SQLite")
+            return
+
+        # Fall back to JSON (migration path)
         if not os.path.exists(TRACKER_FILE):
             return
         try:
@@ -580,7 +910,20 @@ class RewardTracker:
                         setattr(stats, key, val)
                 self.markets[cid] = stats
 
-            log.info(f"Loaded reward tracker: {len(self.markets)} markets from disk")
+            log.info(
+                f"Migrated reward tracker: {len(self.markets)} markets "
+                f"from JSON to SQLite"
+            )
+            # Save to SQLite immediately
+            self._save()
+            # Rename old JSON so it doesn't get loaded again
+            try:
+                migrated = TRACKER_FILE + ".migrated"
+                os.rename(TRACKER_FILE, migrated)
+                log.info(f"Renamed {TRACKER_FILE} → {migrated}")
+            except OSError as rename_err:
+                log.warning(f"Could not rename reward_history.json: {rename_err}")
+
         except Exception as e:
             log.warning(f"Could not load reward tracker: {e}")
 

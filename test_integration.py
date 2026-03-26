@@ -23,6 +23,20 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import logging
 logging.basicConfig(level=logging.WARNING)
 
+# Mock py_clob_client before importing order_manager (not installed in test env)
+try:
+    import py_clob_client  # noqa: F401
+except ImportError:
+    from unittest.mock import MagicMock as _MM
+    _clob = _MM()
+    sys.modules["py_clob_client"] = _clob
+    sys.modules["py_clob_client.client"] = _clob.client
+    sys.modules["py_clob_client.clob_types"] = _clob.clob_types
+    sys.modules["py_clob_client.order_builder"] = _clob.order_builder
+    sys.modules["py_clob_client.order_builder.constants"] = _clob.order_builder.constants
+
+from order_manager import TrackedOrder, UnwindOrder
+
 # Redirect positions.json before importing state
 import state as _state_module
 _original_positions_file = _state_module.POSITIONS_FILE
@@ -161,14 +175,13 @@ try:
 
     # Simulate: place_order placed a YES BUY at 0.30, 100 shares
     # Manually inject into active_orders (as place_order would)
-    mgr.active_orders["order_yes_1"] = {
-        "side": "yes",
-        "price": 0.30,  # YES-equivalent
-        "size": 100.0,
-        "original_size": 100.0,
-        "placed_at": _real_time.time() - 60,
-        "from_post_response": False,
-    }
+    mgr.active_orders["order_yes_1"] = TrackedOrder(
+        side="yes",
+        price=0.30,  # YES-equivalent
+        size=100.0,
+        original_size=100.0,
+        placed_at=_real_time.time() - 60,
+    )
 
     # Exchange says this order is gone (filled)
     mgr.client.get_orders.return_value = []  # Order not in open list
@@ -198,14 +211,13 @@ try:
     mgr = fresh_manager(store)
 
     # NO BUY: price stored as YES-equiv = 0.60, CLOB cost = 0.40
-    mgr.active_orders["order_no_1"] = {
-        "side": "no",
-        "price": 0.60,  # YES-equivalent (NOT the NO CLOB price 0.40)
-        "size": 500.0,
-        "original_size": 500.0,
-        "placed_at": _real_time.time() - 60,
-        "from_post_response": False,
-    }
+    mgr.active_orders["order_no_1"] = TrackedOrder(
+        side="no",
+        price=0.60,  # YES-equivalent (NOT the NO CLOB price 0.40)
+        size=500.0,
+        original_size=500.0,
+        placed_at=_real_time.time() - 60,
+    )
 
     mgr.client.get_orders.return_value = []
     mgr.client.get_order.return_value = {"status": "MATCHED"}
@@ -236,14 +248,13 @@ try:
 
     # Large NO fill: 800 shares at YES-equiv 0.40 → CLOB cost 0.60
     # USD = 800 * 0.60 = $480 > MAX_POSITION_USD ($400)
-    mgr.active_orders["order_big_no"] = {
-        "side": "no",
-        "price": 0.40,
-        "size": 800.0,
-        "original_size": 800.0,
-        "placed_at": _real_time.time() - 60,
-        "from_post_response": False,
-    }
+    mgr.active_orders["order_big_no"] = TrackedOrder(
+        side="no",
+        price=0.40,
+        size=800.0,
+        original_size=800.0,
+        placed_at=_real_time.time() - 60,
+    )
 
     mgr.client.get_orders.return_value = []
     mgr.client.get_order.return_value = {"status": "MATCHED"}
@@ -264,16 +275,15 @@ try:
 
     # Continuing from TEST 3: 800 NO shares, halted
     # Simulate unwind SELL filled for 500 shares
-    mgr.unwind_orders["unwind_no_1"] = {
-        "side": "no",
-        "price": 0.40,   # YES-equiv
-        "clob_price": 0.60,
-        "size": 500.0,
-        "placed_at": _real_time.time() - 120,
-        "created_at": _real_time.time() - 300,
-        "base_clob_price": 0.60,
-        "from_post_response": False,
-    }
+    mgr.unwind_orders["unwind_no_1"] = UnwindOrder(
+        side="no",
+        price=0.40,   # YES-equiv
+        clob_price=0.60,
+        size=500.0,
+        placed_at=_real_time.time() - 120,
+        created_at=_real_time.time() - 300,
+        base_clob_price=0.60,
+    )
 
     # Exchange says unwind is fully matched
     mgr.client.get_orders.return_value = []
@@ -303,14 +313,13 @@ try:
     store = fresh_store()
     mgr = fresh_manager(store)
 
-    mgr.active_orders["order_partial"] = {
-        "side": "yes",
-        "price": 0.35,
-        "size": 200.0,
-        "original_size": 200.0,
-        "placed_at": _real_time.time() - 60,
-        "from_post_response": False,
-    }
+    mgr.active_orders["order_partial"] = TrackedOrder(
+        side="yes",
+        price=0.35,
+        size=200.0,
+        original_size=200.0,
+        placed_at=_real_time.time() - 60,
+    )
 
     # Exchange shows order still open but partially filled
     mgr.client.get_orders.return_value = [
@@ -326,8 +335,8 @@ try:
           "order_partial" in mgr.active_orders,
           f"missing from active_orders")
     check("Partial fill: remaining size updated to 120",
-          abs(mgr.active_orders["order_partial"]["original_size"] - 120.0) < 0.01,
-          f"got {mgr.active_orders['order_partial']['original_size']}")
+          abs(mgr.active_orders["order_partial"].original_size - 120.0) < 0.01,
+          f"got {mgr.active_orders['order_partial'].original_size}")
 
     # ═════════════════════════════════════════════════════════════════════════
     # TEST 6: Cancel Failure → Order Stays Tracked
@@ -338,16 +347,15 @@ try:
     mgr = fresh_manager(store)
 
     # Set up a stale unwind order that needs cancellation
-    mgr.unwind_orders["stale_unwind"] = {
-        "side": "yes",
-        "price": 0.50,
-        "clob_price": 0.50,
-        "size": 100.0,
-        "placed_at": _real_time.time() - 600,
-        "created_at": _real_time.time() - 600,
-        "base_clob_price": 0.50,
-        "from_post_response": False,
-    }
+    mgr.unwind_orders["stale_unwind"] = UnwindOrder(
+        side="yes",
+        price=0.50,
+        clob_price=0.50,
+        size=100.0,
+        placed_at=_real_time.time() - 600,
+        created_at=_real_time.time() - 600,
+        base_clob_price=0.50,
+    )
 
     # Make cancel fail
     mgr.client.cancel.side_effect = Exception("Network error")
@@ -388,7 +396,7 @@ try:
         "success": True,
         "orderID": "0xstoploss_sell",
     }
-    # Return the stop-loss order in open orders for _find_exchange_order_id
+    # Return the stop-loss order in open orders for detect_fills adoption
     mgr.client.get_orders.return_value = [
         make_exchange_order("0xstoploss_exchange", YES_TOKEN, 0.35, "SELL", 500.0),
     ]
@@ -407,11 +415,11 @@ try:
         oid = list(mgr.unwind_orders.keys())[0]
         uorder = mgr.unwind_orders[oid]
         check("Stop-loss: sell at market bid (0.35)",
-              abs(uorder["clob_price"] - 0.35) < 0.01,
-              f"got {uorder['clob_price']}")
+              abs(uorder.clob_price - 0.35) < 0.01,
+              f"got {uorder.clob_price}")
         check("Stop-loss: sell size = 500",
-              abs(uorder["size"] - 500.0) < 0.01,
-              f"got {uorder['size']}")
+              abs(uorder.size - 500.0) < 0.01,
+              f"got {uorder.size}")
 
     # Reset side effect
     mgr.client.get_balance_allowance.side_effect = None
@@ -501,14 +509,13 @@ try:
     # Phase 1: Accumulate position via fills
     for i in range(5):
         oid = f"buy_yes_{i}"
-        mgr.active_orders[oid] = {
-            "side": "yes",
-            "price": 0.45,
-            "size": 200.0,
-            "original_size": 200.0,
-            "placed_at": _real_time.time() - 60,
-            "from_post_response": False,
-        }
+        mgr.active_orders[oid] = TrackedOrder(
+            side="yes",
+            price=0.45,
+            size=200.0,
+            original_size=200.0,
+            placed_at=_real_time.time() - 60,
+        )
 
     mgr.client.get_orders.return_value = []
     mgr.client.get_order.return_value = {"status": "MATCHED"}
@@ -578,16 +585,15 @@ try:
 
     # Simulate a placed unwind order 10 minutes ago
     created_10min_ago = _real_time.time() - 600
-    mgr.unwind_orders["decay_test"] = {
-        "side": "no",
-        "price": 0.30,      # YES-equiv
-        "clob_price": 0.70,  # Was placed at VWAP
-        "size": 500.0,
-        "placed_at": created_10min_ago,
-        "created_at": created_10min_ago,
-        "base_clob_price": 0.70,
-        "from_post_response": False,
-    }
+    mgr.unwind_orders["decay_test"] = UnwindOrder(
+        side="no",
+        price=0.30,      # YES-equiv
+        clob_price=0.70,  # Was placed at VWAP
+        size=500.0,
+        placed_at=created_10min_ago,
+        created_at=created_10min_ago,
+        base_clob_price=0.70,
+    )
 
     # After 10 minutes: 2 decay intervals (10min / 5min = 2)
     # Expected: 0.70 - 2*0.01 = 0.68
@@ -646,7 +652,7 @@ try:
           not mgr.has_open_obligations(),
           f"has_open={mgr.has_open_obligations()}")
 
-    mgr.unwind_orders["test"] = {"side": "yes", "size": 100}
+    mgr.unwind_orders["test"] = UnwindOrder(side="yes", price=0, clob_price=0, size=100)
     check("Has obligations with unwind orders",
           mgr.has_open_obligations(),
           f"has_open={mgr.has_open_obligations()}")
@@ -687,7 +693,8 @@ try:
 
 
 finally:
-    os.unlink(_tmp.name)
+    if os.path.exists(_tmp.name):
+        os.unlink(_tmp.name)
     _state_module.POSITIONS_FILE = _original_positions_file
 
 

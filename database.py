@@ -1,0 +1,828 @@
+"""
+SQLite-based history and analytics database for the Polymarket bot.
+
+Stores every fill, unwind, order placement, cancellation, and cycle
+snapshot in WAL-mode SQLite. The existing JSON positions file remains
+the source of truth for current state; this database is append-only
+history for analytics, P&L tracking, and backtesting.
+
+Usage:
+    from database import get_db
+    db = get_db()
+    db.log_fill(...)
+"""
+
+import logging
+import os
+import sqlite3
+import threading
+import time
+
+log = logging.getLogger(__name__)
+
+DB_PATH = os.path.join(os.path.dirname(__file__), "bot_history.db")
+
+_SCHEMA = """
+-- Filled BUY orders
+CREATE TABLE IF NOT EXISTS fills (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          REAL    NOT NULL,
+    condition_id TEXT   NOT NULL,
+    question    TEXT    NOT NULL DEFAULT '',
+    side        TEXT    NOT NULL,       -- 'yes' or 'no'
+    fill_type   TEXT    NOT NULL,       -- 'FULL' or 'PARTIAL'
+    shares      REAL    NOT NULL,
+    price       REAL    NOT NULL,       -- YES-equivalent price
+    clob_cost   REAL    NOT NULL,       -- actual CLOB cost per share
+    usd_value   REAL    NOT NULL,       -- shares * clob_cost
+    midpoint    REAL    NOT NULL DEFAULT 0,  -- M3: EMA midpoint at fill time
+    slippage    REAL    NOT NULL DEFAULT 0   -- M3: clob_cost - midpoint (>0 = adverse)
+);
+
+-- Filled SELL (unwind) orders
+CREATE TABLE IF NOT EXISTS unwinds (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          REAL    NOT NULL,
+    condition_id TEXT   NOT NULL,
+    question    TEXT    NOT NULL DEFAULT '',
+    side        TEXT    NOT NULL,
+    shares      REAL    NOT NULL,
+    sell_price  REAL    NOT NULL,       -- CLOB sell price
+    usd_value   REAL    NOT NULL,       -- shares * sell_price
+    vwap_cost   REAL    NOT NULL DEFAULT 0,  -- VWAP-based cost for P&L
+    pnl         REAL    NOT NULL DEFAULT 0   -- usd_value - vwap_cost
+);
+
+-- Order placements (BUY)
+CREATE TABLE IF NOT EXISTS orders_placed (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          REAL    NOT NULL,
+    condition_id TEXT   NOT NULL,
+    side        TEXT    NOT NULL,
+    price       REAL    NOT NULL,
+    size        REAL    NOT NULL,
+    order_id    TEXT    NOT NULL DEFAULT '',
+    order_type  TEXT    NOT NULL DEFAULT 'BUY'  -- 'BUY' or 'SELL'
+);
+
+-- Order cancellations
+CREATE TABLE IF NOT EXISTS orders_cancelled (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          REAL    NOT NULL,
+    order_id    TEXT    NOT NULL,
+    reason      TEXT    NOT NULL DEFAULT ''
+);
+
+-- Cycle snapshots (one row per manager per cycle)
+CREATE TABLE IF NOT EXISTS cycle_snapshots (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          REAL    NOT NULL,
+    cycle_num   INTEGER NOT NULL,
+    condition_id TEXT   NOT NULL,
+    best_bid    REAL,
+    best_ask    REAL,
+    our_bid     REAL,
+    our_ask     REAL,
+    yes_position_usd REAL DEFAULT 0,
+    no_position_usd  REAL DEFAULT 0,
+    active_orders    INTEGER DEFAULT 0,
+    unwind_orders    INTEGER DEFAULT 0
+);
+
+-- Merges (YES+NO -> USDC)
+CREATE TABLE IF NOT EXISTS merges (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          REAL    NOT NULL,
+    condition_id TEXT   NOT NULL,
+    shares      REAL    NOT NULL,
+    freed_usd   REAL    NOT NULL
+);
+
+-- Stop-loss events
+CREATE TABLE IF NOT EXISTS stop_losses (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          REAL    NOT NULL,
+    condition_id TEXT   NOT NULL,
+    side        TEXT    NOT NULL,
+    shares      REAL    NOT NULL,
+    cost_price  REAL    NOT NULL,
+    sell_price  REAL    NOT NULL,
+    loss_usd    REAL    NOT NULL
+);
+
+-- Daily P&L summary (generated once per day)
+CREATE TABLE IF NOT EXISTS daily_pnl (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    date        TEXT    NOT NULL UNIQUE,  -- YYYY-MM-DD
+    total_bought_usd    REAL DEFAULT 0,
+    total_sold_usd      REAL DEFAULT 0,
+    total_merged_usd    REAL DEFAULT 0,
+    realized_pnl        REAL DEFAULT 0,
+    num_fills           INTEGER DEFAULT 0,
+    num_unwinds         INTEGER DEFAULT 0,
+    num_merges          INTEGER DEFAULT 0,
+    num_stop_losses     INTEGER DEFAULT 0
+);
+
+-- Reward estimate vs. actual comparison (hourly snapshots)
+CREATE TABLE IF NOT EXISTS reward_comparisons (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts              REAL    NOT NULL,
+    condition_id    TEXT    NOT NULL DEFAULT '',  -- empty = aggregate
+    q_score_est     REAL    NOT NULL DEFAULT 0,
+    legacy_est      REAL    NOT NULL DEFAULT 0,
+    actual_earned   REAL    NOT NULL DEFAULT 0,
+    q_share_pct     REAL    NOT NULL DEFAULT 0,  -- our Q / total market Q
+    our_q_score     REAL    NOT NULL DEFAULT 0,
+    market_q_score  REAL    NOT NULL DEFAULT 0
+);
+
+-- A3: Live position state (replaces positions.json)
+CREATE TABLE IF NOT EXISTS positions (
+    condition_id TEXT    PRIMARY KEY,
+    question     TEXT    NOT NULL DEFAULT '',
+    yes_shares   REAL    NOT NULL DEFAULT 0,
+    yes_avg_price REAL   NOT NULL DEFAULT 0,
+    yes_halted   INTEGER NOT NULL DEFAULT 0,
+    no_shares    REAL    NOT NULL DEFAULT 0,
+    no_avg_price REAL    NOT NULL DEFAULT 0,
+    no_halted    INTEGER NOT NULL DEFAULT 0,
+    updated_at   REAL    NOT NULL DEFAULT 0
+);
+
+-- A3: Reward tracker scalar state (replaces reward_history.json top-level keys)
+CREATE TABLE IF NOT EXISTS reward_tracker_state (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+-- A3: Reward tracker per-market stats (replaces reward_history.json markets)
+CREATE TABLE IF NOT EXISTS reward_market_stats (
+    condition_id TEXT PRIMARY KEY,
+    data         TEXT NOT NULL,
+    updated_at   REAL NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_fills_cid ON fills(condition_id);
+CREATE INDEX IF NOT EXISTS idx_fills_ts ON fills(ts);
+CREATE INDEX IF NOT EXISTS idx_unwinds_cid ON unwinds(condition_id);
+CREATE INDEX IF NOT EXISTS idx_unwinds_ts ON unwinds(ts);
+CREATE INDEX IF NOT EXISTS idx_cycle_ts ON cycle_snapshots(ts);
+CREATE INDEX IF NOT EXISTS idx_daily_date ON daily_pnl(date);
+"""
+
+
+class BotDatabase:
+    """Thread-safe SQLite database for bot history and analytics."""
+
+    def __init__(self, db_path: str = DB_PATH) -> None:
+        self._db_path = db_path
+        self._local = threading.local()
+        self._init_schema()
+
+    def _get_conn(self) -> sqlite3.Connection:
+        """Get a thread-local connection (SQLite connections are not thread-safe)."""
+        if not hasattr(self._local, "conn") or self._local.conn is None:
+            conn = sqlite3.connect(self._db_path, timeout=10)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.row_factory = sqlite3.Row
+            self._local.conn = conn
+        return self._local.conn
+
+    def _init_schema(self) -> None:
+        """Create tables if they don't exist, and migrate existing tables."""
+        try:
+            conn = self._get_conn()
+            conn.executescript(_SCHEMA)
+            # Migrate: add M3 fill quality columns if missing
+            self._migrate_fill_quality(conn)
+            conn.commit()
+            log.info(f"Bot history database ready: {self._db_path}")
+        except Exception as e:
+            log.error(f"Failed to initialize database: {e}")
+
+    def _migrate_fill_quality(self, conn: sqlite3.Connection) -> None:
+        """Add midpoint and slippage columns to fills table if missing."""
+        try:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(fills)")}
+            if "midpoint" not in cols:
+                conn.execute("ALTER TABLE fills ADD COLUMN midpoint REAL NOT NULL DEFAULT 0")
+                log.info("Migrated fills table: added 'midpoint' column")
+            if "slippage" not in cols:
+                conn.execute("ALTER TABLE fills ADD COLUMN slippage REAL NOT NULL DEFAULT 0")
+                log.info("Migrated fills table: added 'slippage' column")
+        except Exception as e:
+            log.warning(f"Fill quality migration check: {e}")
+
+    # ── Logging Methods ───────────────────────────────────────────────────────
+
+    def log_fill(
+        self, condition_id: str, question: str, side: str,
+        fill_type: str, shares: float, price: float,
+        clob_cost: float, usd_value: float,
+        midpoint: float = 0.0, slippage: float = 0.0,
+    ) -> None:
+        """Record a BUY fill with optional fill quality metrics (M3)."""
+        try:
+            conn = self._get_conn()
+            conn.execute(
+                "INSERT INTO fills (ts, condition_id, question, side, "
+                "fill_type, shares, price, clob_cost, usd_value, "
+                "midpoint, slippage) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (time.time(), condition_id, question, side,
+                 fill_type, shares, price, clob_cost, usd_value,
+                 midpoint, slippage),
+            )
+            conn.commit()
+        except Exception as e:
+            log.debug(f"DB log_fill error: {e}")
+
+    def log_unwind(
+        self, condition_id: str, question: str, side: str,
+        shares: float, sell_price: float, usd_value: float,
+        vwap_cost: float = 0.0,
+    ) -> None:
+        """Record a SELL (unwind) fill."""
+        pnl = usd_value - vwap_cost
+        try:
+            conn = self._get_conn()
+            conn.execute(
+                "INSERT INTO unwinds (ts, condition_id, question, side, "
+                "shares, sell_price, usd_value, vwap_cost, pnl) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (time.time(), condition_id, question, side,
+                 shares, sell_price, usd_value, vwap_cost, pnl),
+            )
+            conn.commit()
+        except Exception as e:
+            log.debug(f"DB log_unwind error: {e}")
+
+    def log_order_placed(
+        self, condition_id: str, side: str, price: float,
+        size: float, order_id: str = "", order_type: str = "BUY",
+    ) -> None:
+        """Record an order placement."""
+        try:
+            conn = self._get_conn()
+            conn.execute(
+                "INSERT INTO orders_placed (ts, condition_id, side, price, "
+                "size, order_id, order_type) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (time.time(), condition_id, side, price, size,
+                 order_id, order_type),
+            )
+            conn.commit()
+        except Exception as e:
+            log.debug(f"DB log_order_placed error: {e}")
+
+    def log_order_cancelled(
+        self, order_id: str, reason: str = "",
+    ) -> None:
+        """Record an order cancellation."""
+        try:
+            conn = self._get_conn()
+            conn.execute(
+                "INSERT INTO orders_cancelled (ts, order_id, reason) "
+                "VALUES (?, ?, ?)",
+                (time.time(), order_id, reason),
+            )
+            conn.commit()
+        except Exception as e:
+            log.debug(f"DB log_order_cancelled error: {e}")
+
+    def log_cycle_snapshot(
+        self, cycle_num: int, condition_id: str,
+        best_bid: float = 0, best_ask: float = 0,
+        our_bid: float = 0, our_ask: float = 0,
+        yes_position_usd: float = 0, no_position_usd: float = 0,
+        active_orders: int = 0, unwind_orders: int = 0,
+    ) -> None:
+        """Record a cycle snapshot for one market."""
+        try:
+            conn = self._get_conn()
+            conn.execute(
+                "INSERT INTO cycle_snapshots (ts, cycle_num, condition_id, "
+                "best_bid, best_ask, our_bid, our_ask, "
+                "yes_position_usd, no_position_usd, "
+                "active_orders, unwind_orders) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (time.time(), cycle_num, condition_id,
+                 best_bid, best_ask, our_bid, our_ask,
+                 yes_position_usd, no_position_usd,
+                 active_orders, unwind_orders),
+            )
+            conn.commit()
+        except Exception as e:
+            log.debug(f"DB log_cycle_snapshot error: {e}")
+
+    def log_merge(
+        self, condition_id: str, shares: float, freed_usd: float,
+    ) -> None:
+        """Record a YES+NO merge."""
+        try:
+            conn = self._get_conn()
+            conn.execute(
+                "INSERT INTO merges (ts, condition_id, shares, freed_usd) "
+                "VALUES (?, ?, ?, ?)",
+                (time.time(), condition_id, shares, freed_usd),
+            )
+            conn.commit()
+        except Exception as e:
+            log.debug(f"DB log_merge error: {e}")
+
+    def log_stop_loss(
+        self, condition_id: str, side: str, shares: float,
+        cost_price: float, sell_price: float, loss_usd: float,
+    ) -> None:
+        """Record a stop-loss event."""
+        try:
+            conn = self._get_conn()
+            conn.execute(
+                "INSERT INTO stop_losses (ts, condition_id, side, shares, "
+                "cost_price, sell_price, loss_usd) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (time.time(), condition_id, side, shares,
+                 cost_price, sell_price, loss_usd),
+            )
+            conn.commit()
+        except Exception as e:
+            log.debug(f"DB log_stop_loss error: {e}")
+
+    def log_reward_comparison(
+        self, condition_id: str = "",
+        q_score_est: float = 0, legacy_est: float = 0,
+        actual_earned: float = 0, q_share_pct: float = 0,
+        our_q_score: float = 0, market_q_score: float = 0,
+    ) -> None:
+        """Record a reward estimate vs actual comparison snapshot."""
+        try:
+            conn = self._get_conn()
+            conn.execute(
+                "INSERT INTO reward_comparisons (ts, condition_id, "
+                "q_score_est, legacy_est, actual_earned, q_share_pct, "
+                "our_q_score, market_q_score) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (time.time(), condition_id, q_score_est, legacy_est,
+                 actual_earned, q_share_pct, our_q_score, market_q_score),
+            )
+            conn.commit()
+        except Exception as e:
+            log.debug(f"DB log_reward_comparison error: {e}")
+
+    def get_reward_accuracy_history(self, days: int = 7) -> list[dict]:
+        """Get reward estimate vs actual history for variance analysis."""
+        try:
+            conn = self._get_conn()
+            cutoff = time.time() - days * 86400
+            rows = conn.execute(
+                "SELECT * FROM reward_comparisons "
+                "WHERE ts > ? AND condition_id = '' "
+                "ORDER BY ts DESC",
+                (cutoff,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        except Exception as e:
+            log.debug(f"DB get_reward_accuracy_history error: {e}")
+            return []
+
+    # ── Query Methods ─────────────────────────────────────────────────────────
+
+    def get_daily_pnl(self, date: str = "") -> dict:
+        """Get P&L summary for a specific date (default: today).
+
+        Returns dict with keys: total_bought_usd, total_sold_usd,
+        realized_pnl, num_fills, num_unwinds, etc.
+        """
+        if not date:
+            date = time.strftime("%Y-%m-%d")
+        try:
+            conn = self._get_conn()
+            # Calculate from raw events
+            start_ts = time.mktime(time.strptime(date, "%Y-%m-%d"))
+            end_ts = start_ts + 86400
+
+            row = conn.execute(
+                "SELECT COALESCE(SUM(usd_value), 0) as total, "
+                "COUNT(*) as cnt FROM fills WHERE ts >= ? AND ts < ?",
+                (start_ts, end_ts),
+            ).fetchone()
+            total_bought = row["total"]
+            num_fills = row["cnt"]
+
+            row = conn.execute(
+                "SELECT COALESCE(SUM(usd_value), 0) as total, "
+                "COALESCE(SUM(pnl), 0) as pnl, "
+                "COUNT(*) as cnt FROM unwinds WHERE ts >= ? AND ts < ?",
+                (start_ts, end_ts),
+            ).fetchone()
+            total_sold = row["total"]
+            realized_pnl = row["pnl"]
+            num_unwinds = row["cnt"]
+
+            row = conn.execute(
+                "SELECT COALESCE(SUM(freed_usd), 0) as total, "
+                "COUNT(*) as cnt FROM merges WHERE ts >= ? AND ts < ?",
+                (start_ts, end_ts),
+            ).fetchone()
+            total_merged = row["total"]
+            num_merges = row["cnt"]
+
+            row = conn.execute(
+                "SELECT COUNT(*) as cnt, "
+                "COALESCE(SUM(loss_usd), 0) as total "
+                "FROM stop_losses WHERE ts >= ? AND ts < ?",
+                (start_ts, end_ts),
+            ).fetchone()
+            num_stop_losses = row["cnt"]
+            stop_loss_total = row["total"]
+
+            return {
+                "date": date,
+                "total_bought_usd": round(total_bought, 2),
+                "total_sold_usd": round(total_sold, 2),
+                "total_merged_usd": round(total_merged, 2),
+                "realized_pnl": round(realized_pnl, 2),
+                "stop_loss_usd": round(stop_loss_total, 2),
+                "num_fills": num_fills,
+                "num_unwinds": num_unwinds,
+                "num_merges": num_merges,
+                "num_stop_losses": num_stop_losses,
+            }
+        except Exception as e:
+            log.debug(f"DB get_daily_pnl error: {e}")
+            return {}
+
+    def get_position_history(
+        self, condition_id: str, limit: int = 100
+    ) -> list[dict]:
+        """Get recent fills and unwinds for a market."""
+        try:
+            conn = self._get_conn()
+            fills = conn.execute(
+                "SELECT ts, 'BUY' as action, side, shares, clob_cost as price, "
+                "usd_value FROM fills WHERE condition_id = ? "
+                "ORDER BY ts DESC LIMIT ?",
+                (condition_id, limit),
+            ).fetchall()
+            unwinds = conn.execute(
+                "SELECT ts, 'SELL' as action, side, shares, sell_price as price, "
+                "usd_value FROM unwinds WHERE condition_id = ? "
+                "ORDER BY ts DESC LIMIT ?",
+                (condition_id, limit),
+            ).fetchall()
+            combined = [dict(r) for r in fills] + [dict(r) for r in unwinds]
+            combined.sort(key=lambda x: x["ts"], reverse=True)
+            return combined[:limit]
+        except Exception as e:
+            log.debug(f"DB get_position_history error: {e}")
+            return []
+
+    def get_total_pnl(self) -> float:
+        """Get all-time realized P&L from unwinds."""
+        try:
+            conn = self._get_conn()
+            row = conn.execute(
+                "SELECT COALESCE(SUM(pnl), 0) as total FROM unwinds"
+            ).fetchone()
+            return round(row["total"], 2)
+        except Exception as e:
+            log.debug(f"DB get_total_pnl error: {e}")
+            return 0.0
+
+    # ── A3: Position Persistence (replaces positions.json) ──────────────────
+
+    def save_position(
+        self, condition_id: str, question: str,
+        yes_shares: float, yes_avg_price: float, yes_halted: bool,
+        no_shares: float, no_avg_price: float, no_halted: bool,
+    ) -> None:
+        """UPSERT a single market's position state."""
+        try:
+            conn = self._get_conn()
+            conn.execute(
+                "INSERT OR REPLACE INTO positions "
+                "(condition_id, question, yes_shares, yes_avg_price, yes_halted, "
+                "no_shares, no_avg_price, no_halted, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (condition_id, question, yes_shares, yes_avg_price,
+                 int(yes_halted), no_shares, no_avg_price, int(no_halted),
+                 time.time()),
+            )
+            conn.commit()
+        except Exception as e:
+            log.debug(f"DB save_position error: {e}")
+
+    def save_all_positions(self, positions: dict) -> None:
+        """Batch UPSERT all positions in a single transaction.
+
+        Args:
+            positions: Dict of {condition_id: {question, yes_shares, ...}}
+                matching the format from PositionStore._save().
+        """
+        try:
+            conn = self._get_conn()
+            now = time.time()
+            conn.execute("BEGIN")
+            # Clear old positions not in current set
+            if positions:
+                placeholders = ",".join("?" * len(positions))
+                conn.execute(
+                    f"DELETE FROM positions WHERE condition_id NOT IN ({placeholders})",
+                    list(positions.keys()),
+                )
+            else:
+                conn.execute("DELETE FROM positions")
+            for cid, pos in positions.items():
+                conn.execute(
+                    "INSERT OR REPLACE INTO positions "
+                    "(condition_id, question, yes_shares, yes_avg_price, yes_halted, "
+                    "no_shares, no_avg_price, no_halted, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (cid, pos.get("question", ""),
+                     pos.get("yes_shares", 0), pos.get("yes_avg_price", 0),
+                     int(pos.get("yes_halted", False)),
+                     pos.get("no_shares", 0), pos.get("no_avg_price", 0),
+                     int(pos.get("no_halted", False)),
+                     now),
+                )
+            conn.commit()
+        except Exception as e:
+            log.debug(f"DB save_all_positions error: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+    def load_all_positions(self) -> dict:
+        """Load all positions from SQLite.
+
+        Returns:
+            Dict matching PositionStore's expected format, or empty dict.
+        """
+        try:
+            conn = self._get_conn()
+            rows = conn.execute("SELECT * FROM positions").fetchall()
+            result = {}
+            for r in rows:
+                result[r["condition_id"]] = {
+                    "question": r["question"],
+                    "yes_shares": r["yes_shares"],
+                    "yes_avg_price": r["yes_avg_price"],
+                    "yes_halted": bool(r["yes_halted"]),
+                    "no_shares": r["no_shares"],
+                    "no_avg_price": r["no_avg_price"],
+                    "no_halted": bool(r["no_halted"]),
+                }
+            return result
+        except Exception as e:
+            log.debug(f"DB load_all_positions error: {e}")
+            return {}
+
+    def delete_position(self, condition_id: str) -> None:
+        """Remove a market's position."""
+        try:
+            conn = self._get_conn()
+            conn.execute(
+                "DELETE FROM positions WHERE condition_id = ?", (condition_id,)
+            )
+            conn.commit()
+        except Exception as e:
+            log.debug(f"DB delete_position error: {e}")
+
+    # ── A3: Reward Tracker Persistence (replaces reward_history.json) ─────
+
+    def save_reward_state(self, bot_start: float, last_hourly: float,
+                          last_daily: float) -> None:
+        """Save scalar reward tracker state."""
+        try:
+            conn = self._get_conn()
+            for key, val in [("bot_start", bot_start),
+                             ("last_hourly_log", last_hourly),
+                             ("last_daily_report", last_daily)]:
+                conn.execute(
+                    "INSERT OR REPLACE INTO reward_tracker_state (key, value) "
+                    "VALUES (?, ?)", (key, str(val)),
+                )
+            conn.commit()
+        except Exception as e:
+            log.debug(f"DB save_reward_state error: {e}")
+
+    def load_reward_state(self) -> dict:
+        """Load scalar reward tracker state."""
+        try:
+            conn = self._get_conn()
+            rows = conn.execute("SELECT key, value FROM reward_tracker_state").fetchall()
+            return {r["key"]: float(r["value"]) for r in rows}
+        except Exception as e:
+            log.debug(f"DB load_reward_state error: {e}")
+            return {}
+
+    def save_all_reward_stats(self, markets: dict) -> None:
+        """Batch UPSERT all market stats as JSON blobs.
+
+        Args:
+            markets: Dict of {condition_id: MarketStats dataclass}.
+        """
+        import json as _json
+        from dataclasses import asdict
+        try:
+            conn = self._get_conn()
+            now = time.time()
+            conn.execute("BEGIN")
+            if markets:
+                placeholders = ",".join("?" * len(markets))
+                conn.execute(
+                    f"DELETE FROM reward_market_stats "
+                    f"WHERE condition_id NOT IN ({placeholders})",
+                    list(markets.keys()),
+                )
+            else:
+                conn.execute("DELETE FROM reward_market_stats")
+            for cid, stats in markets.items():
+                d = asdict(stats) if hasattr(stats, "__dataclass_fields__") else stats
+                conn.execute(
+                    "INSERT OR REPLACE INTO reward_market_stats "
+                    "(condition_id, data, updated_at) VALUES (?, ?, ?)",
+                    (cid, _json.dumps(d), now),
+                )
+            conn.commit()
+        except Exception as e:
+            log.debug(f"DB save_all_reward_stats error: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+    def load_all_reward_stats(self) -> dict:
+        """Load all reward market stats from SQLite."""
+        import json as _json
+        try:
+            conn = self._get_conn()
+            rows = conn.execute("SELECT condition_id, data FROM reward_market_stats").fetchall()
+            return {r["condition_id"]: _json.loads(r["data"]) for r in rows}
+        except Exception as e:
+            log.debug(f"DB load_all_reward_stats error: {e}")
+            return {}
+
+    # ── A3: Backtest query methods ─────────────────────────────────────────
+
+    def get_cycle_snapshots(
+        self, condition_id: str = "", start_ts: float = 0,
+        end_ts: float = 0,
+    ) -> list[dict]:
+        """Get cycle snapshots for backtesting."""
+        try:
+            conn = self._get_conn()
+            if not end_ts:
+                end_ts = time.time()
+            if condition_id:
+                rows = conn.execute(
+                    "SELECT * FROM cycle_snapshots "
+                    "WHERE condition_id = ? AND ts >= ? AND ts <= ? "
+                    "ORDER BY ts", (condition_id, start_ts, end_ts),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM cycle_snapshots "
+                    "WHERE ts >= ? AND ts <= ? ORDER BY ts",
+                    (start_ts, end_ts),
+                ).fetchall()
+            return [dict(r) for r in rows]
+        except Exception as e:
+            log.debug(f"DB get_cycle_snapshots error: {e}")
+            return []
+
+    def get_fills_in_range(
+        self, condition_id: str = "", start_ts: float = 0,
+        end_ts: float = 0,
+    ) -> list[dict]:
+        """Get fills for backtesting."""
+        try:
+            conn = self._get_conn()
+            if not end_ts:
+                end_ts = time.time()
+            if condition_id:
+                rows = conn.execute(
+                    "SELECT * FROM fills WHERE condition_id = ? "
+                    "AND ts >= ? AND ts <= ? ORDER BY ts",
+                    (condition_id, start_ts, end_ts),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM fills WHERE ts >= ? AND ts <= ? ORDER BY ts",
+                    (start_ts, end_ts),
+                ).fetchall()
+            return [dict(r) for r in rows]
+        except Exception as e:
+            log.debug(f"DB get_fills_in_range error: {e}")
+            return []
+
+    def get_available_backtest_markets(
+        self, start_ts: float = 0, end_ts: float = 0, min_cycles: int = 100,
+    ) -> list[dict]:
+        """List markets with enough cycle data for backtesting."""
+        try:
+            conn = self._get_conn()
+            if not end_ts:
+                end_ts = time.time()
+            rows = conn.execute(
+                "SELECT condition_id, COUNT(*) as cycles, "
+                "MIN(ts) as first_ts, MAX(ts) as last_ts "
+                "FROM cycle_snapshots "
+                "WHERE ts >= ? AND ts <= ? "
+                "GROUP BY condition_id HAVING cycles >= ? "
+                "ORDER BY cycles DESC",
+                (start_ts, end_ts, min_cycles),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        except Exception as e:
+            log.debug(f"DB get_available_backtest_markets error: {e}")
+            return []
+
+    def get_fill_quality(self, days: int = 7) -> dict:
+        """Get fill quality stats for the given time period (M3).
+
+        Returns dict with:
+          - total_fills: number of fills with midpoint data
+          - avg_slippage: average slippage per fill (>0 = adverse)
+          - adverse_pct: percentage of fills that were adverse
+          - total_adverse_usd: total USD lost to adverse selection
+          - per_market: dict of condition_id → {fills, avg_slippage, adverse_pct}
+        """
+        try:
+            conn = self._get_conn()
+            cutoff = time.time() - days * 86400
+
+            # Aggregate stats (only rows with midpoint data)
+            row = conn.execute(
+                "SELECT COUNT(*) as cnt, "
+                "AVG(slippage) as avg_slip, "
+                "SUM(CASE WHEN slippage > 0 THEN 1 ELSE 0 END) as adverse_cnt, "
+                "SUM(CASE WHEN slippage > 0 THEN slippage * shares ELSE 0 END) as adverse_usd "
+                "FROM fills WHERE ts > ? AND midpoint > 0",
+                (cutoff,),
+            ).fetchone()
+
+            total_fills = row["cnt"] or 0
+            result = {
+                "total_fills": total_fills,
+                "avg_slippage": round(row["avg_slip"] or 0, 6),
+                "adverse_pct": round(
+                    (row["adverse_cnt"] or 0) / total_fills * 100, 1
+                ) if total_fills > 0 else 0,
+                "total_adverse_usd": round(row["adverse_usd"] or 0, 2),
+            }
+
+            # Per-market breakdown
+            rows = conn.execute(
+                "SELECT condition_id, question, "
+                "COUNT(*) as cnt, "
+                "AVG(slippage) as avg_slip, "
+                "SUM(CASE WHEN slippage > 0 THEN 1 ELSE 0 END) as adverse_cnt "
+                "FROM fills WHERE ts > ? AND midpoint > 0 "
+                "GROUP BY condition_id "
+                "ORDER BY avg_slip DESC",
+                (cutoff,),
+            ).fetchall()
+            result["per_market"] = [
+                {
+                    "condition_id": r["condition_id"],
+                    "question": r["question"],
+                    "fills": r["cnt"],
+                    "avg_slippage": round(r["avg_slip"] or 0, 6),
+                    "adverse_pct": round(
+                        (r["adverse_cnt"] or 0) / r["cnt"] * 100, 1
+                    ) if r["cnt"] > 0 else 0,
+                }
+                for r in rows
+            ]
+            return result
+
+        except Exception as e:
+            log.debug(f"DB get_fill_quality error: {e}")
+            return {"total_fills": 0, "avg_slippage": 0, "adverse_pct": 0,
+                    "total_adverse_usd": 0, "per_market": []}
+
+    def close(self) -> None:
+        """Close the thread-local connection."""
+        if hasattr(self._local, "conn") and self._local.conn:
+            self._local.conn.close()
+            self._local.conn = None
+
+
+# ── Singleton ─────────────────────────────────────────────────────────────────
+
+_instance: BotDatabase | None = None
+_instance_lock = threading.Lock()
+
+
+def get_db() -> BotDatabase:
+    """Get the singleton BotDatabase instance."""
+    global _instance
+    if _instance is None:
+        with _instance_lock:
+            if _instance is None:
+                _instance = BotDatabase()
+    return _instance

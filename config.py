@@ -5,7 +5,9 @@ All tunable parameters live here. Sensitive credentials are loaded
 from environment variables via a .env file.
 """
 
+import json
 import os
+import threading
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -70,20 +72,9 @@ ORDER_REFRESH_SECS: int = 30 # Cancel and replace orders every 30 seconds
 # too sparse to trust. Markets with wider spreads are skipped for that cycle.
 MAX_ORDERBOOK_SPREAD: float = 0.10  # 10c — wider than this is too sparse
 
-# Minimum dollar value of existing orders that must sit in front of ours.
-# Higher buffer = orders placed further back = less adverse selection.
-MIN_LIQUIDITY_BUFFER: float = 2000.0  # $2000 of liquidity buffer (was $1000)
 
-# ── Spread-Relative Pricing ─────────────────────────────────────────────────
-# New pricing strategy: place orders at a fraction of the spread from the
-# edge, ensuring orders land inside the reward window while capturing spread.
-# SPREAD_EDGE_PCT: how far from the best bid/ask to place our order, as a
-# fraction of the reward window (max_spread). 0.7 = 70% of the way from
-# midpoint to the reward boundary → sits inside the window, earns rewards,
-# and captures more spread than hiding behind $2K of volume.
-SPREAD_EDGE_PCT: float = 0.70   # Place orders at 70% of max_spread from mid
-MIN_EDGE_TICKS: int = 1         # Stay 1 tick behind best bid/ask (tight but inside reward window)
-USE_SPREAD_PRICING: bool = True  # Toggle: True = spread-relative, False = old buffer
+# ── Pricing ─────────────────────────────────────────────────────────────────
+# Co-best strategy: join at best bid/ask. Queue priority shields us.
 MIN_PRICE_DRIFT_TICKS: int = 2  # Only cancel+replace when price drifts by 2+ ticks
                                  # Keeps orders alive through small oscillations → more reward time
 
@@ -155,6 +146,55 @@ STOP_LOSS_MIN_PRICE: float = 0.20  # Skip stop-loss on tokens under 20c (let dec
 # inventory it cannot sell.
 MIN_BID_DEPTH_USD: float = 500.0   # Minimum $500 on the bid side to accept
 
+# ── M1: EMA Fair Value ────────────────────────────────────────────────────
+# Track exponential moving average of midpoint across cycles.
+# Used as stable midpoint reference for skew and zone checks instead of
+# raw (best_bid + best_ask)/2, which is noisy.
+EMA_HALF_LIFE_CYCLES: int = 20     # Half-life in cycles (~10 min at 30s cycles)
+                                    # alpha = 2 / (N + 1) ≈ 0.095
+
+# ── M2: Dynamic Spread (Volatility-Based) ────────────────────────────────
+# In calm markets, co-best is fine. In volatile markets, joining at best
+# bid/ask = instant adverse selection.  Widen spread proportional to
+# recent volatility.
+VOL_WINDOW_CYCLES: int = 30        # Look-back for vol measurement (~15 min)
+VOL_SPREAD_MULTIPLIER: float = 2.0 # Spread widen = vol × this multiplier
+VOL_WIDEN_MAX_TICKS: int = 3       # Cap: never widen more than 3 ticks from co-best
+
+# ── M4: Dynamic Order Sizing ────────────────────────────────────────────
+# Size orders based on market conditions instead of a flat ORDER_SIZE.
+# High-reward, stable, deep markets get larger orders.
+# Volatile, thin, low-reward markets get smaller orders.
+# The result is clamped to [DYNAMIC_SIZE_MIN, DYNAMIC_SIZE_MAX].
+DYNAMIC_SIZING_ENABLED: bool = True
+DYNAMIC_SIZE_MIN: int = 100          # Never size below $100
+DYNAMIC_SIZE_MAX: int = 500          # Never size above $500
+# Weights for the sizing score (0-1 each, then combined):
+# reward_eff: higher reward per $ deployed → size up
+# stability: low volatility → size up
+# depth: deep bid book → size up (can unwind)
+# spread: wide max_spread → size up (easier to stay in window)
+SIZE_WEIGHT_REWARD: float = 0.35
+SIZE_WEIGHT_STABILITY: float = 0.30
+SIZE_WEIGHT_DEPTH: float = 0.20
+SIZE_WEIGHT_SPREAD: float = 0.15
+
+# ── M5: Book Imbalance Guard ─────────────────────────────────────────────
+# If one side of the order book is much thinner than the other, informed
+# traders are about to push through our quote on the thin side.
+# Widen our quote on the thin side to avoid adverse selection.
+BOOK_IMBALANCE_THRESHOLD: float = 3.0  # Ratio (e.g. 3:1) to trigger guard
+BOOK_IMBALANCE_WIDEN_TICKS: int = 1    # Extra ticks on thin side
+
+# ── M6: Merge Arbitrage Execution ────────────────────────────────────────
+# When YES_ask + NO_ask < $1, buy both sides and merge for guaranteed
+# profit.  Conservative sizing — arb is opportunistic, not primary.
+ARB_ENABLED: bool = True
+ARB_MIN_PROFIT_PCT: float = 0.005  # 0.5% minimum profit to execute
+ARB_MAX_PAIRS: int = 50            # Max pairs per arb trade
+ARB_MAX_BUDGET_USD: float = 100.0  # Max capital per arb trade
+ARB_COOLDOWN_SECS: int = 120       # Per-market cooldown between arb attempts
+
 # ── Reward Tracking ─────────────────────────────────────────────────────────
 # Log earned rewards periodically for profitability visibility.
 REWARD_LOG_INTERVAL_SECS: int = 3600   # Query and log rewards every hour
@@ -191,3 +231,189 @@ def validate_credentials() -> None:
             f"FATAL: Missing required credentials in .env: {', '.join(missing)}\n"
             f"Copy .env.example to .env and fill in all fields."
         )
+
+
+# ── O2: Hot-Reloadable Config ──────────────────────────────────────────────
+# BotConfig reads config_overrides.json to override any parameter at runtime.
+# Usage: cfg("ORDER_SIZE") returns the live value (overridden or default).
+# To change: edit config_overrides.json — the bot picks it up next cycle.
+# Never reloadable: credentials, host, chain_id, signature_type.
+
+OVERRIDES_FILE: str = os.path.join(os.path.dirname(__file__), "config_overrides.json")
+
+# Parameters that are NEVER hot-reloadable (security-sensitive or structural)
+_IMMUTABLE: frozenset = frozenset({
+    "PRIVATE_KEY", "WALLET_ADDRESS", "CLOB_API_KEY", "CLOB_SECRET",
+    "CLOB_PASS_PHRASE", "FUNDER", "SIGNATURE_TYPE", "HOST", "CHAIN_ID",
+    "GAMMA_API", "DISCORD_WEBHOOK_URL",
+})
+
+
+class BotConfig:
+    """Hot-reloadable configuration singleton.
+
+    On each reload():
+      1. Reads config_overrides.json if it exists.
+      2. For each key not in _IMMUTABLE, overrides the live value.
+      3. Logs every change with old → new values.
+
+    All module-level constants remain as the compile-time defaults.
+    cfg("PARAM") returns the live (possibly overridden) value.
+    """
+
+    _instance: "BotConfig | None" = None
+    _init_lock = threading.Lock()
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._overrides: dict = {}
+        self._file_mtime: float = 0
+        # Snapshot of all module-level constants as defaults
+        import config as _self_module
+        self._defaults: dict = {
+            k: v for k, v in vars(_self_module).items()
+            if k.isupper() and not k.startswith("_") and k not in _IMMUTABLE
+        }
+        # Initial load
+        self._try_load()
+
+    @classmethod
+    def instance(cls) -> "BotConfig":
+        if cls._instance is None:
+            with cls._init_lock:
+                if cls._instance is None:
+                    cls._instance = cls()
+        return cls._instance
+
+    def get(self, name: str) -> object:
+        """Return the live value for a config parameter.
+
+        Checks overrides first, then falls back to the module-level default.
+        """
+        with self._lock:
+            if name in self._overrides:
+                return self._overrides[name]
+        # Fall back to module-level constant
+        return self._defaults.get(name)
+
+    def reload(self) -> int:
+        """Reload overrides from config_overrides.json.
+
+        Returns the number of parameters that changed.
+        """
+        return self._try_load()
+
+    def check_and_reload(self) -> int:
+        """Reload only if the overrides file has been modified.
+
+        Designed to be called every cycle — cheap no-op if file unchanged.
+        Returns number of changes (0 if no reload needed).
+        """
+        try:
+            if not os.path.exists(OVERRIDES_FILE):
+                if self._overrides:
+                    # File was deleted — revert to defaults
+                    with self._lock:
+                        old = self._overrides.copy()
+                        self._overrides = {}
+                        self._file_mtime = 0
+                    if old:
+                        import logging
+                        logging.getLogger(__name__).info(
+                            f"CONFIG | Overrides file removed — "
+                            f"reverted {len(old)} param(s) to defaults"
+                        )
+                    return len(old)
+                return 0
+
+            mtime = os.path.getmtime(OVERRIDES_FILE)
+            if mtime <= self._file_mtime:
+                return 0
+            return self._try_load()
+        except Exception:
+            return 0
+
+    def _try_load(self) -> int:
+        """Load overrides from JSON file. Returns number of changes."""
+        import logging
+        log = logging.getLogger(__name__)
+        if not os.path.exists(OVERRIDES_FILE):
+            return 0
+
+        try:
+            with open(OVERRIDES_FILE, "r") as f:
+                raw = json.load(f)
+            if not isinstance(raw, dict):
+                log.warning("CONFIG | config_overrides.json is not a dict — ignoring")
+                return 0
+
+            changes = 0
+            new_overrides = {}
+            for key, val in raw.items():
+                if key in _IMMUTABLE:
+                    log.warning(f"CONFIG | Ignoring immutable param: {key}")
+                    continue
+                if key not in self._defaults:
+                    log.warning(f"CONFIG | Unknown param in overrides: {key}")
+                    continue
+
+                # Type-check: ensure override matches the default's type
+                default_val = self._defaults[key]
+                if default_val is not None:
+                    expected_type = type(default_val)
+                    if not isinstance(val, expected_type):
+                        # Allow int → float promotion
+                        if expected_type is float and isinstance(val, int):
+                            val = float(val)
+                        else:
+                            log.warning(
+                                f"CONFIG | Type mismatch for {key}: "
+                                f"expected {expected_type.__name__}, "
+                                f"got {type(val).__name__} — skipping"
+                            )
+                            continue
+
+                new_overrides[key] = val
+
+            with self._lock:
+                old = self._overrides
+                self._overrides = new_overrides
+                self._file_mtime = os.path.getmtime(OVERRIDES_FILE)
+
+                # Log changes
+                for key, val in new_overrides.items():
+                    old_val = old.get(key, self._defaults.get(key))
+                    if old_val != val:
+                        log.info(f"CONFIG RELOAD | {key}: {old_val} → {val}")
+                        changes += 1
+                # Log reverted params
+                for key in old:
+                    if key not in new_overrides:
+                        log.info(
+                            f"CONFIG RELOAD | {key}: {old[key]} → "
+                            f"{self._defaults.get(key)} (reverted to default)"
+                        )
+                        changes += 1
+
+            if changes:
+                log.info(f"CONFIG | Reloaded {changes} param(s) from {OVERRIDES_FILE}")
+            return changes
+
+        except json.JSONDecodeError as e:
+            log.warning(f"CONFIG | Invalid JSON in overrides file: {e}")
+            return 0
+        except Exception as e:
+            log.warning(f"CONFIG | Could not load overrides: {e}")
+            return 0
+
+
+def cfg(name: str) -> object:
+    """Get the live value of a config parameter (hot-reloadable).
+
+    Usage:
+        from config import cfg
+        size = cfg("ORDER_SIZE")  # Returns overridden value if set
+
+    Falls back to the module-level constant if no override is active.
+    """
+    return BotConfig.instance().get(name)

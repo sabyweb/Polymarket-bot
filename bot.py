@@ -8,6 +8,7 @@ to OrderManager instances, and handles the main trading loop.
 import signal
 import time
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds, BalanceAllowanceParams, AssetType
 
@@ -19,6 +20,8 @@ from config import (
     ORDER_SIZE, FUNDER, SIGNATURE_TYPE,
     HYSTERESIS_SCORE_MARGIN, HEARTBEAT_TIMEOUT_SECS,
     REWARD_LOG_INTERVAL_SECS,
+    ARB_ENABLED, ARB_MIN_PROFIT_PCT, ARB_MAX_PAIRS,
+    ARB_MAX_BUDGET_USD, ARB_COOLDOWN_SECS,
 )
 from market import get_rewards_markets
 from state import PositionStore as PositionTracker
@@ -26,6 +29,7 @@ from orders import OrderManager, BalanceGate
 from rate_limiter import RateLimitedClient
 from arbitrage import ArbitrageScanner
 from reward_tracker import RewardTracker
+from database import get_db
 from alerts import (
     setup_logger, alert_bot_restart, alert_no_markets,
     alert_api_failure, alert_positions, alert_heartbeat_failure,
@@ -58,6 +62,9 @@ class MarketMakerBot:
         self._last_arb_scan: float = 0
         self._last_reward_log: float = 0
         self.reward_tracker: RewardTracker = RewardTracker()
+        self._executor: ThreadPoolExecutor = ThreadPoolExecutor(
+            max_workers=MAX_MARKETS, thread_name_prefix="market"
+        )
 
     # ── Client Setup ─────────────────────────────────────────────────────────
     def connect(self) -> bool:
@@ -358,6 +365,10 @@ class MarketMakerBot:
                 self.cycle_count += 1
                 log_cycle_start(self.cycle_count)
 
+                # ── O2: Hot-reload config if overrides file changed ───
+                from config import BotConfig
+                BotConfig.instance().check_and_reload()
+
                 # ── Heartbeat check ─────────────────────────────────────
                 since_last = time.time() - self._last_successful_cycle
                 if since_last > HEARTBEAT_TIMEOUT_SECS and not self._heartbeat_alerted:
@@ -375,24 +386,52 @@ class MarketMakerBot:
                     time.sleep(ORDER_REFRESH_SECS)
                     continue
 
-                for market in self.active_markets:
-                    if self._shutdown_requested:
-                        break
-                    condition_id = market["condition_id"]
-                    if condition_id in self.order_managers:
-                        manager = self.order_managers[condition_id]
+                # Fetch all exchange orders ONCE per cycle — shared across
+                # all managers. Eliminates per-manager get_orders() calls
+                # (was 3+ calls per manager × 5 managers = 15+ API calls).
+                try:
+                    exchange_orders = self.client.get_orders() or []
+                except Exception as e:
+                    log.error(f"Failed to fetch exchange orders: {e}")
+                    exchange_orders = []
+
+                # ── Run active market cycles concurrently ────────────
+                # Each manager runs its own cycle in a thread. The rate
+                # limiter serializes API calls; PositionStore has a lock
+                # for mutations; BalanceGate is safe for concurrent reads.
+                def _run_market(market_dict: dict) -> str:
+                    """Run one market cycle. Returns condition_id."""
+                    cid = market_dict["condition_id"]
+                    if cid not in self.order_managers:
+                        return cid
+                    mgr = self.order_managers[cid]
+                    try:
+                        mgr.run_cycle(exchange_orders=exchange_orders)
+                    except Exception as exc:
+                        log.error(
+                            f"Cycle error for "
+                            f"{market_dict['question'][:40]}: {exc}"
+                        )
+                    self._record_cycle_stats(cid, market_dict, mgr)
+                    return cid
+
+                if not self._shutdown_requested:
+                    futures = {
+                        self._executor.submit(_run_market, m): m
+                        for m in self.active_markets
+                    }
+                    for fut in as_completed(futures, timeout=120):
                         try:
-                            manager.run_cycle()
+                            fut.result()
                         except Exception as e:
+                            mkt = futures[fut]
                             log.error(
-                                f"Cycle error for "
-                                f"{market['question'][:40]}: {e}"
+                                f"Thread error for "
+                                f"{mkt['question'][:40]}: {e}"
                             )
 
-                        # ── Record per-market stats for reward tracking ───
-                        self._record_cycle_stats(condition_id, market, manager)
-
                 # ── Check unwind-only managers (removed markets) ────────
+                # These run sequentially — typically 0-2 managers.
                 active_cids = {m["condition_id"] for m in self.active_markets}
                 for cid in list(self.order_managers.keys()):
                     if cid not in active_cids:
@@ -400,7 +439,7 @@ class MarketMakerBot:
                         if manager.has_open_obligations():
                             try:
                                 manager.refresh_cached_book()
-                                manager.detect_fills()
+                                manager.detect_fills(exchange_orders=exchange_orders)
                                 manager.reconcile_unwinds()
                             except Exception as e:
                                 log.error(
@@ -430,22 +469,25 @@ class MarketMakerBot:
                     self._reconcile_with_exchange()
                     self._last_reconcile = time.time()
 
-                # ── Arbitrage detection scan (every 5 min) ──────────────
-                # Scan for YES+NO complement mispricing (detection only).
-                # Spread capture is now inline in reconcile_unwinds().
-                if (self._arb_scanner
-                        and time.time() - self._last_arb_scan >= 300):
+                # ── Arbitrage scan + execution (every 2 min) ──────────────
+                if (ARB_ENABLED and self._arb_scanner
+                        and time.time() - self._last_arb_scan >= ARB_COOLDOWN_SECS):
                     try:
-                        self._arb_scanner.scan_complement_arb(
+                        opportunities = self._arb_scanner.scan_complement_arb(
                             self.active_markets
                         )
+                        if opportunities:
+                            self._execute_arb(opportunities)
                     except Exception as e:
-                        log.debug(f"Arb scan error: {e}")
+                        log.debug(f"Arb scan/execution error: {e}")
                     self._last_arb_scan = time.time()
 
                 # ── Reward earnings log (every hour) ────────────────────
                 try:
-                    self.reward_tracker.maybe_log_hourly(self.active_markets)
+                    logged = self.reward_tracker.maybe_log_hourly(self.active_markets)
+                    # Query actual rewards from API alongside hourly estimate
+                    if logged:
+                        self._query_actual_rewards()
                 except Exception as e:
                     log.debug(f"Reward log error: {e}")
 
@@ -857,18 +899,28 @@ class MarketMakerBot:
             )
 
             # Which sides have live orders?
-            active_sides = {o["side"] for o in manager.active_orders.values()}
+            active_sides = {o.side for o in manager.active_orders.values()}
             has_yes = "yes" in active_sides
             has_no = "no" in active_sides
 
-            # Current bid/ask prices from our orders
+            # Current bid/ask prices and sizes from our orders
             bid_price = 0.0
             ask_price = 0.0
+            bid_size = 0.0
+            ask_size = 0.0
             for o in manager.active_orders.values():
-                if o["side"] == "yes":
-                    bid_price = o["price"]
-                elif o["side"] == "no":
-                    ask_price = o["price"]
+                if o.side == "yes":
+                    bid_price = o.price
+                    bid_size = o.size or o.original_size
+                elif o.side == "no":
+                    ask_price = o.price
+                    ask_size = o.size or o.original_size
+
+            # Midpoint and cached order book for Q-score calculation
+            best_bid = getattr(manager, "_cached_best_bid", 0)
+            best_ask = getattr(manager, "_cached_best_ask", 1)
+            midpoint = (best_bid + best_ask) / 2 if best_bid > 0 else 0
+            cached_book = getattr(manager, "_last_order_book", None)
 
             # Inventory on this market
             yes_usd = self.position_tracker.get_position(condition_id, "yes")
@@ -894,21 +946,138 @@ class MarketMakerBot:
                 cooldown_active=cooldown_active,
                 skew_active=skew_active,
                 cycle_duration_secs=ORDER_REFRESH_SECS,
+                midpoint=midpoint,
+                bid_size=bid_size,
+                ask_size=ask_size,
+                order_book=cached_book,
             )
+
+            # Log cycle snapshot to history database (every 10th cycle
+            # to avoid excessive writes)
+            if self.cycle_count % 10 == 0:
+                best_bid = getattr(manager, "_cached_best_bid", 0)
+                best_ask = getattr(manager, "_cached_best_ask", 1)
+                get_db().log_cycle_snapshot(
+                    cycle_num=self.cycle_count,
+                    condition_id=condition_id,
+                    best_bid=best_bid, best_ask=best_ask,
+                    our_bid=bid_price, our_ask=ask_price,
+                    yes_position_usd=yes_usd,
+                    no_position_usd=no_usd,
+                    active_orders=len(manager.active_orders),
+                    unwind_orders=len(manager.unwind_orders),
+                )
         except Exception as e:
             log.debug(f"Reward stat recording error: {e}")
 
-    def _log_reward_earnings(self) -> None:
-        """Query and log estimated reward earnings for visibility.
+    # ── M6: Merge Arbitrage Execution ─────────────────────────────────────
 
-        Uses the CLOB API rewards endpoint if available, otherwise
-        estimates from market daily rates and order presence time.
-        Logs per-market breakdown and total for profitability tracking.
+    def _execute_arb(self, opportunities: list[dict]) -> None:
+        """Execute merge arbitrage: buy both YES + NO, then merge for $1.
+
+        Conservative approach:
+          - Only arb markets we're already managing (have an OrderManager)
+          - Size limited by ARB_MAX_BUDGET_USD and ARB_MAX_PAIRS
+          - Place limit orders at the current asks (not market orders)
+          - If one side fills and the other doesn't, the unwind system
+            handles the inventory — same as any normal fill
+
+        The actual merge happens in reconcile_unwinds() when it detects
+        that both YES and NO positions exist for the same market.
+        """
+        from price import to_clob
+
+        for opp in opportunities:
+            cid = opp.get("condition_id", "")
+            if cid not in self.order_managers:
+                continue  # Only arb markets we're actively managing
+
+            manager = self.order_managers[cid]
+            question = opp.get("question", "")[:40]
+            yes_ask = opp.get("yes_ask", 0)
+            no_ask = opp.get("no_ask", 0)
+            profit_pct = opp.get("profit_pct", 0)
+            max_pairs = opp.get("max_pairs", 0)
+
+            if profit_pct < ARB_MIN_PROFIT_PCT:
+                continue
+
+            # Size: min of (available pairs, budget/cost, config max)
+            cost_per_pair = yes_ask + no_ask
+            if cost_per_pair <= 0:
+                continue
+            budget_pairs = int(ARB_MAX_BUDGET_USD / cost_per_pair)
+            pairs = min(max_pairs, budget_pairs, ARB_MAX_PAIRS)
+
+            if pairs < 1:
+                continue
+
+            # Don't arb if we already have significant inventory in this market
+            # (reconcile_unwinds will handle existing positions)
+            yes_inv = self.position_tracker.get_position(cid, "yes")
+            no_inv = self.position_tracker.get_position(cid, "no")
+            if yes_inv > ARB_MAX_BUDGET_USD or no_inv > ARB_MAX_BUDGET_USD:
+                log.debug(
+                    f"Skipping arb on {question} — existing inventory "
+                    f"YES=${yes_inv:.0f} NO=${no_inv:.0f}"
+                )
+                continue
+
+            est_profit = (1.0 - cost_per_pair) * pairs
+            log.info(
+                f"ARB EXECUTE | {question} | "
+                f"YES@{yes_ask:.4f} + NO@{no_ask:.4f} = {cost_per_pair:.4f} | "
+                f"pairs={pairs} | est_profit=${est_profit:.2f} "
+                f"({profit_pct:.1%})"
+            )
+
+            # Place BUY YES (at the ask price — cross the spread to fill)
+            # yes_ask is already in YES-equivalent terms
+            yes_id = manager.place_order("yes", yes_ask, size=pairs)
+
+            # Place BUY NO (no_ask is in CLOB terms — convert to YES-equiv)
+            # YES-equiv of NO ask = 1 - no_ask
+            no_yes_equiv = round(1.0 - no_ask, 4)
+            no_id = manager.place_order("no", no_yes_equiv, size=pairs)
+
+            if yes_id and no_id:
+                log.info(
+                    f"ARB ORDERS PLACED | {question} | "
+                    f"YES={yes_id[:16]}... NO={no_id[:16]}... | "
+                    f"pairs={pairs} | waiting for fills → merge"
+                )
+                get_db().log_order_placed(
+                    condition_id=cid, side="arb",
+                    price=cost_per_pair, size=float(pairs),
+                    order_id=f"arb:{yes_id[:8]}+{no_id[:8]}",
+                    order_type="ARB",
+                )
+            elif yes_id and not no_id:
+                log.warning(
+                    f"ARB PARTIAL | YES placed but NO failed | {question} — "
+                    f"YES order becomes regular inventory"
+                )
+            elif no_id and not yes_id:
+                log.warning(
+                    f"ARB PARTIAL | NO placed but YES failed | {question} — "
+                    f"NO order becomes regular inventory"
+                )
+            else:
+                log.warning(f"ARB FAILED | Both orders rejected | {question}")
+
+            # Only attempt one arb per scan cycle to be conservative
+            break
+
+    def _query_actual_rewards(self) -> None:
+        """Query actual earned rewards from the Polymarket API.
+
+        Tries the CLOB rewards endpoint. If successful, feeds the actual
+        amounts into the RewardTracker for comparison with our Q-score
+        and legacy estimates.
         """
         try:
             import requests
 
-            # Try the CLOB rewards earned endpoint
             headers = {
                 "POLY_API_KEY": CLOB_API_KEY,
                 "POLY_SECRET": CLOB_SECRET,
@@ -921,80 +1090,66 @@ class MarketMakerBot:
             )
             if resp.status_code == 200:
                 data = resp.json()
+                total_earned = 0.0
+                per_market: dict[str, float] = {}
+
                 if isinstance(data, dict):
-                    total = float(data.get("total_earned", 0))
-                    log.info(
-                        f"REWARD EARNINGS | total=${total:.2f} | "
-                        f"source=CLOB API"
-                    )
-                    # Send to Discord if significant
-                    if total > 0:
-                        from alerts import _send_discord
-                        _send_discord(
-                            "Reward Earnings",
-                            {
-                                "title": "Liquidity Reward Earnings",
-                                "description": f"Total earned: ${total:.2f}",
-                                "color": 0x2ECC71,
-                            },
-                        )
-                    return
+                    total_earned = float(data.get("total_earned", 0))
+                    # Some API versions return per-market breakdown
+                    for item in data.get("markets", []):
+                        cid = item.get("condition_id", "")
+                        earned = float(item.get("earned", 0))
+                        if cid and earned > 0:
+                            per_market[cid] = earned
                 elif isinstance(data, list):
-                    total = sum(float(item.get("earned", 0)) for item in data)
+                    for item in data:
+                        earned = float(item.get("earned", 0))
+                        cid = item.get("condition_id", "")
+                        total_earned += earned
+                        if cid and earned > 0:
+                            per_market[cid] = earned
+
+                if total_earned > 0:
                     log.info(
-                        f"REWARD EARNINGS | total=${total:.2f} | "
-                        f"markets={len(data)} | source=CLOB API"
+                        f"ACTUAL REWARDS | total=${total_earned:.2f} | "
+                        f"markets={len(per_market)} | source=CLOB API"
                     )
-                    return
+                    self.reward_tracker.record_actual_rewards(
+                        total_earned, per_market or None
+                    )
 
-            # API returned non-200 — fall back to estimation
-            log.debug(
-                f"Rewards API returned {resp.status_code} — "
-                f"using estimation fallback"
-            )
-
+                    # Log to database
+                    from database import get_db
+                    db = get_db()
+                    try:
+                        conn = db._get_conn()
+                        conn.execute(
+                            "INSERT OR REPLACE INTO daily_pnl "
+                            "(date, total_bought_usd, total_sold_usd, "
+                            "total_merged_usd, realized_pnl) "
+                            "VALUES (?, 0, 0, 0, ?)",
+                            (time.strftime("%Y-%m-%d"), total_earned),
+                        )
+                        conn.commit()
+                    except Exception:
+                        pass
+                else:
+                    log.debug("Rewards API returned 0 earned — endpoint may not be active")
+            else:
+                log.debug(
+                    f"Rewards API returned {resp.status_code} — "
+                    f"actual rewards not available"
+                )
         except Exception as e:
-            log.debug(f"Rewards API query failed: {e} — using estimation")
-
-        # ── Fallback: estimate from daily rates and active time ────────
-        # Each market has a daily_rate. Our share depends on how much of
-        # the time we have qualifying orders on the book and our order
-        # size relative to total eligible volume. This is a rough estimate.
-        if not self.active_markets:
-            return
-
-        total_daily_rate = sum(
-            m.get("daily_rate", 0) for m in self.active_markets
-        )
-        # Rough estimate: we capture ~5-15% of each market's rewards
-        # (one of many makers, but we're on both sides continuously)
-        est_pct = 0.10
-        est_daily = total_daily_rate * est_pct
-        est_hourly = est_daily / 24
-
-        market_lines = []
-        for m in self.active_markets:
-            rate = m.get("daily_rate", 0)
-            est = rate * est_pct
-            market_lines.append(
-                f"  {m['question'][:40]} | "
-                f"pool=${rate:.0f}/day | est_share=${est:.2f}/day"
-            )
-
-        log.info(
-            f"REWARD ESTIMATE | "
-            f"total_pool=${total_daily_rate:.0f}/day | "
-            f"est_share=${est_daily:.2f}/day (${est_hourly:.2f}/hr) | "
-            f"markets={len(self.active_markets)}"
-        )
-        for line in market_lines:
-            log.info(f"  REWARD {line}")
+            log.debug(f"Actual reward query failed: {e}")
 
     # ── Shutdown ─────────────────────────────────────────────────────────────
     def _shutdown(self) -> None:
         """Clean shutdown — cancel all orders (including unwinds) before exiting."""
         log.info("Shutting down bot...")
+        self._executor.shutdown(wait=False)
         for condition_id, manager in self.order_managers.items():
             manager.cancel_all(reason="bot shutdown", include_unwinds=True)
         self.position_tracker.print_summary()
+        get_db().close()
         log.info("All orders cancelled. Bot stopped cleanly.")
