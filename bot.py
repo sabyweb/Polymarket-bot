@@ -18,11 +18,13 @@ from config import (
     MARKET_REFRESH_SECS, ORDER_REFRESH_SECS,
     ORDER_SIZE, FUNDER, SIGNATURE_TYPE,
     HYSTERESIS_SCORE_MARGIN, HEARTBEAT_TIMEOUT_SECS,
+    REWARD_LOG_INTERVAL_SECS,
 )
 from market import get_rewards_markets
 from state import PositionStore as PositionTracker
 from orders import OrderManager, BalanceGate
 from rate_limiter import RateLimitedClient
+from arbitrage import ArbitrageScanner
 from alerts import (
     setup_logger, alert_bot_restart, alert_no_markets,
     alert_api_failure, alert_positions, alert_heartbeat_failure,
@@ -51,6 +53,9 @@ class MarketMakerBot:
         self._last_successful_cycle: float = time.time()
         self._heartbeat_alerted: bool = False
         self._last_reconcile: float = 0  # Periodic exchange reconciliation
+        self._arb_scanner: ArbitrageScanner | None = None
+        self._last_arb_scan: float = 0
+        self._last_reward_log: float = 0
 
     # ── Client Setup ─────────────────────────────────────────────────────────
     def connect(self) -> bool:
@@ -78,6 +83,7 @@ class MarketMakerBot:
             )
             self.client = RateLimitedClient(raw_client)
             self.balance_gate = BalanceGate(self.client)
+            self._arb_scanner = ArbitrageScanner(self.client)
             log.info("Connected to Polymarket CLOB API (rate-limited)")
 
             # Set COLLATERAL (USDC) allowance at startup.
@@ -408,6 +414,27 @@ class MarketMakerBot:
                 if time.time() - self._last_reconcile >= 300:
                     self._reconcile_with_exchange()
                     self._last_reconcile = time.time()
+
+                # ── Arbitrage detection scan (every 5 min) ──────────────
+                # Scan for YES+NO complement mispricing (detection only).
+                # Spread capture is now inline in reconcile_unwinds().
+                if (self._arb_scanner
+                        and time.time() - self._last_arb_scan >= 300):
+                    try:
+                        self._arb_scanner.scan_complement_arb(
+                            self.active_markets
+                        )
+                    except Exception as e:
+                        log.debug(f"Arb scan error: {e}")
+                    self._last_arb_scan = time.time()
+
+                # ── Reward earnings log (every hour) ────────────────────
+                if time.time() - self._last_reward_log >= REWARD_LOG_INTERVAL_SECS:
+                    try:
+                        self._log_reward_earnings()
+                    except Exception as e:
+                        log.debug(f"Reward log error: {e}")
+                    self._last_reward_log = time.time()
 
                 # ── Wait for next cycle (interruptible) ───────────────────
                 if not self._shutdown_requested:
@@ -794,6 +821,99 @@ class MarketMakerBot:
         except Exception as e:
             log.error(f"Could not fetch open orders for cleanup: {e}")
             log.warning("Old orders may still be live — check Polymarket UI")
+
+    # ── Reward Earnings Tracking ─────────────────────────────────────────────
+    def _log_reward_earnings(self) -> None:
+        """Query and log estimated reward earnings for visibility.
+
+        Uses the CLOB API rewards endpoint if available, otherwise
+        estimates from market daily rates and order presence time.
+        Logs per-market breakdown and total for profitability tracking.
+        """
+        try:
+            import requests
+
+            # Try the CLOB rewards earned endpoint
+            headers = {
+                "POLY_API_KEY": CLOB_API_KEY,
+                "POLY_SECRET": CLOB_SECRET,
+                "POLY_PASSPHRASE": CLOB_PASS_PHRASE,
+            }
+            resp = requests.get(
+                f"{HOST}/rewards/earned",
+                headers=headers,
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, dict):
+                    total = float(data.get("total_earned", 0))
+                    log.info(
+                        f"REWARD EARNINGS | total=${total:.2f} | "
+                        f"source=CLOB API"
+                    )
+                    # Send to Discord if significant
+                    if total > 0:
+                        from alerts import _send_discord
+                        _send_discord(
+                            "Reward Earnings",
+                            {
+                                "title": "Liquidity Reward Earnings",
+                                "description": f"Total earned: ${total:.2f}",
+                                "color": 0x2ECC71,
+                            },
+                        )
+                    return
+                elif isinstance(data, list):
+                    total = sum(float(item.get("earned", 0)) for item in data)
+                    log.info(
+                        f"REWARD EARNINGS | total=${total:.2f} | "
+                        f"markets={len(data)} | source=CLOB API"
+                    )
+                    return
+
+            # API returned non-200 — fall back to estimation
+            log.debug(
+                f"Rewards API returned {resp.status_code} — "
+                f"using estimation fallback"
+            )
+
+        except Exception as e:
+            log.debug(f"Rewards API query failed: {e} — using estimation")
+
+        # ── Fallback: estimate from daily rates and active time ────────
+        # Each market has a daily_rate. Our share depends on how much of
+        # the time we have qualifying orders on the book and our order
+        # size relative to total eligible volume. This is a rough estimate.
+        if not self.active_markets:
+            return
+
+        total_daily_rate = sum(
+            m.get("daily_rate", 0) for m in self.active_markets
+        )
+        # Rough estimate: we capture ~5-15% of each market's rewards
+        # (one of many makers, but we're on both sides continuously)
+        est_pct = 0.10
+        est_daily = total_daily_rate * est_pct
+        est_hourly = est_daily / 24
+
+        market_lines = []
+        for m in self.active_markets:
+            rate = m.get("daily_rate", 0)
+            est = rate * est_pct
+            market_lines.append(
+                f"  {m['question'][:40]} | "
+                f"pool=${rate:.0f}/day | est_share=${est:.2f}/day"
+            )
+
+        log.info(
+            f"REWARD ESTIMATE | "
+            f"total_pool=${total_daily_rate:.0f}/day | "
+            f"est_share=${est_daily:.2f}/day (${est_hourly:.2f}/hr) | "
+            f"markets={len(self.active_markets)}"
+        )
+        for line in market_lines:
+            log.info(f"  REWARD {line}")
 
     # ── Shutdown ─────────────────────────────────────────────────────────────
     def _shutdown(self) -> None:

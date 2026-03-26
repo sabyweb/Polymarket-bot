@@ -289,7 +289,7 @@ print("\n=== TEST 9: Decay Math ===")
 
 from config import (
     UNWIND_DECAY_INTERVAL_SECS, UNWIND_DECAY_TICKS,
-    UNWIND_ACCEL_LOSS_PCT, UNWIND_ACCEL_MULTIPLIER,
+    UNWIND_ACCEL_TIERS,
     MIN_SELL_PRICE,
 )
 
@@ -321,21 +321,26 @@ check("After 25min: sell at 68c (5 ticks decay)",
       abs(expected - 0.68) < 0.001,
       f"got {expected}")
 
-# With acceleration (loss > 8%)
+# With tiered acceleration (loss > 15% → 4x multiplier)
 market_bid = 0.60  # NO market bid
 cur_loss = (vwap_clob - market_bid) / vwap_clob  # (0.73-0.60)/0.73 = 17.8%
-check("17.8% loss triggers acceleration",
-      cur_loss >= UNWIND_ACCEL_LOSS_PCT,
-      f"loss={cur_loss:.1%}, threshold={UNWIND_ACCEL_LOSS_PCT:.0%}")
+# Find the matching tier
+accel_mult = 1
+for threshold, mult in UNWIND_ACCEL_TIERS:
+    if cur_loss >= threshold:
+        accel_mult = mult
+check("17.8% loss triggers tier 3 (4x)",
+      accel_mult == 4,
+      f"got multiplier={accel_mult}")
 
-accel_ticks = UNWIND_DECAY_TICKS * UNWIND_ACCEL_MULTIPLIER  # 5
+accel_ticks = UNWIND_DECAY_TICKS * accel_mult  # 4
 elapsed = 2 * UNWIND_DECAY_INTERVAL_SECS  # 10 min
 decay_intervals = int(elapsed // UNWIND_DECAY_INTERVAL_SECS)  # 2
-decay_amount = decay_intervals * accel_ticks * tick  # 2 * 5 * 0.01 = 0.10
+decay_amount = decay_intervals * accel_ticks * tick  # 2 * 4 * 0.01 = 0.08
 expected = max(MIN_SELL_PRICE, vwap_clob - decay_amount)
 
-check("After 10min accelerated: sell at 63c (10 ticks)",
-      abs(expected - 0.63) < 0.001,
+check("After 10min tiered-accel: sell at 65c (8 ticks)",
+      abs(expected - 0.65) < 0.001,
       f"got {expected}")
 
 

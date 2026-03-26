@@ -17,8 +17,15 @@ from config import (
     MIN_LIQUIDITY_BUFFER, MIN_UNWIND_SHARES,
     UNWIND_DECAY_INTERVAL_SECS, UNWIND_DECAY_TICKS,
     MIN_SELL_PRICE, STOP_LOSS_PCT, MIN_STOP_LOSS_USD, STOP_LOSS_MIN_PRICE,
-    UNWIND_ACCEL_LOSS_PCT, UNWIND_ACCEL_MULTIPLIER,
+    UNWIND_ACCEL_TIERS,
+    UNWIND_AGE_ACCEL_HOURS, UNWIND_AGE_ACCEL_TICKS,
+    UNWIND_AGE_MAX_HOURS, UNWIND_AGE_MAX_TICKS,
     CHEAP_TOKEN_THRESHOLD, CHEAP_TOKEN_SCALE,
+    SPREAD_EDGE_PCT, MIN_EDGE_TICKS, USE_SPREAD_PRICING,
+    MIN_PRICE_DRIFT_TICKS,
+    INVENTORY_SKEW_ENABLED, INVENTORY_SKEW_TICKS, INVENTORY_SKEW_THRESHOLD,
+    POST_FILL_COOLDOWN_SECS, POST_FILL_WIDEN_TICKS,
+    MIN_BID_DEPTH_USD,
 )
 from alerts import (
     alert_order_failure, alert_danger_zone,
@@ -129,6 +136,8 @@ class OrderManager:
         # Short-lived cache for token balances (avoids hitting API
         # multiple times per cycle for the same token)
         self._token_balance_cache: dict[str, tuple[float, float]] = {}  # side → (balance, timestamp)
+        # Post-fill cooldown: track last BUY fill time per side
+        self._last_fill_time: dict[str, float] = {"yes": 0.0, "no": 0.0}
 
     # ── Tick Size Rounding ───────────────────────────────────────────────────
     def round_to_tick(self, price: float) -> float:
@@ -387,16 +396,21 @@ class OrderManager:
     def calculate_order_prices(
         self, order_book: dict
     ) -> tuple[float | None, float | None]:
-        """Walk the orderbook to place orders behind a liquidity buffer.
+        """Calculate bid and ask prices using the active pricing strategy.
 
-        We accumulate dollar volume from the top of each side of the book
-        until we reach MIN_LIQUIDITY_BUFFER, then place our order one tick
-        beyond that level.  This ensures that at least $1000 (by default)
-        of existing orders must be filled before ours are reached.
+        Two strategies available (controlled by USE_SPREAD_PRICING):
+
+        1. **Spread-relative** (default, new): Place orders at a configurable
+           fraction of the reward window from the midpoint.  This ensures
+           orders land inside the reward window (earning rewards) while
+           capturing meaningful spread.  Inventory skew tilts quotes to
+           naturally unwind positions through the spread.
+
+        2. **Liquidity-buffer** (legacy): Walk the book to find the price
+           level with $2000 of cumulative volume in front.
 
         Args:
-            order_book: Dict with 'bids' and 'asks' lists. Each entry is
-                a dict with 'price' and 'size' keys.
+            order_book: Dict with 'bids' and 'asks' lists.
 
         Returns:
             (our_bid, our_ask) or (None, None) if conditions are not met.
@@ -404,51 +418,50 @@ class OrderManager:
         try:
             tick = self.market.get("tick_size", 0.01)
             max_spread = self.market["max_spread"]
-
-            # Walk bids top-down: accumulate $ volume until buffer met.
-            # We join the price level where $1000 of cumulative liquidity
-            # sits at equal-or-better prices.  Orders at the same price
-            # fill FIFO, so existing orders at that level are ahead of us.
-            our_bid = None
-            cumulative = 0.0
-            for level in order_book["bids"]:
-                price = float(level["price"])
-                size = float(level["size"])
-                cumulative += price * size
-                if cumulative >= MIN_LIQUIDITY_BUFFER:
-                    our_bid = self.round_to_tick(price)
-                    break
-
-            # Walk asks bottom-up: accumulate $ volume until buffer met
-            our_ask = None
-            cumulative = 0.0
-            for level in order_book["asks"]:
-                price = float(level["price"])
-                size = float(level["size"])
-                cumulative += price * size
-                if cumulative >= MIN_LIQUIDITY_BUFFER:
-                    our_ask = self.round_to_tick(price)
-                    break
-
-            if our_bid is None or our_ask is None:
-                log.warning(
-                    f"Not enough liquidity buffer (need ${MIN_LIQUIDITY_BUFFER}) "
-                    f"for {self.market['question'][:40]} — skipping"
-                )
-                return None, None
-
-            # Verify we are still inside the reward window
             best_bid = float(order_book["bids"][0]["price"])
             best_ask = float(order_book["asks"][0]["price"])
             midpoint = (best_bid + best_ask) / 2
 
-            if (abs(our_bid - midpoint) > max_spread
-                    or abs(our_ask - midpoint) > max_spread):
-                log.warning(
-                    f"Orders would fall outside reward window "
-                    f"(max_spread={max_spread}) — skipping"
+            if USE_SPREAD_PRICING:
+                our_bid, our_ask = self._spread_relative_prices(
+                    best_bid, best_ask, midpoint, max_spread, tick, order_book
                 )
+            else:
+                our_bid, our_ask = self._liquidity_buffer_prices(
+                    order_book, midpoint, max_spread
+                )
+
+            if our_bid is None or our_ask is None:
                 return None, None
+
+            # ── Inventory skew ──────────────────────────────────────────
+            if INVENTORY_SKEW_ENABLED:
+                our_bid, our_ask = self._apply_inventory_skew(
+                    our_bid, our_ask, tick, midpoint, max_spread
+                )
+
+            # ── Post-fill cooldown ─────────────────────────────────────
+            # After a BUY fills, widen quotes on that side to avoid
+            # repeated adverse selection.  Clamped to reward window.
+            now = _time.time()
+            if now - self._last_fill_time.get("yes", 0) < POST_FILL_COOLDOWN_SECS:
+                widened = self.round_to_tick(our_bid - POST_FILL_WIDEN_TICKS * tick)
+                # Clamp: don't push outside reward window
+                min_bid = self.round_to_tick(midpoint - max_spread)
+                our_bid = max(widened, min_bid)
+                log.info(
+                    f"POST-FILL COOLDOWN | YES bid widened to {our_bid:.4f} | "
+                    f"market={self.market['question'][:40]}"
+                )
+            if now - self._last_fill_time.get("no", 0) < POST_FILL_COOLDOWN_SECS:
+                widened = self.round_to_tick(our_ask + POST_FILL_WIDEN_TICKS * tick)
+                # Clamp: don't push outside reward window
+                max_ask = self.round_to_tick(midpoint + max_spread)
+                our_ask = min(widened, max_ask)
+                log.info(
+                    f"POST-FILL COOLDOWN | NO ask widened to {our_ask:.4f} | "
+                    f"market={self.market['question'][:40]}"
+                )
 
             # Safety clamps
             our_bid = max(0.01, min(our_bid, 0.98))
@@ -464,13 +477,185 @@ class OrderManager:
 
             log.debug(
                 f"Prices | midpoint={midpoint:.4f} | "
-                f"bid={our_bid:.4f} | ask={our_ask:.4f}"
+                f"bid={our_bid:.4f} | ask={our_ask:.4f} | "
+                f"strategy={'spread' if USE_SPREAD_PRICING else 'buffer'}"
             )
             return our_bid, our_ask
 
         except Exception as e:
             log.error(f"Price calculation failed: {e}")
             return None, None
+
+    def _spread_relative_prices(
+        self, best_bid: float, best_ask: float,
+        midpoint: float, max_spread: float, tick: float,
+        order_book: dict,
+    ) -> tuple[float | None, float | None]:
+        """Spread-relative pricing: place orders inside the reward window.
+
+        Strategy: our bid = midpoint - (max_spread * SPREAD_EDGE_PCT)
+                  our ask = midpoint + (max_spread * SPREAD_EDGE_PCT)
+
+        This earns rewards (inside max_spread) while capturing spread
+        and staying far enough from the midpoint to avoid being adversely
+        selected on every small price move.
+
+        Also checks bid-side depth — if the book is too thin to unwind,
+        we skip this market for this cycle.
+        """
+        question = self.market["question"]
+
+        # Check bid-side depth — avoid markets where we can't sell
+        bid_depth = sum(
+            float(level["price"]) * float(level["size"])
+            for level in order_book["bids"][:5]
+        )
+        if bid_depth < MIN_BID_DEPTH_USD:
+            log.warning(
+                f"Bid depth too thin (${bid_depth:.0f} < "
+                f"${MIN_BID_DEPTH_USD:.0f}) for {question[:40]} — "
+                f"skipping to avoid unsellable inventory"
+            )
+            return None, None
+
+        # Core calculation: place at SPREAD_EDGE_PCT of max_spread from mid
+        edge_offset = max_spread * SPREAD_EDGE_PCT
+        our_bid = self.round_to_tick(midpoint - edge_offset)
+        our_ask = self.round_to_tick(midpoint + edge_offset)
+
+        # Enforce minimum distance from best bid/ask (avoid being first in line)
+        min_gap = MIN_EDGE_TICKS * tick
+        if our_bid > best_bid - min_gap:
+            our_bid = self.round_to_tick(best_bid - min_gap)
+        if our_ask < best_ask + min_gap:
+            our_ask = self.round_to_tick(best_ask + min_gap)
+
+        # Verify still inside reward window
+        if abs(our_bid - midpoint) > max_spread:
+            log.warning(
+                f"Bid would fall outside reward window "
+                f"(bid={our_bid:.4f}, mid={midpoint:.4f}, max_spread={max_spread}) "
+                f"for {question[:40]} — skipping bid"
+            )
+            return None, None
+        if abs(our_ask - midpoint) > max_spread:
+            log.warning(
+                f"Ask would fall outside reward window "
+                f"(ask={our_ask:.4f}, mid={midpoint:.4f}, max_spread={max_spread}) "
+                f"for {question[:40]} — skipping ask"
+            )
+            return None, None
+
+        log.debug(
+            f"Spread pricing | mid={midpoint:.4f} | edge={edge_offset:.4f} | "
+            f"bid={our_bid:.4f} | ask={our_ask:.4f} | "
+            f"bid_depth=${bid_depth:.0f}"
+        )
+        return our_bid, our_ask
+
+    def _liquidity_buffer_prices(
+        self, order_book: dict, midpoint: float, max_spread: float,
+    ) -> tuple[float | None, float | None]:
+        """Legacy liquidity-buffer pricing (kept as fallback).
+
+        Walk the book to find price level with MIN_LIQUIDITY_BUFFER of
+        cumulative volume in front.
+        """
+        our_bid = None
+        cumulative = 0.0
+        for level in order_book["bids"]:
+            price = float(level["price"])
+            size = float(level["size"])
+            cumulative += price * size
+            if cumulative >= MIN_LIQUIDITY_BUFFER:
+                our_bid = self.round_to_tick(price)
+                break
+
+        our_ask = None
+        cumulative = 0.0
+        for level in order_book["asks"]:
+            price = float(level["price"])
+            size = float(level["size"])
+            cumulative += price * size
+            if cumulative >= MIN_LIQUIDITY_BUFFER:
+                our_ask = self.round_to_tick(price)
+                break
+
+        if our_bid is None or our_ask is None:
+            log.warning(
+                f"Not enough liquidity buffer (need ${MIN_LIQUIDITY_BUFFER}) "
+                f"for {self.market['question'][:40]} — skipping"
+            )
+            return None, None
+
+        if (abs(our_bid - midpoint) > max_spread
+                or abs(our_ask - midpoint) > max_spread):
+            log.warning(
+                f"Orders would fall outside reward window "
+                f"(max_spread={max_spread}) — skipping"
+            )
+            return None, None
+
+        return our_bid, our_ask
+
+    def _apply_inventory_skew(
+        self, our_bid: float, our_ask: float,
+        tick: float, midpoint: float, max_spread: float,
+    ) -> tuple[float, float]:
+        """Skew quotes based on current inventory to unwind naturally.
+
+        When holding YES inventory: tighten the ask (sell YES faster),
+        widen the bid (buy YES slower).
+        When holding NO inventory: tighten the bid (which is the NO sell
+        equivalent), widen the ask.
+
+        The skew amount scales with inventory size: larger positions get
+        more aggressive skew.
+        """
+        condition_id = self.market["condition_id"]
+        yes_usd = self.position_tracker.get_position(condition_id, "yes")
+        no_usd = self.position_tracker.get_position(condition_id, "no")
+
+        if yes_usd < INVENTORY_SKEW_THRESHOLD and no_usd < INVENTORY_SKEW_THRESHOLD:
+            return our_bid, our_ask
+
+        # Calculate skew steps — each $100 of inventory = 1 step
+        yes_steps = int(yes_usd / 100) if yes_usd >= INVENTORY_SKEW_THRESHOLD else 0
+        no_steps = int(no_usd / 100) if no_usd >= INVENTORY_SKEW_THRESHOLD else 0
+        net_skew = yes_steps - no_steps  # positive = long YES, negative = long NO
+
+        skew_amount = abs(net_skew) * INVENTORY_SKEW_TICKS * tick
+
+        if net_skew > 0:
+            # Long YES → want to SELL YES → tighten ask, widen bid
+            new_ask = self.round_to_tick(our_ask - skew_amount)
+            new_bid = self.round_to_tick(our_bid - skew_amount)
+            # Don't cross midpoint or push outside reward window
+            new_ask = max(new_ask, self.round_to_tick(midpoint + tick))
+            new_bid = max(new_bid, self.round_to_tick(midpoint - max_spread))
+            log.info(
+                f"INVENTORY SKEW | long YES ${yes_usd:.0f} | "
+                f"ask {our_ask:.4f}→{new_ask:.4f} | "
+                f"bid {our_bid:.4f}→{new_bid:.4f} | "
+                f"market={self.market['question'][:40]}"
+            )
+            our_ask, our_bid = new_ask, new_bid
+        elif net_skew < 0:
+            # Long NO → want to SELL NO → in YES-equiv terms, tighten bid, widen ask
+            new_bid = self.round_to_tick(our_bid + skew_amount)
+            new_ask = self.round_to_tick(our_ask + skew_amount)
+            # Don't cross midpoint or push outside reward window
+            new_bid = min(new_bid, self.round_to_tick(midpoint - tick))
+            new_ask = min(new_ask, self.round_to_tick(midpoint + max_spread))
+            log.info(
+                f"INVENTORY SKEW | long NO ${no_usd:.0f} | "
+                f"bid {our_bid:.4f}→{new_bid:.4f} | "
+                f"ask {our_ask:.4f}→{new_ask:.4f} | "
+                f"market={self.market['question'][:40]}"
+            )
+            our_bid, our_ask = new_bid, new_ask
+
+        return our_bid, our_ask
 
     # ── Zone Checking ────────────────────────────────────────────────────────
     def check_order_zone(
@@ -1041,6 +1226,49 @@ class OrderManager:
                 )
             return None
 
+    def _tiered_decay_ticks(
+        self, vwap_clob: float, side: str, created_at: float | None = None,
+    ) -> int:
+        """Calculate decay ticks based on loss severity AND position age.
+
+        Two independent accelerators stack:
+        1. Loss tiers: 5% → 2x, 10% → 3x, 15% → 4x
+        2. Age: >24h → +2 ticks, >48h → +4 ticks
+
+        A position at 3% loss for 30 hours gets: 1 (base) + 2 (age) = 3 ticks.
+        A position at 12% loss for 30 hours gets: 3 (tier) + 2 (age) = 5 ticks.
+        This frees trapped capital without panic-selling.
+
+        Args:
+            vwap_clob: Our VWAP cost in CLOB price terms.
+            side: "yes" or "no".
+            created_at: When the unwind was first created (epoch seconds).
+
+        Returns:
+            Number of ticks to decay per interval.
+        """
+        base_ticks = UNWIND_DECAY_TICKS
+
+        # Loss-based acceleration
+        if vwap_clob > 0:
+            market_bid = self._last_market_bid(side)
+            cur_loss = (vwap_clob - market_bid) / vwap_clob
+            multiplier = 1
+            for threshold, mult in UNWIND_ACCEL_TIERS:
+                if cur_loss >= threshold:
+                    multiplier = mult
+            base_ticks = UNWIND_DECAY_TICKS * multiplier
+
+        # Age-based acceleration (additive, stacks with loss tiers)
+        if created_at is not None:
+            age_hours = (_time.time() - created_at) / 3600
+            if age_hours >= UNWIND_AGE_MAX_HOURS:
+                base_ticks += UNWIND_AGE_MAX_TICKS
+            elif age_hours >= UNWIND_AGE_ACCEL_HOURS:
+                base_ticks += UNWIND_AGE_ACCEL_TICKS
+
+        return base_ticks
+
     def reconcile_unwinds(self) -> None:
         """Position-based unwind reconciliation with exchange verification.
 
@@ -1169,6 +1397,28 @@ class OrderManager:
             # Calculate current base clob price from VWAP
             vwap_clob = self.round_down_to_tick(to_clob(avg_price, side))
 
+            # ── Inline spread capture: sell above VWAP if market is favorable ──
+            # Uses cached best bid/ask from this cycle — zero extra API calls.
+            market_bid = self._last_market_bid(side)
+            if market_bid > vwap_clob and market_bid > MIN_SELL_PRICE:
+                profit_pct = (market_bid - vwap_clob) / vwap_clob if vwap_clob > 0 else 0
+                has_unwind = any(u["side"] == side for u in self.unwind_orders.values())
+                if profit_pct >= 0.005 and not has_unwind:
+                    sell_price = self.round_down_to_tick(market_bid)
+                    est_profit = (sell_price - vwap_clob) * position_shares
+                    log.info(
+                        f"SPREAD CAPTURE | {side.upper()} | "
+                        f"cost={vwap_clob:.4f} | bid={market_bid:.4f} | "
+                        f"profit={profit_pct:.2%} | shares={position_shares:.0f} | "
+                        f"est=${est_profit:.2f} | "
+                        f"market={self.market['question'][:40]}"
+                    )
+                    self.place_unwind_order(
+                        side, avg_price, position_shares,
+                        clob_price_override=sell_price,
+                    )
+                    continue  # Skip normal decay logic — selling at profit
+
             # Check existing unwind orders — are they at the right price?
             stale_orders: list[str] = []
             covered_shares = 0.0
@@ -1182,11 +1432,7 @@ class OrderManager:
                 base = uorder.get("base_clob_price", uorder.get("clob_price", vwap_clob))
                 created = uorder.get("created_at", uorder.get("placed_at", now))
                 elapsed = now - created
-                check_ticks = UNWIND_DECAY_TICKS
-                if vwap_clob > 0:
-                    cur_loss = (vwap_clob - self._last_market_bid(side)) / vwap_clob
-                    if cur_loss >= UNWIND_ACCEL_LOSS_PCT:
-                        check_ticks = UNWIND_DECAY_TICKS * UNWIND_ACCEL_MULTIPLIER
+                check_ticks = self._tiered_decay_ticks(vwap_clob, side, created_at=created)
                 decay_intervals = int(elapsed // UNWIND_DECAY_INTERVAL_SECS)
                 decay_amount = decay_intervals * check_ticks * tick
                 expected_clob = max(MIN_SELL_PRICE, base - decay_amount)
@@ -1285,13 +1531,9 @@ class OrderManager:
                     carry_created = min(carry_created, c)
 
             # Calculate decay from the carried creation time.
-            # Accelerate decay when the position is significantly underwater
-            # to clear bad inventory faster without the sharp loss of stop-loss.
-            decay_ticks = UNWIND_DECAY_TICKS
-            if vwap_clob > 0:
-                current_loss = (vwap_clob - self._last_market_bid(side)) / vwap_clob
-                if current_loss >= UNWIND_ACCEL_LOSS_PCT:
-                    decay_ticks = UNWIND_DECAY_TICKS * UNWIND_ACCEL_MULTIPLIER
+            # Graduated decay acceleration based on loss severity.
+            # Replaces the old 5x panic multiplier with tiered steps.
+            decay_ticks = self._tiered_decay_ticks(vwap_clob, side, created_at=carry_created)
 
             elapsed = now - carry_created
             decay_intervals = int(elapsed // UNWIND_DECAY_INTERVAL_SECS)
@@ -1662,6 +1904,7 @@ class OrderManager:
                                 filled_shares, order["price"],
                                 question=self.market["question"],
                             )
+                            self._last_fill_time[side] = _time.time()
                         except Exception as e:
                             log.error(
                                 f"Error processing fill for {oid[:16]}... "
@@ -1710,6 +1953,7 @@ class OrderManager:
                             filled_shares, order["price"],
                             question=self.market["question"],
                         )
+                        self._last_fill_time[side] = _time.time()
                         # Update tracked size so next partial detection
                         # only captures the NEW delta, not the same fill.
                         # Keep original_size as the LAST known baseline
@@ -1888,16 +2132,19 @@ class OrderManager:
         if our_bid is None:
             return
 
-        # Step 5: Cancel stale orders whose price has drifted from optimal
+        # Step 5: Cancel stale orders whose price has drifted from optimal.
+        # Use MIN_PRICE_DRIFT_TICKS (2 ticks) to avoid cancel+replace on
+        # small oscillations — keeps orders alive longer → more reward time.
         tick = self.market.get("tick_size", 0.01)
+        drift_threshold = MIN_PRICE_DRIFT_TICKS * tick
         for order_id in list(self.active_orders.keys()):
             order = self.active_orders[order_id]
             side = order["side"]
             optimal_price = our_bid if side == "yes" else our_ask
-            if abs(order["price"] - optimal_price) >= tick:
+            if abs(order["price"] - optimal_price) >= drift_threshold:
                 log.info(
-                    f"Price moved: {side.upper()} "
-                    f"{order['price']:.4f} -> {optimal_price:.4f} "
+                    f"Price drifted {abs(order['price'] - optimal_price)/tick:.0f} ticks: "
+                    f"{side.upper()} {order['price']:.4f} -> {optimal_price:.4f} "
                     f"— refreshing"
                 )
                 if not self.cancel_order(order_id, reason="price_refresh"):

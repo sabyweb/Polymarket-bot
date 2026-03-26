@@ -21,6 +21,7 @@ from config import (
     WEIGHT_DAILY_RATE, WEIGHT_COMPETITION,
     WEIGHT_PRICE_BAL, WEIGHT_SPREAD, WEIGHT_LIQUIDITY,
     FUNDER, SIGNATURE_TYPE, GAMMA_API,
+    MIN_BID_DEPTH_USD,
 )
 
 # Cache for CLOB rewards params (refreshed each market refresh cycle)
@@ -335,6 +336,12 @@ def hygiene_check(market: dict, rewards: dict) -> tuple[bool, str]:
     # 7. Must have some liquidity
     if parse_liquidity(market) < MIN_LIQUIDITY:
         return False, "Liquidity too low"
+
+    # 8. Must have meaningful 24h volume (proxy for book depth)
+    # Markets with zero volume are impossible to unwind
+    vol_24h = parse_volume_24h(market)
+    if vol_24h < 500:
+        return False, f"24h volume too low (${vol_24h:.0f})"
 
     return True, "OK"
 
