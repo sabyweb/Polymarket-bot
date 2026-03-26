@@ -35,14 +35,19 @@ HYSTERESIS_SCORE_MARGIN: int = 10  # New market must outscore weakest by this mu
 MARKET_REFRESH_SECS: int = 1800  # Re-score and refresh markets every 30 min
 
 # ── Scoring Weights (must sum to 100) ─────────────────────────────────────────
-# Heavily weight reward rate and competition (reward density).
-# Price balance demoted — balanced markets are most competitive/least rewarding.
+# Optimised for reward EFFICIENCY, not raw pool size.
+# Reward efficiency (estimated $/day we capture per $ deployed) is the
+# primary driver.  Competition and fill safety prevent us from entering
+# crowded or toxic markets.  Liquidity ensures we can unwind.
+# Price balance REMOVED — skewed markets often have less competition and
+# are more capital-efficient for reward capture.
 # Expiry is NOT scored — it is only a hygiene filter (≥ 12 hours).
-WEIGHT_DAILY_RATE: int = 35
-WEIGHT_COMPETITION: int = 35
-WEIGHT_PRICE_BAL: int = 10
-WEIGHT_SPREAD: int = 10
-WEIGHT_LIQUIDITY: int = 10
+WEIGHT_REWARD_EFFICIENCY: int = 25  # Estimated reward per $ of capital deployed
+WEIGHT_COMPETITION: int = 25        # Capture rate (our share of pool)
+WEIGHT_FILL_SAFETY: int = 15        # Lower volume = fewer fills = less adverse selection
+WEIGHT_UNWIND_ABILITY: int = 15     # Bid depth — can we get out?
+WEIGHT_DAILY_RATE: int = 10         # Raw pool size (tiebreaker, not primary)
+WEIGHT_SPREAD: int = 10             # Wider reward window = easier to stay inside
 
 # ── Hygiene Filter Thresholds ─────────────────────────────────────────────────
 MIN_DAYS_TO_EXPIRY: float = 0.5   # Skip markets expiring within 12 hours

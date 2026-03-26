@@ -21,7 +21,7 @@ from config import (
     UNWIND_AGE_ACCEL_HOURS, UNWIND_AGE_ACCEL_TICKS,
     UNWIND_AGE_MAX_HOURS, UNWIND_AGE_MAX_TICKS,
     CHEAP_TOKEN_THRESHOLD, CHEAP_TOKEN_SCALE,
-    SPREAD_EDGE_PCT, MIN_EDGE_TICKS, USE_SPREAD_PRICING,
+    USE_SPREAD_PRICING,
     MIN_PRICE_DRIFT_TICKS,
     INVENTORY_SKEW_ENABLED, INVENTORY_SKEW_TICKS, INVENTORY_SKEW_THRESHOLD,
     POST_FILL_COOLDOWN_SECS, POST_FILL_WIDEN_TICKS,
@@ -493,16 +493,13 @@ class OrderManager:
         midpoint: float, max_spread: float, tick: float,
         order_book: dict,
     ) -> tuple[float | None, float | None]:
-        """Spread-relative pricing: place orders inside the reward window.
+        """Co-best pricing: join at the best bid/ask price.
 
-        Strategy: place just behind the best bid/ask by MIN_EDGE_TICKS,
-        then clamp to stay inside the reward window.  This keeps us near
-        the top of the book (maximising reward share and fill probability)
-        while avoiding being the very first order (adverse selection).
-
-        The old approach (midpoint ± max_spread * 0.70) pushed orders too
-        far from the action when the market spread was tighter than the
-        reward window, resulting in 3-4 tick gaps from best bid/ask.
+        Strategy: always place at the best bid and best ask. With
+        price-time priority, existing orders at that level shield us —
+        they fill before we do. This maximises reward weight (closest
+        to midpoint = exponentially more reward) and is safe as long
+        as the market passed our depth hygiene filters.
 
         Also checks bid-side depth — if the book is too thin to unwind,
         we skip this market for this cycle.
@@ -522,25 +519,9 @@ class OrderManager:
             )
             return None, None
 
-        # Smart placement: if best bid/ask level has ≥$1000 of depth,
-        # join at that price (co-best) — we're shielded by queue priority.
-        # Otherwise, place MIN_EDGE_TICKS behind to avoid being first.
-        bid_top_depth = float(order_book["bids"][0]["price"]) * float(order_book["bids"][0]["size"])
-        ask_top_depth = float(order_book["asks"][0]["price"]) * float(order_book["asks"][0]["size"])
-
-        CO_BEST_DEPTH_THRESHOLD = 1000.0  # Join best price if ≥$1K shields us
-
-        if bid_top_depth >= CO_BEST_DEPTH_THRESHOLD:
-            our_bid = best_bid  # Join at best bid — $1K+ ahead of us in queue
-        else:
-            min_gap = MIN_EDGE_TICKS * tick
-            our_bid = self.round_to_tick(best_bid - min_gap)
-
-        if ask_top_depth >= CO_BEST_DEPTH_THRESHOLD:
-            our_ask = best_ask  # Join at best ask — $1K+ ahead of us in queue
-        else:
-            min_gap = MIN_EDGE_TICKS * tick
-            our_ask = self.round_to_tick(best_ask + min_gap)
+        # Co-best: join at the best bid and best ask
+        our_bid = best_bid
+        our_ask = best_ask
 
         # Clamp to stay inside the reward window (midpoint ± max_spread)
         reward_floor = self.round_to_tick(midpoint - max_spread)
@@ -551,25 +532,28 @@ class OrderManager:
         # Verify still inside reward window after rounding
         if abs(our_bid - midpoint) > max_spread + tick * 0.5:
             log.warning(
-                f"Bid would fall outside reward window "
+                f"Bid outside reward window "
                 f"(bid={our_bid:.4f}, mid={midpoint:.4f}, max_spread={max_spread}) "
                 f"for {question[:40]} — skipping"
             )
             return None, None
         if abs(our_ask - midpoint) > max_spread + tick * 0.5:
             log.warning(
-                f"Ask would fall outside reward window "
+                f"Ask outside reward window "
                 f"(ask={our_ask:.4f}, mid={midpoint:.4f}, max_spread={max_spread}) "
                 f"for {question[:40]} — skipping"
             )
             return None, None
 
+        bid_top_depth = float(order_book["bids"][0]["price"]) * float(order_book["bids"][0]["size"])
+        ask_top_depth = float(order_book["asks"][0]["price"]) * float(order_book["asks"][0]["size"])
+
         log.debug(
-            f"Spread pricing | mid={midpoint:.4f} | "
-            f"bid={our_bid:.4f} (best-{MIN_EDGE_TICKS}t) | "
-            f"ask={our_ask:.4f} (best+{MIN_EDGE_TICKS}t) | "
+            f"Co-best pricing | mid={midpoint:.4f} | "
+            f"bid={our_bid:.4f} (depth=${bid_top_depth:.0f}) | "
+            f"ask={our_ask:.4f} (depth=${ask_top_depth:.0f}) | "
             f"reward_window=[{reward_floor:.4f}, {reward_ceil:.4f}] | "
-            f"bid_depth=${bid_depth:.0f}"
+            f"total_bid_depth=${bid_depth:.0f}"
         )
         return our_bid, our_ask
 

@@ -260,9 +260,12 @@ def log_market_refresh(markets: list[dict]) -> None:
     """
     log.info(f"MARKET REFRESH | {len(markets)} markets selected:")
     for i, m in enumerate(markets, 1):
+        est = m.get("est_daily_reward", 0)
+        cap = m.get("capture_pct", 0)
         log.info(
             f"  #{i} {m['question'][:50]} | "
-            f"score={m['score']} | rate=${m['daily_rate']:.0f}/day"
+            f"score={m['score']} | rate=${m['daily_rate']:.0f}/day | "
+            f"est=${est:.1f}/day ({cap:.0f}% of pool)"
         )
 
 

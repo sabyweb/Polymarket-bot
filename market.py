@@ -18,8 +18,10 @@ from config import (
     MAX_MARKETS, MAX_ORDER_SIZE, MIN_DAYS_TO_EXPIRY,
     MIN_YES_PRICE, MAX_YES_PRICE, MIN_DAILY_RATE,
     MIN_LIQUIDITY, MIN_SPREAD_ALLOWED,
-    WEIGHT_DAILY_RATE, WEIGHT_COMPETITION,
-    WEIGHT_PRICE_BAL, WEIGHT_SPREAD, WEIGHT_LIQUIDITY,
+    WEIGHT_REWARD_EFFICIENCY, WEIGHT_COMPETITION,
+    WEIGHT_FILL_SAFETY, WEIGHT_UNWIND_ABILITY,
+    WEIGHT_DAILY_RATE, WEIGHT_SPREAD,
+    ORDER_SIZE,
     FUNDER, SIGNATURE_TYPE, GAMMA_API,
     MIN_BID_DEPTH_USD,
 )
@@ -382,13 +384,22 @@ def _rank_percentiles(values: list[float], higher_is_better: bool = True) -> lis
 def score_markets_ranked(markets: list[dict]) -> list[dict]:
     """Score markets using rank-based percentile scoring.
 
-    Each component ranks all markets against each other.  Best market
-    on a component gets full weight, worst gets 0, rest interpolated.
+    Optimised for reward EFFICIENCY — estimated reward capture per dollar
+    of capital deployed — rather than raw pool size.
+
+    Components (must sum to 100):
+      - Reward efficiency (25): estimated $/day we capture per $ deployed
+      - Competition / capture rate (25): our share of the pool
+      - Fill safety (15): lower volume = fewer fills = less adverse selection
+      - Unwind ability (15): bid-side liquidity for exit
+      - Daily rate (10): raw pool size (tiebreaker)
+      - Spread width (10): wider reward window = easier to stay inside
+
     Expiry is NOT scored — it is only a hygiene filter.
 
     Args:
         markets: List of parsed market dicts (must have daily_rate,
-                 liquidity, yes_price, max_spread fields).
+                 liquidity, yes_price, max_spread, volume_24h fields).
 
     Returns:
         Same list with "score" and "score_breakdown" keys added,
@@ -398,37 +409,70 @@ def score_markets_ranked(markets: list[dict]) -> list[dict]:
     if n == 0:
         return markets
 
-    # Extract raw component values
-    rates = [m["daily_rate"] for m in markets]
-    densities = []
+    our_capital = ORDER_SIZE * 2  # Both sides
+
+    # ── Raw component values ──────────────────────────────────────────
+
+    # 1. Reward efficiency: estimated $/day we capture per $ deployed
+    efficiencies = []
     for m in markets:
         liq = m.get("liquidity", 0)
-        if liq > 0:
-            densities.append(m["daily_rate"] / (liq / 1000.0))
-        else:
-            densities.append(0.0)
-    price_dists = [abs((m.get("yes_price") or 0.50) - 0.50) for m in markets]
-    spreads = [m["max_spread"] for m in markets]
+        rate = m["daily_rate"]
+        # Estimate our share: our_capital / (our_capital + total_eligible)
+        capture_pct = our_capital / (our_capital + liq) if liq > 0 else 0.5
+        est_daily = rate * capture_pct
+        # Capital required: min_size × max(yes_price, no_price) × 2 sides
+        yes_p = m.get("yes_price") or 0.50
+        max_side = max(yes_p, 1 - yes_p)
+        capital_req = max(m.get("min_size", 1) * max_side * 2, our_capital)
+        efficiency = est_daily / capital_req if capital_req > 0 else 0
+        efficiencies.append(efficiency)
+        m["est_daily_reward"] = round(est_daily, 2)
+        m["capture_pct"] = round(capture_pct * 100, 1)
+
+    # 2. Competition: capture rate (higher = less competition)
+    capture_rates = []
+    for m in markets:
+        liq = m.get("liquidity", 0)
+        capture = our_capital / (our_capital + liq) if liq > 0 else 0.5
+        capture_rates.append(capture)
+
+    # 3. Fill safety: inverse of volume — lower volume = safer
+    # Use 1 / (1 + vol/10000) so it's bounded [0, 1]
+    fill_safeties = []
+    for m in markets:
+        vol = m.get("volume_24h", 0)
+        fill_safeties.append(1.0 / (1.0 + vol / 10000.0))
+
+    # 4. Unwind ability: raw liquidity (higher = easier to exit)
     liqs = [m.get("liquidity", 0) for m in markets]
 
-    # Compute percentile ranks
+    # 5. Daily rate: raw pool size
+    rates = [m["daily_rate"] for m in markets]
+
+    # 6. Spread width: wider = easier to stay in reward window
+    spreads = [m["max_spread"] for m in markets]
+
+    # ── Percentile ranks ──────────────────────────────────────────────
+    pct_efficiency = _rank_percentiles(efficiencies, higher_is_better=True)
+    pct_capture = _rank_percentiles(capture_rates, higher_is_better=True)
+    pct_fill_safety = _rank_percentiles(fill_safeties, higher_is_better=True)
+    pct_unwind = _rank_percentiles(liqs, higher_is_better=True)
     pct_rate = _rank_percentiles(rates, higher_is_better=True)
-    pct_comp = _rank_percentiles(densities, higher_is_better=True)
-    pct_price = _rank_percentiles(price_dists, higher_is_better=False)
     pct_spread = _rank_percentiles(spreads, higher_is_better=True)
-    pct_liq = _rank_percentiles(liqs, higher_is_better=True)
 
     for i, m in enumerate(markets):
         breakdown = {
+            "efficiency": round(pct_efficiency[i] * WEIGHT_REWARD_EFFICIENCY, 2),
+            "competition": round(pct_capture[i] * WEIGHT_COMPETITION, 2),
+            "fill_safety": round(pct_fill_safety[i] * WEIGHT_FILL_SAFETY, 2),
+            "unwind": round(pct_unwind[i] * WEIGHT_UNWIND_ABILITY, 2),
             "daily_rate": round(pct_rate[i] * WEIGHT_DAILY_RATE, 2),
-            "competition": round(pct_comp[i] * WEIGHT_COMPETITION, 2),
-            "price_bal": round(pct_price[i] * WEIGHT_PRICE_BAL, 2),
             "spread": round(pct_spread[i] * WEIGHT_SPREAD, 2),
-            "liquidity": round(pct_liq[i] * WEIGHT_LIQUIDITY, 2),
         }
         m["score"] = round(sum(breakdown.values()), 2)
         m["score_breakdown"] = breakdown
-        m["reward_density"] = round(densities[i], 2)
+        m["reward_efficiency"] = round(efficiencies[i], 4)
 
     markets.sort(key=lambda x: x["score"], reverse=True)
 
@@ -438,11 +482,14 @@ def score_markets_ranked(markets: list[dict]) -> list[dict]:
         log.info(
             f"  #{i} {m['question'][:45]} | "
             f"score={m['score']:.1f} | "
-            f"rate={bd['daily_rate']:.0f}/{WEIGHT_DAILY_RATE} "
+            f"eff={bd['efficiency']:.0f}/{WEIGHT_REWARD_EFFICIENCY} "
             f"comp={bd['competition']:.0f}/{WEIGHT_COMPETITION} "
-            f"price={bd['price_bal']:.0f}/{WEIGHT_PRICE_BAL} "
+            f"fill={bd['fill_safety']:.0f}/{WEIGHT_FILL_SAFETY} "
+            f"unwind={bd['unwind']:.0f}/{WEIGHT_UNWIND_ABILITY} "
+            f"rate={bd['daily_rate']:.0f}/{WEIGHT_DAILY_RATE} "
             f"spread={bd['spread']:.0f}/{WEIGHT_SPREAD} "
-            f"liq={bd['liquidity']:.0f}/{WEIGHT_LIQUIDITY}"
+            f"| est=${m.get('est_daily_reward', 0):.1f}/day "
+            f"({m.get('capture_pct', 0):.0f}% of pool)"
         )
 
     return markets
