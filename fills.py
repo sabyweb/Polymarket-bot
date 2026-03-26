@@ -172,14 +172,23 @@ class FillsMixin:
                                     self._reward_tracker.record_fill_quality(
                                         self.market["condition_id"], slippage,
                                     )
-                            # Record to history database (with M3 fill quality)
+                            # Record to history database with enrichment context
+                            _cid = self.market["condition_id"]
+                            _order_age = _time.time() - order.placed_at
+                            _pos_after = self.position_tracker.get_position(
+                                _cid, order.side
+                            )
+                            _rr = getattr(self, "_get_reward_rate", lambda: 0.0)()
                             get_db().log_fill(
-                                condition_id=self.market["condition_id"],
+                                condition_id=_cid,
                                 question=self.market["question"],
                                 side=order.side, fill_type="FULL",
                                 shares=filled_shares, price=order.price,
                                 clob_cost=clob_cost, usd_value=filled_usd,
                                 midpoint=fill_midpoint, slippage=slippage,
+                                order_age_secs=_order_age,
+                                position_usd_after=_pos_after,
+                                reward_rate_hr=_rr,
                             )
                         except Exception as e:
                             log.error(
@@ -257,14 +266,23 @@ class FillsMixin:
                                 self._reward_tracker.record_fill_quality(
                                     self.market["condition_id"], slippage,
                                 )
-                        # Record to history database (with M3 fill quality)
+                        # Record to history database with enrichment context
+                        _cid = self.market["condition_id"]
+                        _order_age = _time.time() - order.placed_at
+                        _pos_after = self.position_tracker.get_position(
+                            _cid, order.side
+                        )
+                        _rr = getattr(self, "_get_reward_rate", lambda: 0.0)()
                         get_db().log_fill(
-                            condition_id=self.market["condition_id"],
+                            condition_id=_cid,
                             question=self.market["question"],
                             side=order.side, fill_type="PARTIAL",
                             shares=filled_shares, price=order.price,
                             clob_cost=clob_cost, usd_value=filled_usd,
                             midpoint=fill_midpoint, slippage=slippage,
+                            order_age_secs=_order_age,
+                            position_usd_after=_pos_after,
+                            reward_rate_hr=_rr,
                         )
                         # Update tracked size so next partial detection
                         # only captures the NEW delta, not the same fill.
@@ -327,7 +345,10 @@ class FillsMixin:
                                     cid, unwound_shares, unwound_usd,
                                     vwap_cost_usd=vwap_cost,
                                 )
-                            # Record to history database
+                            # Record to history database with hold context
+                            _hold_secs = _time.time() - uorder.placed_at
+                            _rr = getattr(self, "_get_reward_rate", lambda: 0.0)()
+                            _reward_est = _rr * (_hold_secs / 3600)
                             get_db().log_unwind(
                                 condition_id=cid,
                                 question=self.market["question"],
@@ -335,6 +356,9 @@ class FillsMixin:
                                 sell_price=clob_sell,
                                 usd_value=unwound_usd,
                                 vwap_cost=vwap_cost,
+                                hold_duration_secs=_hold_secs,
+                                unwind_type="FULL",
+                                reward_earned_est=_reward_est,
                             )
                             del self.unwind_orders[oid]
                         elif status == "UNKNOWN":
@@ -404,7 +428,10 @@ class FillsMixin:
                                     cid, unwound_shares, unwound_usd,
                                     vwap_cost_usd=vwap_cost,
                                 )
-                            # Record to history database (was missing — Bug #1)
+                            # Record to history database with hold context
+                            _hold_secs = _time.time() - uorder.placed_at
+                            _rr = getattr(self, "_get_reward_rate", lambda: 0.0)()
+                            _reward_est = _rr * (_hold_secs / 3600)
                             get_db().log_unwind(
                                 condition_id=cid,
                                 question=self.market["question"],
@@ -413,6 +440,9 @@ class FillsMixin:
                                 sell_price=clob_sell,
                                 usd_value=unwound_usd,
                                 vwap_cost=vwap_cost,
+                                hold_duration_secs=_hold_secs,
+                                unwind_type="PARTIAL",
+                                reward_earned_est=_reward_est,
                             )
                             uorder.size = u_remaining
 

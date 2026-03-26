@@ -204,6 +204,31 @@ class MarketMakerBot:
 
         log_market_refresh(self.active_markets)
 
+        # Log market selection decisions to database for iteration analysis
+        try:
+            from database import get_db
+            _db = get_db()
+            for m in result:
+                action = "selected" if m["condition_id"] in to_add else "kept"
+                bd = m.get("score_breakdown", {})
+                reason = " | ".join(f"{k}={v}" for k, v in bd.items())
+                _db.log_market_selection(
+                    condition_id=m["condition_id"],
+                    question=m.get("question", ""),
+                    action=action, score=m["score"],
+                    daily_rate=m.get("daily_rate", 0),
+                    reason=reason,
+                    volume_24h=m.get("volume_24h", 0),
+                    liquidity=m.get("liquidity", 0),
+                )
+            for cid in to_remove:
+                _db.log_market_selection(
+                    condition_id=cid, question="",
+                    action="removed", reason="below threshold or outscored",
+                )
+        except Exception as e:
+            log.debug(f"Market selection log error: {e}")
+
         # Create unwind managers for orphaned positions using token data
         # from the candidates we just fetched (avoids Gamma API lookup).
         self._ensure_unwind_managers(new_markets)
@@ -488,6 +513,7 @@ class MarketMakerBot:
                     # Query actual rewards from API alongside hourly estimate
                     if logged:
                         self._query_actual_rewards()
+                        self._log_hourly_pnl_snapshot()
                 except Exception as e:
                     log.debug(f"Reward log error: {e}")
 
@@ -1067,6 +1093,138 @@ class MarketMakerBot:
 
             # Only attempt one arb per scan cycle to be conservative
             break
+
+    def _log_hourly_pnl_snapshot(self) -> None:
+        """Log a comprehensive hourly P&L + reward snapshot to the database.
+
+        Aggregates data from the last hour for iteration analysis:
+        fills, unwinds, positions, rewards, danger cancels, uptime.
+        """
+        try:
+            from database import get_db
+            import json as _json
+            db = get_db()
+            now = time.time()
+            hour_ago = now - 3600
+            hour_label = time.strftime("%Y-%m-%d %H:00")
+            conn = db._get_conn()
+
+            # Fills this hour
+            r = conn.execute(
+                "SELECT COALESCE(SUM(usd_value),0) as bought, COUNT(*) as cnt "
+                "FROM fills WHERE ts > ?", (hour_ago,)
+            ).fetchone()
+            bought = r["bought"]
+            num_fills = r["cnt"]
+
+            # Unwinds this hour
+            r = conn.execute(
+                "SELECT COALESCE(SUM(usd_value),0) as sold, "
+                "COALESCE(SUM(pnl),0) as pnl, COUNT(*) as cnt "
+                "FROM unwinds WHERE ts > ?", (hour_ago,)
+            ).fetchone()
+            sold = r["sold"]
+            realized = r["pnl"]
+            num_unwinds = r["cnt"]
+
+            # Stop losses this hour
+            r = conn.execute(
+                "SELECT COUNT(*) as cnt FROM stop_losses WHERE ts > ?",
+                (hour_ago,)
+            ).fetchone()
+            num_stops = r["cnt"]
+
+            # Danger cancels this hour
+            r = conn.execute(
+                "SELECT COUNT(*) as cnt FROM orders_cancelled "
+                "WHERE ts > ? AND reason = 'danger'", (hour_ago,)
+            ).fetchone()
+            num_danger = r["cnt"]
+
+            # Current position value
+            positions = self.position_tracker.get_all_positions()
+            total_pos = sum(
+                p.get("yes", 0) + p.get("no", 0)
+                for p in positions.values()
+            )
+
+            # Unrealized P&L (rough: total_position - total_cost_basis)
+            unrealized = 0.0
+            for cid, p in positions.items():
+                for side in ("yes", "no"):
+                    shares = p.get(f"{side}_shares", 0)
+                    avg = p.get(f"{side}_avg_price", 0)
+                    if shares > 1 and avg > 0:
+                        # Use last known bid as market value
+                        mgr = self.order_managers.get(cid)
+                        if mgr:
+                            bid = getattr(mgr, "_cached_best_bid", 0)
+                            if side == "yes" and bid > 0:
+                                unrealized += (bid - avg) * shares
+                            elif side == "no" and bid > 0:
+                                no_clob = 1 - avg
+                                market_clob = 1 - bid
+                                unrealized += (no_clob - market_clob) * shares
+
+            # Reward rate
+            total_reward_hr = 0.0
+            for cid, stats in self.reward_tracker.markets.items():
+                snaps = getattr(stats, "reward_snapshots", [])
+                if snaps:
+                    total_reward_hr += snaps[-1].get("est_hourly", 0)
+            est_reward_this_hour = total_reward_hr  # 1 hour at current rate
+
+            # Uptime
+            total_cycles = 0
+            cycles_with_orders = 0
+            for cid, stats in self.reward_tracker.markets.items():
+                total_cycles += getattr(stats, "total_cycles", 0)
+                cycles_with_orders += getattr(stats, "cycles_with_orders", 0)
+            avg_uptime = (
+                cycles_with_orders / total_cycles * 100
+                if total_cycles > 0 else 0
+            )
+
+            # Config snapshot (key params for reproducibility)
+            from config import (
+                ORDER_SIZE as _os, MAX_POSITION_USD as _mp,
+                DYNAMIC_SIZE_MIN as _dmin, DYNAMIC_SIZE_MAX as _dmax,
+                STOP_LOSS_PCT as _sl, DANGER_ZONE_CENTS as _dz,
+                REWARD_LOSS_BUDGET_PCT as _rlb,
+            )
+            cfg_snap = _json.dumps({
+                "ORDER_SIZE": _os, "MAX_POS": _mp,
+                "DYN_MIN": _dmin, "DYN_MAX": _dmax,
+                "STOP_LOSS": _sl, "DANGER": _dz,
+                "REWARD_BUDGET": _rlb,
+            })
+
+            db.log_hourly_snapshot(
+                hour_label=hour_label,
+                num_markets=len(self.active_markets),
+                total_bought_usd=round(bought, 2),
+                total_sold_usd=round(sold, 2),
+                realized_pnl=round(realized, 2),
+                unrealized_pnl=round(unrealized, 2),
+                total_position_usd=round(total_pos, 2),
+                est_reward_usd=round(est_reward_this_hour, 2),
+                est_reward_rate_hr=round(total_reward_hr, 2),
+                num_fills=num_fills,
+                num_unwinds=num_unwinds,
+                num_stop_losses=num_stops,
+                num_danger_cancels=num_danger,
+                avg_uptime_pct=round(avg_uptime, 1),
+                config_json=cfg_snap,
+            )
+            log.info(
+                f"HOURLY SNAPSHOT | bought=${bought:.2f} sold=${sold:.2f} "
+                f"pnl=${realized:+.2f} pos=${total_pos:.2f} "
+                f"reward_rate=${total_reward_hr:.2f}/hr "
+                f"fills={num_fills} unwinds={num_unwinds} "
+                f"danger={num_danger} uptime={avg_uptime:.0f}%"
+            )
+        except Exception as e:
+            log.debug(f"Hourly P&L snapshot error: {e}")
 
     def _query_actual_rewards(self) -> None:
         """Query actual earned rewards from the Polymarket API.

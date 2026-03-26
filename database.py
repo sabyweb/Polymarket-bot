@@ -163,12 +163,49 @@ CREATE TABLE IF NOT EXISTS reward_market_stats (
     updated_at   REAL NOT NULL DEFAULT 0
 );
 
+-- Hourly P&L + reward snapshot (one row per hour, aggregated across all markets)
+CREATE TABLE IF NOT EXISTS hourly_snapshots (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts              REAL    NOT NULL,
+    hour_label      TEXT    NOT NULL,       -- 'YYYY-MM-DD HH:00'
+    num_markets     INTEGER NOT NULL DEFAULT 0,
+    total_bought_usd    REAL NOT NULL DEFAULT 0,
+    total_sold_usd      REAL NOT NULL DEFAULT 0,
+    realized_pnl        REAL NOT NULL DEFAULT 0,
+    unrealized_pnl      REAL NOT NULL DEFAULT 0,
+    total_position_usd  REAL NOT NULL DEFAULT 0,
+    est_reward_usd      REAL NOT NULL DEFAULT 0,  -- est rewards earned THIS hour
+    est_reward_rate_hr  REAL NOT NULL DEFAULT 0,   -- current $/hr rate
+    num_fills           INTEGER NOT NULL DEFAULT 0,
+    num_unwinds         INTEGER NOT NULL DEFAULT 0,
+    num_stop_losses     INTEGER NOT NULL DEFAULT 0,
+    num_danger_cancels  INTEGER NOT NULL DEFAULT 0,
+    avg_uptime_pct      REAL NOT NULL DEFAULT 0,
+    config_json         TEXT NOT NULL DEFAULT '{}'  -- snapshot of key config params
+);
+
+-- Market selection decisions (why market was chosen or rejected)
+CREATE TABLE IF NOT EXISTS market_selection_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts              REAL    NOT NULL,
+    condition_id    TEXT    NOT NULL,
+    question        TEXT    NOT NULL DEFAULT '',
+    action          TEXT    NOT NULL,       -- 'selected', 'rejected', 'kept', 'removed'
+    score           REAL    NOT NULL DEFAULT 0,
+    daily_rate      REAL    NOT NULL DEFAULT 0,
+    reason          TEXT    NOT NULL DEFAULT '',  -- rejection reason or score breakdown
+    volume_24h      REAL    NOT NULL DEFAULT 0,
+    liquidity       REAL    NOT NULL DEFAULT 0
+);
+
 CREATE INDEX IF NOT EXISTS idx_fills_cid ON fills(condition_id);
 CREATE INDEX IF NOT EXISTS idx_fills_ts ON fills(ts);
 CREATE INDEX IF NOT EXISTS idx_unwinds_cid ON unwinds(condition_id);
 CREATE INDEX IF NOT EXISTS idx_unwinds_ts ON unwinds(ts);
 CREATE INDEX IF NOT EXISTS idx_cycle_ts ON cycle_snapshots(ts);
 CREATE INDEX IF NOT EXISTS idx_daily_date ON daily_pnl(date);
+CREATE INDEX IF NOT EXISTS idx_hourly_ts ON hourly_snapshots(ts);
+CREATE INDEX IF NOT EXISTS idx_msl_ts ON market_selection_log(ts);
 """
 
 
@@ -198,6 +235,8 @@ class BotDatabase:
             conn.executescript(_SCHEMA)
             # Migrate: add M3 fill quality columns if missing
             self._migrate_fill_quality(conn)
+            # Migrate: add enrichment columns for iteration data
+            self._migrate_enrichment_columns(conn)
             conn.commit()
             log.info(f"Bot history database ready: {self._db_path}")
         except Exception as e:
@@ -216,6 +255,36 @@ class BotDatabase:
         except Exception as e:
             log.warning(f"Fill quality migration check: {e}")
 
+    def _migrate_enrichment_columns(self, conn: sqlite3.Connection) -> None:
+        """Add iteration-critical context columns to existing tables."""
+        migrations = [
+            # fills: order age, position after, reward rate at fill time
+            ("fills", "order_age_secs", "REAL NOT NULL DEFAULT 0"),
+            ("fills", "position_usd_after", "REAL NOT NULL DEFAULT 0"),
+            ("fills", "reward_rate_hr", "REAL NOT NULL DEFAULT 0"),
+            # unwinds: hold duration, fill type, reward earned during hold
+            ("unwinds", "hold_duration_secs", "REAL NOT NULL DEFAULT 0"),
+            ("unwinds", "unwind_type", "TEXT NOT NULL DEFAULT ''"),
+            ("unwinds", "reward_earned_est", "REAL NOT NULL DEFAULT 0"),
+            # orders_cancelled: market context
+            ("orders_cancelled", "condition_id", "TEXT NOT NULL DEFAULT ''"),
+            ("orders_cancelled", "side", "TEXT NOT NULL DEFAULT ''"),
+            ("orders_cancelled", "price", "REAL NOT NULL DEFAULT 0"),
+            ("orders_cancelled", "age_secs", "REAL NOT NULL DEFAULT 0"),
+        ]
+        for table, col, typedef in migrations:
+            try:
+                existing = {row[1] for row in conn.execute(
+                    f"PRAGMA table_info({table})"
+                )}
+                if col not in existing:
+                    conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {col} {typedef}"
+                    )
+                    log.info(f"Migrated {table}: added '{col}'")
+            except Exception as e:
+                log.warning(f"Migration {table}.{col}: {e}")
+
     # ── Logging Methods ───────────────────────────────────────────────────────
 
     def log_fill(
@@ -223,18 +292,22 @@ class BotDatabase:
         fill_type: str, shares: float, price: float,
         clob_cost: float, usd_value: float,
         midpoint: float = 0.0, slippage: float = 0.0,
+        order_age_secs: float = 0.0, position_usd_after: float = 0.0,
+        reward_rate_hr: float = 0.0,
     ) -> None:
-        """Record a BUY fill with optional fill quality metrics (M3)."""
+        """Record a BUY fill with context for iteration analysis."""
         try:
             conn = self._get_conn()
             conn.execute(
                 "INSERT INTO fills (ts, condition_id, question, side, "
                 "fill_type, shares, price, clob_cost, usd_value, "
-                "midpoint, slippage) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "midpoint, slippage, order_age_secs, position_usd_after, "
+                "reward_rate_hr) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (time.time(), condition_id, question, side,
                  fill_type, shares, price, clob_cost, usd_value,
-                 midpoint, slippage),
+                 midpoint, slippage, order_age_secs, position_usd_after,
+                 reward_rate_hr),
             )
             conn.commit()
         except Exception as e:
@@ -244,17 +317,21 @@ class BotDatabase:
         self, condition_id: str, question: str, side: str,
         shares: float, sell_price: float, usd_value: float,
         vwap_cost: float = 0.0,
+        hold_duration_secs: float = 0.0, unwind_type: str = "",
+        reward_earned_est: float = 0.0,
     ) -> None:
-        """Record a SELL (unwind) fill."""
+        """Record a SELL (unwind) fill with hold context."""
         pnl = usd_value - vwap_cost
         try:
             conn = self._get_conn()
             conn.execute(
                 "INSERT INTO unwinds (ts, condition_id, question, side, "
-                "shares, sell_price, usd_value, vwap_cost, pnl) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "shares, sell_price, usd_value, vwap_cost, pnl, "
+                "hold_duration_secs, unwind_type, reward_earned_est) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (time.time(), condition_id, question, side,
-                 shares, sell_price, usd_value, vwap_cost, pnl),
+                 shares, sell_price, usd_value, vwap_cost, pnl,
+                 hold_duration_secs, unwind_type, reward_earned_est),
             )
             conn.commit()
         except Exception as e:
@@ -279,14 +356,18 @@ class BotDatabase:
 
     def log_order_cancelled(
         self, order_id: str, reason: str = "",
+        condition_id: str = "", side: str = "",
+        price: float = 0.0, age_secs: float = 0.0,
     ) -> None:
-        """Record an order cancellation."""
+        """Record an order cancellation with market context."""
         try:
             conn = self._get_conn()
             conn.execute(
-                "INSERT INTO orders_cancelled (ts, order_id, reason) "
-                "VALUES (?, ?, ?)",
-                (time.time(), order_id, reason),
+                "INSERT INTO orders_cancelled (ts, order_id, reason, "
+                "condition_id, side, price, age_secs) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (time.time(), order_id, reason,
+                 condition_id, side, price, age_secs),
             )
             conn.commit()
         except Exception as e:
@@ -349,6 +430,57 @@ class BotDatabase:
             conn.commit()
         except Exception as e:
             log.debug(f"DB log_stop_loss error: {e}")
+
+    def log_hourly_snapshot(
+        self, hour_label: str, num_markets: int,
+        total_bought_usd: float, total_sold_usd: float,
+        realized_pnl: float, unrealized_pnl: float,
+        total_position_usd: float, est_reward_usd: float,
+        est_reward_rate_hr: float, num_fills: int, num_unwinds: int,
+        num_stop_losses: int, num_danger_cancels: int,
+        avg_uptime_pct: float, config_json: str = "{}",
+    ) -> None:
+        """Record an hourly P&L + reward snapshot for iteration analysis."""
+        try:
+            conn = self._get_conn()
+            conn.execute(
+                "INSERT INTO hourly_snapshots (ts, hour_label, num_markets, "
+                "total_bought_usd, total_sold_usd, realized_pnl, "
+                "unrealized_pnl, total_position_usd, est_reward_usd, "
+                "est_reward_rate_hr, num_fills, num_unwinds, "
+                "num_stop_losses, num_danger_cancels, avg_uptime_pct, "
+                "config_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (time.time(), hour_label, num_markets,
+                 total_bought_usd, total_sold_usd, realized_pnl,
+                 unrealized_pnl, total_position_usd, est_reward_usd,
+                 est_reward_rate_hr, num_fills, num_unwinds,
+                 num_stop_losses, num_danger_cancels, avg_uptime_pct,
+                 config_json),
+            )
+            conn.commit()
+        except Exception as e:
+            log.debug(f"DB log_hourly_snapshot error: {e}")
+
+    def log_market_selection(
+        self, condition_id: str, question: str, action: str,
+        score: float = 0, daily_rate: float = 0,
+        reason: str = "", volume_24h: float = 0,
+        liquidity: float = 0,
+    ) -> None:
+        """Record a market selection decision for iteration analysis."""
+        try:
+            conn = self._get_conn()
+            conn.execute(
+                "INSERT INTO market_selection_log (ts, condition_id, question, "
+                "action, score, daily_rate, reason, volume_24h, liquidity) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (time.time(), condition_id, question, action,
+                 score, daily_rate, reason, volume_24h, liquidity),
+            )
+            conn.commit()
+        except Exception as e:
+            log.debug(f"DB log_market_selection error: {e}")
 
     def log_reward_comparison(
         self, condition_id: str = "",
