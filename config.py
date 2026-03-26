@@ -58,7 +58,7 @@ MAX_YES_PRICE: float = 0.95      # Skip if Yes price above 95c
 MIN_DAILY_RATE: float = 5.0      # Skip if daily reward rate below $5
 MIN_LIQUIDITY: int = 1000        # Skip if liquidity below $1000
 MIN_SPREAD_ALLOWED: float = 0.01 # Skip if max spread below 1c
-MAX_VOLUME_TO_REWARD_RATIO: float = 20.0  # Skip if 24h_volume / daily_rate > 20 (too fill-heavy)
+MAX_VOLUME_TO_REWARD_RATIO: float = 5000.0  # Skip extremely fill-heavy markets (soft filter; scoring handles the rest)
 
 # ── Order Management ──────────────────────────────────────────────────────────
 ORDER_SIZE: int = 150        # Reward farming: smaller fills = less trapped capital
