@@ -452,19 +452,32 @@ def run_passive_cycle(session: PaperSession, active_markets: list, reward_tracke
                         continue
                     dump_price = float(book.bids[0].price)
 
+                    # Cap dump size to available token balance
+                    available = pc._token_balances.get(tid, 0.0)
+                    dump_size = min(remaining, available)
+                    if dump_size < 1.0:
+                        log.warning(
+                            f"[passive] Skip dump {side_name}: "
+                            f"inv={remaining:.0f} but tokens={available:.0f}"
+                        )
+                        inv[side_name] = 0.0
+                        inv[f"{side_name}_cost"] = 0.0
+                        continue
+
                     sell_args = OrderArgs(
                         token_id=tid, price=dump_price,
-                        size=remaining, side=SELL,
+                        size=dump_size, side=SELL,
                     )
                     pc.create_and_post_order(sell_args)
 
-                    dump_revenue = remaining * dump_price
-                    avg_cost = inv[f"{side_name}_cost"] / remaining if remaining > 0 else 0
-                    dump_pnl = dump_revenue - inv[f"{side_name}_cost"]
+                    cost_fraction = (dump_size / remaining) if remaining > 0 else 1.0
+                    dump_cost = inv[f"{side_name}_cost"] * cost_fraction
+                    dump_revenue = dump_size * dump_price
+                    dump_pnl = dump_revenue - dump_cost
 
                     log.info(
-                        f"[passive] DUMP | {side_name.upper()} {remaining:.0f} sh "
-                        f"@ {dump_price:.4f} | cost=${inv[f'{side_name}_cost']:.2f} "
+                        f"[passive] DUMP | {side_name.upper()} {dump_size:.0f} sh "
+                        f"@ {dump_price:.4f} | cost=${dump_cost:.2f} "
                         f"rev=${dump_revenue:.2f} pnl=${dump_pnl:+.2f} | "
                         f"{market['question'][:35]}"
                     )
@@ -472,13 +485,13 @@ def run_passive_cycle(session: PaperSession, active_markets: list, reward_tracke
                     get_db().log_unwind(
                         condition_id=cid,
                         question=market.get("question", ""),
-                        side=side_name, shares=remaining,
+                        side=side_name, shares=dump_size,
                         sell_price=dump_price, usd_value=dump_revenue,
-                        vwap_cost=inv[f"{side_name}_cost"], pnl=dump_pnl,
+                        vwap_cost=dump_cost, pnl=dump_pnl,
                     )
 
-                    inv[side_name] = 0.0
-                    inv[f"{side_name}_cost"] = 0.0
+                    inv[side_name] -= dump_size
+                    inv[f"{side_name}_cost"] -= dump_cost
                 except Exception as e:
                     log.warning(f"[passive] Dump {side_name} failed: {e}")
 
