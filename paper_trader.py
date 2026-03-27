@@ -585,6 +585,15 @@ def run_passive_cycle(session: PaperSession, active_markets: list, reward_tracke
             )
             has_yes = orders.get("yes_oid") is not None
             has_no = orders.get("no_oid") is not None
+
+            # Convert OrderBookSummary to dict for reward_tracker
+            book_dict = None
+            if yes_book and hasattr(yes_book, "bids"):
+                book_dict = {
+                    "bids": [{"price": float(b.price), "size": float(b.size)} for b in yes_book.bids],
+                    "asks": [{"price": float(a.price), "size": float(a.size)} for a in yes_book.asks],
+                }
+
             reward_tracker.record_cycle(
                 condition_id=cid,
                 has_yes_order=has_yes, has_no_order=has_no,
@@ -596,7 +605,7 @@ def run_passive_cycle(session: PaperSession, active_markets: list, reward_tracke
                 midpoint=midpoint,
                 bid_size=float(yes_shares) if has_yes else 0,
                 ask_size=float(no_shares) if has_no else 0,
-                order_book=yes_book,
+                order_book=book_dict,
             )
 
             if session.cycle_count % 10 == 0:

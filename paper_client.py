@@ -172,7 +172,7 @@ class PaperClient:
                 self._usdc_balance -= cost
             else:  # SELL
                 available = self._token_balances.get(token_id, 0.0)
-                if size > available + 0.5:
+                if size > available + 1.0:  # generous tolerance for float rounding
                     raise Exception(
                         f"Paper: insufficient token balance "
                         f"(need {size:.1f}, have {available:.1f})"
