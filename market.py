@@ -12,19 +12,15 @@ import logging
 from datetime import datetime, timezone
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds
+import config
+# Immutable credentials and constants — safe as direct imports
 from config import (
     HOST, CHAIN_ID, PRIVATE_KEY,
     CLOB_API_KEY, CLOB_SECRET, CLOB_PASS_PHRASE,
-    MAX_MARKETS, MAX_ORDER_SIZE, MIN_DAYS_TO_EXPIRY,
-    MIN_YES_PRICE, MAX_YES_PRICE, MIN_DAILY_RATE,
-    MIN_LIQUIDITY, MIN_SPREAD_ALLOWED,
-    MAX_VOLUME_TO_REWARD_RATIO,
-    WEIGHT_REWARD_EFFICIENCY, WEIGHT_COMPETITION,
-    WEIGHT_FILL_SAFETY, WEIGHT_UNWIND_ABILITY,
-    WEIGHT_DAILY_RATE, WEIGHT_SPREAD,
-    ORDER_SIZE,
     FUNDER, SIGNATURE_TYPE, GAMMA_API,
-    MIN_BID_DEPTH_USD,
+    # Hygiene filters (not overridden at runtime)
+    MIN_DAYS_TO_EXPIRY, MIN_YES_PRICE, MAX_YES_PRICE,
+    MIN_DAILY_RATE, MIN_LIQUIDITY, MIN_SPREAD_ALLOWED,
 )
 
 # Cache for CLOB rewards params (refreshed each market refresh cycle)
@@ -325,11 +321,11 @@ def hygiene_check(market: dict, rewards: dict) -> tuple[bool, str]:
     yes_cost = rewards["min_size"] * yes_price
     no_cost = rewards["min_size"] * no_price
     max_cost_usd = max(yes_cost, no_cost)
-    if max_cost_usd > MAX_ORDER_SIZE:
+    if max_cost_usd > config.MAX_ORDER_SIZE:
         return False, (
             f"Order cost YES=${yes_cost:.2f}/NO=${no_cost:.2f} "
             f"({rewards['min_size']} shares) "
-            f"exceeds budget ${MAX_ORDER_SIZE}"
+            f"exceeds budget ${config.MAX_ORDER_SIZE}"
         )
 
     # 6. Max spread must be meaningful
@@ -351,10 +347,10 @@ def hygiene_check(market: dict, rewards: dict) -> tuple[bool, str]:
     # Illinois ($7500/day, low volume) → good. Crude Oil ($500/day, huge volume) → bad.
     if rewards["daily_rate"] > 0:
         vol_reward_ratio = vol_24h / rewards["daily_rate"]
-        if vol_reward_ratio > MAX_VOLUME_TO_REWARD_RATIO:
+        if vol_reward_ratio > config.MAX_VOLUME_TO_REWARD_RATIO:
             return False, (
                 f"Too fill-heavy (vol/reward={vol_reward_ratio:.0f}x, "
-                f"max={MAX_VOLUME_TO_REWARD_RATIO:.0f}x)"
+                f"max={config.MAX_VOLUME_TO_REWARD_RATIO:.0f}x)"
             )
 
     return True, "OK"
@@ -421,7 +417,7 @@ def score_markets_ranked(markets: list[dict]) -> list[dict]:
     if n == 0:
         return markets
 
-    our_capital = ORDER_SIZE * 2  # Both sides
+    our_capital = config.ORDER_SIZE * 2  # Both sides
 
     # ── Raw component values ──────────────────────────────────────────
 
@@ -475,12 +471,12 @@ def score_markets_ranked(markets: list[dict]) -> list[dict]:
 
     for i, m in enumerate(markets):
         breakdown = {
-            "efficiency": round(pct_efficiency[i] * WEIGHT_REWARD_EFFICIENCY, 2),
-            "competition": round(pct_capture[i] * WEIGHT_COMPETITION, 2),
-            "fill_safety": round(pct_fill_safety[i] * WEIGHT_FILL_SAFETY, 2),
-            "unwind": round(pct_unwind[i] * WEIGHT_UNWIND_ABILITY, 2),
-            "daily_rate": round(pct_rate[i] * WEIGHT_DAILY_RATE, 2),
-            "spread": round(pct_spread[i] * WEIGHT_SPREAD, 2),
+            "efficiency": round(pct_efficiency[i] * config.WEIGHT_REWARD_EFFICIENCY, 2),
+            "competition": round(pct_capture[i] * config.WEIGHT_COMPETITION, 2),
+            "fill_safety": round(pct_fill_safety[i] * config.WEIGHT_FILL_SAFETY, 2),
+            "unwind": round(pct_unwind[i] * config.WEIGHT_UNWIND_ABILITY, 2),
+            "daily_rate": round(pct_rate[i] * config.WEIGHT_DAILY_RATE, 2),
+            "spread": round(pct_spread[i] * config.WEIGHT_SPREAD, 2),
         }
         m["score"] = round(sum(breakdown.values()), 2)
         m["score_breakdown"] = breakdown
@@ -494,12 +490,12 @@ def score_markets_ranked(markets: list[dict]) -> list[dict]:
         log.info(
             f"  #{i} {m['question'][:45]} | "
             f"score={m['score']:.1f} | "
-            f"eff={bd['efficiency']:.0f}/{WEIGHT_REWARD_EFFICIENCY} "
-            f"comp={bd['competition']:.0f}/{WEIGHT_COMPETITION} "
-            f"fill={bd['fill_safety']:.0f}/{WEIGHT_FILL_SAFETY} "
-            f"unwind={bd['unwind']:.0f}/{WEIGHT_UNWIND_ABILITY} "
-            f"rate={bd['daily_rate']:.0f}/{WEIGHT_DAILY_RATE} "
-            f"spread={bd['spread']:.0f}/{WEIGHT_SPREAD} "
+            f"eff={bd['efficiency']:.0f}/{config.WEIGHT_REWARD_EFFICIENCY} "
+            f"comp={bd['competition']:.0f}/{config.WEIGHT_COMPETITION} "
+            f"fill={bd['fill_safety']:.0f}/{config.WEIGHT_FILL_SAFETY} "
+            f"unwind={bd['unwind']:.0f}/{config.WEIGHT_UNWIND_ABILITY} "
+            f"rate={bd['daily_rate']:.0f}/{config.WEIGHT_DAILY_RATE} "
+            f"spread={bd['spread']:.0f}/{config.WEIGHT_SPREAD} "
             f"| est=${m.get('est_daily_reward', 0):.1f}/day "
             f"({m.get('capture_pct', 0):.0f}% of pool)"
         )
@@ -508,7 +504,7 @@ def score_markets_ranked(markets: list[dict]) -> list[dict]:
 
 
 # ── Main Function ────────────────────────────────────────────────────────────
-def get_rewards_markets(limit: int = MAX_MARKETS) -> list[dict]:
+def get_rewards_markets(limit: int | None = None) -> list[dict]:
     """Fetch, filter, score, and return the top markets for trading.
 
     Uses rank-based percentile scoring: all eligible markets are ranked
@@ -553,10 +549,10 @@ def get_rewards_markets(limit: int = MAX_MARKETS) -> list[dict]:
             continue
         yes_price = parse_yes_price(market) or 0.50
         max_side_cost = rewards["min_size"] * max(yes_price, 1 - yes_price)
-        if max_side_cost > MAX_ORDER_SIZE:
+        if max_side_cost > config.MAX_ORDER_SIZE:
             rejected.append((
                 market.get("question", "?")[:50],
-                f"max_side_cost=${max_side_cost:.2f} > ${MAX_ORDER_SIZE}",
+                f"max_side_cost=${max_side_cost:.2f} > ${config.MAX_ORDER_SIZE}",
             ))
             continue
 
@@ -582,4 +578,5 @@ def get_rewards_markets(limit: int = MAX_MARKETS) -> list[dict]:
     # Score all eligible markets using rank-based percentile scoring
     scored = score_markets_ranked(passed)
 
-    return scored[:limit]
+    effective_limit = limit if limit is not None else config.MAX_MARKETS
+    return scored[:int(effective_limit)]

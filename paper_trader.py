@@ -55,6 +55,7 @@ STRATEGIES = [
             "MAX_MARKETS": 5,
             "DYNAMIC_SIZE_MIN": 50,
             "DYNAMIC_SIZE_MAX": 250,
+            "DANGER_ZONE_CENTS": 0.01,
         },
         initial_balance=1000.0,
     ),
@@ -66,7 +67,9 @@ STRATEGIES = [
             "DYNAMIC_SIZING_ENABLED": False,
             "DYNAMIC_SIZE_MIN": 5,
             "DYNAMIC_SIZE_MAX": 5,
+            "DANGER_ZONE_CENTS": 0.005,  # half-cent — smaller orders tolerate closer to mid
             "MIN_SCORE_THRESHOLD": 30,
+            "MAX_VOLUME_TO_REWARD_RATIO": 200000,  # allow high-volume markets
         },
         initial_balance=1000.0,
     ),
@@ -78,7 +81,9 @@ STRATEGIES = [
             "DYNAMIC_SIZING_ENABLED": True,
             "DYNAMIC_SIZE_MIN": 5,
             "DYNAMIC_SIZE_MAX": 150,
+            "DANGER_ZONE_CENTS": 0.005,
             "MIN_SCORE_THRESHOLD": 40,
+            "MAX_VOLUME_TO_REWARD_RATIO": 100000,
         },
         initial_balance=1000.0,
     ),
@@ -152,6 +157,7 @@ class PaperSession:
         self.start_time = time.time()
         self.total_bought = 0.0
         self.total_sold = 0.0
+        self.last_hourly_snapshot = time.time()
 
 
 def create_real_client():
@@ -178,6 +184,82 @@ def create_real_client():
         funder=FUNDER,
     )
     return RateLimitedClient(raw_client)
+
+
+def record_paper_cycle_stats(
+    session: PaperSession, market: dict, mgr, reward_tracker
+) -> None:
+    """Record per-market reward stats after each cycle (mirrors bot.py._record_cycle_stats)."""
+    import config as _cfg
+    import time as _t
+    from database import get_db
+
+    try:
+        condition_id = market["condition_id"]
+        reward_tracker.get_or_create(
+            condition_id=condition_id,
+            question=market.get("question", ""),
+            daily_rate=market.get("daily_rate", 0),
+            max_spread=market.get("max_spread", 0),
+        )
+
+        active_sides = {o.side for o in mgr.active_orders.values()}
+        has_yes = "yes" in active_sides
+        has_no = "no" in active_sides
+
+        bid_price = ask_price = 0.0
+        bid_size = ask_size = 0.0
+        for o in mgr.active_orders.values():
+            if o.side == "yes":
+                bid_price, bid_size = o.price, o.size or o.original_size
+            elif o.side == "no":
+                ask_price, ask_size = o.price, o.size or o.original_size
+
+        best_bid = getattr(mgr, "_cached_best_bid", 0)
+        best_ask = getattr(mgr, "_cached_best_ask", 1)
+        midpoint = (best_bid + best_ask) / 2 if best_bid > 0 else 0
+        cached_book = getattr(mgr, "_last_order_book", None)
+
+        yes_usd = session.position_tracker.get_position(condition_id, "yes")
+        no_usd = session.position_tracker.get_position(condition_id, "no")
+        inventory_usd = yes_usd + no_usd
+
+        cooldown_active = (
+            _t.time() - mgr._last_fill_time.get("yes", 0) < _cfg.POST_FILL_COOLDOWN_SECS
+            or _t.time() - mgr._last_fill_time.get("no", 0) < _cfg.POST_FILL_COOLDOWN_SECS
+        )
+        skew_active = inventory_usd > _cfg.INVENTORY_SKEW_THRESHOLD
+
+        reward_tracker.record_cycle(
+            condition_id=condition_id,
+            has_yes_order=has_yes,
+            has_no_order=has_no,
+            bid_price=bid_price,
+            ask_price=ask_price,
+            inventory_usd=inventory_usd,
+            cooldown_active=cooldown_active,
+            skew_active=skew_active,
+            cycle_duration_secs=_cfg.ORDER_REFRESH_SECS,
+            midpoint=midpoint,
+            bid_size=bid_size,
+            ask_size=ask_size,
+            order_book=cached_book,
+        )
+
+        # Cycle snapshot every 10th cycle
+        if session.cycle_count % 10 == 0:
+            get_db().log_cycle_snapshot(
+                cycle_num=session.cycle_count,
+                condition_id=condition_id,
+                best_bid=best_bid, best_ask=best_ask,
+                our_bid=bid_price, our_ask=ask_price,
+                yes_position_usd=yes_usd,
+                no_position_usd=no_usd,
+                active_orders=len(mgr.active_orders),
+                unwind_orders=len(mgr.unwind_orders),
+            )
+    except Exception as e:
+        log.debug(f"Paper cycle stats error: {e}")
 
 
 def run_one_cycle(session: PaperSession, active_markets: list, reward_tracker):
@@ -230,6 +312,8 @@ def run_one_cycle(session: PaperSession, active_markets: list, reward_tracker):
             if mgr:
                 try:
                     mgr.run_cycle(exchange_orders=exchange_orders)
+                    # Record Q-score and reward stats (mirrors bot.py)
+                    record_paper_cycle_stats(session, market, mgr, reward_tracker)
                 except Exception as e:
                     log.debug(
                         f"[{session.strategy.name}] Cycle error "
@@ -242,6 +326,104 @@ def run_one_cycle(session: PaperSession, active_markets: list, reward_tracker):
     finally:
         # Restore config and DB
         restore_config(saved)
+        db_module._instance = original_db
+
+
+def log_hourly_snapshot(session: PaperSession, reward_tracker) -> None:
+    """Log hourly P&L snapshot for a paper session (mirrors bot.py._log_hourly_pnl_snapshot)."""
+    import database as db_module
+    from datetime import datetime
+
+    now = time.time()
+    if now - session.last_hourly_snapshot < 3600:
+        return
+
+    session.last_hourly_snapshot = now
+
+    # Swap DB to session's DB
+    original_db = db_module._instance
+    db_module._instance = session.db
+
+    try:
+        db = session.db
+        hour_label = datetime.now().strftime("%Y-%m-%d %H:00")
+        hour_ago = now - 3600
+
+        # Query fills in the last hour
+        fills = db.conn.execute(
+            "SELECT COALESCE(SUM(CASE WHEN side='yes' THEN shares*price ELSE shares*clob_cost END),0), COUNT(*) "
+            "FROM fills WHERE ts >= ?", (hour_ago,)
+        ).fetchone()
+        total_bought = fills[0]
+        num_fills = fills[1]
+
+        # Query unwinds
+        unwinds = db.conn.execute(
+            "SELECT COALESCE(SUM(usd_value),0), COALESCE(SUM(pnl),0), COUNT(*) "
+            "FROM unwinds WHERE ts >= ?", (hour_ago,)
+        ).fetchone()
+        total_sold = unwinds[0]
+        realized_pnl = unwinds[1]
+        num_unwinds = unwinds[2]
+
+        # Stop losses
+        stop_row = db.conn.execute(
+            "SELECT COALESCE(SUM(loss_usd),0), COUNT(*) FROM stop_losses WHERE ts >= ?",
+            (hour_ago,)
+        ).fetchone()
+        num_stop_losses = stop_row[1]
+
+        # Danger cancels
+        danger_row = db.conn.execute(
+            "SELECT COUNT(*) FROM orders_cancelled WHERE ts >= ? AND reason='danger'",
+            (hour_ago,)
+        ).fetchone()
+        num_danger = danger_row[0]
+
+        # Position value
+        total_pos = 0.0
+        positions = db.conn.execute("SELECT * FROM positions").fetchall()
+        for p in positions:
+            total_pos += p[2] * p[3] + p[5] * p[6]  # yes_shares*yes_avg + no_shares*no_avg
+
+        # Reward estimate
+        est_reward = 0.0
+        reward_stats = db.conn.execute("SELECT data FROM reward_market_stats").fetchall()
+        import json
+        for r in reward_stats:
+            d = json.loads(r[0])
+            est_reward += d.get("est_reward_usd", 0)
+
+        unrealized = total_pos - total_bought if total_bought > 0 else 0
+
+        db.log_hourly_snapshot(
+            hour_label=hour_label,
+            num_markets=len(getattr(session, 'order_managers', {})),
+            total_bought_usd=total_bought,
+            total_sold_usd=total_sold,
+            realized_pnl=realized_pnl,
+            unrealized_pnl=unrealized,
+            total_position_usd=total_pos,
+            est_reward_usd=est_reward,
+            est_reward_rate_hr=est_reward,
+            num_fills=num_fills,
+            num_unwinds=num_unwinds,
+            num_stop_losses=num_stop_losses,
+            num_danger_cancels=num_danger,
+            avg_uptime_pct=100.0,
+            config_json="{}",
+        )
+
+        log.info(
+            f"[{session.strategy.name}] HOURLY SNAPSHOT | "
+            f"bought=${total_bought:.2f} sold=${total_sold:.2f} "
+            f"pos=${total_pos:.2f} rew=${est_reward:.2f} "
+            f"fills={num_fills} unwinds={num_unwinds} stop={num_stop_losses} "
+            f"danger={num_danger}"
+        )
+    except Exception as e:
+        log.debug(f"Hourly snapshot error for {session.strategy.name}: {e}")
+    finally:
         db_module._instance = original_db
 
 
@@ -409,7 +591,7 @@ def main():
     # ── Main loop ────────────────────────────────────────────────────
     start_time = time.time()
     last_report = start_time
-    last_market_refresh = 0
+    last_market_refresh = time.time()  # initial fetch already done above
     cycle = 0
 
     import config
@@ -444,11 +626,14 @@ def main():
             except Exception as e:
                 log.error(f"[{session.strategy.name}] Cycle error: {e}")
 
-        # Hourly progress report
+        # Hourly progress report + snapshots
         elapsed = time.time() - start_time
         if elapsed - (last_report - start_time) >= 3600:
             print_comparison(sessions, elapsed / 3600)
             last_report = time.time()
+            # Log hourly snapshots per session
+            for s in sessions:
+                log_hourly_snapshot(s, reward_tracker)
 
         # Brief status every 10 cycles
         if cycle % 10 == 0:

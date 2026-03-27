@@ -9,11 +9,8 @@ import logging
 import time as _time
 from py_clob_client.clob_types import OrderArgs
 from py_clob_client.order_builder.constants import BUY
-from config import (
-    ORDER_SIZE, MAX_ORDER_BUDGET, ORDER_REFRESH_SECS,
-    DRY_RUN,
-    CHEAP_TOKEN_THRESHOLD, CHEAP_TOKEN_SCALE,
-)
+import config
+from config import DRY_RUN  # truly immutable at runtime
 from alerts import alert_order_failure, log_order_placed
 from price import to_clob
 from database import get_db
@@ -69,19 +66,19 @@ class PlacementMixin:
 
         min_shares = self.market["min_size"]
         # Scale down order size for cheap tokens to limit adverse selection damage
-        base_order_size = budget_usd if budget_usd is not None else ORDER_SIZE
+        base_order_size = budget_usd if budget_usd is not None else config.ORDER_SIZE
         effective_order_size = base_order_size
-        if clob_price < CHEAP_TOKEN_THRESHOLD:
-            effective_order_size = base_order_size * CHEAP_TOKEN_SCALE
+        if clob_price < config.CHEAP_TOKEN_THRESHOLD:
+            effective_order_size = base_order_size * config.CHEAP_TOKEN_SCALE
         budget_shares = effective_order_size / clob_price
         min_cost = min_shares * clob_price
 
         # If the rewards minimum exceeds our hard cap, skip this side
-        if min_cost > MAX_ORDER_BUDGET:
+        if min_cost > config.MAX_ORDER_BUDGET:
             log.warning(
                 f"Min order ({min_shares} shares × ${clob_price:.2f} "
                 f"= ${min_cost:.0f}) exceeds hard cap "
-                f"${MAX_ORDER_BUDGET} — skipping {side.upper()}"
+                f"${config.MAX_ORDER_BUDGET} — skipping {side.upper()}"
             )
             return None
 
@@ -93,11 +90,11 @@ class PlacementMixin:
         size = round(size, 2)
 
         # Hard cap — never exceed MAX_ORDER_BUDGET
-        max_shares = MAX_ORDER_BUDGET / clob_price
+        max_shares = config.MAX_ORDER_BUDGET / clob_price
         if size > max_shares:
             log.debug(
                 f"Size capped from {size} to {max_shares:.2f} shares "
-                f"(hard cap at ${MAX_ORDER_BUDGET})"
+                f"(hard cap at ${config.MAX_ORDER_BUDGET})"
             )
             size = round(max_shares, 2)
 
@@ -224,7 +221,7 @@ class PlacementMixin:
             # instead of each one hammering the API with doomed requests.
             if "not enough balance" in error_str or "allowance" in error_str:
                 if self.balance_gate:
-                    self.balance_gate.mark_depleted(cooldown_secs=ORDER_REFRESH_SECS)
+                    self.balance_gate.mark_depleted(cooldown_secs=config.ORDER_REFRESH_SECS)
 
             alert_order_failure(
                 question, side.upper(), str(e),

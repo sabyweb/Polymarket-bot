@@ -11,24 +11,15 @@ Co-best pricing (join at best bid/ask) with:
 import logging
 import math
 import time as _time
-from config import (
-    DANGER_ZONE_CENTS, DEAD_ZONE_BUFFER,
-    INVENTORY_SKEW_ENABLED, INVENTORY_SKEW_TICKS, INVENTORY_SKEW_THRESHOLD,
-    POST_FILL_COOLDOWN_SECS, POST_FILL_WIDEN_TICKS,
-    MIN_BID_DEPTH_USD,
-    EMA_HALF_LIFE_CYCLES,
-    VOL_WINDOW_CYCLES, VOL_SPREAD_MULTIPLIER, VOL_WIDEN_MAX_TICKS,
-    BOOK_IMBALANCE_THRESHOLD, BOOK_IMBALANCE_WIDEN_TICKS,
-    DYNAMIC_SIZING_ENABLED, DYNAMIC_SIZE_MIN, DYNAMIC_SIZE_MAX,
-    SIZE_WEIGHT_REWARD, SIZE_WEIGHT_STABILITY, SIZE_WEIGHT_DEPTH, SIZE_WEIGHT_SPREAD,
-    ORDER_SIZE,
-)
+import config
+from config import DEAD_ZONE_BUFFER  # truly immutable constant
 from alerts import alert_danger_zone
 
 log = logging.getLogger(__name__)
 
-# EMA smoothing factor: alpha = 2 / (N + 1)
-_EMA_ALPHA: float = 2.0 / (EMA_HALF_LIFE_CYCLES + 1)
+def _ema_alpha() -> float:
+    """EMA smoothing factor: alpha = 2 / (N + 1). Read at call time for overrides."""
+    return 2.0 / (config.EMA_HALF_LIFE_CYCLES + 1)
 
 
 class PricingMixin:
@@ -65,7 +56,7 @@ class PricingMixin:
                 self._ema_mid = raw_mid
                 self._ema_initialized = True
             else:
-                self._ema_mid += _EMA_ALPHA * (raw_mid - self._ema_mid)
+                self._ema_mid += _ema_alpha() * (raw_mid - self._ema_mid)
 
             # Use EMA midpoint for all downstream calculations.
             # This smooths out transient spikes that would cause
@@ -74,8 +65,8 @@ class PricingMixin:
 
             # ── M2: Update volatility history ─────────────────────────
             self._midpoint_history.append(raw_mid)
-            if len(self._midpoint_history) > VOL_WINDOW_CYCLES:
-                self._midpoint_history = self._midpoint_history[-VOL_WINDOW_CYCLES:]
+            if len(self._midpoint_history) > config.VOL_WINDOW_CYCLES:
+                self._midpoint_history = self._midpoint_history[-config.VOL_WINDOW_CYCLES:]
 
             # Layer 1: Co-best + depth check + reward window clamp
             our_bid, our_ask = self._spread_relative_prices(
@@ -102,23 +93,23 @@ class PricingMixin:
                 )
 
             # ── Inventory skew ──────────────────────────────────────────
-            if INVENTORY_SKEW_ENABLED:
+            if config.INVENTORY_SKEW_ENABLED:
                 our_bid, our_ask = self._apply_inventory_skew(
                     our_bid, our_ask, tick, midpoint, max_spread
                 )
 
             # ── Post-fill cooldown ─────────────────────────────────────
             now = _time.time()
-            if now - self._last_fill_time.get("yes", 0) < POST_FILL_COOLDOWN_SECS:
-                widened = self.round_to_tick(our_bid - POST_FILL_WIDEN_TICKS * tick)
+            if now - self._last_fill_time.get("yes", 0) < config.POST_FILL_COOLDOWN_SECS:
+                widened = self.round_to_tick(our_bid - config.POST_FILL_WIDEN_TICKS * tick)
                 min_bid = self.round_to_tick(midpoint - max_spread)
                 our_bid = max(widened, min_bid)
                 log.info(
                     f"POST-FILL COOLDOWN | YES bid widened to {our_bid:.4f} | "
                     f"market={self.market['question'][:40]}"
                 )
-            if now - self._last_fill_time.get("no", 0) < POST_FILL_COOLDOWN_SECS:
-                widened = self.round_to_tick(our_ask + POST_FILL_WIDEN_TICKS * tick)
+            if now - self._last_fill_time.get("no", 0) < config.POST_FILL_COOLDOWN_SECS:
+                widened = self.round_to_tick(our_ask + config.POST_FILL_WIDEN_TICKS * tick)
                 max_ask = self.round_to_tick(midpoint + max_spread)
                 our_ask = min(widened, max_ask)
                 log.info(
@@ -173,8 +164,8 @@ class PricingMixin:
             return 0  # Below noise floor — pure co-best
 
         # Scale: vol_ticks = vol / tick * multiplier, capped
-        vol_ticks = int(vol / tick * VOL_SPREAD_MULTIPLIER)
-        vol_ticks = min(vol_ticks, VOL_WIDEN_MAX_TICKS)
+        vol_ticks = int(vol / tick * config.VOL_SPREAD_MULTIPLIER)
+        vol_ticks = min(vol_ticks, config.VOL_WIDEN_MAX_TICKS)
 
         return vol_ticks
 
@@ -194,8 +185,8 @@ class PricingMixin:
         Returns:
             Target order budget in USD.
         """
-        if not DYNAMIC_SIZING_ENABLED:
-            return float(ORDER_SIZE)
+        if not config.DYNAMIC_SIZING_ENABLED:
+            return float(config.ORDER_SIZE)
 
         # ── Signal 1: Reward efficiency (0-1) ──────────────────────────
         # Estimate our reward capture rate. Markets with high daily_rate
@@ -206,7 +197,7 @@ class PricingMixin:
         # Simplify: daily_rate / (our_capital + liquidity)
         # Normalize: cap at 0.10 (10% daily return is exceptional)
         if liquidity > 0 and daily_rate > 0:
-            eff = daily_rate / (ORDER_SIZE * 2 + liquidity)
+            eff = daily_rate / (config.ORDER_SIZE * 2 + liquidity)
             reward_score = min(1.0, eff / 0.10)
         else:
             reward_score = 0.3  # No data → conservative
@@ -217,7 +208,7 @@ class PricingMixin:
         tick = self.market.get("tick_size", 0.01)
         vol_ticks = self._volatility_widen_ticks(tick)
         # vol_ticks: 0 = calm, 3 = max volatile (VOL_WIDEN_MAX_TICKS)
-        stability_score = 1.0 - (vol_ticks / max(VOL_WIDEN_MAX_TICKS, 1))
+        stability_score = 1.0 - (vol_ticks / max(config.VOL_WIDEN_MAX_TICKS, 1))
 
         # ── Signal 3: Depth (0-1) ─────────────────────────────────────
         # Sum of top-5 bid levels in dollar terms.
@@ -227,7 +218,7 @@ class PricingMixin:
             float(level["price"]) * float(level["size"])
             for level in order_book.get("bids", [])[:5]
         )
-        depth_score = min(1.0, max(0.0, (bid_depth - MIN_BID_DEPTH_USD) / 4500))
+        depth_score = min(1.0, max(0.0, (bid_depth - config.MIN_BID_DEPTH_USD) / 4500))
 
         # ── Signal 4: Spread width (0-1) ──────────────────────────────
         # Wider max_spread = easier to stay in reward window.
@@ -238,15 +229,15 @@ class PricingMixin:
 
         # ── Weighted combination ───────────────────────────────────────
         sizing_score = (
-            SIZE_WEIGHT_REWARD * reward_score
-            + SIZE_WEIGHT_STABILITY * stability_score
-            + SIZE_WEIGHT_DEPTH * depth_score
-            + SIZE_WEIGHT_SPREAD * spread_score
+            config.SIZE_WEIGHT_REWARD * reward_score
+            + config.SIZE_WEIGHT_STABILITY * stability_score
+            + config.SIZE_WEIGHT_DEPTH * depth_score
+            + config.SIZE_WEIGHT_SPREAD * spread_score
         )
         sizing_score = max(0.0, min(1.0, sizing_score))
 
         # Map to dollar range
-        dynamic_size = DYNAMIC_SIZE_MIN + sizing_score * (DYNAMIC_SIZE_MAX - DYNAMIC_SIZE_MIN)
+        dynamic_size = config.DYNAMIC_SIZE_MIN + sizing_score * (config.DYNAMIC_SIZE_MAX - config.DYNAMIC_SIZE_MIN)
 
         log.info(
             f"DYNAMIC SIZE | ${dynamic_size:.0f} "
@@ -286,10 +277,10 @@ class PricingMixin:
             for level in order_book["asks"][:5]
         )
 
-        if bid_depth < MIN_BID_DEPTH_USD:
+        if bid_depth < config.MIN_BID_DEPTH_USD:
             log.warning(
                 f"Bid depth too thin (${bid_depth:.0f} < "
-                f"${MIN_BID_DEPTH_USD:.0f}) for {question[:40]} — "
+                f"${config.MIN_BID_DEPTH_USD:.0f}) for {question[:40]} — "
                 f"skipping to avoid unsellable inventory"
             )
             return None, None
@@ -304,14 +295,14 @@ class PricingMixin:
         min_depth = min(bid_depth, ask_depth)
         if min_depth > 0:
             imbalance_ratio = max(bid_depth, ask_depth) / min_depth
-            if imbalance_ratio >= BOOK_IMBALANCE_THRESHOLD:
-                widen = BOOK_IMBALANCE_WIDEN_TICKS * tick
+            if imbalance_ratio >= config.BOOK_IMBALANCE_THRESHOLD:
+                widen = config.BOOK_IMBALANCE_WIDEN_TICKS * tick
                 if bid_depth < ask_depth:
                     # Thin bids → price likely to drop → widen our bid
                     our_bid = self.round_to_tick(our_bid - widen)
                     log.info(
                         f"IMBALANCE GUARD | Thin bids ({imbalance_ratio:.1f}:1) | "
-                        f"bid widened by {BOOK_IMBALANCE_WIDEN_TICKS} ticks → "
+                        f"bid widened by {config.BOOK_IMBALANCE_WIDEN_TICKS} ticks → "
                         f"{our_bid:.4f} | market={question[:40]}"
                     )
                 else:
@@ -319,7 +310,7 @@ class PricingMixin:
                     our_ask = self.round_to_tick(our_ask + widen)
                     log.info(
                         f"IMBALANCE GUARD | Thin asks ({imbalance_ratio:.1f}:1) | "
-                        f"ask widened by {BOOK_IMBALANCE_WIDEN_TICKS} ticks → "
+                        f"ask widened by {config.BOOK_IMBALANCE_WIDEN_TICKS} ticks → "
                         f"{our_ask:.4f} | market={question[:40]}"
                     )
 
@@ -376,15 +367,15 @@ class PricingMixin:
         yes_usd = self.position_tracker.get_position(condition_id, "yes")
         no_usd = self.position_tracker.get_position(condition_id, "no")
 
-        if yes_usd < INVENTORY_SKEW_THRESHOLD and no_usd < INVENTORY_SKEW_THRESHOLD:
+        if yes_usd < config.INVENTORY_SKEW_THRESHOLD and no_usd < config.INVENTORY_SKEW_THRESHOLD:
             return our_bid, our_ask
 
         # Calculate skew steps — each $100 of inventory = 1 step
-        yes_steps = int(yes_usd / 100) if yes_usd >= INVENTORY_SKEW_THRESHOLD else 0
-        no_steps = int(no_usd / 100) if no_usd >= INVENTORY_SKEW_THRESHOLD else 0
+        yes_steps = int(yes_usd / 100) if yes_usd >= config.INVENTORY_SKEW_THRESHOLD else 0
+        no_steps = int(no_usd / 100) if no_usd >= config.INVENTORY_SKEW_THRESHOLD else 0
         net_skew = yes_steps - no_steps  # positive = long YES, negative = long NO
 
-        skew_amount = abs(net_skew) * INVENTORY_SKEW_TICKS * tick
+        skew_amount = abs(net_skew) * config.INVENTORY_SKEW_TICKS * tick
 
         if net_skew > 0:
             # Long YES → want to SELL YES → tighten ask, widen bid
@@ -452,7 +443,7 @@ class PricingMixin:
 
         gap = abs(order.price - midpoint)
 
-        if gap < DANGER_ZONE_CENTS:
+        if gap < config.DANGER_ZONE_CENTS:
             alert_danger_zone(
                 self.market["question"], order.side.upper(), order.price, midpoint
             )
