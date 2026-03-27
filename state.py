@@ -138,7 +138,7 @@ class SidePosition:
         """
         if actual_shares < 1.0:
             self.shares = 0.0
-            self.avg_price = 0.0
+            # Preserve avg_price for P&L tracking on pending unwinds
             self.halted = False
         else:
             self.shares = actual_shares

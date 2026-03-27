@@ -329,9 +329,10 @@ class FillsMixin:
                                 usd_value=unwound_usd,
                                 market_question=self.market["question"],
                             )
-                            # Compute VWAP cost BEFORE record_unwind (which may zero avg_price)
+                            # Use cost basis frozen at unwind placement time
+                            # (position_tracker.get_avg_price can be zeroed by exchange verification)
                             cid = self.market["condition_id"]
-                            avg_p = self.position_tracker.get_avg_price(cid, uorder.side)
+                            avg_p = uorder.price  # YES-equiv VWAP from UnwindOrder
                             vwap_cost = 0.0
                             if avg_p > 0:
                                 vwap_cost = to_clob(avg_p, uorder.side) * unwound_shares
@@ -407,11 +408,9 @@ class FillsMixin:
                                 f"value=${unwound_usd:.2f} | "
                                 f"market={self.market['question'][:40]}"
                             )
-                            # Compute VWAP cost BEFORE record_unwind (which may zero avg_price)
+                            # Use cost basis frozen at unwind placement time
                             cid = self.market["condition_id"]
-                            avg_p = self.position_tracker.get_avg_price(
-                                cid, uorder.side
-                            )
+                            avg_p = uorder.price  # YES-equiv VWAP from UnwindOrder
                             vwap_cost = 0.0
                             if avg_p > 0:
                                 vwap_cost = (
