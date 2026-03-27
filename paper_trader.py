@@ -91,10 +91,10 @@ STRATEGIES = [
     PaperStrategy(
         name="passive",
         config_overrides={
-            "ORDER_SIZE": 10,
-            "MAX_MARKETS": 15,
+            "ORDER_SIZE": 300,  # go big — edge placement means near-zero fill risk
+            "MAX_MARKETS": 20,
             "DYNAMIC_SIZING_ENABLED": False,
-            "MIN_DAILY_RATE": 100,  # only markets >= $100/day
+            "MIN_DAILY_RATE": 50,  # markets >= $50/day
             "DANGER_ZONE_CENTS": 0.0,  # irrelevant — custom cycle handles placement
             "MIN_SCORE_THRESHOLD": 0,
             "MAX_VOLUME_TO_REWARD_RATIO": 500000,
@@ -277,18 +277,40 @@ def record_paper_cycle_stats(
         log.debug(f"Paper cycle stats error: {e}")
 
 
+def _is_volatile_market(market: dict) -> bool:
+    """Reject markets with high price volatility or geopolitical keywords."""
+    q = (market.get("question") or "").lower()
+    # Keyword blacklist — topics with sharp, unpredictable moves
+    VOLATILE_KEYWORDS = [
+        "iran", "crude oil", "invade", "forces enter", "regime fall",
+        "ceasefire", "military", "war ", "attack", "strike", "missile",
+        "nuclear", "sanctions",
+    ]
+    if any(kw in q for kw in VOLATILE_KEYWORDS):
+        return True
+
+    # Activity ratio: high volume relative to liquidity = active/volatile
+    vol = market.get("volume_24h", 0)
+    liq = market.get("liquidity", 0)
+    if liq > 0 and vol / liq > 4.0:
+        return True
+
+    return False
+
+
 def run_passive_cycle(session: PaperSession, active_markets: list, reward_tracker):
     """Custom cycle for the passive farmer strategy.
 
-    Places orders at the EDGE of the reward window (max_spread - 1 tick from mid)
-    on both sides. If any fill occurs, immediately dumps the acquired inventory
-    at market price. Goal: earn Q-score with near-zero fill probability.
+    Picks calm, non-volatile markets with rewards >= $50/day.
+    Places BIG orders at the EDGE of the reward window on BOTH sides.
+    If both sides fill → merge for $1.00 (profit).
+    If one side fills → dump at market (small known loss).
+    Goal: earn Q-score rewards with near-zero fill probability.
     """
     import config as _cfg
     import database as db_module
     from py_clob_client.clob_types import OrderArgs
     from py_clob_client.order_builder.constants import BUY, SELL
-    from price import to_clob
     from database import get_db
 
     # Apply config overrides
@@ -305,11 +327,21 @@ def run_passive_cycle(session: PaperSession, active_markets: list, reward_tracke
 
         # Lazy init
         if not hasattr(session, "_passive_orders"):
-            session._passive_orders = {}  # cid → {"yes_oid": ..., "no_oid": ...}
-            session._passive_positions = {}  # cid → {"yes_shares": 0, "no_shares": 0, "yes_cost": 0, "no_cost": 0}
+            session._passive_orders = {}   # cid → {"yes_oid": ..., "no_oid": ...}
+            session._passive_inventory = {}  # cid → {"yes": shares, "no": shares, "yes_cost": $, "no_cost": $}
 
-        # Register markets
+        # ── Filter markets: calm + rewarding only ─────────────────────────
+        calm_markets = []
         for market in active_markets:
+            if _is_volatile_market(market):
+                continue
+            rate = market.get("daily_rate", 0)
+            if rate < _cfg.MIN_DAILY_RATE:
+                continue
+            calm_markets.append(market)
+
+        # Register markets with paper client
+        for market in calm_markets:
             cid = market["condition_id"]
             tokens = market.get("token_ids", [])
             if len(tokens) >= 2:
@@ -318,96 +350,140 @@ def run_passive_cycle(session: PaperSession, active_markets: list, reward_tracke
         # Simulate fills from last cycle
         pc.simulate_fills()
 
-        # ── Check for fills and DUMP immediately ──────────────────────────
-        for market in active_markets:
+        # ── Phase 1: Check for fills → merge or dump ──────────────────────
+        for market in calm_markets:
             cid = market["condition_id"]
             orders = session._passive_orders.get(cid, {})
+            inv = session._passive_inventory.setdefault(
+                cid, {"yes": 0.0, "no": 0.0, "yes_cost": 0.0, "no_cost": 0.0}
+            )
             tokens = market.get("token_ids", [])
             if len(tokens) < 2:
                 continue
             yes_tid, no_tid = tokens[0], tokens[1]
 
-            for side_key, tid in [("yes_oid", yes_tid), ("no_oid", no_tid)]:
+            # Check each side for fills
+            for side_key, tid, side_name in [
+                ("yes_oid", yes_tid, "yes"), ("no_oid", no_tid, "no")
+            ]:
                 oid = orders.get(side_key)
                 if not oid:
                     continue
 
-                order_status = pc._paper_get_order(oid)
-                if order_status.get("status") == "MATCHED":
-                    # FILL DETECTED — dump immediately at market
-                    matched = float(order_status.get("size_matched", 0))
-                    fill_price = float(order_status.get("price", 0))
-                    side_name = "YES" if side_key == "yes_oid" else "NO"
+                status = pc._paper_get_order(oid)
+                if status.get("status") != "MATCHED":
+                    continue
 
-                    if matched < 1.0:
-                        orders[side_key] = None
-                        continue
+                matched = float(status.get("size_matched", 0))
+                fill_price = float(status.get("price", 0))
 
-                    log.info(
-                        f"[passive] FILL | {side_name} {matched:.0f} shares "
-                        f"@ {fill_price:.4f} | {market['question'][:35]} "
-                        f"— DUMPING AT MARKET"
-                    )
+                if matched < 1.0:
+                    orders[side_key] = None
+                    continue
 
-                    # Record fill to DB
-                    get_db().log_fill(
-                        condition_id=cid,
-                        question=market.get("question", ""),
-                        side=side_name.lower(),
-                        fill_type="FULL",
-                        shares=matched,
-                        price=fill_price,
-                        clob_cost=fill_price,
-                        usd_value=matched * fill_price,
-                    )
+                # Record inventory
+                inv[side_name] += matched
+                inv[f"{side_name}_cost"] += matched * fill_price
 
-                    # Get current book for dump price
-                    try:
-                        book = pc.get_order_book(tid)
-                        if side_key == "yes_oid":
-                            # Bought YES tokens → sell at best bid
-                            dump_price = float(book.bids[0].price) if book.bids else fill_price * 0.95
-                        else:
-                            # Bought NO tokens → sell at best ask (inverted)
-                            dump_price = float(book.bids[0].price) if book.bids else fill_price * 0.95
+                log.info(
+                    f"[passive] FILL | {side_name.upper()} {matched:.0f} sh "
+                    f"@ {fill_price:.4f} | inv: YES={inv['yes']:.0f} NO={inv['no']:.0f} | "
+                    f"{market['question'][:35]}"
+                )
 
-                        # Place SELL order at dump price
-                        sell_args = OrderArgs(
-                            token_id=tid,
-                            price=dump_price,
-                            size=matched,
-                            side=SELL,
-                        )
-                        pc.create_and_post_order(sell_args)
-                        dump_revenue = matched * dump_price
-                        buy_cost = matched * fill_price
-                        dump_loss = buy_cost - dump_revenue
+                # Record fill to DB
+                get_db().log_fill(
+                    condition_id=cid,
+                    question=market.get("question", ""),
+                    side=side_name, fill_type="FULL",
+                    shares=matched, price=fill_price,
+                    clob_cost=fill_price,
+                    usd_value=matched * fill_price,
+                )
+                orders[side_key] = None  # clear for re-placement
+
+            # ── Try MERGE first (both sides have inventory) ───────────
+            merge_amount = min(inv["yes"], inv["no"])
+            if merge_amount >= 1.0:
+                try:
+                    result = pc.merge_positions(cid, merge_amount)
+                    if isinstance(result, dict) and result.get("success"):
+                        merge_revenue = merge_amount  # $1 per pair
+                        yes_cost_portion = (inv["yes_cost"] / inv["yes"]) * merge_amount if inv["yes"] > 0 else 0
+                        no_cost_portion = (inv["no_cost"] / inv["no"]) * merge_amount if inv["no"] > 0 else 0
+                        total_cost = yes_cost_portion + no_cost_portion
+                        merge_pnl = merge_revenue - total_cost
 
                         log.info(
-                            f"[passive] DUMP | {side_name} {matched:.0f} shares "
-                            f"@ {dump_price:.4f} | cost=${buy_cost:.2f} "
-                            f"rev=${dump_revenue:.2f} loss=${dump_loss:.2f} | "
-                            f"{market['question'][:35]}"
+                            f"[passive] MERGE | {merge_amount:.0f} pairs | "
+                            f"revenue=${merge_revenue:.2f} cost=${total_cost:.2f} "
+                            f"pnl=${merge_pnl:+.2f} | {market['question'][:35]}"
                         )
 
-                        # Record the dump as an unwind
+                        # Update inventory
+                        inv["yes"] -= merge_amount
+                        inv["no"] -= merge_amount
+                        inv["yes_cost"] -= yes_cost_portion
+                        inv["no_cost"] -= no_cost_portion
+
                         get_db().log_unwind(
                             condition_id=cid,
                             question=market.get("question", ""),
-                            side=side_name.lower(),
-                            shares=matched,
-                            sell_price=dump_price,
-                            usd_value=dump_revenue,
-                            vwap_cost=buy_cost,
-                            pnl=dump_revenue - buy_cost,
+                            side="merge", shares=merge_amount,
+                            sell_price=1.0, usd_value=merge_revenue,
+                            vwap_cost=total_cost, pnl=merge_pnl,
                         )
-                    except Exception as e:
-                        log.warning(f"[passive] Dump failed for {cid[:16]}: {e}")
+                except Exception as e:
+                    log.warning(f"[passive] Merge failed for {cid[:16]}: {e}")
 
-                    orders[side_key] = None  # Clear so we re-place
+            # ── Dump any remaining single-side inventory at market ────
+            for side_name, tid in [("yes", yes_tid), ("no", no_tid)]:
+                remaining = inv[side_name]
+                if remaining < 1.0:
+                    continue
+                # Only dump if we DON'T have the other side (merge would have caught it)
+                other = "no" if side_name == "yes" else "yes"
+                if inv[other] >= 1.0:
+                    continue  # wait for merge opportunity
 
-        # ── Place edge orders on markets that need them ───────────────────
-        for market in active_markets:
+                try:
+                    book = pc.get_order_book(tid)
+                    if not book or not book.bids:
+                        continue
+                    dump_price = float(book.bids[0].price)
+
+                    sell_args = OrderArgs(
+                        token_id=tid, price=dump_price,
+                        size=remaining, side=SELL,
+                    )
+                    pc.create_and_post_order(sell_args)
+
+                    dump_revenue = remaining * dump_price
+                    avg_cost = inv[f"{side_name}_cost"] / remaining if remaining > 0 else 0
+                    dump_pnl = dump_revenue - inv[f"{side_name}_cost"]
+
+                    log.info(
+                        f"[passive] DUMP | {side_name.upper()} {remaining:.0f} sh "
+                        f"@ {dump_price:.4f} | cost=${inv[f'{side_name}_cost']:.2f} "
+                        f"rev=${dump_revenue:.2f} pnl=${dump_pnl:+.2f} | "
+                        f"{market['question'][:35]}"
+                    )
+
+                    get_db().log_unwind(
+                        condition_id=cid,
+                        question=market.get("question", ""),
+                        side=side_name, shares=remaining,
+                        sell_price=dump_price, usd_value=dump_revenue,
+                        vwap_cost=inv[f"{side_name}_cost"], pnl=dump_pnl,
+                    )
+
+                    inv[side_name] = 0.0
+                    inv[f"{side_name}_cost"] = 0.0
+                except Exception as e:
+                    log.warning(f"[passive] Dump {side_name} failed: {e}")
+
+        # ── Phase 2: Place BIG edge orders on calm markets ────────────────
+        for market in calm_markets:
             cid = market["condition_id"]
             tokens = market.get("token_ids", [])
             if len(tokens) < 2:
@@ -418,6 +494,7 @@ def run_passive_cycle(session: PaperSession, active_markets: list, reward_tracke
             max_spread = market.get("max_spread", 0.03)
             tick = market.get("tick_size", 0.01)
             min_size = market.get("min_size", 5)
+            decimals = max(2, len(str(tick).rstrip('0').split('.')[-1]))
 
             # Get order book for midpoint
             try:
@@ -430,28 +507,30 @@ def run_passive_cycle(session: PaperSession, active_markets: list, reward_tracke
             except Exception:
                 continue
 
-            # Edge prices: place at max_spread - 1 tick from midpoint
+            # Edge prices: farthest from mid but inside reward window
+            # Place at max_spread - 1 tick from midpoint
             edge_offset = max_spread - tick
-            edge_bid = round(midpoint - edge_offset, len(str(tick).split('.')[-1]))
-            edge_ask = round(midpoint + edge_offset, len(str(tick).split('.')[-1]))
+            edge_bid = round(midpoint - edge_offset, decimals)
+            edge_ask = round(midpoint + edge_offset, decimals)
 
-            # Clamp to valid range
+            # Clamp to sane range
             edge_bid = max(0.01, min(edge_bid, midpoint - tick))
             edge_ask = min(0.99, max(edge_ask, midpoint + tick))
 
-            # Size: use min_size or ORDER_SIZE, whichever is larger (must qualify for rewards)
-            order_size = max(min_size, _cfg.ORDER_SIZE / max(edge_bid, 0.01))
-            order_size = min(order_size, 5000)  # hard cap
+            # BIG order sizes — $ORDER_SIZE budget, converted to shares
+            yes_shares = max(min_size, _cfg.ORDER_SIZE / max(edge_bid, 0.01))
+            yes_shares = min(yes_shares, 10000)  # hard cap
+            no_clob_price = round(1.0 - edge_ask, decimals)
+            no_clob_price = max(0.01, no_clob_price)
+            no_shares = max(min_size, _cfg.ORDER_SIZE / max(no_clob_price, 0.01))
+            no_shares = min(no_shares, 10000)
 
-            # Place YES-side (bid at edge)
+            # Place YES-side (bid at edge of reward window)
             if not orders.get("yes_oid"):
-                # Check if existing order is still live
                 try:
                     args = OrderArgs(
-                        token_id=yes_tid,
-                        price=edge_bid,
-                        size=float(order_size),
-                        side=BUY,
+                        token_id=yes_tid, price=edge_bid,
+                        size=float(yes_shares), side=BUY,
                     )
                     resp = pc.create_and_post_order(args)
                     oid = resp.get("orderID") if isinstance(resp, dict) else None
@@ -459,29 +538,24 @@ def run_passive_cycle(session: PaperSession, active_markets: list, reward_tracke
                         orders["yes_oid"] = oid
                         get_db().log_order_placed(
                             condition_id=cid, side="yes",
-                            price=edge_bid, size=float(order_size),
+                            price=edge_bid, size=float(yes_shares),
                             order_id=oid, order_type="BUY",
                         )
-                        log.debug(
-                            f"[passive] EDGE ORDER | YES @ {edge_bid:.4f} "
-                            f"({order_size:.0f} shares) | mid={midpoint:.4f} | "
-                            f"{market['question'][:35]}"
-                        )
+                        if session.cycle_count <= 3:  # log first few cycles
+                            log.info(
+                                f"[passive] EDGE BID | YES @ {edge_bid:.3f} "
+                                f"({yes_shares:.0f} sh, ${edge_bid*yes_shares:.0f}) | "
+                                f"mid={midpoint:.3f} | {market['question'][:35]}"
+                            )
                 except Exception as e:
                     log.debug(f"[passive] YES edge order failed: {e}")
 
             # Place NO-side (ask at edge — buy NO token at 1 - edge_ask)
             if not orders.get("no_oid"):
-                no_clob_price = round(1.0 - edge_ask, len(str(tick).split('.')[-1]))
-                no_clob_price = max(0.01, no_clob_price)
-                no_order_size = max(min_size, _cfg.ORDER_SIZE / max(no_clob_price, 0.01))
-                no_order_size = min(no_order_size, 5000)
                 try:
                     args = OrderArgs(
-                        token_id=no_tid,
-                        price=no_clob_price,
-                        size=float(no_order_size),
-                        side=BUY,
+                        token_id=no_tid, price=no_clob_price,
+                        size=float(no_shares), side=BUY,
                     )
                     resp = pc.create_and_post_order(args)
                     oid = resp.get("orderID") if isinstance(resp, dict) else None
@@ -489,18 +563,20 @@ def run_passive_cycle(session: PaperSession, active_markets: list, reward_tracke
                         orders["no_oid"] = oid
                         get_db().log_order_placed(
                             condition_id=cid, side="no",
-                            price=edge_ask, size=float(no_order_size),
+                            price=edge_ask, size=float(no_shares),
                             order_id=oid, order_type="BUY",
                         )
-                        log.debug(
-                            f"[passive] EDGE ORDER | NO @ {edge_ask:.4f} "
-                            f"(CLOB {no_clob_price:.4f}, {no_order_size:.0f} shares) | "
-                            f"mid={midpoint:.4f} | {market['question'][:35]}"
-                        )
+                        if session.cycle_count <= 3:
+                            log.info(
+                                f"[passive] EDGE ASK | NO @ {edge_ask:.3f} "
+                                f"(CLOB {no_clob_price:.3f}, {no_shares:.0f} sh, "
+                                f"${no_clob_price*no_shares:.0f}) | "
+                                f"mid={midpoint:.3f} | {market['question'][:35]}"
+                            )
                 except Exception as e:
                     log.debug(f"[passive] NO edge order failed: {e}")
 
-            # Record cycle stats for reward tracking
+            # ── Record reward tracking stats ──────────────────────────
             reward_tracker.get_or_create(
                 condition_id=cid,
                 question=market.get("question", ""),
@@ -511,21 +587,18 @@ def run_passive_cycle(session: PaperSession, active_markets: list, reward_tracke
             has_no = orders.get("no_oid") is not None
             reward_tracker.record_cycle(
                 condition_id=cid,
-                has_yes_order=has_yes,
-                has_no_order=has_no,
+                has_yes_order=has_yes, has_no_order=has_no,
                 bid_price=edge_bid if has_yes else 0,
                 ask_price=edge_ask if has_no else 0,
                 inventory_usd=0.0,
-                cooldown_active=False,
-                skew_active=False,
+                cooldown_active=False, skew_active=False,
                 cycle_duration_secs=_cfg.ORDER_REFRESH_SECS,
                 midpoint=midpoint,
-                bid_size=float(order_size) if has_yes else 0,
-                ask_size=float(no_order_size) if has_no else 0,
+                bid_size=float(yes_shares) if has_yes else 0,
+                ask_size=float(no_shares) if has_no else 0,
                 order_book=yes_book,
             )
 
-            # Cycle snapshot every 10 cycles
             if session.cycle_count % 10 == 0:
                 get_db().log_cycle_snapshot(
                     cycle_num=session.cycle_count,
