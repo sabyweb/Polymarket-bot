@@ -184,6 +184,7 @@ def run_one_cycle(session: PaperSession, active_markets: list, reward_tracker):
     """Run one cycle for a paper session using the shared market list."""
     import config
     from order_manager import OrderManager
+    from state import PositionStore
     import database as db_module
 
     # Apply config overrides for this strategy
@@ -201,7 +202,7 @@ def run_one_cycle(session: PaperSession, active_markets: list, reward_tracker):
         # Ensure order managers exist for each market
         if not hasattr(session, "order_managers"):
             session.order_managers = {}
-            session.position_tracker = __import__("state").PositionStore()
+            session.position_tracker = PositionStore()
 
         # Register markets with paper client
         for market in active_markets:
@@ -212,11 +213,11 @@ def run_one_cycle(session: PaperSession, active_markets: list, reward_tracker):
 
             if cid not in session.order_managers:
                 mgr = OrderManager(
-                    market=market,
                     client=session.paper_client,
+                    market=market,
                     position_tracker=session.position_tracker,
-                    reward_tracker=reward_tracker,
                 )
+                mgr._reward_tracker = reward_tracker
                 session.order_managers[cid] = mgr
 
         # Fetch exchange orders (returns our paper orders)
@@ -381,7 +382,7 @@ def main():
     from market import get_rewards_markets
     log.info("Fetching reward markets...")
     try:
-        all_markets = get_rewards_markets(real_client)
+        all_markets = get_rewards_markets(limit=50)  # fetch all, strategies select subsets
         log.info(f"Found {len(all_markets)} eligible reward markets")
     except Exception as e:
         log.error(f"Failed to fetch markets: {e}")
@@ -425,7 +426,7 @@ def main():
         if time.time() - last_market_refresh >= refresh_interval:
             try:
                 book_cache.invalidate()
-                all_markets = get_rewards_markets(real_client)
+                all_markets = get_rewards_markets(limit=50)
                 last_market_refresh = time.time()
                 log.info(f"Market refresh: {len(all_markets)} eligible markets")
             except Exception as e:
