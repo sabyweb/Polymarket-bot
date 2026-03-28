@@ -167,6 +167,14 @@ class PaperSession:
 
         self.db = database.BotDatabase(db_path=self.db_path)
 
+        # Per-session reward tracker (isolated from other strategies)
+        from reward_tracker import RewardTracker
+        import database as _db_mod
+        _orig = _db_mod._instance
+        _db_mod._instance = self.db
+        self.reward_tracker = RewardTracker()
+        _db_mod._instance = _orig
+
         # Tracking
         self.cycle_count = 0
         self.start_time = time.time()
@@ -464,11 +472,11 @@ def run_passive_cycle(session: PaperSession, active_markets: list, reward_tracke
                         inv[f"{side_name}_cost"] = 0.0
                         continue
 
-                    sell_args = OrderArgs(
-                        token_id=tid, price=dump_price,
-                        size=dump_size, side=SELL,
-                    )
-                    pc.create_and_post_order(sell_args)
+                    # Instant dump: directly deduct tokens and credit USDC
+                    # (simulates a marketable limit order that fills immediately)
+                    with pc._lock:
+                        pc._token_balances[tid] = pc._token_balances.get(tid, 0.0) - dump_size
+                        pc._usdc_balance += dump_size * dump_price
 
                     cost_fraction = (dump_size / remaining) if remaining > 0 else 1.0
                     dump_cost = inv[f"{side_name}_cost"] * cost_fraction
@@ -521,8 +529,8 @@ def run_passive_cycle(session: PaperSession, active_markets: list, reward_tracke
                 continue
 
             # Edge prices: farthest from mid but inside reward window
-            # Place at max_spread - 1 tick from midpoint
-            edge_offset = max_spread - tick
+            # Place at FULL max_spread from midpoint (maximum distance = minimum fill risk)
+            edge_offset = max_spread
             edge_bid = round(midpoint - edge_offset, decimals)
             edge_ask = round(midpoint + edge_offset, decimals)
 
@@ -632,6 +640,12 @@ def run_passive_cycle(session: PaperSession, active_markets: list, reward_tracke
                     unwind_orders=0,
                 )
 
+        # Persist reward stats to session DB (while DB is still swapped)
+        try:
+            reward_tracker._save()
+        except Exception:
+            pass
+
     finally:
         restore_config(saved)
         db_module._instance = original_db
@@ -698,6 +712,12 @@ def run_one_cycle(session: PaperSession, active_markets: list, reward_tracker):
         # Simulate fills based on real order book
         session.paper_client.simulate_fills()
 
+        # Persist reward stats to session DB (while DB is still swapped)
+        try:
+            reward_tracker._save()
+        except Exception:
+            pass
+
     finally:
         # Restore config and DB
         restore_config(saved)
@@ -725,7 +745,7 @@ def log_hourly_snapshot(session: PaperSession, reward_tracker) -> None:
         hour_ago = now - 3600
 
         # Query fills in the last hour
-        fills = db.conn.execute(
+        fills = db._get_conn().execute(
             "SELECT COALESCE(SUM(CASE WHEN side='yes' THEN shares*price ELSE shares*clob_cost END),0), COUNT(*) "
             "FROM fills WHERE ts >= ?", (hour_ago,)
         ).fetchone()
@@ -733,7 +753,7 @@ def log_hourly_snapshot(session: PaperSession, reward_tracker) -> None:
         num_fills = fills[1]
 
         # Query unwinds
-        unwinds = db.conn.execute(
+        unwinds = db._get_conn().execute(
             "SELECT COALESCE(SUM(usd_value),0), COALESCE(SUM(pnl),0), COUNT(*) "
             "FROM unwinds WHERE ts >= ?", (hour_ago,)
         ).fetchone()
@@ -742,14 +762,14 @@ def log_hourly_snapshot(session: PaperSession, reward_tracker) -> None:
         num_unwinds = unwinds[2]
 
         # Stop losses
-        stop_row = db.conn.execute(
+        stop_row = db._get_conn().execute(
             "SELECT COALESCE(SUM(loss_usd),0), COUNT(*) FROM stop_losses WHERE ts >= ?",
             (hour_ago,)
         ).fetchone()
         num_stop_losses = stop_row[1]
 
         # Danger cancels
-        danger_row = db.conn.execute(
+        danger_row = db._get_conn().execute(
             "SELECT COUNT(*) FROM orders_cancelled WHERE ts >= ? AND reason='danger'",
             (hour_ago,)
         ).fetchone()
@@ -757,13 +777,13 @@ def log_hourly_snapshot(session: PaperSession, reward_tracker) -> None:
 
         # Position value
         total_pos = 0.0
-        positions = db.conn.execute("SELECT * FROM positions").fetchall()
+        positions = db._get_conn().execute("SELECT * FROM positions").fetchall()
         for p in positions:
             total_pos += p[2] * p[3] + p[5] * p[6]  # yes_shares*yes_avg + no_shares*no_avg
 
         # Reward estimate
         est_reward = 0.0
-        reward_stats = db.conn.execute("SELECT data FROM reward_market_stats").fetchall()
+        reward_stats = db._get_conn().execute("SELECT data FROM reward_market_stats").fetchall()
         import json
         for r in reward_stats:
             d = json.loads(r[0])
@@ -949,9 +969,7 @@ def main():
         log.error("No eligible markets found. Exiting.")
         sys.exit(1)
 
-    # Create a shared reward tracker for Q-score estimation
-    from reward_tracker import RewardTracker
-    reward_tracker = RewardTracker()
+    # Each session has its own reward_tracker (created in PaperSession.__init__)
 
     # Shutdown handling
     shutdown = False
@@ -999,9 +1017,9 @@ def main():
                 strategy_markets = all_markets[:int(max_mkts)]
 
                 if session.strategy.custom_cycle == "passive":
-                    run_passive_cycle(session, strategy_markets, reward_tracker)
+                    run_passive_cycle(session, strategy_markets, session.reward_tracker)
                 else:
-                    run_one_cycle(session, strategy_markets, reward_tracker)
+                    run_one_cycle(session, strategy_markets, session.reward_tracker)
             except Exception as e:
                 log.error(f"[{session.strategy.name}] Cycle error: {e}")
 
@@ -1012,7 +1030,7 @@ def main():
             last_report = time.time()
             # Log hourly snapshots per session
             for s in sessions:
-                log_hourly_snapshot(s, reward_tracker)
+                log_hourly_snapshot(s, s.reward_tracker)
 
         # Brief status every 10 cycles
         if cycle % 10 == 0:

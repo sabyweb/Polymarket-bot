@@ -34,6 +34,7 @@ class PaperOrder:
     original_size: float
     status: str  # "LIVE", "MATCHED", "CANCELLED"
     created_at: float
+    last_fill_at: float = 0.0  # timestamp of last partial/full fill
 
     @property
     def remaining(self) -> float:
@@ -357,6 +358,10 @@ class FillEngine:
 
     def _check_order(self, paper_client: PaperClient, order: PaperOrder, book):
         """Check if a single order would fill given the current book."""
+        # Cooldown: no more than 1 fill per 60 seconds per order
+        # (prevents same crossing volume from filling repeatedly)
+        if order.last_fill_at > 0 and (time.time() - order.last_fill_at) < 60:
+            return
         if order.side == "BUY":
             self._check_buy(paper_client, order, book)
         else:
@@ -446,6 +451,7 @@ class FillEngine:
         with paper_client._lock:
             order.size_matched += fill_amount
             order.size = order.remaining
+            order.last_fill_at = time.time()
 
             if order.side == "BUY":
                 # Tokens credited (collateral was already reserved at placement)
