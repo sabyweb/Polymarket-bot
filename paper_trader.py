@@ -346,6 +346,10 @@ def run_passive_cycle(session: PaperSession, active_markets: list, reward_tracke
             rate = market.get("daily_rate", 0)
             if rate < _cfg.MIN_DAILY_RATE:
                 continue
+            # Need wide enough reward window for edge placement to be safe
+            ms = market.get("max_spread", 0.03)
+            if ms < 0.025:
+                continue  # too narrow — edge orders would be too close to mid
             calm_markets.append(market)
 
         # Register markets with paper client
@@ -1022,6 +1026,20 @@ def main():
                     run_one_cycle(session, strategy_markets, session.reward_tracker)
             except Exception as e:
                 log.error(f"[{session.strategy.name}] Cycle error: {e}")
+
+        # Trigger reward estimation for each session every hour
+        # (must run with session DB swapped so _save writes to correct DB)
+        for session in sessions:
+            import database as _db_mod
+            _orig_db = _db_mod._instance
+            _db_mod._instance = session.db
+            try:
+                max_mkts = session.strategy.config_overrides.get("MAX_MARKETS", 5)
+                session.reward_tracker.maybe_log_hourly(all_markets[:int(max_mkts)])
+            except Exception as e:
+                log.debug(f"[{session.strategy.name}] Reward hourly error: {e}")
+            finally:
+                _db_mod._instance = _orig_db
 
         # Hourly progress report + snapshots
         elapsed = time.time() - start_time
