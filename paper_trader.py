@@ -1292,15 +1292,36 @@ def main():
     from market import get_rewards_markets
     log.info("Fetching reward markets...")
     try:
-        all_markets = get_rewards_markets(limit=50)  # fetch all, strategies select subsets
-        log.info(f"Found {len(all_markets)} eligible reward markets")
+        all_markets = get_rewards_markets(limit=50)  # filtered by default config hygiene
+        log.info(f"Found {len(all_markets)} eligible reward markets (standard)")
+
+        # Also fetch with relaxed filters for custom-cycle strategies
+        # Temporarily override config for wider net
+        import config as _cfg_tmp
+        _saved_vr = _cfg_tmp.MAX_VOLUME_TO_REWARD_RATIO
+        _saved_dr = _cfg_tmp.MIN_DAILY_RATE
+        _saved_st = _cfg_tmp.MIN_SCORE_THRESHOLD
+        _cfg_tmp.MAX_VOLUME_TO_REWARD_RATIO = 500000
+        _cfg_tmp.MIN_DAILY_RATE = 5
+        _cfg_tmp.MIN_SCORE_THRESHOLD = 0
+        try:
+            all_markets_wide = get_rewards_markets(limit=50)
+            log.info(f"Found {len(all_markets_wide)} eligible reward markets (wide filter)")
+        except Exception:
+            all_markets_wide = all_markets
+        finally:
+            _cfg_tmp.MAX_VOLUME_TO_REWARD_RATIO = _saved_vr
+            _cfg_tmp.MIN_DAILY_RATE = _saved_dr
+            _cfg_tmp.MIN_SCORE_THRESHOLD = _saved_st
     except Exception as e:
         log.error(f"Failed to fetch markets: {e}")
         sys.exit(1)
 
-    if not all_markets:
+    if not all_markets and not all_markets_wide:
         log.error("No eligible markets found. Exiting.")
         sys.exit(1)
+    if not all_markets:
+        all_markets = all_markets_wide
 
     # Each session has its own reward_tracker (created in PaperSession.__init__)
 
@@ -1335,8 +1356,24 @@ def main():
             try:
                 book_cache.invalidate()
                 all_markets = get_rewards_markets(limit=50)
+                # Wide filter refresh for custom-cycle strategies
+                _cfg_tmp = __import__('config')
+                _sv = _cfg_tmp.MAX_VOLUME_TO_REWARD_RATIO
+                _sd = _cfg_tmp.MIN_DAILY_RATE
+                _ss = _cfg_tmp.MIN_SCORE_THRESHOLD
+                _cfg_tmp.MAX_VOLUME_TO_REWARD_RATIO = 500000
+                _cfg_tmp.MIN_DAILY_RATE = 5
+                _cfg_tmp.MIN_SCORE_THRESHOLD = 0
+                try:
+                    all_markets_wide = get_rewards_markets(limit=50)
+                except Exception:
+                    all_markets_wide = all_markets
+                finally:
+                    _cfg_tmp.MAX_VOLUME_TO_REWARD_RATIO = _sv
+                    _cfg_tmp.MIN_DAILY_RATE = _sd
+                    _cfg_tmp.MIN_SCORE_THRESHOLD = _ss
                 last_market_refresh = time.time()
-                log.info(f"Market refresh: {len(all_markets)} eligible markets")
+                log.info(f"Market refresh: {len(all_markets)} standard, {len(all_markets_wide)} wide")
             except Exception as e:
                 log.warning(f"Market refresh failed: {e}")
 
@@ -1350,9 +1387,11 @@ def main():
                 strategy_markets = all_markets[:int(max_mkts)]
 
                 if session.strategy.custom_cycle == "passive":
-                    run_passive_cycle(session, strategy_markets, session.reward_tracker)
+                    # Passive uses wide market list (its own filtering)
+                    run_passive_cycle(session, all_markets_wide, session.reward_tracker)
                 elif session.strategy.custom_cycle == "reward_farmer_max":
-                    run_reward_farmer_max_cycle(session, strategy_markets, session.reward_tracker)
+                    # RFM uses wide market list (its own filtering)
+                    run_reward_farmer_max_cycle(session, all_markets_wide, session.reward_tracker)
                 else:
                     run_one_cycle(session, strategy_markets, session.reward_tracker)
             except Exception as e:
