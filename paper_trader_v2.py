@@ -413,10 +413,11 @@ def run_cycle(session: Session, markets: list[dict]):
         if best_ask - best_bid > 0.15:  # skip markets with extremely wide spreads
             continue
 
-        # Compute edge prices
+        # Compute edge prices — one tick INSIDE the reward window edge
+        # (exactly AT max_spread gives Q-score = 0 due to the >= check)
         if strat.placement == "edge":
-            edge_bid = round(midpoint - max_spread, decimals)
-            edge_ask = round(midpoint + max_spread, decimals)
+            edge_bid = round(midpoint - max_spread + tick, decimals)
+            edge_ask = round(midpoint + max_spread - tick, decimals)
         else:  # "cobest"
             edge_bid = best_bid
             edge_ask = best_ask
