@@ -565,13 +565,26 @@ def get_results(session: Session) -> dict:
     reward_details = []
     for r in db.execute("SELECT data FROM reward_market_stats").fetchall():
         d = json.loads(r[0])
-        est = d.get('est_reward_usd', 0)
+
+        # Compute reward estimate directly from Q-score data
+        # (don't rely on maybe_log_hourly which has a 1-hour gate)
+        q_share_pct = 0.0
+        if d.get('total_market_q', 0) > 0 and d.get('q_score_samples', 0) > 0:
+            q_share_pct = d['total_q_score'] / d['total_market_q']
+
+        # How many hours of data?
+        on_book_hrs = d.get('time_on_book_secs', 0) / 3600.0
+        uptime = 1.0  # assume 100% uptime for paper trading
+
+        # est_reward = daily_rate × q_share × uptime × hours / 24
+        daily_rate = d.get('daily_rate', 0)
+        est = daily_rate * q_share_pct * uptime * on_book_hrs / 24.0
+
         total_rewards += est
         if d.get('total_cycles', 0) > 0:
-            q_share = d['total_q_score'] / d['total_market_q'] * 100 if d.get('total_market_q', 0) > 0 else 0
             reward_details.append({
-                'q': d['question'][:40], 'rate': d.get('daily_rate', 0),
-                'est': est, 'q_share': q_share,
+                'q': d['question'][:40], 'rate': daily_rate,
+                'est': est, 'q_share': q_share_pct * 100,
                 'both': d.get('cycles_both_sides', 0), 'cycles': d.get('total_cycles', 0),
             })
 
