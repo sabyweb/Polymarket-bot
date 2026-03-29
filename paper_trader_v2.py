@@ -682,6 +682,114 @@ def create_client():
     return RateLimitedClient(raw)
 
 
+def fetch_all_reward_markets() -> list[dict]:
+    """Fetch ALL reward markets from the CLOB endpoint + Gamma details.
+
+    The CLOB endpoint has 4700+ reward markets with authoritative
+    min_size, max_spread, and daily_rate. Gamma provides question text,
+    token IDs, liquidity, volume, and prices.
+
+    Returns list of market dicts compatible with run_cycle().
+    """
+    import requests
+
+    # Step 1: Fetch ALL CLOB reward markets (paginated)
+    log.info("  Fetching CLOB rewards (authoritative source)...")
+    clob_markets = []
+    cursor = ""
+    for _ in range(20):
+        params = {"limit": 500}
+        if cursor:
+            params["next_cursor"] = cursor
+        try:
+            resp = requests.get(
+                "https://clob.polymarket.com/rewards/markets/current",
+                params=params, timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            log.warning(f"  CLOB rewards fetch failed: {e}")
+            break
+        items = data.get("data", [])
+        clob_markets.extend(items)
+        cursor = data.get("next_cursor", "")
+        if not cursor or not items:
+            break
+    log.info(f"  CLOB: {len(clob_markets)} reward markets")
+
+    # Step 2: Fetch Gamma markets for details (paginated)
+    log.info("  Fetching Gamma market details...")
+    gamma_all = []
+    for offset in range(0, 2000, 100):
+        try:
+            resp = requests.get(
+                "https://gamma-api.polymarket.com/markets",
+                params={"limit": 100, "offset": offset, "closed": "false"},
+                timeout=15,
+            )
+            batch = resp.json()
+        except Exception:
+            break
+        if not batch:
+            break
+        gamma_all.extend(batch)
+    log.info(f"  Gamma: {len(gamma_all)} markets")
+
+    gamma_by_cid = {m.get("conditionId", ""): m for m in gamma_all}
+
+    # Step 3: Merge
+    merged = []
+    for c in clob_markets:
+        cid = c["condition_id"]
+        rate = float(c.get("total_daily_rate") or 0)
+        if rate < 1:
+            continue
+        min_size = float(c.get("rewards_min_size") or 50)
+        ms_cents = float(c.get("rewards_max_spread") or 4.5)
+
+        g = gamma_by_cid.get(cid)
+        if not g:
+            continue
+
+        # Parse token IDs
+        try:
+            token_ids = json.loads(g.get("clobTokenIds") or "[]")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if len(token_ids) < 2:
+            continue
+
+        # Parse prices
+        yes_price = None
+        try:
+            prices = json.loads(g.get("outcomePrices") or "[]")
+            yes_price = float(prices[0]) if prices else None
+        except Exception:
+            pass
+
+        liq = float(g.get("liquidityNum") or 0)
+        vol = float(g.get("volume24hrClob") or 0)
+
+        merged.append({
+            "condition_id": cid,
+            "question": g.get("question", ""),
+            "token_ids": token_ids,
+            "yes_price": yes_price,
+            "daily_rate": rate,
+            "min_size": min_size,
+            "max_spread": ms_cents / 100.0,  # cents → price units
+            "tick_size": float(g.get("orderPriceMinTickSize") or 0.01),
+            "liquidity": liq,
+            "volume_24h": vol,
+        })
+
+    # Sort by liquidity ascending (lowest competition first)
+    merged.sort(key=lambda x: x["liquidity"])
+    log.info(f"  Merged: {len(merged)} markets with rate >= $1/day")
+    return merged
+
+
 def main():
     parser = argparse.ArgumentParser(description="Paper Trading Simulator v2")
     parser.add_argument("--duration", default="1h", help="e.g. 10m, 1h, 6h")
@@ -701,12 +809,10 @@ def main():
     from paper_client import CachedOrderBookProvider
     book_cache = CachedOrderBookProvider(real_client, ttl_secs=25.0)
 
-    # Fetch markets
-    from market import get_rewards_markets
+    # Fetch ALL reward markets from CLOB + Gamma
     log.info("Fetching reward markets...")
     try:
-        all_markets = get_rewards_markets(limit=50)
-        log.info(f"Found {len(all_markets)} eligible reward markets")
+        all_markets = fetch_all_reward_markets()
     except Exception as e:
         log.error(f"Failed to fetch markets: {e}")
         sys.exit(1)
@@ -715,11 +821,13 @@ def main():
         log.error("No eligible markets found. Exiting.")
         sys.exit(1)
 
-    # Log market summary
-    for i, m in enumerate(all_markets[:15]):
+    # Log market summary (lowest liquidity first = best farming targets)
+    low_comp = [m for m in all_markets if m["daily_rate"] >= 10]
+    log.info(f"Markets with rate >= $10/day: {len(low_comp)}")
+    for i, m in enumerate(low_comp[:15]):
         log.info(
             f"  #{i+1} {m['question'][:45]} | rate=${m['daily_rate']:.0f}/d | "
-            f"spread={m['max_spread']:.3f} | score={m.get('score',0):.1f}"
+            f"liq=${m['liquidity']:.0f} | spread={m['max_spread']:.3f} | min_sz={m['min_size']:.0f}"
         )
 
     # Create sessions
@@ -754,7 +862,7 @@ def main():
         if time.time() - last_market_refresh >= refresh_secs:
             try:
                 book_cache.invalidate()
-                all_markets = get_rewards_markets(limit=50)
+                all_markets = fetch_all_reward_markets()
                 last_market_refresh = time.time()
                 log.info(f"Market refresh: {len(all_markets)} markets")
             except Exception as e:
