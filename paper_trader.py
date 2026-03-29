@@ -102,6 +102,21 @@ STRATEGIES = [
         initial_balance=1000.0,
         custom_cycle="passive",
     ),
+    PaperStrategy(
+        name="reward_farmer_max",
+        config_overrides={
+            "ORDER_SIZE": 500,  # ~500 shares per side (adjusted by price)
+            "MAX_MARKETS": 23,
+            "DYNAMIC_SIZING_ENABLED": False,
+            "MIN_DAILY_RATE": 50,
+            "DANGER_ZONE_CENTS": 0.0,
+            "MIN_SCORE_THRESHOLD": 0,
+            "MAX_VOLUME_TO_REWARD_RATIO": 500000,
+            "REWARD_FARMER_SHARES": 500,  # fixed 500 shares per side
+        },
+        initial_balance=1000.0,
+        custom_cycle="reward_farmer_max",
+    ),
 ]
 
 
@@ -655,6 +670,320 @@ def run_passive_cycle(session: PaperSession, active_markets: list, reward_tracke
         db_module._instance = original_db
 
 
+def run_reward_farmer_max_cycle(session: PaperSession, active_markets: list, reward_tracker):
+    """Reward Farmer Max: ALL reward markets >= $50/day, 500 shares per side,
+    placed at the farthest possible distance from best quotes but within
+    the reward window. No volatility filter — distance is the protection.
+
+    On fill: dump at market immediately (like passive).
+    """
+    import config as _cfg
+    import database as db_module
+    from py_clob_client.clob_types import OrderArgs
+    from py_clob_client.order_builder.constants import BUY, SELL
+    from database import get_db
+
+    all_keys = set(session.strategy.config_overrides.keys())
+    saved = save_config_state(all_keys)
+    apply_config_overrides(session.strategy.config_overrides)
+
+    original_db = db_module._instance
+    db_module._instance = session.db
+
+    try:
+        session.cycle_count += 1
+        pc = session.paper_client
+        SHARES_PER_SIDE = session.strategy.config_overrides.get("REWARD_FARMER_SHARES", 500)
+
+        if not hasattr(session, "_rfm_orders"):
+            session._rfm_orders = {}    # cid → {"yes_oid": ..., "no_oid": ...}
+            session._rfm_inventory = {} # cid → {"yes": shares, "no": shares, "yes_cost": $, "no_cost": $}
+
+        # ── Filter: all markets with rewards >= $50/day ──────────────────
+        eligible = []
+        for market in active_markets:
+            rate = market.get("daily_rate", 0)
+            if rate < 50:
+                continue
+            eligible.append(market)
+
+        # Register markets
+        for market in eligible:
+            tokens = market.get("token_ids", [])
+            if len(tokens) >= 2:
+                pc.register_market(market["condition_id"], tokens[0], tokens[1])
+
+        # Simulate fills
+        pc.simulate_fills()
+
+        # ── Phase 1: Detect fills, merge or dump ────────────────────────
+        for market in eligible:
+            cid = market["condition_id"]
+            tokens = market.get("token_ids", [])
+            if len(tokens) < 2:
+                continue
+            yes_tid, no_tid = tokens[0], tokens[1]
+            max_spread = market.get("max_spread", 0.03)
+
+            orders = session._rfm_orders.get(cid, {})
+            inv = session._rfm_inventory.setdefault(
+                cid, {"yes": 0.0, "no": 0.0, "yes_cost": 0.0, "no_cost": 0.0}
+            )
+
+            # Check each side for fills
+            for side_key, side_name, tid in [("yes_oid", "yes", yes_tid), ("no_oid", "no", no_tid)]:
+                oid = orders.get(side_key)
+                if not oid:
+                    continue
+                status = pc._paper_get_order(oid)
+                if status.get("status") != "MATCHED":
+                    continue
+                matched = float(status.get("size_matched", 0))
+                fill_price = float(status.get("price", 0))
+                if matched < 1.0:
+                    orders[side_key] = None
+                    continue
+
+                inv[side_name] += matched
+                inv[f"{side_name}_cost"] += matched * fill_price
+
+                log.info(
+                    f"[rfm] FILL | {side_name.upper()} {matched:.0f} sh "
+                    f"@ {fill_price:.4f} | inv: YES={inv['yes']:.0f} NO={inv['no']:.0f} | "
+                    f"{market['question'][:35]}"
+                )
+                get_db().log_fill(
+                    condition_id=cid, question=market.get("question", ""),
+                    side=side_name, fill_type="FULL",
+                    shares=matched, price=fill_price,
+                    clob_cost=fill_price, usd_value=matched * fill_price,
+                )
+                orders[side_key] = None
+
+            # Merge if both sides have inventory
+            merge_amount = min(inv["yes"], inv["no"])
+            if merge_amount >= 1.0:
+                try:
+                    result = pc.merge_positions(cid, merge_amount)
+                    if isinstance(result, dict) and result.get("success"):
+                        merge_revenue = merge_amount
+                        yc = (inv["yes_cost"] / inv["yes"]) * merge_amount if inv["yes"] > 0 else 0
+                        nc = (inv["no_cost"] / inv["no"]) * merge_amount if inv["no"] > 0 else 0
+                        merge_pnl = merge_revenue - yc - nc
+                        log.info(
+                            f"[rfm] MERGE | {merge_amount:.0f} pairs | "
+                            f"pnl=${merge_pnl:+.2f} | {market['question'][:35]}"
+                        )
+                        inv["yes"] -= merge_amount
+                        inv["no"] -= merge_amount
+                        inv["yes_cost"] -= yc
+                        inv["no_cost"] -= nc
+                        get_db().log_unwind(
+                            condition_id=cid, question=market.get("question", ""),
+                            side="merge", shares=merge_amount,
+                            sell_price=1.0, usd_value=merge_revenue,
+                            vwap_cost=yc + nc, pnl=merge_pnl,
+                        )
+                except Exception as e:
+                    log.warning(f"[rfm] Merge failed: {e}")
+
+            # Dump remaining single-side inventory at market
+            for side_name, tid in [("yes", yes_tid), ("no", no_tid)]:
+                remaining = inv[side_name]
+                if remaining < 1.0:
+                    continue
+                other = "no" if side_name == "yes" else "yes"
+                if inv[other] >= 1.0:
+                    continue
+                try:
+                    book = pc.get_order_book(tid)
+                    if not book or not book.bids:
+                        continue
+                    dump_price = float(book.bids[0].price)
+                    available = pc._token_balances.get(tid, 0.0)
+                    dump_size = min(remaining, available)
+                    if dump_size < 1.0:
+                        inv[side_name] = 0.0
+                        inv[f"{side_name}_cost"] = 0.0
+                        continue
+                    # Instant dump
+                    with pc._lock:
+                        pc._token_balances[tid] = pc._token_balances.get(tid, 0.0) - dump_size
+                        pc._usdc_balance += dump_size * dump_price
+                    cost_frac = (dump_size / remaining) if remaining > 0 else 1.0
+                    dump_cost = inv[f"{side_name}_cost"] * cost_frac
+                    dump_pnl = dump_size * dump_price - dump_cost
+                    log.info(
+                        f"[rfm] DUMP | {side_name.upper()} {dump_size:.0f} sh "
+                        f"@ {dump_price:.4f} | pnl=${dump_pnl:+.2f} | {market['question'][:35]}"
+                    )
+                    get_db().log_unwind(
+                        condition_id=cid, question=market.get("question", ""),
+                        side=side_name, shares=dump_size,
+                        sell_price=dump_price, usd_value=dump_size * dump_price,
+                        vwap_cost=dump_cost, pnl=dump_pnl,
+                    )
+                    inv[side_name] -= dump_size
+                    inv[f"{side_name}_cost"] -= dump_cost
+                except Exception as e:
+                    log.warning(f"[rfm] Dump {side_name} failed: {e}")
+
+        # ── Phase 2: Place orders at farthest edge of reward window ─────
+        for market in eligible:
+            cid = market["condition_id"]
+            tokens = market.get("token_ids", [])
+            if len(tokens) < 2:
+                continue
+            yes_tid, no_tid = tokens[0], tokens[1]
+            max_spread = market.get("max_spread", 0.03)
+            min_size = market.get("min_size", 5)
+            tick = market.get("tick_size", 0.01)
+            decimals = max(2, len(str(tick).rstrip('0').split('.')[-1]))
+
+            orders = session._rfm_orders.setdefault(cid, {})
+
+            try:
+                yes_book = pc.get_order_book(yes_tid)
+                if not yes_book or not yes_book.bids or not yes_book.asks:
+                    continue
+                best_bid = float(yes_book.bids[0].price)
+                best_ask = float(yes_book.asks[0].price)
+                midpoint = (best_bid + best_ask) / 2
+            except Exception:
+                continue
+
+            # Place at the FARTHEST point from best quotes but within reward window
+            # For BUY YES: place at midpoint - max_spread (lowest possible bid in window)
+            # For BUY NO:  place at midpoint + max_spread (highest possible ask in window)
+            edge_bid = round(midpoint - max_spread, decimals)
+            edge_ask = round(midpoint + max_spread, decimals)
+
+            # Clamp
+            edge_bid = max(0.01, edge_bid)
+            edge_ask = min(0.99, edge_ask)
+
+            # Skip if edge_bid is at or above best_bid (would be at front of queue)
+            if edge_bid >= best_bid:
+                edge_bid = round(best_bid - tick, decimals)
+                if edge_bid <= 0:
+                    continue
+
+            # Fixed 500 shares per side
+            yes_shares = max(min_size, SHARES_PER_SIDE)
+            no_clob_price = round(1.0 - edge_ask, decimals)
+            no_clob_price = max(0.01, no_clob_price)
+            no_shares = max(min_size, SHARES_PER_SIDE)
+
+            # Check balance
+            yes_cost = yes_shares * edge_bid
+            no_cost = no_shares * no_clob_price
+            if yes_cost + no_cost > pc._usdc_balance:
+                # Scale down proportionally
+                scale = pc._usdc_balance / (yes_cost + no_cost) * 0.9
+                yes_shares = max(min_size, yes_shares * scale)
+                no_shares = max(min_size, no_shares * scale)
+
+            # Place YES bid
+            if not orders.get("yes_oid"):
+                try:
+                    args = OrderArgs(
+                        token_id=yes_tid, price=edge_bid,
+                        size=float(yes_shares), side=BUY,
+                    )
+                    resp = pc.create_and_post_order(args)
+                    oid = resp.get("orderID") if isinstance(resp, dict) else None
+                    if oid:
+                        orders["yes_oid"] = oid
+                        get_db().log_order_placed(
+                            condition_id=cid, side="yes",
+                            price=edge_bid, size=float(yes_shares),
+                            order_id=oid, order_type="BUY",
+                        )
+                        if session.cycle_count <= 3:
+                            log.info(
+                                f"[rfm] BID YES @ {edge_bid:.3f} "
+                                f"({yes_shares:.0f} sh) | best_bid={best_bid:.3f} "
+                                f"mid={midpoint:.3f} | {market['question'][:30]}"
+                            )
+                except Exception as e:
+                    log.debug(f"[rfm] YES order failed: {e}")
+
+            # Place NO ask (buy NO token)
+            if not orders.get("no_oid"):
+                try:
+                    args = OrderArgs(
+                        token_id=no_tid, price=no_clob_price,
+                        size=float(no_shares), side=BUY,
+                    )
+                    resp = pc.create_and_post_order(args)
+                    oid = resp.get("orderID") if isinstance(resp, dict) else None
+                    if oid:
+                        orders["no_oid"] = oid
+                        get_db().log_order_placed(
+                            condition_id=cid, side="no",
+                            price=edge_ask, size=float(no_shares),
+                            order_id=oid, order_type="BUY",
+                        )
+                        if session.cycle_count <= 3:
+                            log.info(
+                                f"[rfm] ASK NO @ {edge_ask:.3f} (CLOB {no_clob_price:.3f}, "
+                                f"{no_shares:.0f} sh) | best_ask={best_ask:.3f} "
+                                f"mid={midpoint:.3f} | {market['question'][:30]}"
+                            )
+                except Exception as e:
+                    log.debug(f"[rfm] NO order failed: {e}")
+
+            # Reward tracking
+            reward_tracker.get_or_create(
+                condition_id=cid,
+                question=market.get("question", ""),
+                daily_rate=market.get("daily_rate", 0),
+                max_spread=max_spread,
+            )
+            has_yes = orders.get("yes_oid") is not None
+            has_no = orders.get("no_oid") is not None
+            book_dict = None
+            if yes_book and hasattr(yes_book, "bids"):
+                book_dict = {
+                    "bids": [{"price": float(b.price), "size": float(b.size)} for b in yes_book.bids],
+                    "asks": [{"price": float(a.price), "size": float(a.size)} for a in yes_book.asks],
+                }
+            reward_tracker.record_cycle(
+                condition_id=cid,
+                has_yes_order=has_yes, has_no_order=has_no,
+                bid_price=edge_bid if has_yes else 0,
+                ask_price=edge_ask if has_no else 0,
+                inventory_usd=0.0,
+                cooldown_active=False, skew_active=False,
+                cycle_duration_secs=getattr(_cfg, "ORDER_REFRESH_SECS", 30),
+                midpoint=midpoint,
+                bid_size=float(yes_shares) if has_yes else 0,
+                ask_size=float(no_shares) if has_no else 0,
+                order_book=book_dict,
+            )
+
+            if session.cycle_count % 10 == 0:
+                get_db().log_cycle_snapshot(
+                    cycle_num=session.cycle_count,
+                    condition_id=cid,
+                    best_bid=best_bid, best_ask=best_ask,
+                    our_bid=edge_bid, our_ask=edge_ask,
+                    yes_position_usd=0, no_position_usd=0,
+                    active_orders=int(has_yes) + int(has_no),
+                    unwind_orders=0,
+                )
+
+        # Persist reward stats
+        try:
+            reward_tracker._save()
+        except Exception:
+            pass
+
+    finally:
+        restore_config(saved)
+        db_module._instance = original_db
+
+
 def run_one_cycle(session: PaperSession, active_markets: list, reward_tracker):
     """Run one cycle for a paper session using the shared market list."""
     import config
@@ -1022,6 +1351,8 @@ def main():
 
                 if session.strategy.custom_cycle == "passive":
                     run_passive_cycle(session, strategy_markets, session.reward_tracker)
+                elif session.strategy.custom_cycle == "reward_farmer_max":
+                    run_reward_farmer_max_cycle(session, strategy_markets, session.reward_tracker)
                 else:
                     run_one_cycle(session, strategy_markets, session.reward_tracker)
             except Exception as e:
