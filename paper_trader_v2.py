@@ -97,6 +97,53 @@ VOLATILE_KEYWORDS = [
 ]
 
 
+def get_merged_book(book_provider, yes_tid: str, no_tid: str) -> dict | None:
+    """Fetch YES + NO order books and merge into a single YES-equivalent view.
+
+    Mirrors order_manager.get_order_book() logic:
+    - NO asks → derived YES bids (1 - ask_price)
+    - NO bids → derived YES asks (1 - bid_price)
+    Returns dict with "bids" and "asks" keys, each list of {"price": float, "size": float}.
+    """
+    try:
+        ob_yes = book_provider.get_order_book(yes_tid)
+        if not ob_yes:
+            return None
+
+        all_bids = []  # (price, size) tuples
+        all_asks = []
+
+        for b in getattr(ob_yes, "bids", []):
+            all_bids.append((float(b.price), float(b.size)))
+        for a in getattr(ob_yes, "asks", []):
+            all_asks.append((float(a.price), float(a.size)))
+
+        # Merge NO book
+        ob_no = book_provider.get_order_book(no_tid)
+        if ob_no:
+            for a in getattr(ob_no, "asks", []):
+                derived = round(1.0 - float(a.price), 4)
+                if derived > 0:
+                    all_bids.append((derived, float(a.size)))
+            for b in getattr(ob_no, "bids", []):
+                derived = round(1.0 - float(b.price), 4)
+                if derived < 1:
+                    all_asks.append((derived, float(b.size)))
+
+        all_bids.sort(key=lambda x: x[0], reverse=True)
+        all_asks.sort(key=lambda x: x[0])
+
+        if not all_bids or not all_asks:
+            return None
+
+        return {
+            "bids": [{"price": p, "size": s} for p, s in all_bids],
+            "asks": [{"price": p, "size": s} for p, s in all_asks],
+        }
+    except Exception:
+        return None
+
+
 def is_volatile(question: str) -> bool:
     q = question.lower()
     return any(kw in q for kw in VOLATILE_KEYWORDS)
@@ -301,10 +348,10 @@ def run_cycle(session: Session, markets: list[dict]):
                     continue
 
                 try:
-                    book = pc.get_order_book(tid)
-                    if not book or not book.bids:
+                    dump_book = get_merged_book(pc._book_cache or pc._real_client, yes_tid, no_tid)
+                    if not dump_book or not dump_book["bids"]:
                         continue
-                    dump_price = float(book.bids[0].price)
+                    dump_price = float(dump_book["bids"][0]["price"])
                     available = pc._token_balances.get(tid, 0.0)
                     dump_size = min(remaining, available)
                     if dump_size < 1.0:
@@ -355,15 +402,15 @@ def run_cycle(session: Session, markets: list[dict]):
 
         slots = s.orders.setdefault(cid, {"yes": OrderSlot(), "no": OrderSlot()})
 
-        # Get order book for midpoint
-        try:
-            yes_book = pc.get_order_book(yes_tid)
-            if not yes_book or not yes_book.bids or not yes_book.asks:
-                continue
-            best_bid = float(yes_book.bids[0].price)
-            best_ask = float(yes_book.asks[0].price)
-            midpoint = (best_bid + best_ask) / 2
-        except Exception:
+        # Get MERGED order book (YES + NO combined) for accurate midpoint
+        merged = get_merged_book(pc._book_cache or pc._real_client, yes_tid, no_tid)
+        if not merged or not merged["bids"] or not merged["asks"]:
+            continue
+        best_bid = float(merged["bids"][0]["price"])
+        best_ask = float(merged["asks"][0]["price"])
+        midpoint = (best_bid + best_ask) / 2
+
+        if best_ask - best_bid > 0.15:  # skip markets with extremely wide spreads
             continue
 
         # Compute edge prices
@@ -374,8 +421,10 @@ def run_cycle(session: Session, markets: list[dict]):
             edge_bid = best_bid
             edge_ask = best_ask
 
-        edge_bid = max(0.01, min(edge_bid, best_bid))
-        edge_ask = min(0.99, max(edge_ask, best_ask))
+        # Clamp: stay within valid price range, but DON'T clamp to best bid/ask
+        # (we WANT to be far from best — that's the whole point of edge placement)
+        edge_bid = max(0.01, edge_bid)
+        edge_ask = min(0.99, edge_ask)
 
         # Share count
         yes_shares = max(min_size, strat.shares_per_side)
@@ -433,12 +482,8 @@ def run_cycle(session: Session, markets: list[dict]):
         has_yes = slots["yes"].order_id is not None
         has_no = slots["no"].order_id is not None
 
-        book_dict = None
-        if yes_book and hasattr(yes_book, "bids"):
-            book_dict = {
-                "bids": [{"price": float(b.price), "size": float(b.size)} for b in yes_book.bids],
-                "asks": [{"price": float(a.price), "size": float(a.size)} for a in yes_book.asks],
-            }
+        # merged book is already a dict with "bids"/"asks" keys
+        book_dict = merged
 
         s.reward_tracker.get_or_create(
             condition_id=cid,
