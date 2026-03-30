@@ -377,13 +377,13 @@ def run_cycle(session: Session, markets: list[dict]):
 
                     def _log_dump(cid=cid, m=m, side=side, dump_size=dump_size,
                                   dump_clob_price=dump_clob_price, dump_revenue=dump_revenue,
-                                  dump_cost=dump_cost, dump_pnl=dump_pnl):
+                                  dump_cost=dump_cost):
                         from database import get_db
                         get_db().log_unwind(
                             condition_id=cid, question=m.get("question", ""),
                             side=side, shares=dump_size,
                             sell_price=dump_clob_price, usd_value=dump_revenue,
-                            vwap_cost=dump_cost, pnl=dump_pnl,
+                            vwap_cost=dump_cost,
                         )
                     s.with_db(_log_dump)
 
