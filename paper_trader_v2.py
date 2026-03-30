@@ -204,45 +204,55 @@ class Session:
 # ═══════════════════════════════════════════════════════════════════════
 
 def run_cycle(session: Session, markets: list[dict]):
-    """Run one cycle for a session. Steps:
-    1. Filter markets for this strategy
-    2. Simulate fills on existing orders
-    3. Detect fills → merge or dump
-    4. Place new orders where needed
-    5. Record reward tracking data
+    """Run one cycle for a session using tiered refresh.
+
+    Tier A (every cycle):   Detect fills + dump. No book fetches needed.
+    Tier B (batched):       Fetch books + place/refresh orders for a BATCH of markets.
+    On-book tracking:       Count actual seconds orders are on the exchange.
     """
     s = session
     pc = s.pc
     strat = s.strategy
     s.cycle_count += 1
 
-    # ── Step 1: Filter markets ──────────────────────────────────────
-    eligible = []
-    for m in markets:
-        rate = m.get("daily_rate", 0)
-        if rate < strat.min_daily_rate:
-            continue
-        ms = m.get("max_spread", 0.03)
-        if ms < strat.min_max_spread:
-            continue
-        if strat.volatility_filter and is_volatile(m.get("question", "")):
-            continue
-        if strat.max_liquidity > 0 and m.get("liquidity", 0) > strat.max_liquidity:
-            continue
-        tokens = m.get("token_ids", [])
-        if len(tokens) < 2:
-            continue
-        eligible.append(m)
+    TIER_B_BATCH = 5  # markets to refresh per cycle
 
+    # ── Step 1: Filter eligible markets (once, cheap) ───────────────
+    if not hasattr(s, '_eligible') or s.cycle_count % 20 == 1:
+        # Re-filter every 20 cycles (~10 min) or on first cycle
+        s._eligible = []
+        for m in markets:
+            rate = m.get("daily_rate", 0)
+            if rate < strat.min_daily_rate:
+                continue
+            ms = m.get("max_spread", 0.03)
+            if ms < strat.min_max_spread:
+                continue
+            if strat.volatility_filter and is_volatile(m.get("question", "")):
+                continue
+            if strat.max_liquidity > 0 and m.get("liquidity", 0) > strat.max_liquidity:
+                continue
+            tokens = m.get("token_ids", [])
+            if len(tokens) < 2:
+                continue
+            s._eligible.append(m)
+        # Cap to max_markets, sorted by rate/liq ratio (best first)
+        s._eligible.sort(key=lambda x: x.get("daily_rate", 0) / max(x.get("liquidity", 1), 1), reverse=True)
+        s._eligible = s._eligible[:strat.max_markets]
+        # Initialize batch pointer
+        if not hasattr(s, '_batch_idx'):
+            s._batch_idx = 0
+
+    eligible = s._eligible
     if not eligible:
         return
 
-    # Register markets with paper client
+    # Register all markets with paper client (cheap, idempotent)
     for m in eligible:
         tids = m["token_ids"]
         pc.register_market(m["condition_id"], tids[0], tids[1])
 
-    # ── Step 2: Simulate fills ──────────────────────────────────────
+    # ── Step 2: Simulate fills (Tier A — every cycle, no API calls) ─
     pc.simulate_fills()
 
     # ── Step 3: Detect fills, merge, dump ───────────────────────────
@@ -382,8 +392,15 @@ def run_cycle(session: Session, markets: list[dict]):
                 except Exception as e:
                     log.error(f"[{s.name}] Dump {side} FAILED: {e}", exc_info=True)
 
-    # ── Step 4: Place orders ────────────────────────────────────────
-    for m in eligible:
+    # ── Step 4: Place orders (Tier B — batched, TIER_B_BATCH markets per cycle)
+    # Only fetch books + place for a rotating batch to stay within API budget
+    batch_start = s._batch_idx
+    batch_end = min(batch_start + TIER_B_BATCH, len(eligible))
+    batch = eligible[batch_start:batch_end]
+    # Advance pointer, wrap around
+    s._batch_idx = batch_end if batch_end < len(eligible) else 0
+
+    for m in batch:
         cid = m["condition_id"]
         tids = m["token_ids"]
         yes_tid, no_tid = tids[0], tids[1]
@@ -468,50 +485,66 @@ def run_cycle(session: Session, markets: list[dict]):
             except Exception as e:
                 log.debug(f"[{s.name}] NO order failed: {e}")
 
-        # ── Step 5: Record reward tracking ──────────────────────────
-        has_yes = slots["yes"].order_id is not None
-        has_no = slots["no"].order_id is not None
+        # (Reward tracking moved to Step 6 — records ALL markets with orders, not just batch)
 
-        # merged book is already a dict with "bids"/"asks" keys
-        book_dict = merged
-
+    # ── Step 6: Record rewards for ALL markets with active orders ────
+    # (not just the batch — orders from previous batches are still on-book)
+    for m in eligible:
+        cid = m["condition_id"]
+        slots = s.orders.get(cid, {})
+        has_yes = isinstance(slots.get("yes"), OrderSlot) and slots["yes"].order_id is not None
+        has_no = isinstance(slots.get("no"), OrderSlot) and slots["no"].order_id is not None
+        if not has_yes and not has_no:
+            continue
+        # Use cached book data if available, otherwise record without book
+        # (Q-score from order_book is for market_q estimation, our_q just needs our price+size)
         s.reward_tracker.get_or_create(
             condition_id=cid,
             question=m.get("question", ""),
             daily_rate=m.get("daily_rate", 0),
-            max_spread=max_spread,
+            max_spread=m.get("max_spread", 0.03),
         )
+        bid_slot = slots.get("yes", OrderSlot())
+        ask_slot = slots.get("no", OrderSlot())
+        # Use last known midpoint from slot prices as a reasonable proxy
+        mid_est = (bid_slot.price + ask_slot.price) / 2 if bid_slot.price > 0 and ask_slot.price > 0 else 0
         s.reward_tracker.record_cycle(
             condition_id=cid,
             has_yes_order=has_yes, has_no_order=has_no,
-            bid_price=edge_bid if has_yes else 0,
-            ask_price=edge_ask if has_no else 0,
+            bid_price=bid_slot.price if has_yes else 0,
+            ask_price=ask_slot.price if has_no else 0,
             inventory_usd=0.0,
             cooldown_active=False, skew_active=False,
             cycle_duration_secs=30.0,
-            midpoint=midpoint,
-            bid_size=float(yes_shares) if has_yes else 0,
-            ask_size=float(no_shares) if has_no else 0,
-            order_book=book_dict,
+            midpoint=mid_est,
+            bid_size=bid_slot.shares if has_yes else 0,
+            ask_size=ask_slot.shares if has_no else 0,
+            order_book=None,  # skip market_q estimation for non-batch markets (saves CPU)
         )
 
-        # Cycle snapshot every 10 cycles
-        if s.cycle_count % 10 == 0:
-            def _log_snap(cid=cid, best_bid=best_bid, best_ask=best_ask,
-                          edge_bid=edge_bid, edge_ask=edge_ask, has_yes=has_yes, has_no=has_no):
+    # Cycle snapshot for batch markets every 10 cycles
+    if s.cycle_count % 10 == 0:
+        for m in batch:
+            cid = m["condition_id"]
+            slots = s.orders.get(cid, {})
+            has_yes = isinstance(slots.get("yes"), OrderSlot) and slots["yes"].order_id is not None
+            has_no = isinstance(slots.get("no"), OrderSlot) and slots["no"].order_id is not None
+            def _log_snap(cid=cid, has_yes=has_yes, has_no=has_no):
                 from database import get_db
                 get_db().log_cycle_snapshot(
                     cycle_num=s.cycle_count, condition_id=cid,
-                    best_bid=best_bid, best_ask=best_ask,
-                    our_bid=edge_bid, our_ask=edge_ask,
+                    best_bid=0, best_ask=0,
+                    our_bid=s.orders.get(cid, {}).get("yes", OrderSlot()).price,
+                    our_ask=s.orders.get(cid, {}).get("no", OrderSlot()).price,
                     active_orders=int(has_yes) + int(has_no), unwind_orders=0,
                 )
             s.with_db(_log_snap)
 
-    # ── Persist reward tracker (inside DB context) ──────────────────
-    def _save_rewards():
-        s.reward_tracker._save()
-    s.with_db(_save_rewards)
+    # ── Persist reward tracker ──────────────────────────────────────
+    if s.cycle_count % 5 == 0:  # save every 5th cycle, not every cycle
+        def _save_rewards():
+            s.reward_tracker._save()
+        s.with_db(_save_rewards)
 
     # ── Trigger hourly reward estimation ────────────────────────────
     now = time.time()
@@ -520,7 +553,6 @@ def run_cycle(session: Session, markets: list[dict]):
         def _hourly():
             s.reward_tracker.maybe_log_hourly(eligible)
         s.with_db(_hourly)
-        # Force the internal timer so it doesn't skip
         s.reward_tracker._last_hourly_log = 0
 
 
