@@ -44,19 +44,7 @@ class Strategy:
 
 
 STRATEGIES = [
-    # User profile: mimics manual strategy — min_size on zero-competition markets
-    Strategy(
-        name="user_profile",
-        shares_per_side=50,       # min_size on most markets
-        max_markets=100,          # cover as many as possible
-        min_daily_rate=1,         # even $1/day markets with zero competition
-        min_max_spread=0.01,
-        placement_ticks_inside=1, # 1 tick inside edge (safe, but with no competition = 100% Q)
-        volatility_filter=False,
-        dump_on_fill=True,
-        max_liquidity=500,        # ONLY markets with < $500 liquidity (zero competition)
-    ),
-    # Broader: same as user but higher liq threshold
+    # Winner from paper testing: 50 shares, low competition, all reward markets
     Strategy(
         name="low_comp_50sh",
         shares_per_side=50,
@@ -66,31 +54,7 @@ STRATEGIES = [
         placement_ticks_inside=1,
         volatility_filter=False,
         dump_on_fill=True,
-        max_liquidity=5000,       # markets with < $5K liquidity
-    ),
-    # Medium: 200 shares, 2 ticks inside, moderate competition
-    Strategy(
-        name="mid_comp_200sh",
-        shares_per_side=200,
-        max_markets=50,
-        min_daily_rate=5,
-        min_max_spread=0.01,
-        placement_ticks_inside=2,
-        volatility_filter=False,
-        dump_on_fill=True,
-        max_liquidity=50000,
-    ),
-    # Aggressive: 500 shares, 3 ticks inside
-    Strategy(
-        name="aggressive_500sh",
-        shares_per_side=500,
-        max_markets=30,
-        min_daily_rate=10,
-        min_max_spread=0.01,
-        placement_ticks_inside=3,
-        volatility_filter=False,
-        dump_on_fill=True,
-        max_liquidity=0,          # no limit
+        max_liquidity=5000,
     ),
 ]
 
