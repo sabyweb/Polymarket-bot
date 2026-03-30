@@ -743,10 +743,11 @@ def fetch_all_reward_markets() -> list[dict]:
             break
     log.info(f"  CLOB: {len(clob_markets)} reward markets")
 
-    # Step 2: Fetch Gamma markets for details (paginated)
+    # Step 2: Fetch ALL Gamma markets for details (paginated, up to 10K)
+    # Weather/temperature markets are beyond offset 2000, need full coverage
     log.info("  Fetching Gamma market details...")
     gamma_all = []
-    for offset in range(0, 2000, 100):
+    for offset in range(0, 10000, 100):
         try:
             resp = requests.get(
                 "https://gamma-api.polymarket.com/markets",
