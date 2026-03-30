@@ -37,51 +37,60 @@ class Strategy:
     max_markets: int              # how many markets to trade
     min_daily_rate: float         # minimum $/day to consider a market
     min_max_spread: float         # skip markets with reward window < this
-    placement: str                # "edge" = farthest from mid; "cobest" = at best bid/ask
+    placement_ticks_inside: int   # how many ticks inside the reward edge to place
     volatility_filter: bool       # if True, skip volatile keyword markets
     dump_on_fill: bool            # if True, dump at market on fill; else hold
+    max_liquidity: float          # skip markets with more liquidity than this (0 = no limit)
 
 
 STRATEGIES = [
+    # User profile: mimics manual strategy — min_size on zero-competition markets
     Strategy(
-        name="rfm_500",
-        shares_per_side=500,
-        max_markets=23,
-        min_daily_rate=50,
-        min_max_spread=0.01,      # accept all reward windows
-        placement="edge",
-        volatility_filter=False,  # no filter — distance is the protection
+        name="user_profile",
+        shares_per_side=50,       # min_size on most markets
+        max_markets=100,          # cover as many as possible
+        min_daily_rate=1,         # even $1/day markets with zero competition
+        min_max_spread=0.01,
+        placement_ticks_inside=1, # 1 tick inside edge (safe, but with no competition = 100% Q)
+        volatility_filter=False,
         dump_on_fill=True,
+        max_liquidity=500,        # ONLY markets with < $500 liquidity (zero competition)
     ),
+    # Broader: same as user but higher liq threshold
     Strategy(
-        name="rfm_200",
+        name="low_comp_50sh",
+        shares_per_side=50,
+        max_markets=100,
+        min_daily_rate=1,
+        min_max_spread=0.01,
+        placement_ticks_inside=1,
+        volatility_filter=False,
+        dump_on_fill=True,
+        max_liquidity=5000,       # markets with < $5K liquidity
+    ),
+    # Medium: 200 shares, 2 ticks inside, moderate competition
+    Strategy(
+        name="mid_comp_200sh",
         shares_per_side=200,
-        max_markets=23,
-        min_daily_rate=50,
+        max_markets=50,
+        min_daily_rate=5,
         min_max_spread=0.01,
-        placement="edge",
+        placement_ticks_inside=2,
         volatility_filter=False,
         dump_on_fill=True,
+        max_liquidity=50000,
     ),
+    # Aggressive: 500 shares, 3 ticks inside
     Strategy(
-        name="rfm_calm_500",
+        name="aggressive_500sh",
         shares_per_side=500,
-        max_markets=23,
-        min_daily_rate=50,
-        min_max_spread=0.025,     # only wide reward windows
-        placement="edge",
-        volatility_filter=True,   # skip Iran/crude/military
-        dump_on_fill=True,
-    ),
-    Strategy(
-        name="rfm_1000",
-        shares_per_side=1000,
-        max_markets=23,
-        min_daily_rate=50,
+        max_markets=30,
+        min_daily_rate=10,
         min_max_spread=0.01,
-        placement="edge",
+        placement_ticks_inside=3,
         volatility_filter=False,
         dump_on_fill=True,
+        max_liquidity=0,          # no limit
     ),
 ]
 
@@ -253,6 +262,8 @@ def run_cycle(session: Session, markets: list[dict]):
         if ms < strat.min_max_spread:
             continue
         if strat.volatility_filter and is_volatile(m.get("question", "")):
+            continue
+        if strat.max_liquidity > 0 and m.get("liquidity", 0) > strat.max_liquidity:
             continue
         tokens = m.get("token_ids", [])
         if len(tokens) < 2:
@@ -430,14 +441,11 @@ def run_cycle(session: Session, markets: list[dict]):
         if best_ask - best_bid > 0.15:  # skip markets with extremely wide spreads
             continue
 
-        # Compute edge prices — one tick INSIDE the reward window edge
+        # Compute edge prices — N ticks INSIDE the reward window edge
         # (exactly AT max_spread gives Q-score = 0 due to the >= check)
-        if strat.placement == "edge":
-            edge_bid = round(midpoint - max_spread + tick, decimals)
-            edge_ask = round(midpoint + max_spread - tick, decimals)
-        else:  # "cobest"
-            edge_bid = best_bid
-            edge_ask = best_ask
+        ticks_in = strat.placement_ticks_inside
+        edge_bid = round(midpoint - max_spread + tick * ticks_in, decimals)
+        edge_ask = round(midpoint + max_spread - tick * ticks_in, decimals)
 
         # Clamp: stay within valid price range, but DON'T clamp to best bid/ask
         # (we WANT to be far from best — that's the whole point of edge placement)
