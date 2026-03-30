@@ -41,6 +41,7 @@ class Strategy:
     volatility_filter: bool       # if True, skip volatile keyword markets
     dump_on_fill: bool            # if True, dump at market on fill; else hold
     max_liquidity: float          # skip markets with more liquidity than this (0 = no limit)
+    max_cost_per_market: float    # skip if min_size × max(price, 1-price) > this (0 = no limit)
 
 
 STRATEGIES = [
@@ -55,6 +56,7 @@ STRATEGIES = [
         volatility_filter=False,
         dump_on_fill=True,
         max_liquidity=5000,
+        max_cost_per_market=50.0,  # never deploy >$50 per market (prevents H100 $148 fills)
     ),
 ]
 
@@ -232,6 +234,13 @@ def run_cycle(session: Session, markets: list[dict]):
                 continue
             if strat.max_liquidity > 0 and m.get("liquidity", 0) > strat.max_liquidity:
                 continue
+            # Cost cap: skip if min_size order on the expensive side exceeds cap
+            if strat.max_cost_per_market > 0:
+                yes_p = m.get("yes_price") or 0.5
+                min_sz = m.get("min_size", 50)
+                max_side_cost = min_sz * max(yes_p, 1 - yes_p)
+                if max_side_cost > strat.max_cost_per_market:
+                    continue
             tokens = m.get("token_ids", [])
             if len(tokens) < 2:
                 continue
@@ -313,13 +322,13 @@ def run_cycle(session: Session, markets: list[dict]):
                 inv.yes_cost -= yc
                 inv.no_cost -= nc
 
-                def _log_merge(cid=cid, m=m, merge_qty=merge_qty, yc=yc, nc=nc, pnl=pnl):
+                def _log_merge(cid=cid, m=m, merge_qty=merge_qty, yc=yc, nc=nc):
                     from database import get_db
                     get_db().log_unwind(
                         condition_id=cid, question=m.get("question", ""),
                         side="merge", shares=merge_qty,
                         sell_price=1.0, usd_value=merge_qty,
-                        vwap_cost=yc + nc, pnl=pnl,
+                        vwap_cost=yc + nc,
                     )
                 s.with_db(_log_merge)
 
