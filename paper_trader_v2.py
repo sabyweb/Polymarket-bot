@@ -344,43 +344,60 @@ def run_cycle(session: Session, markets: list[dict]):
                 remaining = getattr(inv, f"{side}_shares")
                 other_side = "no" if side == "yes" else "yes"
                 other_remaining = getattr(inv, f"{other_side}_shares")
-                if remaining < 1.0 or other_remaining >= 1.0:
+                if remaining < 1.0:
                     continue
+                if other_remaining >= 1.0:
+                    continue  # wait for merge
 
                 try:
-                    dump_book = get_merged_book(pc._book_cache or pc._real_client, yes_tid, no_tid)
-                    if not dump_book or not dump_book["bids"]:
+                    # For YES dump: sell YES tokens → use YES book bids
+                    # For NO dump: sell NO tokens → use NO book bids
+                    dump_tid = tid
+                    raw_book = (pc._book_cache or pc._real_client).get_order_book(dump_tid)
+                    if not raw_book or not getattr(raw_book, 'bids', None):
+                        log.warning(f"[{s.name}] Dump {side}: no book for {dump_tid[:16]}")
                         continue
-                    dump_price = float(dump_book["bids"][0]["price"])
+
+                    dump_clob_price = float(raw_book.bids[0].price)
+
+                    # For YES: dump_price = clob_price (we sell YES at YES bid)
+                    # For NO:  dump_price = clob_price (we sell NO at NO bid)
+                    # Revenue = shares × clob_price
                     available = pc._token_balances.get(tid, 0.0)
                     dump_size = min(remaining, available)
                     if dump_size < 1.0:
-                        # Reset stuck inventory
+                        log.warning(
+                            f"[{s.name}] Dump {side}: inv={remaining:.0f} but tokens={available:.0f}, resetting"
+                        )
                         setattr(inv, f"{side}_shares", 0.0)
                         setattr(inv, f"{side}_cost", 0.0)
                         continue
 
+                    dump_revenue = dump_size * dump_clob_price
+
                     # Instant dump: direct balance mutation
                     with pc._lock:
                         pc._token_balances[tid] = pc._token_balances.get(tid, 0.0) - dump_size
-                        pc._usdc_balance += dump_size * dump_price
+                        pc._usdc_balance += dump_revenue
 
                     cost_frac = dump_size / remaining if remaining > 0 else 1.0
                     dump_cost = getattr(inv, f"{side}_cost") * cost_frac
-                    dump_pnl = dump_size * dump_price - dump_cost
+                    dump_pnl = dump_revenue - dump_cost
 
                     log.info(
-                        f"[{s.name}] DUMP {side.upper()} {dump_size:.0f}sh @ {dump_price:.4f} "
-                        f"pnl=${dump_pnl:+.2f} | {m['question'][:30]}"
+                        f"[{s.name}] DUMP {side.upper()} {dump_size:.0f}sh @ {dump_clob_price:.4f} "
+                        f"rev=${dump_revenue:.2f} cost=${dump_cost:.2f} pnl=${dump_pnl:+.2f} | "
+                        f"{m['question'][:30]}"
                     )
 
                     def _log_dump(cid=cid, m=m, side=side, dump_size=dump_size,
-                                  dump_price=dump_price, dump_cost=dump_cost, dump_pnl=dump_pnl):
+                                  dump_clob_price=dump_clob_price, dump_revenue=dump_revenue,
+                                  dump_cost=dump_cost, dump_pnl=dump_pnl):
                         from database import get_db
                         get_db().log_unwind(
                             condition_id=cid, question=m.get("question", ""),
                             side=side, shares=dump_size,
-                            sell_price=dump_price, usd_value=dump_size * dump_price,
+                            sell_price=dump_clob_price, usd_value=dump_revenue,
                             vwap_cost=dump_cost, pnl=dump_pnl,
                         )
                     s.with_db(_log_dump)
@@ -388,7 +405,7 @@ def run_cycle(session: Session, markets: list[dict]):
                     setattr(inv, f"{side}_shares", getattr(inv, f"{side}_shares") - dump_size)
                     setattr(inv, f"{side}_cost", getattr(inv, f"{side}_cost") - dump_cost)
                 except Exception as e:
-                    log.warning(f"[{s.name}] Dump failed: {e}")
+                    log.error(f"[{s.name}] Dump {side} FAILED: {e}", exc_info=True)
 
     # ── Step 4: Place orders ────────────────────────────────────────
     for m in eligible:
