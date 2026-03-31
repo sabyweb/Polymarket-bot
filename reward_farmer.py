@@ -34,7 +34,7 @@ log = logging.getLogger("reward_farmer")
 
 SHARES_PER_SIDE = 50
 PLACEMENT_TICKS_INSIDE = 1
-MIN_DAILY_RATE = 1.0
+MIN_DAILY_RATE = 10.0
 MAX_LIQUIDITY = 5000
 MAX_COST_PER_MARKET = 50.0
 MAX_MARKETS = 40
@@ -418,7 +418,36 @@ class RewardFarmer:
                         dump_status = "UNKNOWN"
 
                     if dump_status == "MATCHED":
-                        log.info(f"DUMP CONFIRMED {side.upper()} | {ms.question[:30]}")
+                        # Get REAL fill price from exchange (not the stale book price)
+                        actual_price = float(status.get("price", 0))
+                        actual_matched = float(status.get("size_matched", 0))
+                        sell_revenue = actual_matched * actual_price if actual_price > 0 else 0
+
+                        from price import to_clob
+                        avg_p = self.positions.get_avg_price(ms.cid, side)
+                        vwap_cost = actual_matched * to_clob(avg_p, side) if avg_p > 0 else 0
+
+                        log.info(
+                            f"DUMP CONFIRMED {side.upper()} {actual_matched:.0f}sh @ {actual_price:.4f} | "
+                            f"rev=${sell_revenue:.2f} cost=${vwap_cost:.2f} pnl=${sell_revenue - vwap_cost:+.2f} | "
+                            f"{ms.question[:30]}"
+                        )
+
+                        # NOW record with real numbers
+                        self.positions.record_unwind(ms.cid, side, actual_matched)
+                        self.db.log_unwind(
+                            condition_id=ms.cid, question=ms.question,
+                            side=side, shares=actual_matched,
+                            sell_price=actual_price, usd_value=sell_revenue,
+                            vwap_cost=vwap_cost,
+                        )
+                        from alerts import alert_unwind
+                        alert_unwind(
+                            side=side.upper(), price=actual_price,
+                            size=actual_matched, usd_value=sell_revenue,
+                            market_question=ms.question,
+                        )
+
                         ms.dump_orders[side] = None
                         ms.dump_failures = 0
                     elif dump_status == "UNKNOWN":
@@ -697,10 +726,9 @@ class RewardFarmer:
                     self._dump_position(ms, side, shares)
 
     def _dump_position(self, ms: MarketState, side: str, shares: float):
-        """Sell position at best bid immediately."""
+        """Post SELL at best bid. Actual fill tracked in Step 2 of next cycle."""
         from py_clob_client.clob_types import OrderArgs
         from py_clob_client.order_builder.constants import SELL
-        from alerts import alert_unwind
 
         tid = ms.yes_tid if side == "yes" else ms.no_tid
 
@@ -710,6 +738,21 @@ class RewardFarmer:
             return
 
         try:
+            # Check actual token balance before dumping
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            try:
+                bal = self.client.get_balance_allowance(
+                    BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=tid)
+                )
+                actual_balance = float(bal.get("balance", 0)) / 1e6
+                dump_shares = min(shares, actual_balance)
+                if dump_shares < 1.0:
+                    log.warning(f"Skip dump {side}: want {shares:.0f} but only {actual_balance:.0f} on exchange | {ms.question[:30]}")
+                    ms.dump_failures += 1
+                    return
+            except Exception:
+                dump_shares = shares  # fallback: try with requested amount
+
             book = self.client.get_order_book(tid)
             if not book or not book.bids:
                 log.warning(f"No bids for dump {side} | {ms.question[:30]}")
@@ -717,38 +760,18 @@ class RewardFarmer:
                 return
 
             sell_price = float(book.bids[0].price)
-            args = OrderArgs(token_id=tid, price=sell_price, size=float(shares), side=SELL)
+            args = OrderArgs(token_id=tid, price=sell_price, size=float(dump_shares), side=SELL)
             resp = self.client.create_and_post_order(args)
             oid = resp.get("orderID") if isinstance(resp, dict) else None
 
             if oid:
-                # Track the dump order — DON'T unwind position yet
-                # Position will be unwound when dump order fills (Step 2 of next cycle)
+                # Track the dump order. DO NOT log unwind or update position yet.
+                # Real price + actual fill will be recorded in Step 2 when dump confirms.
                 ms.dump_orders[side] = oid
                 ms.dump_failures = 0
-
-                sell_revenue = shares * sell_price
                 log.info(
-                    f"DUMP POSTED {side.upper()} {shares:.0f}sh @ {sell_price:.4f} | "
+                    f"DUMP POSTED {side.upper()} {dump_shares:.0f}sh @ {sell_price:.4f} | "
                     f"oid={oid[:16]} | {ms.question[:30]}"
-                )
-
-                from price import to_clob
-                avg_price = self.positions.get_avg_price(ms.cid, side)
-                vwap_cost = shares * to_clob(avg_price, side) if avg_price > 0 else 0
-
-                # Record unwind now (position tracker needs to reflect reality)
-                self.positions.record_unwind(ms.cid, side, shares)
-                self.db.log_unwind(
-                    condition_id=ms.cid, question=ms.question,
-                    side=side, shares=shares,
-                    sell_price=sell_price, usd_value=sell_revenue,
-                    vwap_cost=vwap_cost,
-                )
-                alert_unwind(
-                    side=side.upper(), price=sell_price,
-                    size=shares, usd_value=sell_revenue,
-                    market_question=ms.question,
                 )
             else:
                 log.warning(f"Dump {side} no order ID | {ms.question[:30]}")
