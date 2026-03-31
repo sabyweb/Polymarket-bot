@@ -70,6 +70,7 @@ class MarketState:
     yes_price: float | None
     orders: dict = field(default_factory=lambda: {"yes": OrderSlot(), "no": OrderSlot()})
     dump_orders: dict = field(default_factory=lambda: {"yes": None, "no": None})  # side → SELL order_id
+    dump_state: dict = field(default_factory=lambda: {"yes": None, "no": None})  # side → {"fill_price", "started_at", "shares", "tid"}
     dump_failures: int = 0
     unknown_count: dict = field(default_factory=lambda: {"yes": 0, "no": 0})  # consecutive UNKNOWN status counts
     last_book_fetch: float = 0.0
@@ -449,6 +450,7 @@ class RewardFarmer:
                         )
 
                         ms.dump_orders[side] = None
+                        ms.dump_state[side] = None  # clear decay state
                         ms.dump_failures = 0
                     elif dump_status == "UNKNOWN":
                         ms.unknown_count[side] = ms.unknown_count.get(side, 0) + 1
@@ -459,6 +461,26 @@ class RewardFarmer:
                         # CANCELLED or other — dump failed, will retry
                         log.warning(f"Dump order {dump_status} — will retry | {ms.question[:30]}")
                         ms.dump_orders[side] = None
+
+        # ── Step 2.5: Reprice active dumps (decay schedule) ──────────
+        for cid, ms in list(self.markets.items()):
+            for side in ["yes", "no"]:
+                if not ms.dump_state[side]:
+                    continue
+                dump_oid = ms.dump_orders[side]
+                # If dump order is still LIVE on exchange, check if it needs repricing
+                if dump_oid and dump_oid in open_ids:
+                    elapsed_min = (time.time() - ms.dump_state[side]["started_at"]) / 60.0
+                    last_reprice_min = ms.dump_state[side].get("last_reprice_min", 0)
+                    # Reprice every minute
+                    if int(elapsed_min) > int(last_reprice_min):
+                        ms.dump_state[side]["last_reprice_min"] = elapsed_min
+                        shares = ms.dump_state[side]["shares"]
+                        self._dump_position(ms, side, shares)
+                # If dump order gone but not confirmed in Step 2, it was cancelled → retry
+                elif not dump_oid and ms.dump_state[side]:
+                    shares = ms.dump_state[side]["shares"]
+                    self._dump_position(ms, side, shares)
 
         # ── Step 3: Detect BUY order fills ───────────────────────────
         for cid, ms in list(self.markets.items()):
@@ -726,11 +748,22 @@ class RewardFarmer:
                     self._dump_position(ms, side, shares)
 
     def _dump_position(self, ms: MarketState, side: str, shares: float):
-        """Post SELL at best bid. Actual fill tracked in Step 2 of next cycle."""
+        """Smart dump: SELL near fill price, decay over 5 minutes.
+
+        T+0:  SELL at fill_price - 1 tick (near breakeven)
+        T+1m: lower by 1 tick
+        T+2m: lower by 1 tick
+        T+3m: lower by 1 tick
+        T+4m: lower by 1 tick
+        T+5m: market dump at best bid (safety timeout)
+
+        If already have a dump in progress, check if it needs repricing.
+        """
         from py_clob_client.clob_types import OrderArgs
         from py_clob_client.order_builder.constants import SELL
 
         tid = ms.yes_tid if side == "yes" else ms.no_tid
+        tick = ms.tick_size
 
         if self.dry_run:
             log.info(f"[DRY] DUMP {side.upper()} {shares:.0f}sh | {ms.question[:30]}")
@@ -738,7 +771,7 @@ class RewardFarmer:
             return
 
         try:
-            # Check actual token balance before dumping
+            # Check actual token balance
             from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
             try:
                 bal = self.client.get_balance_allowance(
@@ -751,28 +784,54 @@ class RewardFarmer:
                     ms.dump_failures += 1
                     return
             except Exception:
-                dump_shares = shares  # fallback: try with requested amount
+                dump_shares = shares
 
-            book = self.client.get_order_book(tid)
-            if not book or not book.bids:
-                log.warning(f"No bids for dump {side} | {ms.question[:30]}")
-                ms.dump_failures += 1
-                return
+            # Initialize dump state if first attempt
+            if ms.dump_state[side] is None:
+                from price import to_clob
+                fill_price_clob = to_clob(ms.orders[side].price, side) if ms.orders[side].price > 0 else 0
+                ms.dump_state[side] = {
+                    "fill_price": fill_price_clob,
+                    "started_at": time.time(),
+                    "shares": dump_shares,
+                    "tid": tid,
+                }
 
-            sell_price = float(book.bids[0].price)
+            state = ms.dump_state[side]
+            elapsed_min = (time.time() - state["started_at"]) / 60.0
+
+            # Compute decay price
+            if elapsed_min >= 5.0:
+                # Timeout — market dump at best bid
+                book = self.client.get_order_book(tid)
+                if not book or not book.bids:
+                    ms.dump_failures += 1
+                    return
+                sell_price = float(book.bids[0].price)
+                log.info(f"DUMP TIMEOUT {side.upper()} → market sell @ {sell_price:.4f} | {ms.question[:30]}")
+            else:
+                # Decay: fill_price - (1 + elapsed_minutes) ticks
+                decay_ticks = 1 + int(elapsed_min)
+                sell_price = round(state["fill_price"] - decay_ticks * tick, 4)
+                sell_price = max(0.01, sell_price)
+
+            # Cancel existing dump order if any (repricing)
+            if ms.dump_orders[side]:
+                self._cancel_order(ms.dump_orders[side], reason="dump_reprice")
+                ms.dump_orders[side] = None
+
             args = OrderArgs(token_id=tid, price=sell_price, size=float(dump_shares), side=SELL)
             resp = self.client.create_and_post_order(args)
             oid = resp.get("orderID") if isinstance(resp, dict) else None
 
             if oid:
-                # Track the dump order. DO NOT log unwind or update position yet.
-                # Real price + actual fill will be recorded in Step 2 when dump confirms.
                 ms.dump_orders[side] = oid
                 ms.dump_failures = 0
-                log.info(
-                    f"DUMP POSTED {side.upper()} {dump_shares:.0f}sh @ {sell_price:.4f} | "
-                    f"oid={oid[:16]} | {ms.question[:30]}"
-                )
+                if elapsed_min < 0.1:  # only log first placement
+                    log.info(
+                        f"DUMP POSTED {side.upper()} {dump_shares:.0f}sh @ {sell_price:.4f} "
+                        f"(fill was {state['fill_price']:.4f}) | {ms.question[:30]}"
+                    )
             else:
                 log.warning(f"Dump {side} no order ID | {ms.question[:30]}")
                 ms.dump_failures += 1
