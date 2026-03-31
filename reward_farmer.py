@@ -69,7 +69,9 @@ class MarketState:
     tick_size: float
     yes_price: float | None
     orders: dict = field(default_factory=lambda: {"yes": OrderSlot(), "no": OrderSlot()})
+    dump_orders: dict = field(default_factory=lambda: {"yes": None, "no": None})  # side → SELL order_id
     dump_failures: int = 0
+    unknown_count: dict = field(default_factory=lambda: {"yes": 0, "no": 0})  # consecutive UNKNOWN status counts
     last_book_fetch: float = 0.0
     midpoint: float = 0.0
 
@@ -256,6 +258,9 @@ class RewardFarmer:
         from database import get_db
         self.db = get_db()
 
+        # Startup reconciliation: cancel orphaned orders from previous run
+        self._reconcile_on_startup()
+
         # Market state
         self.markets: dict[str, MarketState] = {}  # cid → MarketState
         self.all_market_data: list[dict] = []       # raw market dicts from fetcher
@@ -268,13 +273,40 @@ class RewardFarmer:
         self._last_reconcile = 0.0
         self._last_reward_log = 0.0
 
+    # ── Startup Reconciliation ─────────────────────────────────────
+
+    def _reconcile_on_startup(self):
+        """Cancel orphaned orders from previous run. Start clean."""
+        if self.dry_run:
+            log.info("[DRY] Skipping startup reconciliation")
+            return
+
+        try:
+            orphans = self.client.get_orders() or []
+            if orphans:
+                log.info(f"Cancelling {len(orphans)} orphaned orders from previous run...")
+                for o in orphans:
+                    try:
+                        self.client.cancel(o["id"])
+                    except Exception:
+                        pass
+                log.info("Orphaned orders cancelled.")
+            else:
+                log.info("No orphaned orders found — starting clean.")
+        except Exception as e:
+            log.warning(f"Startup reconciliation failed: {e}")
+
     # ── Market Management ────────────────────────────────────────────
 
     def refresh_markets(self):
-        """Discover and filter reward markets."""
+        """Discover and filter reward markets (blocking, for startup only)."""
         log.info("Refreshing reward markets...")
-        raw = fetch_all_reward_markets()
-        self.all_market_data = raw
+        self.all_market_data = fetch_all_reward_markets()
+        self._apply_market_changes()
+
+    def _apply_market_changes(self):
+        """Apply market data to active market set."""
+        raw = self.all_market_data
 
         # Filter for our strategy
         eligible = []
@@ -350,8 +382,8 @@ class RewardFarmer:
     def run_cycle(self):
         """One 30-second cycle. Steps:
         1. Fetch exchange orders (1 API call)
-        2. Detect fills
-        3. Dump/merge fills
+        2. Check dump SELL orders (did they fill?)
+        3. Detect BUY order fills + handle
         4. Place orders on batch of markets
         5. Record reward tracking
         """
@@ -366,7 +398,36 @@ class RewardFarmer:
 
         open_ids = {o["id"] for o in exchange_orders}
 
-        # ── Step 2 + 3: Detect fills and handle them ─────────────────
+        # ── Step 2: Check dump SELL orders ───────────────────────────
+        for cid, ms in list(self.markets.items()):
+            for side in ["yes", "no"]:
+                dump_oid = ms.dump_orders[side]
+                if not dump_oid:
+                    continue
+
+                if dump_oid not in open_ids:
+                    # Dump order gone from exchange — check if it filled
+                    try:
+                        status = self.client.get_order(dump_oid)
+                        dump_status = status.get("status", "UNKNOWN")
+                    except Exception:
+                        dump_status = "UNKNOWN"
+
+                    if dump_status == "MATCHED":
+                        log.info(f"DUMP CONFIRMED {side.upper()} | {ms.question[:30]}")
+                        ms.dump_orders[side] = None
+                        ms.dump_failures = 0
+                    elif dump_status == "UNKNOWN":
+                        ms.unknown_count[side] = ms.unknown_count.get(side, 0) + 1
+                        if ms.unknown_count[side] >= 5:
+                            log.warning(f"Dump order stuck UNKNOWN 5×, clearing | {ms.question[:30]}")
+                            ms.dump_orders[side] = None
+                    else:
+                        # CANCELLED or other — dump failed, will retry
+                        log.warning(f"Dump order {dump_status} — will retry | {ms.question[:30]}")
+                        ms.dump_orders[side] = None
+
+        # ── Step 3: Detect BUY order fills ───────────────────────────
         for cid, ms in list(self.markets.items()):
             for side in ["yes", "no"]:
                 slot = ms.orders[side]
@@ -378,15 +439,26 @@ class RewardFarmer:
                     try:
                         status = self.client.get_order(slot.order_id)
                         order_status = status.get("status", "UNKNOWN")
+                        matched = float(status.get("size_matched", 0))
                     except Exception:
                         order_status = "UNKNOWN"
+                        matched = 0
 
-                    if order_status == "MATCHED":
-                        self._handle_fill(ms, side, slot)
+                    if order_status == "MATCHED" and matched > 0:
+                        self._handle_fill(ms, side, slot, actual_shares=matched)
+                        ms.unknown_count[side] = 0
                     elif order_status == "UNKNOWN":
-                        log.warning(f"Order {slot.order_id[:16]} status UNKNOWN — keeping")
-                        continue  # don't clear, retry next cycle
-                    # else: CANCELLED or other — clear it
+                        ms.unknown_count[side] = ms.unknown_count.get(side, 0) + 1
+                        if ms.unknown_count[side] >= 5:
+                            log.warning(f"BUY order stuck UNKNOWN 5×, clearing | {ms.question[:30]}")
+                            slot.order_id = None
+                            ms.unknown_count[side] = 0
+                        else:
+                            log.warning(f"Order {slot.order_id[:16]} UNKNOWN ({ms.unknown_count[side]}/5)")
+                        continue  # don't clear yet, retry next cycle
+                    else:
+                        ms.unknown_count[side] = 0
+                    # Clear the order slot (MATCHED, CANCELLED, etc.)
                     slot.order_id = None
 
         # ── Step 4: Place orders on batch ────────────────────────────
@@ -512,8 +584,11 @@ class RewardFarmer:
         ms = self.markets.get(cid)
         if not ms:
             return False
-        # Already have an order on this side
+        # Already have a BUY order on this side
         if ms.orders[side].order_id:
+            return False
+        # Have a pending dump SELL on this side
+        if ms.dump_orders[side]:
             return False
         # Have inventory on this side (need to dump first)
         if self.positions.get_shares(cid, side) > 1:
@@ -530,20 +605,21 @@ class RewardFarmer:
         return True
 
     def _total_exposure(self) -> float:
-        """Sum of all open position USD values."""
+        """Sum of all open position USD values (actual, not estimated)."""
         total = 0.0
         for cid in self.markets:
             for side in ["yes", "no"]:
-                total += self.positions.get_shares(cid, side) * 0.5  # rough estimate
+                total += self.positions.get_position(cid, side)
         return total
 
     # ── Fill Handling ────────────────────────────────────────────────
 
-    def _handle_fill(self, ms: MarketState, side: str, slot: OrderSlot):
+    def _handle_fill(self, ms: MarketState, side: str, slot: OrderSlot,
+                     actual_shares: float = 0):
         """Process a detected fill: record, then merge or dump."""
         from alerts import alert_fill
 
-        filled_shares = slot.shares
+        filled_shares = actual_shares if actual_shares > 0 else slot.shares
         fill_price = slot.price
         cid = ms.cid
 
@@ -585,17 +661,36 @@ class RewardFarmer:
         self._dump_position(ms, side, filled_shares)
 
     def _try_merge(self, ms: MarketState, amount: float):
-        """Merge YES + NO positions for $1 each."""
+        """Merge YES + NO positions for $1 each. Falls back to dual dump."""
         if self.dry_run:
             log.info(f"[DRY] MERGE {amount:.0f} pairs | {ms.question[:30]}")
+            self.positions.record_unwind(ms.cid, "yes", amount)
+            self.positions.record_unwind(ms.cid, "no", amount)
             return
 
-        # TODO: implement real merge via CLOB API
-        # For now, fall back to dumping both sides
-        for side in ["yes", "no"]:
-            shares = self.positions.get_shares(ms.cid, side)
-            if shares >= 1:
-                self._dump_position(ms, side, shares)
+        try:
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            # Ensure allowance for both tokens
+            for tid in [ms.yes_tid, ms.no_tid]:
+                self.client.update_balance_allowance(
+                    BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=tid)
+                )
+            # Execute merge
+            result = self.client.merge_positions(ms.cid, amount)
+            log.info(f"MERGE {amount:.0f} pairs | {ms.question[:30]}")
+            self.positions.record_unwind(ms.cid, "yes", amount)
+            self.positions.record_unwind(ms.cid, "no", amount)
+            self.db.log_unwind(
+                condition_id=ms.cid, question=ms.question,
+                side="merge", shares=amount,
+                sell_price=1.0, usd_value=amount,
+            )
+        except Exception as e:
+            log.warning(f"Merge failed ({e}) — falling back to dual dump | {ms.question[:30]}")
+            for side in ["yes", "no"]:
+                shares = self.positions.get_shares(ms.cid, side)
+                if shares >= 1:
+                    self._dump_position(ms, side, shares)
 
     def _dump_position(self, ms: MarketState, side: str, shares: float):
         """Sell position at best bid immediately."""
@@ -623,16 +718,22 @@ class RewardFarmer:
             oid = resp.get("orderID") if isinstance(resp, dict) else None
 
             if oid:
+                # Track the dump order — DON'T unwind position yet
+                # Position will be unwound when dump order fills (Step 2 of next cycle)
+                ms.dump_orders[side] = oid
+                ms.dump_failures = 0
+
                 sell_revenue = shares * sell_price
+                log.info(
+                    f"DUMP POSTED {side.upper()} {shares:.0f}sh @ {sell_price:.4f} | "
+                    f"oid={oid[:16]} | {ms.question[:30]}"
+                )
+
                 from price import to_clob
                 avg_price = self.positions.get_avg_price(ms.cid, side)
                 vwap_cost = shares * to_clob(avg_price, side) if avg_price > 0 else 0
 
-                log.info(
-                    f"DUMP {side.upper()} {shares:.0f}sh @ {sell_price:.4f} | "
-                    f"rev=${sell_revenue:.2f} | {ms.question[:30]}"
-                )
-
+                # Record unwind now (position tracker needs to reflect reality)
                 self.positions.record_unwind(ms.cid, side, shares)
                 self.db.log_unwind(
                     condition_id=ms.cid, question=ms.question,
@@ -645,7 +746,6 @@ class RewardFarmer:
                     size=shares, usd_value=sell_revenue,
                     market_question=ms.question,
                 )
-                ms.dump_failures = 0
             else:
                 log.warning(f"Dump {side} no order ID | {ms.question[:30]}")
                 ms.dump_failures += 1
@@ -693,9 +793,24 @@ class RewardFarmer:
 
             t0 = time.time()
 
-            # Market refresh
+            # Market refresh (in background to avoid blocking trading)
             if time.time() - self._last_market_refresh >= MARKET_REFRESH_SECS:
-                self.refresh_markets()
+                if not hasattr(self, '_refresh_thread') or not self._refresh_thread.is_alive():
+                    def _bg_refresh():
+                        try:
+                            new_data = fetch_all_reward_markets()
+                            self._pending_market_data = new_data
+                        except Exception as e:
+                            log.warning(f"Background market refresh failed: {e}")
+                    self._refresh_thread = threading.Thread(target=_bg_refresh, daemon=True)
+                    self._refresh_thread.start()
+                    self._last_market_refresh = time.time()
+
+            # Apply pending market data from background refresh
+            if hasattr(self, '_pending_market_data') and self._pending_market_data:
+                self.all_market_data = self._pending_market_data
+                self._pending_market_data = None
+                self._apply_market_changes()
 
             # Run cycle
             try:
@@ -735,13 +850,18 @@ class RewardFarmer:
         self._shutdown_cleanup()
 
     def _shutdown_cleanup(self):
-        """Cancel all orders, save state."""
+        """Cancel ALL orders (BUY + dump SELL), save state."""
         log.info("Shutting down...")
         for ms in self.markets.values():
             for side in ["yes", "no"]:
+                # Cancel BUY orders
                 oid = ms.orders[side].order_id
                 if oid and oid != "dry_yes" and oid != "dry_no":
                     self._cancel_order(oid, reason="shutdown")
+                # Cancel dump SELL orders
+                dump_oid = ms.dump_orders[side]
+                if dump_oid:
+                    self._cancel_order(dump_oid, reason="shutdown_dump")
         self.rewards._save()
         log.info("All orders cancelled. Shutdown complete.")
 
