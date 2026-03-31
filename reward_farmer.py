@@ -138,35 +138,58 @@ def fetch_all_reward_markets() -> list[dict]:
         ms_cents = float(c.get("rewards_max_spread") or 4.5)
 
         g = gamma_by_cid.get(cid)
-        if not g:
-            continue
-
-        try:
-            token_ids = json.loads(g.get("clobTokenIds") or "[]")
-        except (json.JSONDecodeError, TypeError):
-            continue
-        if len(token_ids) < 2:
-            continue
-
-        yes_price = None
-        try:
-            prices = json.loads(g.get("outcomePrices") or "[]")
-            yes_price = float(prices[0]) if prices else None
-        except Exception:
-            pass
-
-        liq = float(g.get("liquidityNum") or 0)
-        vol = float(g.get("volume24hrClob") or 0)
+        if g:
+            # ── Path A: Gamma has this market (most common) ──────
+            try:
+                token_ids = json.loads(g.get("clobTokenIds") or "[]")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if len(token_ids) < 2:
+                continue
+            yes_price = None
+            try:
+                prices = json.loads(g.get("outcomePrices") or "[]")
+                yes_price = float(prices[0]) if prices else None
+            except Exception:
+                pass
+            liq = float(g.get("liquidityNum") or 0)
+            vol = float(g.get("volume24hrClob") or 0)
+            question = g.get("question", "")
+            tick = float(g.get("orderPriceMinTickSize") or 0.01)
+        else:
+            # ── Path B: Gamma doesn't have it — fetch from CLOB directly ──
+            # This unlocks weather/daily/niche markets invisible to Gamma
+            if rate < MIN_DAILY_RATE:
+                continue
+            try:
+                mkt_resp = requests.get(
+                    f"https://clob.polymarket.com/markets/{cid}",
+                    timeout=10,
+                )
+                if mkt_resp.status_code != 200:
+                    continue
+                mkt = mkt_resp.json()
+                tokens_data = mkt.get("tokens", [])
+                if len(tokens_data) < 2:
+                    continue
+                token_ids = [tokens_data[0]["token_id"], tokens_data[1]["token_id"]]
+                yes_price = float(tokens_data[0].get("price", 0.5))
+                question = mkt.get("question", "")
+                tick = float(mkt.get("minimum_tick_size") or 0.01)
+                liq = 0.0  # CLOB doesn't return liquidity
+                vol = 0.0
+            except Exception:
+                continue
 
         merged.append({
             "condition_id": cid,
-            "question": g.get("question", ""),
+            "question": question,
             "token_ids": token_ids,
             "yes_price": yes_price,
             "daily_rate": rate,
             "min_size": min_size,
             "max_spread": ms_cents / 100.0,
-            "tick_size": float(g.get("orderPriceMinTickSize") or 0.01),
+            "tick_size": tick,
             "liquidity": liq,
             "volume_24h": vol,
         })
