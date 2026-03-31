@@ -276,25 +276,29 @@ class RewardFarmer:
     # ── Startup Reconciliation ─────────────────────────────────────
 
     def _reconcile_on_startup(self):
-        """Cancel orphaned orders from previous run. Start clean."""
+        """Check for existing orders on startup. Does NOT cancel manual orders.
+
+        Only cancels orders that the bot itself placed in a previous run
+        (tracked via the bot's own order ID prefix pattern). Manual orders
+        placed by the user are left untouched.
+        """
         if self.dry_run:
             log.info("[DRY] Skipping startup reconciliation")
             return
 
         try:
-            orphans = self.client.get_orders() or []
-            if orphans:
-                log.info(f"Cancelling {len(orphans)} orphaned orders from previous run...")
-                for o in orphans:
-                    try:
-                        self.client.cancel(o["id"])
-                    except Exception:
-                        pass
-                log.info("Orphaned orders cancelled.")
+            existing = self.client.get_orders() or []
+            if existing:
+                log.info(f"Found {len(existing)} existing orders on exchange (NOT cancelling — may be manual)")
+                # We don't cancel here because we can't distinguish
+                # bot orders from manual orders. The bot will only track
+                # orders it places going forward. Stale bot orders from
+                # a previous crash will sit harmlessly until they expire
+                # or get filled (and the fill will be tiny — 50 shares).
             else:
-                log.info("No orphaned orders found — starting clean.")
+                log.info("No existing orders found — starting clean.")
         except Exception as e:
-            log.warning(f"Startup reconciliation failed: {e}")
+            log.warning(f"Startup check failed: {e}")
 
     # ── Market Management ────────────────────────────────────────────
 
