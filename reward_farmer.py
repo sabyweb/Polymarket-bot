@@ -81,6 +81,69 @@ class MarketState:
 # MARKET DISCOVERY (from paper_trader_v2.py, proven)
 # ═══════════════════════════════════════════════════════════════════════
 
+def _verify_order_books(markets: list[dict]) -> list[dict]:
+    """Verify each candidate market has real order book depth.
+
+    Replaces unreliable liquidity values with actual on-book USD depth.
+    Filters out markets resolving within 12 hours and one-sided books.
+    This is the ground truth — no keyword filters, no price heuristics.
+    """
+    import requests
+    from datetime import datetime, timezone, timedelta
+
+    verified = []
+    now = datetime.now(timezone.utc)
+    cutoff = now + timedelta(hours=12)
+
+    for m in markets:
+        # ── Expiry check: skip markets resolving within 12 hours ──
+        end_date = m.get("end_date_iso")
+        if end_date:
+            try:
+                dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                if dt <= cutoff:
+                    log.debug(f"  Skip (resolves <12h): {m['question'][:40]}")
+                    continue
+            except Exception:
+                pass  # unparseable date — don't skip on that basis
+
+        # ── Order book depth check: the ground truth ──
+        yes_tid = m["token_ids"][0]
+        try:
+            resp = requests.get(
+                "https://clob.polymarket.com/book",
+                params={"token_id": yes_tid},
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                continue  # can't verify → don't trade
+            book = resp.json()
+        except Exception:
+            continue  # can't verify → don't trade
+
+        bids = book.get("bids", [])
+        asks = book.get("asks", [])
+
+        # Must have both sides to be tradeable
+        if not bids or not asks:
+            log.debug(f"  Skip (one-sided book): {m['question'][:40]}")
+            continue
+
+        # Sum top 5 levels on each side (price × size = USD depth)
+        bid_depth = sum(float(b["price"]) * float(b["size"]) for b in bids[:5])
+        ask_depth = sum(float(a["price"]) * float(a["size"]) for a in asks[:5])
+        on_book_depth = bid_depth + ask_depth
+
+        # Replace unreliable liquidity with real on-book depth
+        m["liquidity"] = on_book_depth
+
+        verified.append(m)
+        time.sleep(0.15)  # respect rate limit
+
+    log.info(f"  Verified: {len(verified)}/{len(markets)} passed order book check")
+    return verified
+
+
 def fetch_all_reward_markets() -> list[dict]:
     """Fetch ALL reward markets from CLOB endpoint + Gamma details."""
     import requests
@@ -156,6 +219,7 @@ def fetch_all_reward_markets() -> list[dict]:
             vol = float(g.get("volume24hrClob") or 0)
             question = g.get("question", "")
             tick = float(g.get("orderPriceMinTickSize") or 0.01)
+            end_date_iso = g.get("endDateIso") or g.get("end_date_iso")
         else:
             # ── Path B: Gamma doesn't have it — fetch from CLOB directly ──
             # This unlocks weather/daily/niche markets invisible to Gamma
@@ -176,7 +240,8 @@ def fetch_all_reward_markets() -> list[dict]:
                 yes_price = float(tokens_data[0].get("price", 0.5))
                 question = mkt.get("question", "")
                 tick = float(mkt.get("minimum_tick_size") or 0.01)
-                liq = 0.0  # CLOB doesn't return liquidity
+                end_date_iso = mkt.get("end_date_iso")
+                liq = 999999.0  # placeholder — will be replaced by _verify_order_books()
                 vol = 0.0
             except Exception:
                 continue
@@ -192,10 +257,18 @@ def fetch_all_reward_markets() -> list[dict]:
             "tick_size": tick,
             "liquidity": liq,
             "volume_24h": vol,
+            "end_date_iso": end_date_iso,
         })
 
+    log.info(f"  Merged: {len(merged)} candidates with rate >= ${MIN_DAILY_RATE}/day")
+
+    # ── Order book verification: the ground truth for liquidity ──
+    log.info(f"  Verifying order books for {len(merged)} candidates...")
+    merged = _verify_order_books(merged)
+
+    # Sort by liquidity ascending (lowest on-book depth = least competition = best)
     merged.sort(key=lambda x: x["liquidity"])
-    log.info(f"  Merged: {len(merged)} markets with rate >= ${MIN_DAILY_RATE}/day")
+    log.info(f"  Final: {len(merged)} verified markets")
     return merged
 
 
