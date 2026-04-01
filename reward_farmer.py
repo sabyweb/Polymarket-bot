@@ -694,6 +694,23 @@ class RewardFarmer:
         edge_bid = max(0.01, edge_bid)
         edge_ask = min(0.99, edge_ask)
 
+        # ── Reprice stale orders outside reward window ───────────────
+        # If midpoint moved, our orders may be outside the reward window
+        # (earning zero Q-score but still taking fill risk). Cancel and re-place.
+        for side, edge_price in [("yes", edge_bid), ("no", edge_ask)]:
+            slot = ms.orders[side]
+            if not slot.order_id:
+                continue
+            order_dist = abs(slot.price - midpoint)
+            if order_dist >= ms.max_spread:
+                # Order is outside reward window — cancel it
+                self._cancel_order(slot.order_id, reason="outside_reward_window")
+                log.info(
+                    f"REPRICE {side.upper()} | old={slot.price:.3f} dist={order_dist:.3f} >= spread={ms.max_spread:.3f} | "
+                    f"new={edge_price:.3f} | {ms.question[:30]}"
+                )
+                slot.order_id = None  # will be re-placed below
+
         # Shares
         yes_shares = max(ms.min_size, SHARES_PER_SIDE)
         no_clob = round(1.0 - edge_ask, decimals)
