@@ -96,10 +96,15 @@ def _verify_order_books(markets: list[dict]) -> list[dict]:
     cutoff = now + timedelta(hours=12)
 
     for m in markets:
-        # ── Live event check: skip "during X" markets (real-time event pricing) ──
+        # ── Market type filter ──
         q_lower = (m.get("question") or "").lower()
+        # Skip live event markets (real-time event pricing)
         if " during " in q_lower:
             log.debug(f"  Skip (live event): {m['question'][:40]}")
+            continue
+        # Skip Natural Gas — commodity markets fill aggressively, net negative
+        if "natural gas" in q_lower or "(ng)" in q_lower:
+            log.debug(f"  Skip (commodity): {m['question'][:40]}")
             continue
 
         # ── Expiry check: skip markets resolving within 12 hours ──
