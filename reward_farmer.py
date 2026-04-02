@@ -725,14 +725,33 @@ class RewardFarmer:
                 )
                 slot.order_id = None  # will be re-placed below
 
+        # ── Exit liquidity check: only place if we can dump within 2¢ ──
+        # Count shares of bid depth within 2¢ of our YES edge (for YES exit)
+        yes_exit_depth = sum(
+            float(b["size"]) for b in merged["bids"]
+            if float(b["price"]) >= edge_bid - 0.02
+        )
+        # Count shares of ask depth within 2¢ of our NO edge (for NO exit)
+        no_exit_depth = sum(
+            float(a["size"]) for a in merged["asks"]
+            if float(a["price"]) <= edge_ask + 0.02
+        )
+        can_exit_yes = yes_exit_depth >= SHARES_PER_SIDE
+        can_exit_no = no_exit_depth >= SHARES_PER_SIDE
+
+        if not can_exit_yes:
+            log.debug(f"Skip YES {ms.question[:25]}: exit depth {yes_exit_depth:.0f} < {SHARES_PER_SIDE}")
+        if not can_exit_no:
+            log.debug(f"Skip NO {ms.question[:25]}: exit depth {no_exit_depth:.0f} < {SHARES_PER_SIDE}")
+
         # Shares
         yes_shares = max(ms.min_size, SHARES_PER_SIDE)
         no_clob = round(1.0 - edge_ask, decimals)
         no_clob = max(0.01, no_clob)
         no_shares = max(ms.min_size, SHARES_PER_SIDE)
 
-        # Place YES bid
-        if self._can_place(ms.cid, "yes", yes_shares * edge_bid):
+        # Place YES bid (only if exit liquidity exists)
+        if can_exit_yes and self._can_place(ms.cid, "yes", yes_shares * edge_bid):
             if self.dry_run:
                 log.info(f"[DRY] BID YES @ {edge_bid:.3f} ({yes_shares:.0f}sh) | {ms.question[:30]}")
                 ms.orders["yes"] = OrderSlot(order_id="dry_yes", price=edge_bid, shares=yes_shares, placed_at=time.time())
@@ -749,8 +768,8 @@ class RewardFarmer:
                 except Exception as e:
                     log.debug(f"YES order failed {ms.question[:25]}: {e}")
 
-        # Place NO ask
-        if self._can_place(ms.cid, "no", no_shares * no_clob):
+        # Place NO ask (only if exit liquidity exists)
+        if can_exit_no and self._can_place(ms.cid, "no", no_shares * no_clob):
             if self.dry_run:
                 log.info(f"[DRY] ASK NO @ {edge_ask:.3f} (clob={no_clob:.3f}, {no_shares:.0f}sh) | {ms.question[:30]}")
                 ms.orders["no"] = OrderSlot(order_id="dry_no", price=edge_ask, shares=no_shares, placed_at=time.time())
@@ -949,27 +968,36 @@ class RewardFarmer:
             elapsed_min = (time.time() - state["started_at"]) / 60.0
 
             # Compute decay price
-            if elapsed_min >= 5.0:
-                # Timeout — market dump using MERGED book (not single-token book)
-                # Single-token books have sparse bids (often 1¢). The merged book
-                # shows real liquidity from both sides of the market.
+            if elapsed_min >= 30.0:
+                # Hard timeout — 30 minutes. Accept the loss, clear state.
+                log.warning(f"DUMP ABANDONED {side.upper()} after 30m | {ms.question[:30]}")
+                ms.dump_state[side] = None
+                if ms.dump_orders[side]:
+                    self._cancel_order(ms.dump_orders[side], reason="dump_30m_timeout")
+                    ms.dump_orders[side] = None
+                return
+
+            elif elapsed_min >= 5.0:
+                # Past aggressive decay — switch to passive mode.
+                # Reprice to merged book fair price every 5 minutes.
+                last_passive = state.get("last_passive_reprice", 5.0)
+                if elapsed_min - last_passive < 5.0:
+                    return  # keep current SELL alive, don't reprice yet
+                state["last_passive_reprice"] = elapsed_min
+
                 merged = get_merged_book(self.client, ms.yes_tid, ms.no_tid)
                 if not merged or not merged["bids"] or not merged["asks"]:
                     ms.dump_failures += 1
                     return
 
                 if side == "yes":
-                    # Selling YES: use merged book best bid (people buying YES)
                     sell_price = float(merged["bids"][0]["price"])
                 else:
-                    # Selling NO: merged book best ask = price at which YES is offered
-                    # Someone offering YES at X will buy NO at (1-X)
-                    # Our NO SELL CLOB price = (1 - merged_best_ask)
                     best_yes_ask = float(merged["asks"][0]["price"])
                     sell_price = round(1.0 - best_yes_ask, 4)
 
                 sell_price = max(0.01, sell_price)
-                log.info(f"DUMP TIMEOUT {side.upper()} → merged book sell @ {sell_price:.4f} | {ms.question[:30]}")
+                log.info(f"DUMP PASSIVE {side.upper()} @ {sell_price:.4f} ({elapsed_min:.0f}m) | {ms.question[:30]}")
             else:
                 # Decay: fill_price - (1 + elapsed_minutes) ticks
                 decay_ticks = 1 + int(elapsed_min)
