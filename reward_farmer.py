@@ -115,8 +115,8 @@ def _verify_order_books(markets: list[dict]) -> list[dict]:
                 if dt <= cutoff:
                     log.debug(f"  Skip (resolves <12h): {m['question'][:40]}")
                     continue
-            except Exception:
-                pass  # unparseable date — don't skip on that basis
+            except Exception as e:
+                log.debug(f"  Date parse error for {m['question'][:30]}: {e}")
 
         # ── Order book depth check: the ground truth ──
         yes_tid = m["token_ids"][0]
@@ -127,10 +127,12 @@ def _verify_order_books(markets: list[dict]) -> list[dict]:
                 timeout=10,
             )
             if resp.status_code != 200:
-                continue  # can't verify → don't trade
+                log.debug(f"  Book fetch {resp.status_code}: {m['question'][:30]}")
+                continue
             book = resp.json()
-        except Exception:
-            continue  # can't verify → don't trade
+        except Exception as e:
+            log.debug(f"  Book fetch error: {m['question'][:30]}: {e}")
+            continue
 
         bids = book.get("bids", [])
         asks = book.get("asks", [])
@@ -193,7 +195,8 @@ def fetch_all_reward_markets() -> list[dict]:
                 timeout=15,
             )
             batch = resp.json()
-        except Exception:
+        except Exception as e:
+            log.debug(f"  Gamma fetch failed at offset {offset}: {e}")
             break
         if not batch:
             break
@@ -224,8 +227,8 @@ def fetch_all_reward_markets() -> list[dict]:
             try:
                 prices = json.loads(g.get("outcomePrices") or "[]")
                 yes_price = float(prices[0]) if prices else None
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug(f"  Price parse error: {g.get('question','')[:30]}: {e}")
             liq = float(g.get("liquidityNum") or 0)
             vol = float(g.get("volume24hrClob") or 0)
             question = g.get("question", "")
@@ -254,7 +257,8 @@ def fetch_all_reward_markets() -> list[dict]:
                 end_date_iso = mkt.get("end_date_iso")
                 liq = 999999.0  # placeholder — will be replaced by _verify_order_books()
                 vol = 0.0
-            except Exception:
+            except Exception as e:
+                log.debug(f"  CLOB market fetch failed {cid[:16]}: {e}")
                 continue
 
         merged.append({
@@ -319,7 +323,8 @@ def get_merged_book(client, yes_tid: str, no_tid: str) -> dict | None:
             "bids": [{"price": p, "size": s} for p, s in all_bids],
             "asks": [{"price": p, "size": s} for p, s in all_asks],
         }
-    except Exception:
+    except Exception as e:
+        log.debug(f"Merged book fetch error: {e}")
         return None
 
 
@@ -372,11 +377,13 @@ class RewardFarmer:
         # Market state
         self.markets: dict[str, MarketState] = {}  # cid → MarketState
         self.all_market_data: list[dict] = []       # raw market dicts from fetcher
+        self._market_lock = threading.Lock()        # protects all_market_data + _pending_market_data
 
         # Cycle state
         self.cycle_count = 0
         self._batch_idx = 0
         self._shutdown = False
+        self._pending_market_data: list[dict] | None = None
         self._last_market_refresh = 0.0
         self._last_reconcile = 0.0
         self._last_reward_log = 0.0
@@ -522,7 +529,8 @@ class RewardFarmer:
                     try:
                         status = self.client.get_order(dump_oid)
                         dump_status = status.get("status", "UNKNOWN")
-                    except Exception:
+                    except Exception as e:
+                        log.debug(f"Dump order status check failed {dump_oid[:16]}: {e}")
                         dump_status = "UNKNOWN"
 
                     if dump_status == "MATCHED":
@@ -602,7 +610,8 @@ class RewardFarmer:
                         status = self.client.get_order(slot.order_id)
                         order_status = status.get("status", "UNKNOWN")
                         matched = float(status.get("size_matched", 0))
-                    except Exception:
+                    except Exception as e:
+                        log.debug(f"BUY order status check failed {slot.order_id[:16]}: {e}")
                         order_status = "UNKNOWN"
                         matched = 0
 
@@ -763,23 +772,23 @@ class RewardFarmer:
         ms = self.markets.get(cid)
         if not ms:
             return False
-        # Already have a BUY order on this side
         if ms.orders[side].order_id:
+            log.debug(f"Skip {side} {ms.question[:20]}: already have order")
             return False
-        # Have a pending dump SELL on this side
         if ms.dump_orders[side]:
+            log.debug(f"Skip {side} {ms.question[:20]}: dump pending")
             return False
-        # Have inventory on this side (need to dump first)
         if self.positions.get_shares(cid, side) > 1:
+            log.debug(f"Skip {side} {ms.question[:20]}: have inventory")
             return False
-        # Position halted
         if not self.positions.can_quote(cid, side):
+            log.debug(f"Skip {side} {ms.question[:20]}: halted")
             return False
-        # Too many dump failures on this market
         if ms.dump_failures >= 3:
+            log.debug(f"Skip {side} {ms.question[:20]}: 3+ dump failures")
             return False
-        # Portfolio exposure limit
         if self._total_exposure() > MAX_TOTAL_EXPOSURE:
+            log.debug(f"Skip {side} {ms.question[:20]}: exposure limit")
             return False
         return True
 
@@ -913,7 +922,8 @@ class RewardFarmer:
                     log.warning(f"Skip dump {side}: want {shares:.0f} but only {actual_balance:.0f} on exchange | {ms.question[:30]}")
                     ms.dump_failures += 1
                     return
-            except Exception:
+            except Exception as e:
+                log.debug(f"Balance check failed for dump {side}: {e}")
                 dump_shares = shares
 
             # Initialize dump state if first attempt
@@ -1036,24 +1046,43 @@ class RewardFarmer:
                     def _bg_refresh():
                         try:
                             new_data = fetch_all_reward_markets()
-                            self._pending_market_data = new_data
+                            with self._market_lock:
+                                self._pending_market_data = new_data
                         except Exception as e:
                             log.warning(f"Background market refresh failed: {e}")
                     self._refresh_thread = threading.Thread(target=_bg_refresh, daemon=True)
                     self._refresh_thread.start()
                     self._last_market_refresh = time.time()
 
-            # Apply pending market data from background refresh
-            if hasattr(self, '_pending_market_data') and self._pending_market_data:
-                self.all_market_data = self._pending_market_data
-                self._pending_market_data = None
+            # Apply pending market data from background refresh (thread-safe)
+            with self._market_lock:
+                if self._pending_market_data is not None:
+                    self.all_market_data = self._pending_market_data
+                    self._pending_market_data = None
+                    apply_now = True
+                else:
+                    apply_now = False
+            if apply_now:
                 self._apply_market_changes()
 
             # Run cycle
+            cycle_t0 = time.time()
             try:
                 self.run_cycle()
             except Exception as e:
                 log.error(f"Cycle error: {e}")
+            cycle_duration = time.time() - cycle_t0
+
+            # Log cycle metrics every 10 cycles
+            if self.cycle_count % 10 == 0 and self.cycle_count > 0:
+                on_book = sum(1 for ms in self.markets.values()
+                              if ms.orders["yes"].order_id or ms.orders["no"].order_id)
+                active_dumps = sum(1 for ms in self.markets.values()
+                                   if ms.dump_orders["yes"] or ms.dump_orders["no"])
+                log.info(
+                    f"[metrics] cycle={self.cycle_count} | {cycle_duration:.1f}s | "
+                    f"on_book={on_book}/{len(self.markets)} | dumps={active_dumps}"
+                )
 
             # Hourly reward log
             if time.time() - self._last_reward_log >= 3600:
