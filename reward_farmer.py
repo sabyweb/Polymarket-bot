@@ -823,6 +823,12 @@ class RewardFarmer:
             market_question=ms.question,
         )
 
+        # Capture fill price BEFORE slot might be cleared
+        # _dump_position needs this to compute decay start price
+        if not hasattr(ms, '_last_fill_price'):
+            ms._last_fill_price = {}
+        ms._last_fill_price[side] = fill_price  # YES-equivalent price
+
         # Try merge first
         yes_shares = self.positions.get_shares(cid, "yes")
         no_shares = self.positions.get_shares(cid, "no")
@@ -908,7 +914,15 @@ class RewardFarmer:
             # Initialize dump state if first attempt
             if ms.dump_state[side] is None:
                 from price import to_clob
-                fill_price_clob = to_clob(ms.orders[side].price, side) if ms.orders[side].price > 0 else 0
+                # Use captured fill price (set in _handle_fill before slot cleared)
+                # Fall back to slot price, then 0
+                fill_price_yes_equiv = 0
+                if hasattr(ms, '_last_fill_price') and ms._last_fill_price.get(side, 0) > 0:
+                    fill_price_yes_equiv = ms._last_fill_price[side]
+                elif ms.orders[side].price > 0:
+                    fill_price_yes_equiv = ms.orders[side].price
+
+                fill_price_clob = to_clob(fill_price_yes_equiv, side) if fill_price_yes_equiv > 0 else 0
                 ms.dump_state[side] = {
                     "fill_price": fill_price_clob,
                     "started_at": time.time(),
@@ -921,13 +935,26 @@ class RewardFarmer:
 
             # Compute decay price
             if elapsed_min >= 5.0:
-                # Timeout — market dump at best bid
-                book = self.client.get_order_book(tid)
-                if not book or not book.bids:
+                # Timeout — market dump using MERGED book (not single-token book)
+                # Single-token books have sparse bids (often 1¢). The merged book
+                # shows real liquidity from both sides of the market.
+                merged = get_merged_book(self.client, ms.yes_tid, ms.no_tid)
+                if not merged or not merged["bids"] or not merged["asks"]:
                     ms.dump_failures += 1
                     return
-                sell_price = float(book.bids[0].price)
-                log.info(f"DUMP TIMEOUT {side.upper()} → market sell @ {sell_price:.4f} | {ms.question[:30]}")
+
+                if side == "yes":
+                    # Selling YES: use merged book best bid (people buying YES)
+                    sell_price = float(merged["bids"][0]["price"])
+                else:
+                    # Selling NO: merged book best ask = price at which YES is offered
+                    # Someone offering YES at X will buy NO at (1-X)
+                    # Our NO SELL CLOB price = (1 - merged_best_ask)
+                    best_yes_ask = float(merged["asks"][0]["price"])
+                    sell_price = round(1.0 - best_yes_ask, 4)
+
+                sell_price = max(0.01, sell_price)
+                log.info(f"DUMP TIMEOUT {side.upper()} → merged book sell @ {sell_price:.4f} | {ms.question[:30]}")
             else:
                 # Decay: fill_price - (1 + elapsed_minutes) ticks
                 decay_ticks = 1 + int(elapsed_min)
