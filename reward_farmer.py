@@ -423,11 +423,76 @@ class RewardFarmer:
         self.all_market_data = fetch_all_reward_markets()
         self._apply_market_changes()
 
+    def _load_allocations(self) -> list[dict] | None:
+        """Load oversight agent allocations if available and fresh.
+
+        Returns list of "deploy" market dicts, or None if:
+        - File doesn't exist (agent not running)
+        - File is stale (> 2 hours old)
+        - File is corrupt
+        """
+        alloc_path = os.path.join(
+            os.path.dirname(__file__) or ".", "market_allocations.json"
+        )
+        try:
+            if not os.path.exists(alloc_path):
+                return None
+
+            with open(alloc_path) as f:
+                data = json.load(f)
+
+            # Check freshness
+            generated_at = data.get("generated_at", "")
+            if generated_at:
+                from datetime import datetime, timezone, timedelta
+                gen_dt = datetime.fromisoformat(generated_at)
+                age = datetime.now(timezone.utc) - gen_dt
+                if age > timedelta(hours=2):
+                    log.debug("Allocation file stale (>2h) — using default logic")
+                    return None
+
+            # Extract deploy markets
+            deploy = [m for m in data.get("markets", []) if m.get("action") == "deploy"]
+            if not deploy:
+                return None
+
+            log.info(f"Loaded {len(deploy)} market allocations from oversight agent")
+            return deploy
+
+        except Exception as e:
+            log.debug(f"Allocation load failed: {e}")
+            return None
+
     def _apply_market_changes(self):
-        """Apply market data to active market set."""
+        """Apply market data to active market set.
+
+        If oversight agent allocations exist and are fresh, use those.
+        Otherwise fall back to default filtering logic.
+        """
+        # Check for oversight agent allocations
+        agent_alloc = self._load_allocations()
+        if agent_alloc is not None:
+            # Build eligible list from agent's recommendations
+            raw_by_cid = {m["condition_id"]: m for m in self.all_market_data}
+            eligible = []
+            for alloc in agent_alloc:
+                cid = alloc["condition_id"]
+                m = raw_by_cid.get(cid)
+                if m:
+                    # Use agent's share recommendation
+                    m["_agent_shares"] = alloc.get("shares_per_side", SHARES_PER_SIDE)
+                    eligible.append(m)
+                else:
+                    log.debug(f"Agent market {cid[:16]} not in market data — skipping")
+
+            log.info(f"Using agent allocations: {len(eligible)} markets")
+            # Skip default filtering — go straight to market state update
+            self._update_market_states(eligible)
+            return
+
         raw = self.all_market_data
 
-        # Filter for our strategy
+        # Default filtering (when no agent)
         eligible = []
         for m in raw:
             if m["daily_rate"] < MIN_DAILY_RATE:
@@ -451,7 +516,10 @@ class RewardFarmer:
         )
         eligible = eligible[:MAX_MARKETS]
 
-        # Update market states
+        self._update_market_states(eligible)
+
+    def _update_market_states(self, eligible: list[dict]):
+        """Update active market set from eligible list. Shared by default + agent paths."""
         new_cids = {m["condition_id"] for m in eligible}
         old_cids = set(self.markets.keys())
 
@@ -459,13 +527,11 @@ class RewardFarmer:
         for cid in old_cids - new_cids:
             ms = self.markets[cid]
             log.info(f"Dropping market: {ms.question[:40]}")
-            # Cancel active orders
             for side in ["yes", "no"]:
                 oid = ms.orders[side].order_id
                 if oid:
                     self._cancel_order(oid, reason="market_removed")
                     ms.orders[side].order_id = None
-            # Dump any position
             for side in ["yes", "no"]:
                 shares = self.positions.get_shares(cid, side)
                 if shares > 1:
