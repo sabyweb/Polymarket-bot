@@ -31,56 +31,155 @@ class MarketMetrics:
 
 
 def fetch_actual_rewards() -> dict[str, float]:
-    """Query actual earned rewards from Polymarket API.
+    """Fetch actual reward payouts from Polymarket Data API.
 
-    Returns {condition_id: total_earned_usd}. Empty dict on failure.
+    Polymarket pays rewards as daily lump sums (no per-market breakdown in the API).
+    This returns an empty dict for per-market data, but the daily totals are used
+    by fetch_reward_correction_factor() to calibrate Q-score estimates.
+
+    Returns: empty dict (per-market data not available from API).
+    """
+    # Per-market reward data is not available from any API.
+    # Rewards are paid as lump sums with conditionId="".
+    # Use fetch_reward_correction_factor() for estimate calibration instead.
+    return {}
+
+
+def fetch_reward_correction_factor(hours: float = 24) -> float:
+    """Compute correction factor: actual_daily_payout / estimated_daily_total.
+
+    Fetches actual reward payouts from Data API (lump sums), computes total
+    paid in the lookback window, and returns a scaling factor for Q-score estimates.
+
+    Returns:
+        Correction factor (e.g. 0.5 means estimates are 2× too high).
+        Returns 1.0 if no data available (no correction).
     """
     import requests
 
-    api_key = os.getenv("CLOB_API_KEY", "")
-    secret = os.getenv("CLOB_SECRET", "")
-    passphrase = os.getenv("CLOB_PASS_PHRASE", "")
-
-    if not api_key:
-        log.warning("No CLOB_API_KEY — skipping rewards API")
-        return {}
+    # Use FUNDER address (that's where rewards are paid)
+    funder = os.getenv("FUNDER", "")
+    if not funder:
+        # Fall back to WALLET_ADDRESS
+        funder = os.getenv("WALLET_ADDRESS", "")
+    if not funder:
+        log.debug("No FUNDER or WALLET_ADDRESS — cannot compute correction factor")
+        return 1.0
 
     try:
-        headers = {
-            "POLY_API_KEY": api_key,
-            "POLY_SECRET": secret,
-            "POLY_PASSPHRASE": passphrase,
-        }
-        resp = requests.get(
-            "https://clob.polymarket.com/rewards/earned",
-            headers=headers,
-            timeout=10,
-        )
-        if resp.status_code != 200:
-            log.debug(f"Rewards API returned {resp.status_code}")
-            return {}
+        cutoff_ts = time.time() - hours * 3600
+        total_paid = 0.0
+        offset = 0
+        limit = 500
+        payout_count = 0
 
-        data = resp.json()
-        result: dict[str, float] = {}
+        while True:
+            resp = requests.get(
+                "https://data-api.polymarket.com/activity",
+                params={
+                    "user": funder,
+                    "type": "REWARD",
+                    "limit": limit,
+                    "offset": offset,
+                },
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                break
 
-        if isinstance(data, dict):
-            for item in data.get("markets", []):
-                cid = item.get("condition_id", "")
-                earned = float(item.get("earned", 0))
-                if cid and earned > 0:
-                    result[cid] = earned
-        elif isinstance(data, list):
+            data = resp.json()
+            if not data:
+                break
+
             for item in data:
-                cid = item.get("condition_id", "")
-                earned = float(item.get("earned", 0))
-                if cid and earned > 0:
-                    result[cid] = earned
+                ts = float(item.get("timestamp", 0))
+                if ts < cutoff_ts:
+                    continue
+                amount = float(item.get("usdcSize", 0) or item.get("amount", 0))
+                if amount > 0:
+                    total_paid += amount
+                    payout_count += 1
 
-        log.info(f"Rewards API: {len(result)} markets, ${sum(result.values()):.2f} total")
+            if len(data) < limit:
+                break
+            offset += limit
+            time.sleep(0.2)
+
+        if total_paid > 0:
+            log.info(
+                f"Reward correction: ${total_paid:.2f} paid in {payout_count} payouts "
+                f"over {hours:.0f}h"
+            )
+        else:
+            log.debug(f"No reward payouts found in {hours:.0f}h window")
+
+        return total_paid  # Return raw total; caller computes the factor
+
+    except Exception as e:
+        log.warning(f"Reward correction factor fetch failed: {e}")
+        return 0.0
+
+
+def query_per_market_pnl(db_path: str, hours: float = 24) -> dict[str, dict]:
+    """Query per-market realized P&L from fills, unwinds, and merges.
+
+    Returns {condition_id: {"fill_cost": float, "dump_revenue": float,
+                            "merge_revenue": float, "net_trading_pnl": float}}.
+    """
+    cutoff = time.time() - hours * 3600
+    try:
+        db = sqlite3.connect(db_path, timeout=5)
+        db.row_factory = sqlite3.Row
+
+        # Aggregate fills
+        fills = {}
+        for r in db.execute(
+            """SELECT condition_id,
+                      SUM(CASE WHEN side='yes' THEN shares*price ELSE shares*clob_cost END) as cost,
+                      COUNT(*) as cnt
+               FROM fills WHERE ts > ? GROUP BY condition_id""",
+            (cutoff,),
+        ).fetchall():
+            fills[r["condition_id"]] = {"cost": r["cost"] or 0, "count": r["cnt"] or 0}
+
+        # Aggregate unwinds (dumps)
+        unwinds = {}
+        for r in db.execute(
+            """SELECT condition_id, SUM(usd_value) as revenue
+               FROM unwinds WHERE ts > ? GROUP BY condition_id""",
+            (cutoff,),
+        ).fetchall():
+            unwinds[r["condition_id"]] = r["revenue"] or 0
+
+        # Aggregate merges
+        merges = {}
+        for r in db.execute(
+            """SELECT condition_id, SUM(shares) as merged_shares
+               FROM merges WHERE ts > ? GROUP BY condition_id""",
+            (cutoff,),
+        ).fetchall():
+            # Each merged share returns $1.00
+            merges[r["condition_id"]] = r["merged_shares"] or 0
+
+        db.close()
+
+        # Combine
+        all_cids = set(fills.keys()) | set(unwinds.keys()) | set(merges.keys())
+        result = {}
+        for cid in all_cids:
+            fill_cost = fills.get(cid, {}).get("cost", 0)
+            dump_rev = unwinds.get(cid, 0)
+            merge_rev = merges.get(cid, 0)
+            result[cid] = {
+                "fill_cost": fill_cost,
+                "dump_revenue": dump_rev,
+                "merge_revenue": merge_rev,
+                "net_trading_pnl": dump_rev + merge_rev - fill_cost,
+            }
         return result
 
     except Exception as e:
-        log.warning(f"Rewards API failed: {e}")
+        log.warning(f"Per-market P&L query failed: {e}")
         return {}
 
 
@@ -208,10 +307,39 @@ def query_reward_stats(db_path: str) -> dict[str, dict]:
         return {}
 
 
+def compute_available_capital(db_path: str, total_capital: float = 1500.0) -> float:
+    """Compute available capital by subtracting locked positions AND pending dumps.
+
+    Returns actual deployable capital (never negative, floors at 0).
+    """
+    positions = query_positions(db_path)
+    locked_positions = sum(p["total"] for p in positions.values())
+
+    # Also count capital locked in pending dumps
+    locked_dumps = 0.0
+    try:
+        db = sqlite3.connect(db_path, timeout=5)
+        db.row_factory = sqlite3.Row
+        rows = db.execute("SELECT shares, fill_price FROM dump_states").fetchall()
+        db.close()
+        for r in rows:
+            locked_dumps += r["shares"] * r["fill_price"]
+    except Exception:
+        pass  # table may not exist yet
+
+    locked = locked_positions + locked_dumps
+    available = max(0, total_capital - locked)
+    log.info(
+        f"Capital: ${total_capital:.0f} total - ${locked_positions:.0f} positions "
+        f"- ${locked_dumps:.0f} dumps = ${available:.0f} available"
+    )
+    return available
+
+
 def collect_all(
     db_path: str = "bot_history.db",
     hours: float = 24,
-) -> list[MarketMetrics]:
+) -> tuple[list[MarketMetrics], float]:
     """Main entry. Cross-references all data sources into per-market metrics.
 
     Args:
@@ -219,10 +347,13 @@ def collect_all(
         hours: Lookback window for fill/dump data
 
     Returns:
-        List of MarketMetrics, one per known market.
+        Tuple of (list of MarketMetrics, reward_correction_factor).
+        correction_factor: actual_daily / estimated_daily. Use to scale Q-score estimates.
+        Returns 1.0 if actual payout data is unavailable.
     """
     # Gather from all sources
-    actual_rewards = fetch_actual_rewards()
+    actual_rewards = fetch_actual_rewards()  # empty (per-market not available)
+    actual_daily_total = fetch_reward_correction_factor(hours)
     fills = query_fill_costs(db_path, hours)
     dumps = query_dump_revenue(db_path, hours)
     positions = query_positions(db_path)
@@ -265,8 +396,27 @@ def collect_all(
             q_share_pct=stat_data.get("q_share", 0),
         ))
 
+    # Compute correction factor: actual total paid / sum of estimates
+    estimated_daily_total = sum(
+        m.daily_rate * m.q_share_pct for m in metrics if m.q_share_pct > 0
+    )
+    correction_factor = 1.0
+    if actual_daily_total > 0 and estimated_daily_total > 0:
+        # Scale to daily if window != 24h
+        actual_per_day = actual_daily_total / max(hours / 24, 0.1)
+        correction_factor = actual_per_day / estimated_daily_total
+        correction_factor = max(0.1, min(10.0, correction_factor))  # clamp to reasonable range
+        log.info(
+            f"Reward correction: actual=${actual_per_day:.2f}/d vs "
+            f"estimated=${estimated_daily_total:.2f}/d → factor={correction_factor:.2f}"
+        )
+    elif actual_daily_total > 0:
+        log.info(f"Reward correction: actual=${actual_daily_total:.2f} but no estimates to compare")
+    else:
+        log.debug("No actual reward data — using estimates at face value (factor=1.0)")
+
     log.info(
         f"Collected metrics for {len(metrics)} markets | "
-        f"rewards={len(actual_rewards)} fills={len(fills)} positions={len(positions)}"
+        f"fills={len(fills)} positions={len(positions)} correction={correction_factor:.2f}"
     )
-    return metrics
+    return metrics, correction_factor

@@ -15,7 +15,6 @@ from .market_scorer import ScoredMarket
 log = logging.getLogger("oversight.allocator")
 
 # Capital constraints
-TOTAL_CAPITAL_LIMIT = 1500.0
 MAX_PER_MARKET = 200.0
 DEFAULT_SHARES = 50
 MIN_SHARES = 20
@@ -24,7 +23,7 @@ EST_PRICE_PER_SHARE = 0.30  # rough average for capital estimation
 
 def compute_allocations(
     scored_markets: list[ScoredMarket],
-    total_capital: float = TOTAL_CAPITAL_LIMIT,
+    total_capital: float = 1500.0,
     max_per_market: float = MAX_PER_MARKET,
 ) -> list[dict]:
     """Apply capital constraints and compute final allocations.

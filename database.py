@@ -198,6 +198,52 @@ CREATE TABLE IF NOT EXISTS market_selection_log (
     liquidity       REAL    NOT NULL DEFAULT 0
 );
 
+-- Market performance snapshots (adaptive agent tracking)
+CREATE TABLE IF NOT EXISTS market_performance (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts              REAL    NOT NULL,
+    condition_id    TEXT    NOT NULL,
+    question        TEXT    NOT NULL DEFAULT '',
+    window_hours    REAL    NOT NULL DEFAULT 24,
+    estimated_daily REAL    NOT NULL DEFAULT 0,
+    correction_factor REAL  NOT NULL DEFAULT 1.0,
+    corrected_daily REAL    NOT NULL DEFAULT 0,
+    fill_cost       REAL    NOT NULL DEFAULT 0,
+    dump_revenue    REAL    NOT NULL DEFAULT 0,
+    net_score       REAL    NOT NULL DEFAULT 0,
+    action          TEXT    NOT NULL DEFAULT 'deploy',
+    q_share_pct     REAL    NOT NULL DEFAULT 0,
+    on_book_hours   REAL    NOT NULL DEFAULT 0,
+    fill_count      INTEGER NOT NULL DEFAULT 0,
+    shares_recommended INTEGER NOT NULL DEFAULT 50
+);
+CREATE INDEX IF NOT EXISTS idx_mp_cid ON market_performance(condition_id);
+CREATE INDEX IF NOT EXISTS idx_mp_ts ON market_performance(ts);
+
+-- Active dump state (persisted for crash recovery)
+CREATE TABLE IF NOT EXISTS dump_states (
+    condition_id TEXT NOT NULL,
+    side         TEXT NOT NULL,
+    fill_price   REAL NOT NULL,
+    started_at   REAL NOT NULL,
+    shares       REAL NOT NULL,
+    tid          TEXT NOT NULL,
+    dump_order_id TEXT DEFAULT '',
+    last_passive_reprice REAL DEFAULT 0,
+    PRIMARY KEY (condition_id, side)
+);
+
+-- Active orders placed by the bot (persisted for crash recovery)
+CREATE TABLE IF NOT EXISTS active_orders (
+    order_id     TEXT PRIMARY KEY,
+    condition_id TEXT NOT NULL,
+    side         TEXT NOT NULL,
+    order_type   TEXT NOT NULL DEFAULT 'buy',
+    price        REAL NOT NULL,
+    shares       REAL NOT NULL,
+    placed_at    REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_fills_cid ON fills(condition_id);
 CREATE INDEX IF NOT EXISTS idx_fills_ts ON fills(ts);
 CREATE INDEX IF NOT EXISTS idx_unwinds_cid ON unwinds(condition_id);
@@ -936,6 +982,190 @@ class BotDatabase:
             log.debug(f"DB get_fill_quality error: {e}")
             return {"total_fills": 0, "avg_slippage": 0, "adverse_pct": 0,
                     "total_adverse_usd": 0, "per_market": []}
+
+    # ── Market Performance Tracking (adaptive agent) ──────────────────
+
+    def save_performance_snapshot(self, snapshot: dict) -> None:
+        """Write a single market performance snapshot."""
+        try:
+            self._get_conn().execute(
+                """INSERT INTO market_performance
+                   (ts, condition_id, question, window_hours, estimated_daily,
+                    correction_factor, corrected_daily, fill_cost, dump_revenue,
+                    net_score, action, q_share_pct, on_book_hours, fill_count,
+                    shares_recommended)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (snapshot["ts"], snapshot["condition_id"], snapshot.get("question", ""),
+                 snapshot.get("window_hours", 24), snapshot.get("estimated_daily", 0),
+                 snapshot.get("correction_factor", 1.0), snapshot.get("corrected_daily", 0),
+                 snapshot.get("fill_cost", 0), snapshot.get("dump_revenue", 0),
+                 snapshot.get("net_score", 0), snapshot.get("action", "deploy"),
+                 snapshot.get("q_share_pct", 0), snapshot.get("on_book_hours", 0),
+                 snapshot.get("fill_count", 0), snapshot.get("shares_recommended", 50)),
+            )
+            self._get_conn().commit()
+        except Exception as e:
+            log.debug(f"save_performance_snapshot error: {e}")
+
+    def save_performance_batch(self, snapshots: list[dict]) -> None:
+        """Write multiple performance snapshots in one transaction."""
+        if not snapshots:
+            return
+        try:
+            conn = self._get_conn()
+            conn.executemany(
+                """INSERT INTO market_performance
+                   (ts, condition_id, question, window_hours, estimated_daily,
+                    correction_factor, corrected_daily, fill_cost, dump_revenue,
+                    net_score, action, q_share_pct, on_book_hours, fill_count,
+                    shares_recommended)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [(s["ts"], s["condition_id"], s.get("question", ""),
+                  s.get("window_hours", 24), s.get("estimated_daily", 0),
+                  s.get("correction_factor", 1.0), s.get("corrected_daily", 0),
+                  s.get("fill_cost", 0), s.get("dump_revenue", 0),
+                  s.get("net_score", 0), s.get("action", "deploy"),
+                  s.get("q_share_pct", 0), s.get("on_book_hours", 0),
+                  s.get("fill_count", 0), s.get("shares_recommended", 50))
+                 for s in snapshots],
+            )
+            conn.commit()
+            log.debug(f"Saved {len(snapshots)} performance snapshots")
+        except Exception as e:
+            log.debug(f"save_performance_batch error: {e}")
+
+    def get_market_performance_history(
+        self, condition_id: str, days: int = 7
+    ) -> list[dict]:
+        """Get performance history for a specific market over N days."""
+        cutoff = time.time() - days * 86400
+        try:
+            rows = self._get_conn().execute(
+                """SELECT * FROM market_performance
+                   WHERE condition_id = ? AND ts > ?
+                   ORDER BY ts DESC""",
+                (condition_id, cutoff),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        except Exception as e:
+            log.debug(f"get_market_performance_history error: {e}")
+            return []
+
+    def get_performance_summary(self, days: int = 7) -> dict:
+        """Get aggregate performance summary across all markets."""
+        cutoff = time.time() - days * 86400
+        try:
+            row = self._get_conn().execute(
+                """SELECT
+                    COUNT(DISTINCT condition_id) as unique_markets,
+                    COUNT(*) as total_snapshots,
+                    AVG(correction_factor) as avg_correction,
+                    SUM(CASE WHEN action='deploy' THEN 1 ELSE 0 END) as deploy_decisions,
+                    SUM(CASE WHEN action='avoid' THEN 1 ELSE 0 END) as avoid_decisions,
+                    AVG(net_score) as avg_score,
+                    SUM(fill_cost) as total_fill_cost,
+                    SUM(dump_revenue) as total_dump_revenue
+                   FROM market_performance WHERE ts > ?""",
+                (cutoff,),
+            ).fetchone()
+            return dict(row) if row else {}
+        except Exception as e:
+            log.debug(f"get_performance_summary error: {e}")
+            return {}
+
+    # ── Dump State Persistence (crash recovery) ───────────────────────
+
+    def save_dump_state(self, condition_id: str, side: str, state: dict) -> None:
+        """Persist a dump state for crash recovery."""
+        try:
+            self._get_conn().execute(
+                """INSERT OR REPLACE INTO dump_states
+                   (condition_id, side, fill_price, started_at, shares, tid,
+                    dump_order_id, last_passive_reprice)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (condition_id, side, state["fill_price"], state["started_at"],
+                 state["shares"], state["tid"],
+                 state.get("dump_order_id", ""),
+                 state.get("last_passive_reprice", 0)),
+            )
+            self._get_conn().commit()
+        except Exception as e:
+            log.debug(f"save_dump_state error: {e}")
+
+    def load_all_dump_states(self) -> dict[str, dict]:
+        """Load all saved dump states. Returns {(cid, side): state_dict}."""
+        try:
+            rows = self._get_conn().execute("SELECT * FROM dump_states").fetchall()
+            result = {}
+            for r in rows:
+                key = (r["condition_id"], r["side"])
+                result[key] = {
+                    "fill_price": r["fill_price"],
+                    "started_at": r["started_at"],
+                    "shares": r["shares"],
+                    "tid": r["tid"],
+                    "dump_order_id": r["dump_order_id"],
+                    "last_passive_reprice": r["last_passive_reprice"],
+                }
+            return result
+        except Exception as e:
+            log.debug(f"load_all_dump_states error: {e}")
+            return {}
+
+    def delete_dump_state(self, condition_id: str, side: str) -> None:
+        """Remove a dump state after dump completes or is abandoned."""
+        try:
+            self._get_conn().execute(
+                "DELETE FROM dump_states WHERE condition_id = ? AND side = ?",
+                (condition_id, side),
+            )
+            self._get_conn().commit()
+        except Exception as e:
+            log.debug(f"delete_dump_state error: {e}")
+
+    # ── Active Order Persistence (crash recovery) ────────────────────
+
+    def save_active_order(self, order_id: str, condition_id: str, side: str,
+                          order_type: str, price: float, shares: float) -> None:
+        """Persist an active order for crash recovery."""
+        try:
+            self._get_conn().execute(
+                """INSERT OR REPLACE INTO active_orders
+                   (order_id, condition_id, side, order_type, price, shares, placed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (order_id, condition_id, side, order_type, price, shares, time.time()),
+            )
+            self._get_conn().commit()
+        except Exception as e:
+            log.debug(f"save_active_order error: {e}")
+
+    def load_active_orders(self) -> list[dict]:
+        """Load all saved active orders."""
+        try:
+            rows = self._get_conn().execute("SELECT * FROM active_orders").fetchall()
+            return [dict(r) for r in rows]
+        except Exception as e:
+            log.debug(f"load_active_orders error: {e}")
+            return []
+
+    def delete_active_order(self, order_id: str) -> None:
+        """Remove an active order after it fills or is cancelled."""
+        try:
+            self._get_conn().execute(
+                "DELETE FROM active_orders WHERE order_id = ?", (order_id,)
+            )
+            self._get_conn().commit()
+        except Exception as e:
+            log.debug(f"delete_active_order error: {e}")
+
+    def clear_all_active_orders(self) -> None:
+        """Clear all active orders (called on clean startup)."""
+        try:
+            self._get_conn().execute("DELETE FROM active_orders")
+            self._get_conn().execute("DELETE FROM dump_states")
+            self._get_conn().commit()
+        except Exception as e:
+            log.debug(f"clear_all_active_orders error: {e}")
 
     def close(self) -> None:
         """Close the thread-local connection."""

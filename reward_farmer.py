@@ -32,300 +32,28 @@ log = logging.getLogger("reward_farmer")
 # STRATEGY PARAMETERS (from paper testing)
 # ═══════════════════════════════════════════════════════════════════════
 
-SHARES_PER_SIDE = 50
-PLACEMENT_TICKS_INSIDE = 1
-MIN_DAILY_RATE = 10.0
-MAX_LIQUIDITY = 5000
-MAX_COST_PER_MARKET = 50.0
-MAX_MARKETS = 40
-MAX_TOTAL_EXPOSURE = 1500.0
-CYCLE_SECS = 30
-BATCH_SIZE = 5
-MARKET_REFRESH_SECS = 1800
+from config import cfg
+
+# Shorthand accessors for frequently-used parameters (hot-reloadable via cfg())
+def SHARES_PER_SIDE(): return cfg("RF_SHARES_PER_SIDE")
+def PLACEMENT_TICKS_INSIDE(): return cfg("RF_PLACEMENT_TICKS_INSIDE")
+def MIN_DAILY_RATE(): return cfg("RF_MIN_DAILY_RATE")
+def MAX_LIQUIDITY(): return cfg("RF_MAX_LIQUIDITY")
+def MAX_COST_PER_MARKET(): return cfg("RF_MAX_COST_PER_MARKET")
+def MAX_MARKETS(): return cfg("RF_MAX_MARKETS")
+def MAX_TOTAL_EXPOSURE(): return cfg("RF_MAX_TOTAL_EXPOSURE")
+def CYCLE_SECS(): return cfg("RF_CYCLE_SECS")
+def BATCH_SIZE(): return cfg("RF_BATCH_SIZE")
+def MARKET_REFRESH_SECS(): return cfg("RF_MARKET_REFRESH_SECS")
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # DATA CLASSES
 # ═══════════════════════════════════════════════════════════════════════
 
-@dataclass
-class OrderSlot:
-    order_id: str | None = None
-    price: float = 0.0
-    shares: float = 0.0
-    placed_at: float = 0.0
+from models import OrderSlot, MarketState
+from market_discovery import fetch_all_reward_markets, get_merged_book
 
-
-@dataclass
-class MarketState:
-    """Per-market tracking."""
-    cid: str
-    question: str
-    yes_tid: str
-    no_tid: str
-    daily_rate: float
-    max_spread: float
-    min_size: float
-    tick_size: float
-    yes_price: float | None
-    orders: dict = field(default_factory=lambda: {"yes": OrderSlot(), "no": OrderSlot()})
-    dump_orders: dict = field(default_factory=lambda: {"yes": None, "no": None})  # side → SELL order_id
-    dump_state: dict = field(default_factory=lambda: {"yes": None, "no": None})  # side → {"fill_price", "started_at", "shares", "tid"}
-    dump_failures: int = 0
-    unknown_count: dict = field(default_factory=lambda: {"yes": 0, "no": 0})  # consecutive UNKNOWN status counts
-    last_book_fetch: float = 0.0
-    midpoint: float = 0.0
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# MARKET DISCOVERY (from paper_trader_v2.py, proven)
-# ═══════════════════════════════════════════════════════════════════════
-
-def _verify_order_books(markets: list[dict]) -> list[dict]:
-    """Verify each candidate market has real order book depth.
-
-    Replaces unreliable liquidity values with actual on-book USD depth.
-    Filters out markets resolving within 12 hours and one-sided books.
-    This is the ground truth — no keyword filters, no price heuristics.
-    """
-    import requests
-    from datetime import datetime, timezone, timedelta
-
-    verified = []
-    now = datetime.now(timezone.utc)
-    cutoff = now + timedelta(hours=12)
-
-    for m in markets:
-        # ── Market type filter ──
-        q_lower = (m.get("question") or "").lower()
-        # Skip live event markets (real-time event pricing)
-        if " during " in q_lower:
-            log.debug(f"  Skip (live event): {m['question'][:40]}")
-            continue
-        # Skip Natural Gas — commodity markets fill aggressively, net negative
-        if "natural gas" in q_lower or "(ng)" in q_lower:
-            log.debug(f"  Skip (commodity): {m['question'][:40]}")
-            continue
-
-        # ── Expiry check: skip markets resolving within 12 hours ──
-        end_date = m.get("end_date_iso")
-        if end_date:
-            try:
-                dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
-                if dt <= cutoff:
-                    log.debug(f"  Skip (resolves <12h): {m['question'][:40]}")
-                    continue
-            except Exception as e:
-                log.debug(f"  Date parse error for {m['question'][:30]}: {e}")
-
-        # ── Order book depth check: the ground truth ──
-        yes_tid = m["token_ids"][0]
-        try:
-            resp = requests.get(
-                "https://clob.polymarket.com/book",
-                params={"token_id": yes_tid},
-                timeout=10,
-            )
-            if resp.status_code != 200:
-                log.debug(f"  Book fetch {resp.status_code}: {m['question'][:30]}")
-                continue
-            book = resp.json()
-        except Exception as e:
-            log.debug(f"  Book fetch error: {m['question'][:30]}: {e}")
-            continue
-
-        bids = book.get("bids", [])
-        asks = book.get("asks", [])
-
-        # Must have both sides to be tradeable
-        if not bids or not asks:
-            log.debug(f"  Skip (one-sided book): {m['question'][:40]}")
-            continue
-
-        # Sum top 5 levels on each side (price × size = USD depth)
-        bid_depth = sum(float(b["price"]) * float(b["size"]) for b in bids[:5])
-        ask_depth = sum(float(a["price"]) * float(a["size"]) for a in asks[:5])
-        on_book_depth = bid_depth + ask_depth
-
-        # Replace unreliable liquidity with real on-book depth
-        m["liquidity"] = on_book_depth
-
-        verified.append(m)
-        time.sleep(0.15)  # respect rate limit
-
-    log.info(f"  Verified: {len(verified)}/{len(markets)} passed order book check")
-    return verified
-
-
-def fetch_all_reward_markets() -> list[dict]:
-    """Fetch ALL reward markets from CLOB endpoint + Gamma details."""
-    import requests
-
-    log.info("  Fetching CLOB rewards (authoritative source)...")
-    clob_markets = []
-    cursor = ""
-    for _ in range(20):
-        params = {"limit": 500}
-        if cursor:
-            params["next_cursor"] = cursor
-        try:
-            resp = requests.get(
-                "https://clob.polymarket.com/rewards/markets/current",
-                params=params, timeout=15,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            log.warning(f"  CLOB rewards fetch failed: {e}")
-            break
-        items = data.get("data", [])
-        clob_markets.extend(items)
-        cursor = data.get("next_cursor", "")
-        if not cursor or not items:
-            break
-    log.info(f"  CLOB: {len(clob_markets)} reward markets")
-
-    log.info("  Fetching Gamma market details...")
-    gamma_all = []
-    for offset in range(0, 10000, 100):
-        try:
-            resp = requests.get(
-                "https://gamma-api.polymarket.com/markets",
-                params={"limit": 100, "offset": offset, "closed": "false"},
-                timeout=15,
-            )
-            batch = resp.json()
-        except Exception as e:
-            log.debug(f"  Gamma fetch failed at offset {offset}: {e}")
-            break
-        if not batch:
-            break
-        gamma_all.extend(batch)
-    log.info(f"  Gamma: {len(gamma_all)} markets")
-
-    gamma_by_cid = {m.get("conditionId", ""): m for m in gamma_all}
-
-    merged = []
-    for c in clob_markets:
-        cid = c["condition_id"]
-        rate = float(c.get("total_daily_rate") or 0)
-        if rate < MIN_DAILY_RATE:
-            continue
-        min_size = float(c.get("rewards_min_size") or 50)
-        ms_cents = float(c.get("rewards_max_spread") or 4.5)
-
-        g = gamma_by_cid.get(cid)
-        if g:
-            # ── Path A: Gamma has this market (most common) ──────
-            try:
-                token_ids = json.loads(g.get("clobTokenIds") or "[]")
-            except (json.JSONDecodeError, TypeError):
-                continue
-            if len(token_ids) < 2:
-                continue
-            yes_price = None
-            try:
-                prices = json.loads(g.get("outcomePrices") or "[]")
-                yes_price = float(prices[0]) if prices else None
-            except Exception as e:
-                log.debug(f"  Price parse error: {g.get('question','')[:30]}: {e}")
-            liq = float(g.get("liquidityNum") or 0)
-            vol = float(g.get("volume24hrClob") or 0)
-            question = g.get("question", "")
-            tick = float(g.get("orderPriceMinTickSize") or 0.01)
-            end_date_iso = g.get("endDateIso") or g.get("end_date_iso")
-        else:
-            # ── Path B: Gamma doesn't have it — fetch from CLOB directly ──
-            # This unlocks weather/daily/niche markets invisible to Gamma
-            if rate < MIN_DAILY_RATE:
-                continue
-            try:
-                mkt_resp = requests.get(
-                    f"https://clob.polymarket.com/markets/{cid}",
-                    timeout=10,
-                )
-                if mkt_resp.status_code != 200:
-                    continue
-                mkt = mkt_resp.json()
-                tokens_data = mkt.get("tokens", [])
-                if len(tokens_data) < 2:
-                    continue
-                token_ids = [tokens_data[0]["token_id"], tokens_data[1]["token_id"]]
-                yes_price = float(tokens_data[0].get("price", 0.5))
-                question = mkt.get("question", "")
-                tick = float(mkt.get("minimum_tick_size") or 0.01)
-                end_date_iso = mkt.get("end_date_iso")
-                liq = 999999.0  # placeholder — will be replaced by _verify_order_books()
-                vol = 0.0
-            except Exception as e:
-                log.debug(f"  CLOB market fetch failed {cid[:16]}: {e}")
-                continue
-
-        merged.append({
-            "condition_id": cid,
-            "question": question,
-            "token_ids": token_ids,
-            "yes_price": yes_price,
-            "daily_rate": rate,
-            "min_size": min_size,
-            "max_spread": ms_cents / 100.0,
-            "tick_size": tick,
-            "liquidity": liq,
-            "volume_24h": vol,
-            "end_date_iso": end_date_iso,
-        })
-
-    log.info(f"  Merged: {len(merged)} candidates with rate >= ${MIN_DAILY_RATE}/day")
-
-    # ── Order book verification: the ground truth for liquidity ──
-    log.info(f"  Verifying order books for {len(merged)} candidates...")
-    merged = _verify_order_books(merged)
-
-    # Sort by liquidity ascending (lowest on-book depth = least competition = best)
-    merged.sort(key=lambda x: x["liquidity"])
-    log.info(f"  Final: {len(merged)} verified markets")
-    return merged
-
-
-def get_merged_book(client, yes_tid: str, no_tid: str) -> dict | None:
-    """Fetch YES + NO order books and merge into YES-equivalent view."""
-    try:
-        ob_yes = client.get_order_book(yes_tid)
-        if not ob_yes:
-            return None
-
-        all_bids = []
-        all_asks = []
-
-        for b in getattr(ob_yes, "bids", []):
-            all_bids.append((float(b.price), float(b.size)))
-        for a in getattr(ob_yes, "asks", []):
-            all_asks.append((float(a.price), float(a.size)))
-
-        ob_no = client.get_order_book(no_tid)
-        if ob_no:
-            for a in getattr(ob_no, "asks", []):
-                derived = round(1.0 - float(a.price), 4)
-                if derived > 0:
-                    all_bids.append((derived, float(a.size)))
-            for b in getattr(ob_no, "bids", []):
-                derived = round(1.0 - float(b.price), 4)
-                if derived < 1:
-                    all_asks.append((derived, float(b.size)))
-
-        all_bids.sort(key=lambda x: x[0], reverse=True)
-        all_asks.sort(key=lambda x: x[0])
-
-        if not all_bids or not all_asks:
-            return None
-
-        return {
-            "bids": [{"price": p, "size": s} for p, s in all_bids],
-            "asks": [{"price": p, "size": s} for p, s in all_asks],
-        }
-    except Exception as e:
-        log.debug(f"Merged book fetch error: {e}")
-        return None
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -391,29 +119,75 @@ class RewardFarmer:
     # ── Startup Reconciliation ─────────────────────────────────────
 
     def _reconcile_on_startup(self):
-        """Check for existing orders on startup. Does NOT cancel manual orders.
+        """Cancel all existing orders and verify positions on startup.
 
-        Only cancels orders that the bot itself placed in a previous run
-        (tracked via the bot's own order ID prefix pattern). Manual orders
-        placed by the user are left untouched.
+        After a crash, stale BUY orders remain on exchange and can cause
+        duplicate fills. We cancel everything — the bot re-places its own
+        orders in the first cycle. This is safe: reward farming orders are
+        tiny (50 shares) and easily re-created.
         """
         if self.dry_run:
             log.info("[DRY] Skipping startup reconciliation")
             return
 
+        # Step 1: Cancel all existing orders (start clean)
         try:
             existing = self.client.get_orders() or []
             if existing:
-                log.info(f"Found {len(existing)} existing orders on exchange (NOT cancelling — may be manual)")
-                # We don't cancel here because we can't distinguish
-                # bot orders from manual orders. The bot will only track
-                # orders it places going forward. Stale bot orders from
-                # a previous crash will sit harmlessly until they expire
-                # or get filled (and the fill will be tiny — 50 shares).
+                cancelled = 0
+                for order in existing:
+                    oid = order.get("id", "")
+                    try:
+                        self.client.cancel(oid)
+                        cancelled += 1
+                    except Exception as e:
+                        log.debug(f"Cancel failed for {oid[:16]}: {e}")
+                log.info(f"Startup: cancelled {cancelled}/{len(existing)} existing orders")
             else:
                 log.info("No existing orders found — starting clean.")
         except Exception as e:
-            log.warning(f"Startup check failed: {e}")
+            log.warning(f"Startup order check failed: {e}")
+
+        # Step 2: Position verification happens later in _reconcile_positions()
+        # after market data is loaded (we need token IDs to check balances)
+
+    def _reconcile_positions(self):
+        """Verify tracked positions against actual exchange balances.
+
+        Called after market data is loaded (need token IDs).
+        """
+        if self.dry_run:
+            return
+
+        try:
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            corrections = 0
+            for cid, ms in self.markets.items():
+                for side, tid in [("yes", ms.yes_tid), ("no", ms.no_tid)]:
+                    tracked_shares = self.positions.get_shares(cid, side)
+                    if tracked_shares < 0.5:
+                        continue
+                    try:
+                        bal = self.client.get_balance_allowance(
+                            BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=tid)
+                        )
+                        actual = float(bal.get("balance", 0)) / 1e6
+                        diff = abs(actual - tracked_shares)
+                        if diff > 1.0:
+                            log.warning(
+                                f"Position mismatch {side.upper()} {ms.question[:25]}: "
+                                f"tracked={tracked_shares:.0f} actual={actual:.0f}"
+                            )
+                            self.positions.set_shares(cid, side, actual)
+                            corrections += 1
+                    except Exception as e:
+                        log.debug(f"Balance check failed for {ms.question[:20]} {side}: {e}")
+            if corrections:
+                log.info(f"Reconciled {corrections} position mismatches")
+            else:
+                log.info("All positions match exchange balances")
+        except Exception as e:
+            log.warning(f"Position reconciliation failed: {e}")
 
     # ── Market Management ────────────────────────────────────────────
 
@@ -447,7 +221,7 @@ class RewardFarmer:
                 from datetime import datetime, timezone, timedelta
                 gen_dt = datetime.fromisoformat(generated_at)
                 age = datetime.now(timezone.utc) - gen_dt
-                if age > timedelta(hours=2):
+                if age > timedelta(hours=cfg("RF_ALLOCATION_TTL_HOURS")):
                     log.debug("Allocation file stale (>2h) — using default logic")
                     return None
 
@@ -480,14 +254,25 @@ class RewardFarmer:
                 m = raw_by_cid.get(cid)
                 if m:
                     # Use agent's share recommendation
-                    m["_agent_shares"] = alloc.get("shares_per_side", SHARES_PER_SIDE)
+                    m["_agent_shares"] = alloc.get("shares_per_side", SHARES_PER_SIDE())
                     eligible.append(m)
                 else:
                     log.debug(f"Agent market {cid[:16]} not in market data — skipping")
 
-            log.info(f"Using agent allocations: {len(eligible)} markets")
-            # Skip default filtering — go straight to market state update
-            self._update_market_states(eligible)
+            # Minimal validation — agent markets still need basic sanity checks
+            validated = []
+            for m in eligible:
+                tokens = m.get("token_ids", [])
+                if len(tokens) < 2:
+                    continue
+                yes_p = m.get("yes_price") or 0.5
+                if yes_p < 0.02 or yes_p > 0.98:
+                    log.debug(f"Agent market skipped (extreme price {yes_p}): {m.get('question', '')[:30]}")
+                    continue
+                validated.append(m)
+
+            log.info(f"Using agent allocations: {len(validated)}/{len(eligible)} markets (after validation)")
+            self._update_market_states(validated)
             return
 
         raw = self.all_market_data
@@ -495,14 +280,14 @@ class RewardFarmer:
         # Default filtering (when no agent)
         eligible = []
         for m in raw:
-            if m["daily_rate"] < MIN_DAILY_RATE:
+            if m["daily_rate"] < MIN_DAILY_RATE():
                 continue
-            if MAX_LIQUIDITY > 0 and m.get("liquidity", 0) > MAX_LIQUIDITY:
+            if MAX_LIQUIDITY() > 0 and m.get("liquidity", 0) > MAX_LIQUIDITY():
                 continue
-            if MAX_COST_PER_MARKET > 0:
+            if MAX_COST_PER_MARKET() > 0:
                 yes_p = m.get("yes_price") or 0.5
                 min_sz = m.get("min_size", 50)
-                if min_sz * max(yes_p, 1 - yes_p) > MAX_COST_PER_MARKET:
+                if min_sz * max(yes_p, 1 - yes_p) > MAX_COST_PER_MARKET():
                     continue
             tokens = m.get("token_ids", [])
             if len(tokens) < 2:
@@ -514,7 +299,7 @@ class RewardFarmer:
             key=lambda x: x["daily_rate"] / max(x.get("liquidity", 1), 1),
             reverse=True,
         )
-        eligible = eligible[:MAX_MARKETS]
+        eligible = eligible[:MAX_MARKETS()]
 
         self._update_market_states(eligible)
 
@@ -552,6 +337,7 @@ class RewardFarmer:
                     min_size=m["min_size"],
                     tick_size=m.get("tick_size", 0.01),
                     yes_price=m.get("yes_price"),
+                    agent_shares=float(m.get("_agent_shares", 0)),
                 )
                 self.positions.register_market(cid, m["question"])
 
@@ -575,19 +361,28 @@ class RewardFarmer:
         self.cycle_count += 1
 
         # ── Step 1: Fetch all exchange orders ────────────────────────
-        try:
-            exchange_orders = self.client.get_orders() or []
-        except Exception as e:
-            log.error(f"get_orders failed: {e}")
-            return
-
-        open_ids = {o["id"] for o in exchange_orders}
+        if self.dry_run:
+            exchange_orders = []
+            open_ids = set()
+        else:
+            try:
+                exchange_orders = self.client.get_orders() or []
+            except Exception as e:
+                log.error(f"get_orders failed: {e}")
+                return
+            open_ids = {o["id"] for o in exchange_orders}
 
         # ── Step 2: Check dump SELL orders ───────────────────────────
         for cid, ms in list(self.markets.items()):
             for side in ["yes", "no"]:
                 dump_oid = ms.dump_orders[side]
                 if not dump_oid:
+                    continue
+
+                # Skip exchange API calls for dry-run fake order IDs
+                if self.dry_run:
+                    ms.dump_orders[side] = None
+                    ms.dump_state[side] = None
                     continue
 
                 if dump_oid not in open_ids:
@@ -633,9 +428,10 @@ class RewardFarmer:
                         ms.dump_orders[side] = None
                         ms.dump_state[side] = None  # clear decay state
                         ms.dump_failures = 0
+                        self.db.delete_dump_state(ms.cid, side)
                     elif dump_status == "UNKNOWN":
                         ms.unknown_count[side] = ms.unknown_count.get(side, 0) + 1
-                        if ms.unknown_count[side] >= 5:
+                        if ms.unknown_count[side] >= cfg("RF_UNKNOWN_RETRY_THRESHOLD"):
                             log.warning(f"Dump order stuck UNKNOWN 5×, clearing | {ms.question[:30]}")
                             ms.dump_orders[side] = None
                     else:
@@ -670,6 +466,11 @@ class RewardFarmer:
                 if not slot.order_id:
                     continue
 
+                # Skip exchange API calls for dry-run fake order IDs
+                if self.dry_run:
+                    slot.order_id = None
+                    continue
+
                 if slot.order_id not in open_ids:
                     # Order gone from exchange — check if filled
                     try:
@@ -681,12 +482,20 @@ class RewardFarmer:
                         order_status = "UNKNOWN"
                         matched = 0
 
-                    if order_status == "MATCHED" and matched > 0:
-                        self._handle_fill(ms, side, slot, actual_shares=matched)
+                    if matched > 0 and order_status in ("MATCHED", "CANCELLED"):
+                        # Full or partial fill — record whatever matched
+                        fill_type = "FULL" if matched >= slot.shares - 0.5 else "PARTIAL"
+                        actual_price = float(status.get("price", slot.price))
+                        if fill_type == "PARTIAL":
+                            log.info(
+                                f"PARTIAL fill {side.upper()} {matched:.0f}/{slot.shares:.0f}sh "
+                                f"(order {order_status}) | {ms.question[:30]}"
+                            )
+                        self._handle_fill(ms, side, slot, actual_shares=matched, actual_price=actual_price)
                         ms.unknown_count[side] = 0
                     elif order_status == "UNKNOWN":
                         ms.unknown_count[side] = ms.unknown_count.get(side, 0) + 1
-                        if ms.unknown_count[side] >= 5:
+                        if ms.unknown_count[side] >= cfg("RF_UNKNOWN_RETRY_THRESHOLD"):
                             log.warning(f"BUY order stuck UNKNOWN 5×, clearing | {ms.question[:30]}")
                             slot.order_id = None
                             ms.unknown_count[side] = 0
@@ -696,6 +505,8 @@ class RewardFarmer:
                     else:
                         ms.unknown_count[side] = 0
                     # Clear the order slot (MATCHED, CANCELLED, etc.)
+                    if slot.order_id:
+                        self.db.delete_active_order(slot.order_id)
                     slot.order_id = None
 
         # ── Step 4: Place orders on batch ────────────────────────────
@@ -704,7 +515,7 @@ class RewardFarmer:
             return
 
         batch_start = self._batch_idx
-        batch_end = min(batch_start + BATCH_SIZE, len(market_list))
+        batch_end = min(batch_start + BATCH_SIZE(), len(market_list))
         batch = market_list[batch_start:batch_end]
         self._batch_idx = batch_end if batch_end < len(market_list) else 0
 
@@ -735,7 +546,7 @@ class RewardFarmer:
                 ask_price=ms.orders["no"].price if has_no else 0,
                 inventory_usd=0.0,
                 cooldown_active=False, skew_active=False,
-                cycle_duration_secs=CYCLE_SECS,
+                cycle_duration_secs=CYCLE_SECS(),
                 midpoint=mid,
                 bid_size=ms.orders["yes"].shares if has_yes else 0,
                 ask_size=ms.orders["no"].shares if has_no else 0,
@@ -763,14 +574,14 @@ class RewardFarmer:
         ms.midpoint = midpoint
         ms.last_book_fetch = time.time()
 
-        if best_ask - best_bid > 0.15:
+        if best_ask - best_bid > cfg("RF_MAX_BOOK_SPREAD"):
             return  # too wide
 
         # Edge prices
         tick = ms.tick_size
         decimals = max(2, len(str(tick).rstrip('0').split('.')[-1]))
-        edge_bid = round(midpoint - ms.max_spread + tick * PLACEMENT_TICKS_INSIDE, decimals)
-        edge_ask = round(midpoint + ms.max_spread - tick * PLACEMENT_TICKS_INSIDE, decimals)
+        edge_bid = round(midpoint - ms.max_spread + tick * PLACEMENT_TICKS_INSIDE(), decimals)
+        edge_ask = round(midpoint + ms.max_spread - tick * PLACEMENT_TICKS_INSIDE(), decimals)
         edge_bid = max(0.01, edge_bid)
         edge_ask = min(0.99, edge_ask)
 
@@ -791,32 +602,31 @@ class RewardFarmer:
                 )
                 slot.order_id = None  # will be re-placed below
 
-        # ── Exit liquidity check: only place if we can dump within 2¢ ──
-        # Count shares of bid depth within 2¢ of our YES edge (for YES exit)
+        # ── Exit liquidity check: only place if we can dump within buffer ──
+        exit_buf = cfg("RF_DUMP_EXIT_DEPTH_BUFFER")
         yes_exit_depth = sum(
             float(b["size"]) for b in merged["bids"]
-            if float(b["price"]) >= edge_bid - 0.02
+            if float(b["price"]) >= edge_bid - exit_buf
         )
-        # Count shares of ask depth within 2¢ of our NO edge (for NO exit)
         no_exit_depth = sum(
             float(a["size"]) for a in merged["asks"]
-            if float(a["price"]) <= edge_ask + 0.02
+            if float(a["price"]) <= edge_ask + exit_buf
         )
-        agent_shares_check = getattr(ms, '_agent_shares', SHARES_PER_SIDE)
-        can_exit_yes = yes_exit_depth >= agent_shares_check
-        can_exit_no = no_exit_depth >= agent_shares_check
+        effective_shares = ms.agent_shares if ms.agent_shares > 0 else SHARES_PER_SIDE()
+        can_exit_yes = yes_exit_depth >= effective_shares
+        can_exit_no = no_exit_depth >= effective_shares
 
         if not can_exit_yes:
-            log.debug(f"Skip YES {ms.question[:25]}: exit depth {yes_exit_depth:.0f} < {agent_shares_check}")
+            log.debug(f"Skip YES {ms.question[:25]}: exit depth {yes_exit_depth:.0f} < {effective_shares}")
         if not can_exit_no:
-            log.debug(f"Skip NO {ms.question[:25]}: exit depth {no_exit_depth:.0f} < {agent_shares_check}")
+            log.debug(f"Skip NO {ms.question[:25]}: exit depth {no_exit_depth:.0f} < {effective_shares}")
 
         # Shares — use agent's per-market sizing if available, else default
-        agent_shares = getattr(ms, '_agent_shares', SHARES_PER_SIDE)
-        yes_shares = max(ms.min_size, agent_shares)
+        shares_target = ms.agent_shares if ms.agent_shares > 0 else SHARES_PER_SIDE()
+        yes_shares = max(ms.min_size, shares_target)
         no_clob = round(1.0 - edge_ask, decimals)
         no_clob = max(0.01, no_clob)
-        no_shares = max(ms.min_size, agent_shares)
+        no_shares = max(ms.min_size, shares_target)
 
         # Place YES bid (only if exit liquidity exists)
         if can_exit_yes and self._can_place(ms.cid, "yes", yes_shares * edge_bid):
@@ -831,6 +641,7 @@ class RewardFarmer:
                     if oid:
                         ms.orders["yes"] = OrderSlot(order_id=oid, price=edge_bid, shares=yes_shares, placed_at=time.time())
                         self.db.log_order_placed(condition_id=ms.cid, side="yes", price=edge_bid, size=float(yes_shares), order_id=oid)
+                        self.db.save_active_order(oid, ms.cid, "yes", "buy", edge_bid, yes_shares)
                         if self.cycle_count <= 3:
                             log.info(f"BID YES @ {edge_bid:.3f} ({yes_shares:.0f}sh) | {ms.question[:30]}")
                 except Exception as e:
@@ -849,6 +660,7 @@ class RewardFarmer:
                     if oid:
                         ms.orders["no"] = OrderSlot(order_id=oid, price=edge_ask, shares=no_shares, placed_at=time.time())
                         self.db.log_order_placed(condition_id=ms.cid, side="no", price=edge_ask, size=float(no_shares), order_id=oid)
+                        self.db.save_active_order(oid, ms.cid, "no", "buy", edge_ask, no_shares)
                         if self.cycle_count <= 3:
                             log.info(f"ASK NO @ {edge_ask:.3f} (clob={no_clob:.3f}, {no_shares:.0f}sh) | {ms.question[:30]}")
                 except Exception as e:
@@ -871,10 +683,10 @@ class RewardFarmer:
         if not self.positions.can_quote(cid, side):
             log.debug(f"Skip {side} {ms.question[:20]}: halted")
             return False
-        if ms.dump_failures >= 3:
+        if ms.dump_failures >= cfg("RF_DUMP_MAX_FAILURES"):
             log.debug(f"Skip {side} {ms.question[:20]}: 3+ dump failures")
             return False
-        if self._total_exposure() > MAX_TOTAL_EXPOSURE:
+        if self._total_exposure() > MAX_TOTAL_EXPOSURE():
             log.debug(f"Skip {side} {ms.question[:20]}: exposure limit")
             return False
         return True
@@ -890,12 +702,17 @@ class RewardFarmer:
     # ── Fill Handling ────────────────────────────────────────────────
 
     def _handle_fill(self, ms: MarketState, side: str, slot: OrderSlot,
-                     actual_shares: float = 0):
-        """Process a detected fill: record, then merge or dump."""
+                     actual_shares: float = 0, actual_price: float = 0.0):
+        """Process a detected fill: record, then merge or dump.
+
+        Args:
+            actual_shares: Exchange-reported filled qty (from size_matched)
+            actual_price: Exchange-reported fill price (from get_order response)
+        """
         from alerts import alert_fill
 
         filled_shares = actual_shares if actual_shares > 0 else slot.shares
-        fill_price = slot.price
+        fill_price = actual_price if actual_price > 0 else slot.price
         cid = ms.cid
 
         log.info(
@@ -926,9 +743,7 @@ class RewardFarmer:
 
         # Capture fill price BEFORE slot might be cleared
         # _dump_position needs this to compute decay start price
-        if not hasattr(ms, '_last_fill_price'):
-            ms._last_fill_price = {}
-        ms._last_fill_price[side] = fill_price  # YES-equivalent price
+        ms.last_fill_price[side] = fill_price  # YES-equivalent price
 
         # Try merge first
         yes_shares = self.positions.get_shares(cid, "yes")
@@ -1019,8 +834,8 @@ class RewardFarmer:
                 # Use captured fill price (set in _handle_fill before slot cleared)
                 # Fall back to slot price, then 0
                 fill_price_yes_equiv = 0
-                if hasattr(ms, '_last_fill_price') and ms._last_fill_price.get(side, 0) > 0:
-                    fill_price_yes_equiv = ms._last_fill_price[side]
+                if ms.last_fill_price.get(side, 0) > 0:
+                    fill_price_yes_equiv = ms.last_fill_price[side]
                 elif ms.orders[side].price > 0:
                     fill_price_yes_equiv = ms.orders[side].price
 
@@ -1031,25 +846,28 @@ class RewardFarmer:
                     "shares": dump_shares,
                     "tid": tid,
                 }
+                self.db.save_dump_state(ms.cid, side, ms.dump_state[side])
 
             state = ms.dump_state[side]
             elapsed_min = (time.time() - state["started_at"]) / 60.0
 
             # Compute decay price
-            if elapsed_min >= 30.0:
-                # Hard timeout — 30 minutes. Accept the loss, clear state.
-                log.warning(f"DUMP ABANDONED {side.upper()} after 30m | {ms.question[:30]}")
+            if elapsed_min >= cfg("RF_DUMP_ABANDON_MINS"):
+                # Hard timeout. Accept the loss, clear state.
+                log.warning(f"DUMP ABANDONED {side.upper()} after {elapsed_min:.0f}m | {ms.question[:30]}")
                 ms.dump_state[side] = None
+                self.db.delete_dump_state(ms.cid, side)
                 if ms.dump_orders[side]:
                     self._cancel_order(ms.dump_orders[side], reason="dump_30m_timeout")
                     ms.dump_orders[side] = None
                 return
 
-            elif elapsed_min >= 5.0:
+            elif elapsed_min >= cfg("RF_DUMP_AGGRESSIVE_MINS"):
                 # Past aggressive decay — switch to passive mode.
-                # Reprice to merged book fair price every 5 minutes.
-                last_passive = state.get("last_passive_reprice", 5.0)
-                if elapsed_min - last_passive < 5.0:
+                # Reprice to merged book fair price periodically.
+                passive_interval = cfg("RF_DUMP_PASSIVE_REPRICE_MINS")
+                last_passive = state.get("last_passive_reprice", cfg("RF_DUMP_AGGRESSIVE_MINS"))
+                if elapsed_min - last_passive < passive_interval:
                     return  # keep current SELL alive, don't reprice yet
                 state["last_passive_reprice"] = elapsed_min
 
@@ -1084,6 +902,10 @@ class RewardFarmer:
             if oid:
                 ms.dump_orders[side] = oid
                 ms.dump_failures = 0
+                # Persist dump order ID for crash recovery
+                state["dump_order_id"] = oid
+                self.db.save_dump_state(ms.cid, side, state)
+                self.db.save_active_order(oid, ms.cid, side, "dump_sell", sell_price, dump_shares)
                 if elapsed_min < 0.1:  # only log first placement
                     log.info(
                         f"DUMP POSTED {side.upper()} {dump_shares:.0f}sh @ {sell_price:.4f} "
@@ -1125,6 +947,9 @@ class RewardFarmer:
             log.error("No eligible markets found. Exiting.")
             return
 
+        # Verify positions against exchange (needs token IDs from market data)
+        self._reconcile_positions()
+
         start = time.time()
         last_status = time.time()
 
@@ -1136,8 +961,12 @@ class RewardFarmer:
 
             t0 = time.time()
 
+            # Hot-reload config if config_overrides.json changed
+            from config import BotConfig
+            BotConfig.instance().check_and_reload()
+
             # Market refresh (in background to avoid blocking trading)
-            if time.time() - self._last_market_refresh >= MARKET_REFRESH_SECS:
+            if time.time() - self._last_market_refresh >= MARKET_REFRESH_SECS():
                 if not hasattr(self, '_refresh_thread') or not self._refresh_thread.is_alive():
                     def _bg_refresh():
                         try:
@@ -1183,7 +1012,7 @@ class RewardFarmer:
             # Hourly reward log
             if time.time() - self._last_reward_log >= 3600:
                 self._last_reward_log = time.time()
-                self.rewards.maybe_log_hourly(self.all_market_data[:MAX_MARKETS])
+                self.rewards.maybe_log_hourly(self.all_market_data[:MAX_MARKETS()])
                 self.rewards._last_hourly_log = 0
 
             # Status every 5 min
@@ -1200,7 +1029,7 @@ class RewardFarmer:
 
             # Sleep
             elapsed_cycle = time.time() - t0
-            sleep_time = max(0, CYCLE_SECS - elapsed_cycle)
+            sleep_time = max(0, CYCLE_SECS() - elapsed_cycle)
             if sleep_time > 0 and not self._shutdown:
                 # Sleep in 1s intervals for responsive shutdown
                 for _ in range(int(sleep_time)):
@@ -1252,9 +1081,9 @@ def main():
     log.info("Reward Farmer starting")
     log.info(f"  Dry run: {args.dry_run}")
     log.info(f"  Duration: {'indefinite' if duration == 0 else f'{duration}s'}")
-    log.info(f"  Strategy: {SHARES_PER_SIDE}sh/side, {PLACEMENT_TICKS_INSIDE} tick inside edge")
-    log.info(f"  Markets: max {MAX_MARKETS}, rate >= ${MIN_DAILY_RATE}/d, liq < ${MAX_LIQUIDITY}")
-    log.info(f"  Cost cap: ${MAX_COST_PER_MARKET}/market, ${MAX_TOTAL_EXPOSURE} total exposure")
+    log.info(f"  Strategy: {SHARES_PER_SIDE()}sh/side, {PLACEMENT_TICKS_INSIDE()} tick inside edge")
+    log.info(f"  Markets: max {MAX_MARKETS()}, rate >= ${MIN_DAILY_RATE()}/d, liq < ${MAX_LIQUIDITY()}")
+    log.info(f"  Cost cap: ${MAX_COST_PER_MARKET()}/market, ${MAX_TOTAL_EXPOSURE()} total exposure")
 
     bot = RewardFarmer(dry_run=args.dry_run)
     bot.run(duration_secs=duration)

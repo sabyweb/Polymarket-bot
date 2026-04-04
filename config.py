@@ -218,7 +218,28 @@ HEARTBEAT_TIMEOUT_SECS: int = 300  # 5 minutes
 DISCORD_WEBHOOK_URL: str | None = os.getenv("DISCORD_WEBHOOK_URL")
 
 
-# ── Credential Validation ───────────────────────────────────────────────────
+# ── Reward Farmer Parameters ───────────────��────────────────────────────────
+# All parameters for reward_farmer.py. Hot-reloadable via config_overrides.json.
+RF_SHARES_PER_SIDE: int = 50               # Default order size per side
+RF_PLACEMENT_TICKS_INSIDE: int = 1          # Ticks inside from midpoint edge
+RF_MIN_DAILY_RATE: float = 10.0             # Minimum reward rate ($/day) to consider market
+RF_MAX_LIQUIDITY: int = 5000                # Skip markets with on-book depth above this
+RF_MAX_COST_PER_MARKET: float = 50.0        # Max initial position cost per market
+RF_MAX_MARKETS: int = 40                    # Maximum markets in portfolio
+RF_MAX_TOTAL_EXPOSURE: float = 1500.0       # Total USD at risk limit
+RF_CYCLE_SECS: int = 30                     # Main loop cycle frequency
+RF_BATCH_SIZE: int = 5                      # Markets processed per cycle
+RF_MARKET_REFRESH_SECS: int = 1800          # Background market refresh interval
+RF_DUMP_AGGRESSIVE_MINS: float = 5.0        # Duration of aggressive dump decay phase
+RF_DUMP_PASSIVE_REPRICE_MINS: float = 5.0   # Reprice interval in passive dump mode
+RF_DUMP_ABANDON_MINS: float = 30.0          # Hard timeout: give up on dump
+RF_DUMP_EXIT_DEPTH_BUFFER: float = 0.02     # Max price buffer for exit depth check
+RF_UNKNOWN_RETRY_THRESHOLD: int = 5         # Retries before clearing UNKNOWN status order
+RF_DUMP_MAX_FAILURES: int = 3               # Dump failures before blocking placement
+RF_MAX_BOOK_SPREAD: float = 0.15            # Skip if merged book spread exceeds this
+RF_ALLOCATION_TTL_HOURS: float = 2.0        # Max age of oversight agent allocations
+
+# ── Credential Validation ───────────────────────────────────��───────────────
 def validate_credentials() -> None:
     """Fail fast if any required credential is missing or empty.
 

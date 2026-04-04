@@ -230,9 +230,21 @@ class PositionStore:
                 1 for m in self._markets.values()
                 if not m["yes"].is_empty or not m["no"].is_empty
             )
+            # Prune empty positions on load (cleanup stale entries)
+            empty_cids = [
+                cid for cid, m in self._markets.items()
+                if (m["yes"].is_empty and m["no"].is_empty
+                    and not m["yes"].halted and not m["no"].halted)
+            ]
+            for cid in empty_cids:
+                del self._markets[cid]
+            if empty_cids:
+                log.info(f"Pruned {len(empty_cids)} empty positions on load")
+
+            non_zero = len(self._markets)  # recount after pruning
             log.info(
-                f"Loaded {len(self._markets)} positions from SQLite "
-                f"({non_zero} with open exposure)"
+                f"Loaded {non_zero} positions from SQLite "
+                f"(with open exposure)"
             )
             # Also merge in any JSON positions not yet in SQLite
             self._merge_json_if_needed()

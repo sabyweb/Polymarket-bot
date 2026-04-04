@@ -28,47 +28,116 @@ logging.basicConfig(
 log = logging.getLogger("oversight")
 
 
+def _write_performance_snapshots(
+    db_path: str,
+    scored: list,
+    metrics: list,
+    correction_factor: float,
+    hours: float,
+) -> None:
+    """Write per-market performance snapshots for adaptive tracking.
+
+    This builds the historical dataset that enables the agent to learn
+    which markets are actually profitable over time, not just estimated to be.
+    """
+    from database import BotDatabase
+    try:
+        db = BotDatabase(db_path)
+        now = time.time()
+
+        # Build metrics lookup by condition_id
+        metrics_by_cid = {m.condition_id: m for m in metrics}
+
+        snapshots = []
+        for sm in scored:
+            m = metrics_by_cid.get(sm.condition_id)
+            if not m:
+                continue
+            estimated_daily = m.daily_rate * m.q_share_pct
+            snapshots.append({
+                "ts": now,
+                "condition_id": sm.condition_id,
+                "question": sm.question[:100],
+                "window_hours": hours,
+                "estimated_daily": estimated_daily,
+                "correction_factor": correction_factor,
+                "corrected_daily": estimated_daily * correction_factor,
+                "fill_cost": m.fill_cost_recent,
+                "dump_revenue": m.dump_revenue_recent,
+                "net_score": sm.score,
+                "action": sm.action,
+                "q_share_pct": m.q_share_pct,
+                "on_book_hours": m.on_book_hours,
+                "fill_count": m.fill_count_recent,
+                "shares_recommended": sm.recommended_shares,
+            })
+
+        db.save_performance_batch(snapshots)
+        log.info(f"Saved {len(snapshots)} performance snapshots to DB")
+
+        # Log performance summary if we have history
+        summary = db.get_performance_summary(days=7)
+        if summary and summary.get("total_snapshots", 0) > 1:
+            log.info(
+                f"7-day performance: {summary.get('unique_markets', 0)} markets tracked, "
+                f"avg_correction={summary.get('avg_correction', 1.0):.2f}, "
+                f"avg_score={summary.get('avg_score', 0):.4f}"
+            )
+
+    except Exception as e:
+        log.warning(f"Performance snapshot write failed: {e}")
+
+
 def run_once(
     db_path: str = "bot_history.db",
     output_path: str = "market_allocations.json",
     hours: float = 24,
+    capital: float = 1500.0,
     dry_run: bool = False,
 ) -> dict:
     """One full cycle: collect → score → allocate → write.
 
     Returns summary dict for logging/testing.
     """
-    from oversight.data_collector import collect_all
+    from oversight.data_collector import collect_all, compute_available_capital
     from oversight.market_scorer import rank_markets
     from oversight.allocation_writer import (
         compute_allocations, write_allocations, generate_summary,
-        TOTAL_CAPITAL_LIMIT,
     )
 
-    # Step 1: Collect
+    # Step 1: Compute available capital (total minus locked positions)
+    available_capital = compute_available_capital(db_path, total_capital=capital)
+
+    # Step 2: Collect metrics + correction factor
     log.info(f"Collecting metrics (lookback={hours:.0f}h, db={db_path})...")
-    metrics = collect_all(db_path=db_path, hours=hours)
+    metrics, correction_factor = collect_all(db_path=db_path, hours=hours)
 
     if not metrics:
         log.warning("No market data collected — skipping allocation")
         return {"status": "no_data", "markets": 0}
 
-    # Step 2: Score
-    log.info(f"Scoring {len(metrics)} markets...")
-    scored = rank_markets(metrics, hours=hours)
+    # Step 3: Score (with correction factor from actual payouts)
+    log.info(f"Scoring {len(metrics)} markets (reward correction={correction_factor:.2f})...")
+    scored = rank_markets(metrics, hours=hours, correction_factor=correction_factor, db_path=db_path)
 
-    # Step 3: Allocate
-    log.info("Computing allocations...")
-    allocations = compute_allocations(scored)
-    total_deployed = TOTAL_CAPITAL_LIMIT - sum(
-        0 for a in allocations if a["action"] == "avoid"
+    # Step 4: Allocate with ACTUAL available capital
+    log.info(f"Computing allocations (${available_capital:.0f} available)...")
+    allocations = compute_allocations(scored, total_capital=available_capital)
+    total_deployed = sum(
+        a.get("shares_per_side", 0) * 0.30 * 2
+        for a in allocations if a["action"] == "deploy"
     )
 
-    # Step 4: Summary
+    # Step 5: Write performance snapshots (adaptive tracking)
+    _write_performance_snapshots(
+        db_path, scored, metrics, correction_factor, hours
+    )
+
+    # Step 6: Summary
     summary = generate_summary(allocations)
     print(summary)
 
-    # Step 5: Write (unless dry-run)
+    # Step 7: Write allocations (unless dry-run)
     if dry_run:
         log.info("[DRY RUN] Would write allocations — skipping")
     else:
@@ -82,6 +151,7 @@ def run_once(
         "markets_total": len(metrics),
         "markets_deploy": deploy_count,
         "markets_avoid": avoid_count,
+        "correction_factor": correction_factor,
         "dry_run": dry_run,
     }
 
@@ -130,6 +200,7 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Analyze only, don't write")
     parser.add_argument("--interval", type=int, default=3600, help="Loop interval in seconds")
     parser.add_argument("--hours", type=float, default=24, help="Lookback window in hours")
+    parser.add_argument("--capital", type=float, default=1500.0, help="Total capital available")
     parser.add_argument("--db", default="bot_history.db", help="Path to bot_history.db")
     parser.add_argument("--output", default="market_allocations.json", help="Output path")
     args = parser.parse_args()
@@ -140,6 +211,7 @@ def main():
             db_path=args.db,
             output_path=args.output,
             hours=args.hours,
+            capital=args.capital,
             dry_run=args.dry_run,
         )
     else:
@@ -147,6 +219,7 @@ def main():
             db_path=args.db,
             output_path=args.output,
             hours=args.hours,
+            capital=args.capital,
             dry_run=args.dry_run,
         )
         log.info(f"Done: {result}")

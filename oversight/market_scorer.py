@@ -30,22 +30,29 @@ class ScoredMarket:
     daily_rate: float              # pool rate
 
 
-def score_market(m: MarketMetrics, hours: float = 24) -> float:
+def score_market(m: MarketMetrics, hours: float = 24, correction_factor: float = 1.0) -> float:
     """Compute net profitability score for a market.
 
-    Priority: Q-share is king. A market where we own 100% of the reward pool
-    is infinitely better than one where we own 0.1%, regardless of pool size.
+    Uses Q-score estimate (daily_rate × q_share_pct), calibrated by the
+    correction_factor derived from actual vs estimated daily payouts.
 
-    Score = q_share_weight × daily_rate - fill_penalty
+    Args:
+        correction_factor: actual_daily_payout / estimated_daily_total.
+            < 1.0 means our estimates are too high (common — hidden orders).
+            > 1.0 means our estimates are too low.
+            1.0 means no correction data available.
 
-    This ensures:
-    - 100% Q-share at $50/day scores HIGHER than 0.1% Q-share at $7500/day
-    - Any fills make the score negative (fill_penalty dominates)
-    - Zero-fill markets with high Q-share are always ranked first
+    Score = corrected_daily_reward - daily_fill_damage
     """
-    # Effective daily reward: what we actually capture
-    # Q-share 100% at $50/day = $50. Q-share 0.1% at $7500/day = $7.50.
-    effective_daily = m.daily_rate * m.q_share_pct  # $/day we capture
+    # Estimated daily reward, corrected by actual payout data
+    estimated_daily = m.daily_rate * m.q_share_pct
+    effective_daily = estimated_daily * correction_factor
+
+    if correction_factor != 1.0 and estimated_daily > 0:
+        log.debug(
+            f"Score {m.condition_id[:12]}: est=${estimated_daily:.2f}/d "
+            f"× {correction_factor:.2f} = ${effective_daily:.2f}/d"
+        )
 
     # Fill penalty: total damage in the window, scaled to daily
     fill_damage = m.fill_cost_recent - m.dump_revenue_recent
@@ -80,25 +87,30 @@ def classify_market(
         confidence = "low"
 
     # ── Intelligent sizing based on Q-share ──
-    # Deploy minimum where we dominate (saves capital, same reward).
-    # Deploy more only where extra shares increase our Q-share meaningfully.
+    # Most markets require min_size of 50 to qualify for rewards.
+    # Never go below min_shares. Only increase above default when competing.
     q_pct = m.q_share_pct * 100  # convert to percentage
 
-    if q_pct >= 90:
-        sized_shares = min_shares  # dominant — min_size captures the same pool
-        size_reason = "dominant Q-share, min_size sufficient"
-    elif q_pct >= 50:
-        sized_shares = min_shares  # strong — still safe with min_size
-        size_reason = "strong Q-share, min_size to reduce fill risk"
+    if q_pct >= 50:
+        # Dominant — min_size is enough (50 on most markets)
+        sized_shares = default_shares
+        size_reason = f"dominant Q-share ({q_pct:.0f}%), standard size"
     elif q_pct >= 10:
-        sized_shares = default_shares  # moderate — full size to compete
-        size_reason = "moderate Q-share, full size to compete"
+        # Moderate — standard size to maintain share
+        sized_shares = default_shares
+        size_reason = f"moderate Q-share ({q_pct:.0f}%), standard size"
     elif q_pct > 0 and m.daily_rate >= 50:
-        sized_shares = min_shares  # low share, high rate — trial
-        size_reason = "low Q-share high rate, trial with min_size"
+        # Low share, high rate — worth trying at standard size
+        sized_shares = default_shares
+        size_reason = f"low Q-share ({q_pct:.1f}%) but ${m.daily_rate:.0f}/d rate"
+    elif q_pct > 0:
+        # Low share, low rate — not worth the capital
+        sized_shares = 0
+        size_reason = f"low Q-share ({q_pct:.1f}%), low rate, skip"
     else:
-        sized_shares = 0  # negligible — not worth capital
-        size_reason = "negligible Q-share"
+        # Zero Q-share data — new market, deploy at standard
+        sized_shares = default_shares
+        size_reason = "no Q-share data, standard size"
 
     # ── Decision logic ──
     if m.fill_count_recent == 0 and m.daily_rate > 0:
@@ -141,25 +153,114 @@ def classify_market(
     )
 
 
+def load_historical_adjustments(db_path: str, days: int = 7) -> dict[str, dict]:
+    """Load historical performance data to adjust scoring.
+
+    For markets with 3+ historical snapshots, computes:
+    - trend: is the market getting better or worse over time?
+    - reliability: how consistent is the score across snapshots?
+    - fill_rate: what fraction of snapshots had fills?
+
+    Returns {condition_id: {"trend_mult": float, "fill_rate": float, "snapshots": int}}
+    """
+    import sqlite3
+    cutoff_ts = __import__("time").time() - days * 86400
+    result = {}
+
+    try:
+        db = sqlite3.connect(db_path, timeout=5)
+        db.row_factory = sqlite3.Row
+
+        # Get per-market aggregates from performance history
+        rows = db.execute(
+            """SELECT condition_id,
+                      COUNT(*) as snapshots,
+                      AVG(net_score) as avg_score,
+                      AVG(fill_count) as avg_fills,
+                      SUM(CASE WHEN fill_count > 0 THEN 1 ELSE 0 END) as fill_snapshots,
+                      MIN(net_score) as worst_score,
+                      MAX(net_score) as best_score
+               FROM market_performance
+               WHERE ts > ?
+               GROUP BY condition_id
+               HAVING snapshots >= 3""",
+            (cutoff_ts,),
+        ).fetchall()
+        db.close()
+
+        for r in rows:
+            cid = r["condition_id"]
+            snapshots = r["snapshots"]
+            fill_rate = r["fill_snapshots"] / snapshots if snapshots > 0 else 0
+
+            # Trend multiplier: penalize markets that fill frequently
+            # fill_rate 0% → 1.2 bonus, fill_rate 50% → 0.8 penalty, fill_rate 100% → 0.5
+            trend_mult = max(0.5, 1.2 - fill_rate * 0.7)
+
+            # Extra penalty if worst score is very negative (risky market)
+            if r["worst_score"] < -5.0:
+                trend_mult *= 0.8
+
+            result[cid] = {
+                "trend_mult": trend_mult,
+                "fill_rate": fill_rate,
+                "avg_score": r["avg_score"],
+                "snapshots": snapshots,
+            }
+
+        if result:
+            log.info(f"Historical adjustments: {len(result)} markets with 3+ snapshots")
+
+    except Exception as e:
+        log.debug(f"Historical adjustments load failed: {e}")
+
+    return result
+
+
 def rank_markets(
     metrics: list[MarketMetrics],
     hours: float = 24,
     max_markets: int = 40,
+    correction_factor: float = 1.0,
+    db_path: str = "bot_history.db",
 ) -> list[ScoredMarket]:
     """Score all markets, rank by score descending, return recommendations.
+
+    Uses historical performance data (when available) to adjust scores:
+    - Markets with zero fills historically get a reliability bonus
+    - Markets with frequent fills get penalized
+    - New markets (< 3 snapshots) scored purely on current data
 
     Args:
         metrics: Raw per-market data from data_collector
         hours: Lookback window for fill/dump data
         max_markets: Maximum markets to recommend for deployment
+        correction_factor: Actual/estimated reward ratio for calibration
+        db_path: Path to bot DB for historical performance lookup
 
     Returns:
         List of ScoredMarket sorted by score (highest first).
         Markets beyond max_markets are set to "avoid" even if positive.
     """
+    # Load historical adjustments for adaptive scoring
+    historical = load_historical_adjustments(db_path)
+
     scored = []
     for m in metrics:
-        s = score_market(m, hours)
+        s = score_market(m, hours, correction_factor=correction_factor)
+
+        # Apply historical adjustment if available
+        hist = historical.get(m.condition_id)
+        if hist:
+            original_score = s
+            s *= hist["trend_mult"]
+            if abs(s - original_score) > 0.01:
+                log.debug(
+                    f"Historical adj {m.condition_id[:12]}: "
+                    f"{original_score:.4f} × {hist['trend_mult']:.2f} = {s:.4f} "
+                    f"(fill_rate={hist['fill_rate']:.0%}, {hist['snapshots']} snapshots)"
+                )
+
         sm = classify_market(m, s)
         scored.append(sm)
 
