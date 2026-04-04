@@ -802,19 +802,21 @@ class RewardFarmer:
             float(a["size"]) for a in merged["asks"]
             if float(a["price"]) <= edge_ask + 0.02
         )
-        can_exit_yes = yes_exit_depth >= SHARES_PER_SIDE
-        can_exit_no = no_exit_depth >= SHARES_PER_SIDE
+        agent_shares_check = getattr(ms, '_agent_shares', SHARES_PER_SIDE)
+        can_exit_yes = yes_exit_depth >= agent_shares_check
+        can_exit_no = no_exit_depth >= agent_shares_check
 
         if not can_exit_yes:
-            log.debug(f"Skip YES {ms.question[:25]}: exit depth {yes_exit_depth:.0f} < {SHARES_PER_SIDE}")
+            log.debug(f"Skip YES {ms.question[:25]}: exit depth {yes_exit_depth:.0f} < {agent_shares_check}")
         if not can_exit_no:
-            log.debug(f"Skip NO {ms.question[:25]}: exit depth {no_exit_depth:.0f} < {SHARES_PER_SIDE}")
+            log.debug(f"Skip NO {ms.question[:25]}: exit depth {no_exit_depth:.0f} < {agent_shares_check}")
 
-        # Shares
-        yes_shares = max(ms.min_size, SHARES_PER_SIDE)
+        # Shares — use agent's per-market sizing if available, else default
+        agent_shares = getattr(ms, '_agent_shares', SHARES_PER_SIDE)
+        yes_shares = max(ms.min_size, agent_shares)
         no_clob = round(1.0 - edge_ask, decimals)
         no_clob = max(0.01, no_clob)
-        no_shares = max(ms.min_size, SHARES_PER_SIDE)
+        no_shares = max(ms.min_size, agent_shares)
 
         # Place YES bid (only if exit liquidity exists)
         if can_exit_yes and self._can_place(ms.cid, "yes", yes_shares * edge_bid):

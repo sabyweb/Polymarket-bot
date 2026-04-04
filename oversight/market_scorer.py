@@ -33,34 +33,32 @@ class ScoredMarket:
 def score_market(m: MarketMetrics, hours: float = 24) -> float:
     """Compute net profitability score for a market.
 
-    Score = (reward_rate - fill_damage_rate) / capital_at_risk
+    Priority: Q-share is king. A market where we own 100% of the reward pool
+    is infinitely better than one where we own 0.1%, regardless of pool size.
 
-    Positive = profitable. Negative = losing money. Higher = better.
+    Score = q_share_weight × daily_rate - fill_penalty
+
+    This ensures:
+    - 100% Q-share at $50/day scores HIGHER than 0.1% Q-share at $7500/day
+    - Any fills make the score negative (fill_penalty dominates)
+    - Zero-fill markets with high Q-share are always ranked first
     """
-    # Estimate hourly reward from total and on-book time
-    if m.on_book_hours > 1:
-        reward_rate = m.actual_reward_total / m.on_book_hours  # $/hr
-    elif m.daily_rate > 0:
-        reward_rate = m.daily_rate / 24 * m.q_share_pct  # theoretical
-    else:
-        reward_rate = 0
+    # Effective daily reward: what we actually capture
+    # Q-share 100% at $50/day = $50. Q-share 0.1% at $7500/day = $7.50.
+    effective_daily = m.daily_rate * m.q_share_pct  # $/day we capture
 
-    # Fill damage rate
+    # Fill penalty: total damage in the window, scaled to daily
     fill_damage = m.fill_cost_recent - m.dump_revenue_recent
-    fill_damage_rate = fill_damage / max(hours, 1)  # $/hr
+    daily_damage = fill_damage / max(hours / 24, 0.1)
 
-    net_rate = reward_rate - fill_damage_rate
+    # Score: what we earn minus what we lose, per day
+    score = effective_daily - daily_damage
 
-    # Capital at risk (what we deployed)
-    # Use current position if we have one, otherwise estimate from rate
-    if m.current_position_usd > 1:
-        capital = m.current_position_usd
-    elif m.fill_cost_recent > 0:
-        capital = m.fill_cost_recent / max(m.fill_count_recent, 1)  # avg cost per fill
-    else:
-        capital = max(m.daily_rate * 0.5, 10)  # rough estimate
+    # Bonus for zero fills (reward certainty)
+    if m.fill_count_recent == 0 and effective_daily > 0:
+        score += effective_daily * 0.5  # 50% bonus for zero-fill certainty
 
-    return net_rate / max(capital, 1.0)
+    return score
 
 
 def classify_market(
@@ -81,36 +79,52 @@ def classify_market(
     else:
         confidence = "low"
 
-    # Decision logic
+    # ── Intelligent sizing based on Q-share ──
+    # Deploy minimum where we dominate (saves capital, same reward).
+    # Deploy more only where extra shares increase our Q-share meaningfully.
+    q_pct = m.q_share_pct * 100  # convert to percentage
+
+    if q_pct >= 90:
+        sized_shares = min_shares  # dominant — min_size captures the same pool
+        size_reason = "dominant Q-share, min_size sufficient"
+    elif q_pct >= 50:
+        sized_shares = min_shares  # strong — still safe with min_size
+        size_reason = "strong Q-share, min_size to reduce fill risk"
+    elif q_pct >= 10:
+        sized_shares = default_shares  # moderate — full size to compete
+        size_reason = "moderate Q-share, full size to compete"
+    elif q_pct > 0 and m.daily_rate >= 50:
+        sized_shares = min_shares  # low share, high rate — trial
+        size_reason = "low Q-share high rate, trial with min_size"
+    else:
+        sized_shares = 0  # negligible — not worth capital
+        size_reason = "negligible Q-share"
+
+    # ── Decision logic ──
     if m.fill_count_recent == 0 and m.daily_rate > 0:
-        # Zero fills = pure reward earnings, always deploy
         action = "deploy"
-        shares = default_shares
-        reason = f"Zero fills, ${m.daily_rate:.0f}/d pool, Q-share={m.q_share_pct*100:.1f}%"
+        shares = sized_shares if sized_shares > 0 else min_shares
+        reason = f"Zero fills, ${m.daily_rate:.0f}/d, Q={q_pct:.0f}%, {size_reason}"
 
     elif score > 0:
-        # Net positive — deploy
         action = "deploy"
-        shares = default_shares
-        reason = f"Net positive: reward=${m.actual_reward_total:.2f} > damage=${fill_damage:.2f}"
+        shares = sized_shares if sized_shares > 0 else min_shares
+        reason = f"Net positive: rew=${m.actual_reward_total:.2f} > dmg=${fill_damage:.2f}, {size_reason}"
 
     elif m.fill_count_recent >= 3 and fill_damage > m.actual_reward_total:
-        # Many fills, damage exceeds rewards — avoid
         action = "avoid"
         shares = 0
-        reason = f"High fill rate ({m.fill_count_recent}), damage=${fill_damage:.2f} > reward=${m.actual_reward_total:.2f}"
+        reason = f"High fills ({m.fill_count_recent}), dmg=${fill_damage:.2f} > rew=${m.actual_reward_total:.2f}"
 
     elif confidence == "low" and m.daily_rate >= 5:
-        # New market, not enough data — trial with min_size
         action = "deploy"
         shares = min_shares
-        reason = f"New market (low confidence), ${m.daily_rate:.0f}/d pool — trial"
+        reason = f"New market, ${m.daily_rate:.0f}/d pool — trial with min_size"
 
     else:
-        # Default: negative score, some data → avoid
         action = "avoid"
         shares = 0
-        reason = f"Net negative: score={score:.4f}, damage=${fill_damage:.2f}"
+        reason = f"Net negative: score={score:.4f}, dmg=${fill_damage:.2f}"
 
     return ScoredMarket(
         condition_id=m.condition_id,
