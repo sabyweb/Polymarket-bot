@@ -751,6 +751,16 @@ def collect_all(
         pos_data = positions.get(cid, {"total": 0, "question": ""})
         stat_data = stats.get(cid, {"rate": 0, "q_share": 0, "on_book_hrs": 0, "question": ""})
 
+        # CRITICAL: prefer fresh CLOB rate over stale DB stats.
+        # The bot's reward_market_stats stores the rate from first discovery
+        # and never refreshes it. A market that was $50/day when found could
+        # drop to $0.14/day — without this, we'd keep using the stale $50.
+        clob_data = clob_reward_markets.get(cid, {})
+        if clob_data.get("daily_rate", 0) > 0:
+            daily_rate = clob_data["daily_rate"]
+        else:
+            daily_rate = stat_data.get("rate", 0)
+
         question = stat_data.get("question") or pos_data.get("question", "")
         fill_cost = fill_data["cost"]
         dump_rev = dump_data["revenue"]
@@ -759,7 +769,7 @@ def collect_all(
         metrics.append(MarketMetrics(
             condition_id=cid,
             question=question,
-            daily_rate=stat_data.get("rate", 0),
+            daily_rate=daily_rate,
             actual_reward_total=reward,
             fill_cost_recent=fill_cost,
             dump_revenue_recent=dump_rev,

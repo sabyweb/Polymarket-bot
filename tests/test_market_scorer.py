@@ -535,6 +535,36 @@ class TestQuestionGrouping(unittest.TestCase):
         self.assertEqual(_question_group_key(""), "")
 
 
+class TestCapitalEfficiency(unittest.TestCase):
+    """Test that capital-inefficient markets are rejected."""
+
+    def test_low_rate_high_cost_avoided(self):
+        """$0.14/day pool with $186 deployed → capital inefficient → avoid."""
+        # This is the Todd Blanche scenario: $0.14/day, 200sh × $0.93 = $186
+        m = _make_metric(daily_rate=0.14, q_share_pct=0.01, max_spread=0.04)
+        sm = classify_market(m, score=0.01, default_shares=200)
+        # 0.14 / (200 * 0.92) = 0.00076 = 0.076% < 1% threshold → avoid
+        self.assertEqual(sm.action, "avoid")
+        self.assertIn("Capital inefficient", sm.reason)
+
+    def test_high_rate_passes_efficiency_check(self):
+        """$50/day pool with $91 deployed → very efficient → deploy."""
+        m = _make_metric(daily_rate=50, q_share_pct=1.0, max_spread=0.045)
+        sm = classify_market(m, score=50.0)
+        self.assertEqual(sm.action, "deploy")
+
+    def test_low_rate_filtered_in_rank_markets(self):
+        """Markets below $5/day should be filtered before scoring."""
+        metrics = [
+            _make_metric(condition_id="cheap", daily_rate=0.14, q_share_pct=0.01),
+            _make_metric(condition_id="good", daily_rate=50, q_share_pct=1.0),
+        ]
+        scored = rank_markets(metrics, max_markets=10)
+        cids = {s.condition_id for s in scored}
+        self.assertNotIn("cheap", cids)
+        self.assertIn("good", cids)
+
+
 class TestCorrectionFactorSmoothing(unittest.TestCase):
     """Test EMA smoothing of correction factor."""
 

@@ -203,6 +203,23 @@ def classify_market(
     # Compute estimated capital cost for this allocation
     est_capital = shares * cost_per_share_both if shares > 0 else 0.0
 
+    # ── Capital efficiency gate ──
+    # If the total pool reward is too low relative to capital deployed,
+    # this market can never be capital-efficient regardless of Q-share.
+    # Example: $0.14/day pool, $186 deployed → 0.075%/day even at 100% Q.
+    # Threshold: pool rate must be at least 1% of deployed capital per day
+    # (i.e., payback in <100 days at 100% Q-share, which is already generous).
+    if action == "deploy" and est_capital > 0 and m.daily_rate > 0:
+        max_daily_return_pct = m.daily_rate / est_capital
+        if max_daily_return_pct < 0.01:  # < 1% of capital/day even at 100% Q
+            reason = (
+                f"Capital inefficient: ${m.daily_rate:.2f}/d pool vs "
+                f"${est_capital:.0f} deployed = {max_daily_return_pct:.4%}/d max return"
+            )
+            action = "avoid"
+            shares = 0
+            est_capital = 0.0
+
     return ScoredMarket(
         condition_id=m.condition_id,
         question=m.question,
@@ -348,10 +365,14 @@ def rank_markets(
     feedback = query_placement_feedback(db_path)
 
     active_metrics = []
-    filtered_reasons = {"zero_rate": 0, "expiring": 0, "no_expiry": 0, "both_skipped": 0}
+    min_rate = 5.0  # minimum $/day to consider — matches discovery filter
+    filtered_reasons = {"zero_rate": 0, "low_rate": 0, "expiring": 0, "no_expiry": 0, "both_skipped": 0}
     for m in metrics:
         if m.daily_rate <= 0:
             filtered_reasons["zero_rate"] += 1
+            continue
+        if m.daily_rate < min_rate:
+            filtered_reasons["low_rate"] += 1
             continue
         # Expiry check using actual end_date_iso from CLOB
         if m.end_date_iso:
