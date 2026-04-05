@@ -47,6 +47,8 @@ class MarketStats:
     total_cycles: int = 0          # Total order cycles run
     cycles_with_orders: int = 0    # Cycles where we had live orders on book
     cycles_both_sides: int = 0     # Cycles with orders on BOTH yes and no
+    cycles_in_reward_window: int = 0    # Cycles where at least one order was within reward spread
+    cycles_both_in_window: int = 0      # Cycles where BOTH sides were within reward spread
     time_on_book_secs: float = 0.0 # Estimated seconds with orders live
 
     # Order placement
@@ -119,6 +121,18 @@ class MarketStats:
         if self.total_cycles == 0:
             return 0.0
         return self.cycles_both_sides / self.total_cycles * 100
+
+    def in_window_pct(self) -> float:
+        """Fraction of cycles with at least one order inside the reward spread."""
+        if self.total_cycles == 0:
+            return 0.0
+        return self.cycles_in_reward_window / self.total_cycles * 100
+
+    def both_in_window_pct(self) -> float:
+        """Fraction of cycles with BOTH sides inside the reward spread."""
+        if self.total_cycles == 0:
+            return 0.0
+        return self.cycles_both_in_window / self.total_cycles * 100
 
     def net_pnl(self) -> float:
         """Net P&L from trading (excludes rewards)."""
@@ -257,6 +271,15 @@ class RewardTracker:
 
         if has_yes_order and has_no_order:
             stats.cycles_both_sides += 1
+
+        # Track orders within the reward spread window
+        if stats.max_spread > 0 and midpoint > 0:
+            yes_in = has_yes_order and bid_price > 0 and abs(bid_price - midpoint) <= stats.max_spread
+            no_in = has_no_order and ask_price > 0 and abs(ask_price - midpoint) <= stats.max_spread
+            if yes_in or no_in:
+                stats.cycles_in_reward_window += 1
+            if yes_in and no_in:
+                stats.cycles_both_in_window += 1
 
         if bid_price > 0 and ask_price > 0:
             stats.price_samples += 1
@@ -550,7 +573,8 @@ class RewardTracker:
                 f"old=${old_hourly:>5.2f}/hr | "
                 f"Q_share={q_share_pct:>5.1%} | "
                 f"uptime={stats.uptime_pct():>4.0f}% | "
-                f"both={stats.both_sides_pct():>4.0f}%{variance}"
+                f"both={stats.both_sides_pct():>4.0f}% | "
+                f"in_window={stats.in_window_pct():>4.0f}%{variance}"
             )
 
         log.info(
@@ -607,7 +631,7 @@ class RewardTracker:
         log.info("")
         log.info("─── MARKET RANKINGS (by total P&L) ───")
         log.info(f"  {'#':<3} {'Market':<45} {'Reward$':>8} {'Trade$':>8} "
-                 f"{'Total$':>8} {'ROI%':>7} {'Uptime':>7} {'Both%':>7}")
+                 f"{'Total$':>8} {'ROI%':>7} {'Uptime':>7} {'Both%':>7} {'InWin%':>7}")
         log.info("  " + "─" * 95)
 
         total_rewards = 0.0
@@ -626,7 +650,8 @@ class RewardTracker:
                 f"  {i:<3} {stats.question[:45]:<45} "
                 f"${reward_est:>7.2f} ${trade_pnl:>7.2f} "
                 f"${total_p:>7.2f} {stats.roi_pct():>6.1f}% "
-                f"{stats.uptime_pct():>6.1f}% {stats.both_sides_pct():>6.1f}%"
+                f"{stats.uptime_pct():>6.1f}% {stats.both_sides_pct():>6.1f}% "
+                f"{stats.both_in_window_pct():>6.1f}%"
             )
 
         log.info("  " + "─" * 95)
@@ -834,6 +859,7 @@ class RewardTracker:
                     f"   Rewards: ${s.est_reward_usd:.2f} | "
                     f"Trade P&L: ${s.net_pnl():.2f} | "
                     f"Uptime: {s.uptime_pct():.0f}% | "
+                    f"InWin: {s.both_in_window_pct():.0f}% | "
                     f"Fills: {s.buy_fills}B/{s.sell_fills}S"
                 )
 
@@ -950,6 +976,7 @@ class RewardTracker:
                     "est_rewards": s.est_reward_usd,
                     "trade_pnl": s.net_pnl(),
                     "uptime_pct": s.uptime_pct(),
+                    "in_window_pct": s.both_in_window_pct(),
                     "fills": s.buy_fills + s.sell_fills,
                 }
                 for cid, s in self.markets.items()

@@ -90,6 +90,11 @@ class DumpManager:
                         if ms.unknown_count[side] >= cfg("RF_UNKNOWN_RETRY_THRESHOLD"):
                             log.warning(f"Dump order stuck UNKNOWN {cfg('RF_UNKNOWN_RETRY_THRESHOLD')}x, clearing | {ms.question[:30]}")
                             ms.dump_orders[side] = None
+                            # Also clear dump_state so we don't keep retrying
+                            # with stale state. The position still exists and
+                            # will be re-dumped on the next cycle if needed.
+                            ms.dump_state[side] = None
+                            self.db.delete_dump_state(ms.cid, side)
                     else:
                         log.warning(f"Dump order {dump_status} — will retry | {ms.question[:30]}")
                         ms.dump_orders[side] = None

@@ -14,42 +14,128 @@ from dataclasses import dataclass
 log = logging.getLogger("oversight.collector")
 
 
-def _fetch_all_clob_reward_markets(min_rate: float = 10.0) -> dict[str, dict]:
+_REWARD_MARKETS_CACHE_TTL = 2 * 3600  # 2h — stale cache is better than no data
+
+
+def _fetch_all_clob_reward_markets(
+    min_rate: float = 5.0,
+    db_path: str = "bot_history.db",
+) -> dict[str, dict]:
     """Fetch all reward markets from CLOB endpoint. Independent of bot's tracking.
 
     Returns {condition_id: {"daily_rate": float, "min_size": float, "max_spread": float}}.
     Only includes markets with daily_rate >= min_rate.
+
+    On API failure, retries once then falls back to DB cache.
+    On success, saves results to DB cache for future fallback.
     """
     import requests
-    result = {}
-    cursor = ""
-    for _ in range(20):
-        params = {"limit": 500}
-        if cursor:
-            params["next_cursor"] = cursor
-        try:
-            resp = requests.get(
-                "https://clob.polymarket.com/rewards/markets/current",
-                params=params, timeout=15,
-            )
-            if resp.status_code != 200:
+
+    result = _fetch_clob_reward_markets_api(requests, min_rate)
+
+    if result:
+        _save_reward_markets_cache(result, db_path)
+        return result
+
+    # API failed — fall back to DB cache
+    cached = _load_reward_markets_cache(db_path, min_rate)
+    if cached:
+        log.warning(f"CLOB reward API failed — using {len(cached)} cached markets")
+    else:
+        log.warning("CLOB reward API failed and no cache available — zero discovery this cycle")
+    return cached
+
+
+def _fetch_clob_reward_markets_api(requests, min_rate: float) -> dict[str, dict]:
+    """Fetch from API with one retry on failure."""
+    for attempt in range(2):
+        result = {}
+        cursor = ""
+        failed = False
+        for _ in range(20):
+            params = {"limit": 500}
+            if cursor:
+                params["next_cursor"] = cursor
+            try:
+                resp = requests.get(
+                    "https://clob.polymarket.com/rewards/markets/current",
+                    params=params, timeout=15,
+                )
+                if resp.status_code != 200:
+                    failed = True
+                    break
+                data = resp.json()
+            except Exception as e:
+                if attempt == 0:
+                    log.debug(f"CLOB reward fetch attempt {attempt + 1} failed: {e}")
+                failed = True
                 break
-            data = resp.json()
-        except Exception:
-            break
-        items = data.get("data", [])
-        for m in items:
-            rate = float(m.get("total_daily_rate") or 0)
-            if rate >= min_rate:
-                result[m["condition_id"]] = {
-                    "daily_rate": rate,
-                    "min_size": float(m.get("rewards_min_size") or 50),
-                    "max_spread": float(m.get("rewards_max_spread") or 4.5) / 100.0,
-                }
-        cursor = data.get("next_cursor", "")
-        if not cursor or not items or cursor == "LTE=":
-            break
-    return result
+            items = data.get("data", [])
+            for m in items:
+                rate = float(m.get("total_daily_rate") or 0)
+                if rate >= min_rate:
+                    result[m["condition_id"]] = {
+                        "daily_rate": rate,
+                        "min_size": float(m.get("rewards_min_size") or 50),
+                        "max_spread": float(m.get("rewards_max_spread") or 4.5) / 100.0,
+                    }
+            cursor = data.get("next_cursor", "")
+            if not cursor or not items or cursor == "LTE=":
+                break
+        if not failed and result:
+            return result
+        if attempt == 0 and failed:
+            time.sleep(2)  # brief backoff before retry
+    return {}
+
+
+def _save_reward_markets_cache(markets: dict[str, dict], db_path: str) -> None:
+    """Cache CLOB reward markets to DB for fallback on API failure."""
+    try:
+        db = sqlite3.connect(db_path, timeout=5)
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS reward_markets_cache (
+                condition_id TEXT PRIMARY KEY,
+                daily_rate   REAL NOT NULL,
+                min_size     REAL NOT NULL,
+                max_spread   REAL NOT NULL,
+                fetched_at   REAL NOT NULL
+            )"""
+        )
+        now = time.time()
+        db.execute("DELETE FROM reward_markets_cache")
+        db.executemany(
+            "INSERT INTO reward_markets_cache (condition_id, daily_rate, min_size, max_spread, fetched_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [(cid, m["daily_rate"], m["min_size"], m["max_spread"], now) for cid, m in markets.items()],
+        )
+        db.commit()
+        db.close()
+    except Exception as e:
+        log.debug(f"Failed to cache reward markets: {e}")
+
+
+def _load_reward_markets_cache(db_path: str, min_rate: float) -> dict[str, dict]:
+    """Load cached CLOB reward markets from DB."""
+    try:
+        db = sqlite3.connect(db_path, timeout=5)
+        db.row_factory = sqlite3.Row
+        cutoff = time.time() - _REWARD_MARKETS_CACHE_TTL
+        rows = db.execute(
+            "SELECT * FROM reward_markets_cache WHERE fetched_at > ? AND daily_rate >= ?",
+            (cutoff, min_rate),
+        ).fetchall()
+        db.close()
+        return {
+            r["condition_id"]: {
+                "daily_rate": r["daily_rate"],
+                "min_size": r["min_size"],
+                "max_spread": r["max_spread"],
+            }
+            for r in rows
+        }
+    except Exception:
+        return {}
 
 
 def _fetch_reward_market_expiries(condition_ids: list[str] | None = None,
@@ -292,11 +378,11 @@ def query_per_market_pnl(db_path: str, hours: float = 24) -> dict[str, dict]:
         db = sqlite3.connect(db_path, timeout=5)
         db.row_factory = sqlite3.Row
 
-        # Aggregate fills
+        # Aggregate fills — use clob_cost for both sides (actual USDC spent)
         fills = {}
         for r in db.execute(
             """SELECT condition_id,
-                      SUM(CASE WHEN side='yes' THEN shares*price ELSE shares*clob_cost END) as cost,
+                      SUM(shares * clob_cost) as cost,
                       COUNT(*) as cnt
                FROM fills WHERE ts > ? GROUP BY condition_id""",
             (cutoff,),
@@ -355,7 +441,7 @@ def query_fill_costs(db_path: str, hours: float = 24) -> dict[str, dict]:
         db.row_factory = sqlite3.Row
         rows = db.execute(
             """SELECT condition_id,
-                      SUM(CASE WHEN side='yes' THEN shares*price ELSE shares*clob_cost END) as cost,
+                      SUM(shares * clob_cost) as cost,
                       COUNT(*) as cnt,
                       SUM(shares) as total_shares
                FROM fills WHERE ts > ?
@@ -422,8 +508,10 @@ def query_positions(db_path: str) -> dict[str, dict]:
         db.close()
         result = {}
         for r in rows:
+            # avg_price is YES-equivalent; CLOB cost for NO = (1 - avg_price)
             yv = r["yes_shares"] * r["yes_avg_price"]
-            nv = r["no_shares"] * r["no_avg_price"]
+            no_avg = r["no_avg_price"]
+            nv = r["no_shares"] * (1 - no_avg) if no_avg > 0 else 0
             result[r["condition_id"]] = {
                 "yes_usd": yv,
                 "no_usd": nv,
@@ -469,32 +557,112 @@ def query_reward_stats(db_path: str) -> dict[str, dict]:
 
 
 def compute_available_capital(db_path: str, total_capital: float = 1500.0) -> float:
-    """Compute available capital by subtracting locked positions AND pending dumps.
+    """Compute available capital by subtracting locked positions, pending dumps,
+    AND pending (unfilled) BUY orders.
 
     Returns actual deployable capital (never negative, floors at 0).
     """
     positions = query_positions(db_path)
     locked_positions = sum(p["total"] for p in positions.values())
 
-    # Also count capital locked in pending dumps
     locked_dumps = 0.0
+    locked_pending = 0.0
     try:
         db = sqlite3.connect(db_path, timeout=5)
         db.row_factory = sqlite3.Row
-        rows = db.execute("SELECT shares, fill_price FROM dump_states").fetchall()
-        db.close()
-        for r in rows:
-            locked_dumps += r["shares"] * r["fill_price"]
-    except Exception:
-        pass  # table may not exist yet
 
-    locked = locked_positions + locked_dumps
+        # Capital locked in pending dumps
+        for r in db.execute("SELECT shares, fill_price FROM dump_states").fetchall():
+            locked_dumps += r["shares"] * r["fill_price"]
+
+        # Capital locked in pending (unfilled) BUY orders
+        for r in db.execute(
+            "SELECT shares, price, side FROM active_orders WHERE order_type = 'buy'"
+        ).fetchall():
+            # price is YES-equivalent; CLOB cost depends on side
+            if r["side"] == "yes":
+                locked_pending += r["shares"] * r["price"]
+            else:
+                locked_pending += r["shares"] * (1 - r["price"])
+
+        db.close()
+    except Exception:
+        pass  # tables may not exist yet
+
+    locked = locked_positions + locked_dumps + locked_pending
     available = max(0, total_capital - locked)
     log.info(
         f"Capital: ${total_capital:.0f} total - ${locked_positions:.0f} positions "
-        f"- ${locked_dumps:.0f} dumps = ${available:.0f} available"
+        f"- ${locked_dumps:.0f} dumps - ${locked_pending:.0f} pending = ${available:.0f} available"
     )
     return available
+
+
+def _smooth_correction_factor(
+    raw_factor: float,
+    db_path: str,
+    alpha: float = 0.3,
+    has_new_observation: bool = True,
+) -> float:
+    """EMA-smooth the correction factor using DB-persisted history.
+
+    Stores each raw observation with timestamp. On read, computes an
+    exponential moving average so a single noisy day doesn't whip the factor.
+
+    If no new observation this cycle, returns the last stored EMA (or 1.0).
+    """
+    try:
+        db = sqlite3.connect(db_path, timeout=5)
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS correction_factor_history (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts        REAL    NOT NULL,
+                raw       REAL    NOT NULL,
+                smoothed  REAL    NOT NULL
+            )"""
+        )
+
+        # Read last smoothed value
+        row = db.execute(
+            "SELECT smoothed FROM correction_factor_history ORDER BY ts DESC LIMIT 1"
+        ).fetchone()
+        prev_smoothed = row[0] if row else 1.0
+
+        if has_new_observation:
+            # EMA: new_smoothed = alpha * raw + (1 - alpha) * prev_smoothed
+            smoothed = alpha * raw_factor + (1 - alpha) * prev_smoothed
+            smoothed = max(0.1, min(10.0, smoothed))
+
+            db.execute(
+                "INSERT INTO correction_factor_history (ts, raw, smoothed) VALUES (?, ?, ?)",
+                (time.time(), raw_factor, smoothed),
+            )
+            # Keep only last 30 observations (~30 cycles ≈ 15h at 30min intervals)
+            db.execute(
+                """DELETE FROM correction_factor_history
+                   WHERE id NOT IN (
+                       SELECT id FROM correction_factor_history
+                       ORDER BY ts DESC LIMIT 30
+                   )"""
+            )
+            db.commit()
+
+            if abs(smoothed - raw_factor) > 0.05:
+                log.info(
+                    f"Correction factor smoothed: raw={raw_factor:.3f} → "
+                    f"EMA={smoothed:.3f} (prev={prev_smoothed:.3f}, α={alpha})"
+                )
+        else:
+            smoothed = prev_smoothed
+            if smoothed != 1.0:
+                log.info(f"No new payout data — using last smoothed factor={smoothed:.3f}")
+
+        db.close()
+        return smoothed
+
+    except Exception as e:
+        log.debug(f"Correction factor smoothing failed: {e}")
+        return raw_factor if has_new_observation else 1.0
 
 
 def collect_all(
@@ -529,7 +697,7 @@ def collect_all(
 
     # Independent discovery: fetch ALL CLOB reward markets so the agent
     # can score markets the bot hasn't tracked yet (closes discovery gap)
-    clob_reward_markets = _fetch_all_clob_reward_markets()
+    clob_reward_markets = _fetch_all_clob_reward_markets(db_path=db_path)
     new_discovered = 0
     for cid, mkt_data in clob_reward_markets.items():
         if cid not in all_cids:
@@ -579,23 +747,31 @@ def collect_all(
         ))
 
     # Compute correction factor: actual total paid / sum of estimates
+    # Uses EMA smoothing so a single noisy payout day doesn't whip the factor.
     estimated_daily_total = sum(
         m.daily_rate * m.q_share_pct for m in metrics if m.q_share_pct > 0
     )
-    correction_factor = 1.0
+    raw_factor = 1.0
     if actual_daily_total > 0 and estimated_daily_total > 0:
-        # Scale to daily if window != 24h
         actual_per_day = actual_daily_total / max(hours / 24, 0.1)
-        correction_factor = actual_per_day / estimated_daily_total
-        correction_factor = max(0.1, min(10.0, correction_factor))  # clamp to reasonable range
+        raw_factor = actual_per_day / estimated_daily_total
+        raw_factor = max(0.1, min(10.0, raw_factor))  # clamp to reasonable range
         log.info(
             f"Reward correction: actual=${actual_per_day:.2f}/d vs "
-            f"estimated=${estimated_daily_total:.2f}/d → factor={correction_factor:.2f}"
+            f"estimated=${estimated_daily_total:.2f}/d → raw_factor={raw_factor:.2f}"
         )
     elif actual_daily_total > 0:
         log.info(f"Reward correction: actual=${actual_daily_total:.2f} but no estimates to compare")
     else:
         log.debug("No actual reward data — using estimates at face value (factor=1.0)")
+
+    # EMA smoothing: blend new observation with historical average.
+    # Alpha=0.3 means ~70% weight on history, ~30% on latest observation.
+    # This damps out single-day spikes (late payouts, double payouts).
+    correction_factor = _smooth_correction_factor(
+        raw_factor, db_path, alpha=0.3,
+        has_new_observation=(actual_daily_total > 0 and estimated_daily_total > 0),
+    )
 
     log.info(
         f"Collected metrics for {len(metrics)} markets | "

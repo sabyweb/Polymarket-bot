@@ -44,7 +44,9 @@ def score_market(m: MarketMetrics, hours: float = 24, correction_factor: float =
             > 1.0 means our estimates are too low.
             1.0 means no correction data available.
 
-    Score = corrected_daily_reward - daily_fill_damage
+    Score = corrected_daily_reward - daily_fill_damage + zero_fill_bonus
+    Zero-fill bonus is capped at $2/day so low-rate markets can't outrank
+    genuinely profitable ones purely on fill luck.
     """
     # Estimated daily reward, corrected by actual payout data
     estimated_daily = m.daily_rate * m.q_share_pct
@@ -63,9 +65,12 @@ def score_market(m: MarketMetrics, hours: float = 24, correction_factor: float =
     # Score: what we earn minus what we lose, per day
     score = effective_daily - daily_damage
 
-    # Bonus for zero fills (reward certainty)
+    # Bonus for zero fills — capped so a $0.01/day market with zero fills
+    # can't outscore a $50/day market with minor fill damage.
+    # Cap: min(50% of effective, $2/day) — meaningful for real markets,
+    # negligible for dust-rate ones.
     if m.fill_count_recent == 0 and effective_daily > 0:
-        score += effective_daily * 0.5  # 50% bonus for zero-fill certainty
+        score += min(effective_daily * 0.5, 2.0)
 
     return score
 
@@ -93,48 +98,60 @@ def classify_market(
     else:
         confidence = "low"
 
-    # ── Intelligent sizing ──
-    # Base: market's min_size (usually 50, can be 100, 200, 1000+)
-    # Scale up for zero-fill high-value markets — more shares = more Q-score = more reward
+    # ── Continuous ROI-based sizing ──
+    # Instead of discrete tiers, compute a multiplier from the score itself.
+    # Score already incorporates daily_rate × q_share - fill_damage, so
+    # sizing by score automatically rewards profitable markets and penalizes
+    # risky ones. The multiplier is continuous: no cliff edges.
+    #
+    # Formula: multiplier = 1 + log2(1 + score / scale_param)
+    #   score=0  → 1.0x (default)
+    #   score=25 → ~1.7x
+    #   score=50 → ~2.0x
+    #   score=100 → ~2.3x
+    #   score=200 → ~2.6x
+    # Logarithmic so diminishing returns prevent over-concentration.
     q_pct = m.q_share_pct * 100
+    import math
 
-    # Start at default
-    sized_shares = default_shares
-
-    if m.fill_count_recent == 0 and q_pct >= 90 and m.daily_rate >= 50:
-        # Zero fills + dominant + high rate: scale to 2x-4x default
-        # Higher rate = more worth deploying extra capital
-        if m.daily_rate >= 200:
-            sized_shares = default_shares * 4  # 200sh for $200+/day markets
-        elif m.daily_rate >= 100:
-            sized_shares = default_shares * 3  # 150sh for $100+/day markets
-        else:
-            sized_shares = default_shares * 2  # 100sh for $50+/day markets
-        size_reason = f"zero-fill {q_pct:.0f}%Q ${m.daily_rate:.0f}/d, scaled {sized_shares}sh"
-    elif m.fill_count_recent == 0 and q_pct >= 50:
-        # Zero fills + strong Q: standard or slight bump
-        sized_shares = default_shares
-        size_reason = f"zero-fill {q_pct:.0f}%Q, standard {sized_shares}sh"
-    elif q_pct > 0 and m.daily_rate >= 50:
-        sized_shares = default_shares
-        size_reason = f"{q_pct:.0f}%Q ${m.daily_rate:.0f}/d rate, standard"
+    scale_param = 25.0  # score at which we roughly double shares
+    if score > 0 and m.fill_count_recent == 0:
+        raw_mult = 1.0 + math.log2(1 + score / scale_param)
+        # Cap at 4x to prevent over-concentration on a single market
+        multiplier = min(raw_mult, 4.0)
+        sized_shares = int(default_shares * multiplier)
+        size_reason = (
+            f"zero-fill {q_pct:.0f}%Q ${m.daily_rate:.0f}/d, "
+            f"ROI-mult={multiplier:.1f}x → {sized_shares}sh"
+        )
+    elif score > 0:
+        # Has fills but still net positive — conservative 1.0-1.5x
+        raw_mult = 1.0 + 0.5 * math.log2(1 + score / scale_param)
+        multiplier = min(raw_mult, 1.5)
+        sized_shares = int(default_shares * multiplier)
+        size_reason = (
+            f"{q_pct:.0f}%Q, fills={m.fill_count_recent}, "
+            f"conservative-mult={multiplier:.1f}x → {sized_shares}sh"
+        )
     elif q_pct == 0:
         sized_shares = default_shares
         size_reason = "new market, standard size"
     else:
         sized_shares = default_shares
-        size_reason = f"{q_pct:.0f}%Q, standard"
+        size_reason = f"{q_pct:.0f}%Q, score≤0, standard"
 
     # ── Decision logic ──
-    if m.fill_count_recent == 0 and m.daily_rate > 0:
+    # Primary gate: score > 0 means reward exceeds damage. Deploy.
+    # Secondary: zero-fill markets with score > 0 get sized shares.
+    # Trial: new markets (low confidence) with decent rate get a small trial.
+    # Avoid: everything else.
+    if score > 0:
         action = "deploy"
         shares = sized_shares if sized_shares > 0 else default_shares
-        reason = f"Zero fills, ${m.daily_rate:.0f}/d, Q={q_pct:.0f}%, {size_reason}"
-
-    elif score > 0:
-        action = "deploy"
-        shares = sized_shares if sized_shares > 0 else default_shares
-        reason = f"Net positive: rew=${m.actual_reward_total:.2f} > dmg=${fill_damage:.2f}, {size_reason}"
+        if m.fill_count_recent == 0:
+            reason = f"Net positive (zero fills), ${m.daily_rate:.0f}/d, Q={q_pct:.0f}%, {size_reason}"
+        else:
+            reason = f"Net positive: rew=${m.actual_reward_total:.2f} > dmg=${fill_damage:.2f}, {size_reason}"
 
     elif m.fill_count_recent >= 3 and fill_damage > m.actual_reward_total:
         action = "avoid"
@@ -142,9 +159,18 @@ def classify_market(
         reason = f"High fills ({m.fill_count_recent}), dmg=${fill_damage:.2f} > rew=${m.actual_reward_total:.2f}"
 
     elif confidence == "low" and m.daily_rate >= 5:
+        # New market with no data — small trial to gather signal
         action = "deploy"
         shares = default_shares
         reason = f"New market, ${m.daily_rate:.0f}/d pool — trial with default_size"
+
+    elif m.fill_count_recent == 0 and m.daily_rate >= 10:
+        # Score <= 0 but zero fills and decent rate — trial at default size.
+        # Could be a market where q_share is low (hidden competition)
+        # but no fill risk. Worth a small probe.
+        action = "deploy"
+        shares = default_shares
+        reason = f"Zero fills but low Q-share, trial at {default_shares}sh"
 
     else:
         action = "avoid"
@@ -174,53 +200,76 @@ def load_historical_adjustments(db_path: str, days: int = 7) -> dict[str, dict]:
     For markets with 3+ historical snapshots, computes:
     - trend: is the market getting better or worse over time?
     - reliability: how consistent is the score across snapshots?
-    - fill_rate: what fraction of snapshots had fills?
+    - fill_rate: what fraction of snapshots had fills (recency-weighted)?
+
+    Recent snapshots are weighted more heavily via exponential decay
+    (half-life = 2 days). A fill yesterday counts ~3.5x more than a
+    fill 5 days ago.
 
     Returns {condition_id: {"trend_mult": float, "fill_rate": float, "snapshots": int}}
     """
     import sqlite3
-    cutoff_ts = __import__("time").time() - days * 86400
+    import math
+    now = __import__("time").time()
+    cutoff_ts = now - days * 86400
     result = {}
+    half_life_secs = 2 * 86400  # 2-day half-life
 
     try:
         db = sqlite3.connect(db_path, timeout=5)
         db.row_factory = sqlite3.Row
 
-        # Get per-market aggregates from performance history
+        # Fetch individual snapshots for recency-weighted fill rate
         rows = db.execute(
-            """SELECT condition_id,
-                      COUNT(*) as snapshots,
-                      AVG(net_score) as avg_score,
-                      AVG(fill_count) as avg_fills,
-                      SUM(CASE WHEN fill_count > 0 THEN 1 ELSE 0 END) as fill_snapshots,
-                      MIN(net_score) as worst_score,
-                      MAX(net_score) as best_score
+            """SELECT condition_id, ts, fill_count, net_score
                FROM market_performance
                WHERE ts > ?
-               GROUP BY condition_id
-               HAVING snapshots >= 3""",
+               ORDER BY condition_id, ts""",
             (cutoff_ts,),
         ).fetchall()
         db.close()
 
+        # Group by condition_id
+        per_market: dict[str, list] = {}
         for r in rows:
             cid = r["condition_id"]
-            snapshots = r["snapshots"]
-            fill_rate = r["fill_snapshots"] / snapshots if snapshots > 0 else 0
+            per_market.setdefault(cid, []).append(dict(r))
+
+        for cid, snaps in per_market.items():
+            if len(snaps) < 3:
+                continue
+
+            # Recency-weighted fill rate: each snapshot weighted by
+            # 2^(-age_days / half_life_days)
+            weighted_fills = 0.0
+            total_weight = 0.0
+            worst_score = float("inf")
+            score_sum = 0.0
+
+            for s in snaps:
+                age_secs = max(0, now - s["ts"])
+                weight = math.pow(0.5, age_secs / half_life_secs)
+                total_weight += weight
+                if s["fill_count"] > 0:
+                    weighted_fills += weight
+                worst_score = min(worst_score, s["net_score"])
+                score_sum += s["net_score"] * weight
+
+            fill_rate = weighted_fills / total_weight if total_weight > 0 else 0
 
             # Trend multiplier: penalize markets that fill frequently
             # fill_rate 0% → 1.2 bonus, fill_rate 50% → 0.8 penalty, fill_rate 100% → 0.5
             trend_mult = max(0.5, 1.2 - fill_rate * 0.7)
 
             # Extra penalty if worst score is very negative (risky market)
-            if r["worst_score"] < -5.0:
+            if worst_score < -5.0:
                 trend_mult *= 0.8
 
             result[cid] = {
                 "trend_mult": trend_mult,
                 "fill_rate": fill_rate,
-                "avg_score": r["avg_score"],
-                "snapshots": snapshots,
+                "avg_score": score_sum / total_weight if total_weight > 0 else 0,
+                "snapshots": len(snaps),
             }
 
         if result:
@@ -300,7 +349,29 @@ def rank_markets(
     for m in active_metrics:
         s = score_market(m, hours, correction_factor=correction_factor)
 
+        # ── Fast-react: immediate penalty for recent fills ──
+        # If a market had fills in THIS window, apply a circuit-breaker
+        # penalty proportional to fill count. Don't wait for historical
+        # data to accumulate — react NOW. This is the single biggest
+        # adaptation speed improvement.
+        if m.fill_count_recent > 0:
+            # Each fill in the window reduces score by 15% (compounds)
+            # 1 fill → 0.85x, 2 fills → 0.72x, 3+ fills → 0.61x or worse
+            fast_react_mult = 0.85 ** m.fill_count_recent
+            fast_react_mult = max(fast_react_mult, 0.3)  # floor at 30%
+            s *= fast_react_mult
+
+        # ── Confidence ramp-up for new markets ──
+        # Markets with < 8h on-book get a graduated confidence discount
+        # on their sizing (not score). This prevents the agent from
+        # over-allocating to unproven markets. Ramps linearly:
+        #   0h → 50%, 4h → 75%, 8h+ → 100%
+        confidence_mult = 1.0
+        if m.on_book_hours < 8:
+            confidence_mult = 0.5 + 0.5 * (m.on_book_hours / 8.0)
+
         # Penalize markets the bot persistently can't place on
+        placement_penalty = 1.0
         fb = feedback.get(m.condition_id, {})
         yes_skip = fb.get("yes", {}).get("status") == "skipped"
         no_skip = fb.get("no", {}).get("status") == "skipped"
@@ -308,9 +379,11 @@ def rank_markets(
             skip_reason = fb.get("yes", {}).get("reason", "")
             if skip_reason in ("wide_spread", "exit_liquidity"):
                 s *= 0.3  # Heavy penalty — bot can't trade this market
+                placement_penalty = 0.3
                 log.debug(f"Placement penalty {m.condition_id[:12]}: both sides skipped ({skip_reason})")
             elif skip_reason not in ("capital_exhausted", "already_has_order"):
                 s *= 0.5  # Moderate penalty for other persistent skips
+                placement_penalty = 0.5
 
         # Apply historical adjustment if available
         hist = historical.get(m.condition_id)
@@ -325,6 +398,23 @@ def rank_markets(
                 )
 
         sm = classify_market(m, s)
+
+        # Apply confidence ramp-up to sizing (not score)
+        if confidence_mult < 1.0 and sm.recommended_shares > 0:
+            sm.recommended_shares = max(
+                int(m.min_size),
+                int(sm.recommended_shares * confidence_mult),
+            )
+
+        # Reduce allocation size when bot can't place — don't just penalize
+        # the score, also shrink the order so the bot doesn't keep failing
+        # with the same oversized order next cycle.
+        if placement_penalty < 1.0 and sm.recommended_shares > 0:
+            sm.recommended_shares = max(
+                int(m.min_size),
+                int(sm.recommended_shares * placement_penalty),
+            )
+
         scored.append(sm)
 
     # Sort by score descending

@@ -186,7 +186,8 @@ class RewardFarmer:
                 cleaned += 1
                 continue
             ms.dump_state[side] = state
-            ms.dump_orders[side] = None
+            saved_oid = state.get("dump_order_id", "")
+            ms.dump_orders[side] = saved_oid if saved_oid else None
             restored += 1
             log.info(f"Restored dump {side.upper()} {state['shares']:.0f}sh @ {state['fill_price']:.4f} ({elapsed_min:.0f}m elapsed) | {ms.question[:30]}")
         if restored or cleaned:

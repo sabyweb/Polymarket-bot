@@ -43,15 +43,31 @@ class TestScoreMarket(unittest.TestCase):
         """Perfect market: 100% Q-share, zero fills, should score highest."""
         m = _make_metric(daily_rate=50, q_share_pct=1.0)
         score = score_market(m, hours=24)
-        # effective_daily = 50 * 1.0 = 50, + 50% bonus = 75
-        self.assertAlmostEqual(score, 75.0)
+        # effective_daily = 50 * 1.0 = 50, + min(50*0.5, 2.0) = +2.0 = 52
+        self.assertAlmostEqual(score, 52.0)
 
     def test_zero_fill_low_qshare(self):
         """Low Q-share but zero fills: still positive."""
         m = _make_metric(daily_rate=100, q_share_pct=0.1)
         score = score_market(m, hours=24)
-        # effective = 10, + 50% bonus = 15
-        self.assertAlmostEqual(score, 15.0)
+        # effective = 10, + min(10*0.5, 2.0) = +2.0 = 12
+        self.assertAlmostEqual(score, 12.0)
+
+    def test_zero_fill_bonus_capped(self):
+        """Zero-fill bonus is capped at $2/day so dust markets can't dominate."""
+        tiny = _make_metric(daily_rate=1, q_share_pct=0.01)  # effective = $0.01/day
+        score_tiny = score_market(tiny, hours=24)
+        # effective = 0.01, bonus = min(0.005, 2.0) = 0.005, total = 0.015
+        self.assertAlmostEqual(score_tiny, 0.015)
+
+        big = _make_metric(daily_rate=50, q_share_pct=1.0, fill_count_recent=1,
+                           fill_cost_recent=1.0, dump_revenue_recent=0.0)
+        score_big = score_market(big, hours=24)
+        # effective = 50, damage = 1, no bonus (has fills), total = 49
+        self.assertAlmostEqual(score_big, 49.0)
+
+        # Big market with 1 fill MUST outscore dust market with zero fills
+        self.assertGreater(score_big, score_tiny)
 
     def test_fills_reduce_score(self):
         """Fills should reduce score by fill_damage/day."""
@@ -81,10 +97,10 @@ class TestScoreMarket(unittest.TestCase):
         m = _make_metric(daily_rate=100, q_share_pct=1.0)
         score_no_correction = score_market(m, hours=24, correction_factor=1.0)
         score_with_correction = score_market(m, hours=24, correction_factor=0.1)
-        # Without: 100 + 50% = 150
-        # With 0.1: 10 + 50% = 15
-        self.assertAlmostEqual(score_no_correction, 150.0)
-        self.assertAlmostEqual(score_with_correction, 15.0)
+        # Without: 100 + min(50, 2) = 102
+        # With 0.1: 10 + min(5, 2) = 12
+        self.assertAlmostEqual(score_no_correction, 102.0)
+        self.assertAlmostEqual(score_with_correction, 12.0)
 
     def test_correction_factor_does_not_affect_fill_damage(self):
         """Fill damage is real, should NOT be scaled by correction factor."""
@@ -93,7 +109,7 @@ class TestScoreMarket(unittest.TestCase):
             fill_cost_recent=20.0, fill_count_recent=2,
         )
         score = score_market(m, hours=24, correction_factor=0.1)
-        # corrected_daily = 10, damage = 20/day, score = 10 - 20 = -10
+        # corrected_daily = 10, damage = 20/day, score = 10 - 20 = -10 (no bonus, has fills)
         self.assertAlmostEqual(score, -10.0)
 
 
@@ -237,6 +253,163 @@ class TestHistoricalAdjustments(unittest.TestCase):
             self._insert_snapshot("0xold", fill_count=0, ts_offset=8*86400)
         result = load_historical_adjustments(self.db_path)
         self.assertNotIn("0xold", result)
+
+
+class TestContinuousSizing(unittest.TestCase):
+    """Test that sizing scales continuously with score, not discrete tiers."""
+
+    def test_higher_score_gets_more_shares(self):
+        """Markets with higher scores get strictly more shares."""
+        low = _make_metric(daily_rate=20, q_share_pct=1.0)
+        high = _make_metric(daily_rate=100, q_share_pct=1.0)
+        sm_low = classify_market(low, score=20.0)
+        sm_high = classify_market(high, score=100.0)
+        self.assertGreater(sm_high.recommended_shares, sm_low.recommended_shares)
+
+    def test_no_cliff_at_boundaries(self):
+        """Markets at $49/d and $51/d should NOT jump 2x in shares."""
+        m49 = _make_metric(daily_rate=49, q_share_pct=1.0)
+        m51 = _make_metric(daily_rate=51, q_share_pct=1.0)
+        sm49 = classify_market(m49, score=49.0)
+        sm51 = classify_market(m51, score=51.0)
+        # Ratio should be close, not 2x jump
+        ratio = sm51.recommended_shares / sm49.recommended_shares
+        self.assertLess(ratio, 1.2)  # no more than 20% jump
+
+    def test_fills_reduce_sizing_multiplier(self):
+        """Markets with fills get more conservative sizing than zero-fill."""
+        m_nofill = _make_metric(daily_rate=50, q_share_pct=1.0)
+        m_fills = _make_metric(daily_rate=50, q_share_pct=1.0,
+                               fill_count_recent=2, fill_cost_recent=5.0)
+        sm_nofill = classify_market(m_nofill, score=50.0)
+        sm_fills = classify_market(m_fills, score=45.0)
+        self.assertGreaterEqual(sm_nofill.recommended_shares, sm_fills.recommended_shares)
+
+    def test_negative_score_gets_default_or_zero(self):
+        """Negative score: should not scale up."""
+        m = _make_metric(daily_rate=50, q_share_pct=0.5,
+                         fill_count_recent=5, fill_cost_recent=100.0)
+        sm = classify_market(m, score=-50.0)
+        self.assertEqual(sm.recommended_shares, 0)
+
+    def test_capped_at_4x(self):
+        """Even an amazing market can't exceed 4x default shares."""
+        m = _make_metric(daily_rate=1000, q_share_pct=1.0)
+        sm = classify_market(m, score=1000.0)
+        self.assertLessEqual(sm.recommended_shares, 50 * 4)
+
+
+class TestFastReactAndConfidence(unittest.TestCase):
+    """Test fast-react fill penalty and confidence ramp-up."""
+
+    def test_fills_reduce_score_via_fast_react(self):
+        """rank_markets should penalize markets with recent fills immediately."""
+        # Two identical markets: one with fills, one without
+        metrics = [
+            _make_metric(condition_id="clean", daily_rate=50, q_share_pct=1.0),
+            _make_metric(condition_id="dirty", daily_rate=50, q_share_pct=1.0,
+                         fill_count_recent=3, fill_cost_recent=5.0),
+        ]
+        scored = rank_markets(metrics, max_markets=10)
+        scores = {s.condition_id: s.score for s in scored}
+        # Clean should have higher score than dirty after fast-react
+        self.assertGreater(scores["clean"], scores["dirty"])
+
+    def test_new_market_gets_reduced_shares(self):
+        """Markets with <8h on-book should get reduced shares (confidence ramp)."""
+        m_new = _make_metric(condition_id="new", daily_rate=50, q_share_pct=1.0,
+                             on_book_hours=2)
+        m_old = _make_metric(condition_id="old", daily_rate=50, q_share_pct=1.0,
+                             on_book_hours=24)
+        scored = rank_markets([m_new, m_old], max_markets=10)
+        shares = {s.condition_id: s.recommended_shares for s in scored}
+        # New market should have fewer shares due to confidence ramp
+        self.assertLess(shares["new"], shares["old"])
+
+
+class TestCapitalRedistribution(unittest.TestCase):
+    """Test the two-pass allocation with redistribution."""
+
+    def test_surplus_gets_redistributed(self):
+        """When budget > base allocation, surplus goes to top markets."""
+        from oversight.allocation_writer import compute_allocations
+        scored = [
+            ScoredMarket(condition_id="top", question="Top?", score=100.0,
+                         action="deploy", recommended_shares=50, reason="test",
+                         confidence="high", actual_reward_total=10.0,
+                         fill_damage=0, fill_count=0, daily_rate=100,
+                         min_size=50, max_spread=0.045),
+            ScoredMarket(condition_id="mid", question="Mid?", score=50.0,
+                         action="deploy", recommended_shares=50, reason="test",
+                         confidence="high", actual_reward_total=5.0,
+                         fill_damage=0, fill_count=0, daily_rate=50,
+                         min_size=50, max_spread=0.045),
+        ]
+        # Base cost: 2 markets × 50sh × $0.455 × 2 = ~$91. With $500 budget,
+        # there's surplus to redistribute.
+        allocs = compute_allocations(scored, total_capital=500.0)
+        deployed = [a for a in allocs if a["action"] == "deploy"]
+
+        # Top market should get more than base 50 from redistribution
+        top_alloc = next(a for a in deployed if a["condition_id"] == "top")
+        self.assertGreater(top_alloc["shares_per_side"], 50)
+
+    def test_per_market_cap_respected(self):
+        """No single market exceeds max_capital_pct of total budget."""
+        from oversight.allocation_writer import compute_allocations, _est_market_cost
+        scored = [
+            ScoredMarket(condition_id="only", question="Only?", score=100.0,
+                         action="deploy", recommended_shares=50, reason="test",
+                         confidence="high", actual_reward_total=10.0,
+                         fill_damage=0, fill_count=0, daily_rate=100,
+                         min_size=50, max_spread=0.045),
+        ]
+        allocs = compute_allocations(scored, total_capital=2000.0, max_capital_pct=0.15)
+        deployed = [a for a in allocs if a["action"] == "deploy"]
+        for a in deployed:
+            cost = _est_market_cost(a["shares_per_side"], a.get("max_spread", 0.045))
+            self.assertLessEqual(cost, 2000.0 * 0.15 + 1.0)  # allow $1 rounding
+
+
+class TestCorrectionFactorSmoothing(unittest.TestCase):
+    """Test EMA smoothing of correction factor."""
+
+    def setUp(self):
+        self.db_fd, self.db_path = tempfile.mkstemp(suffix=".db")
+
+    def tearDown(self):
+        os.close(self.db_fd)
+        os.unlink(self.db_path)
+
+    def test_first_observation_used_directly(self):
+        """First observation: EMA = alpha * raw + (1-alpha) * 1.0."""
+        from oversight.data_collector import _smooth_correction_factor
+        result = _smooth_correction_factor(0.5, self.db_path, alpha=0.3,
+                                           has_new_observation=True)
+        # 0.3 * 0.5 + 0.7 * 1.0 = 0.85
+        self.assertAlmostEqual(result, 0.85, places=2)
+
+    def test_smoothing_damps_spike(self):
+        """A spike from 1.0 to 3.0 should be damped by EMA."""
+        from oversight.data_collector import _smooth_correction_factor
+        # First: factor=1.0 → smoothed = 0.3*1.0 + 0.7*1.0 = 1.0
+        _smooth_correction_factor(1.0, self.db_path, alpha=0.3,
+                                  has_new_observation=True)
+        # Second: spike to 3.0 → smoothed = 0.3*3.0 + 0.7*1.0 = 1.6
+        result = _smooth_correction_factor(3.0, self.db_path, alpha=0.3,
+                                           has_new_observation=True)
+        self.assertAlmostEqual(result, 1.6, places=1)
+        # Without smoothing would be 3.0 — EMA brings it to ~1.6
+
+    def test_no_observation_returns_last(self):
+        """When no new data, return last stored smoothed value."""
+        from oversight.data_collector import _smooth_correction_factor
+        _smooth_correction_factor(0.6, self.db_path, alpha=0.3,
+                                  has_new_observation=True)
+        result = _smooth_correction_factor(999.0, self.db_path, alpha=0.3,
+                                           has_new_observation=False)
+        # Should return prev smoothed, not 999
+        self.assertLess(result, 2.0)
 
 
 if __name__ == "__main__":

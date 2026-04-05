@@ -18,46 +18,112 @@ log = logging.getLogger("oversight.allocator")
 MAX_PER_MARKET = 200.0
 DEFAULT_SHARES = 50
 MIN_SHARES = 20
-EST_PRICE_PER_SHARE = 0.30  # rough average for capital estimation
+
+
+def _est_market_cost(shares: int, max_spread: float) -> float:
+    """Estimate capital needed for a market (both sides)."""
+    spread = max_spread if max_spread > 0 else 0.045
+    est_price_per_share = max(0.10, (1.0 - 2 * spread) / 2)
+    return shares * est_price_per_share * 2
 
 
 def compute_allocations(
     scored_markets: list[ScoredMarket],
     total_capital: float = 1500.0,
     max_per_market: float = MAX_PER_MARKET,
+    max_capital_pct: float = 0.15,
 ) -> list[dict]:
     """Apply capital constraints and compute final allocations.
 
-    Algorithm:
-    1. Take "deploy" markets sorted by score (already sorted from scorer)
-    2. Each gets base_shares (DEFAULT_SHARES or their recommended_shares)
-    3. Walk down list, accumulating capital
-    4. When budget exhausted, remaining markets demoted to "avoid"
+    Two-pass algorithm:
+    1. **Base pass** — each deploy market gets its recommended shares (from scorer).
+       Markets are funded in score order until budget runs out.
+    2. **Redistribution pass** — if surplus capital remains, redistribute it
+       proportionally to top-scoring deployed markets (by score weight).
+       This ensures capital isn't left idle when we have profitable markets
+       that could absorb more. Each market is capped at max_per_market and
+       max_capital_pct of total to prevent over-concentration.
+
+    Args:
+        scored_markets: Pre-sorted by score descending from rank_markets.
+        total_capital: Total deployable capital.
+        max_per_market: Hard cap on capital per market.
+        max_capital_pct: Max fraction of total capital per market (default 15%).
 
     Returns list of allocation dicts ready for JSON serialization.
     """
+    per_market_cap = min(max_per_market, total_capital * max_capital_pct)
     allocations = []
     remaining_capital = total_capital
 
+    # ── Pass 1: Base allocation ──
     for sm in scored_markets:
         if sm.action == "avoid":
             allocations.append(_to_dict(sm, shares=0))
             continue
 
         shares = sm.recommended_shares if sm.recommended_shares > 0 else DEFAULT_SHARES
-
-        # Estimate capital for this market (both sides)
-        est_cost = shares * EST_PRICE_PER_SHARE * 2
-        est_cost = min(est_cost, max_per_market)
+        spread = getattr(sm, "max_spread", 0.045)
+        est_cost = min(_est_market_cost(shares, spread), per_market_cap)
 
         if est_cost > remaining_capital:
-            # Budget exhausted — demote
             allocations.append(_to_dict(sm, shares=0, action_override="avoid",
                                         reason_override="Capital budget exhausted"))
             continue
 
         remaining_capital -= est_cost
         allocations.append(_to_dict(sm, shares=shares))
+
+    # ── Pass 2: Redistribute surplus capital ──
+    # If >10% of budget is undeployed and we have deployed markets, spread
+    # the surplus across top markets proportional to their score.
+    deployed_indices = [
+        i for i, a in enumerate(allocations)
+        if a["action"] == "deploy" and a["score"] > 0
+    ]
+    surplus_threshold = total_capital * 0.10
+
+    if remaining_capital > surplus_threshold and deployed_indices:
+        # Weight by score (min 0.01 to avoid division by zero)
+        scores = [max(allocations[i]["score"], 0.01) for i in deployed_indices]
+        total_score = sum(scores)
+
+        redistrib_count = 0
+        for idx, s in zip(deployed_indices, scores):
+            a = allocations[idx]
+            spread = a.get("max_spread", 0.045)
+            est_price = max(0.10, (1.0 - 2 * spread) / 2)
+            current_cost = _est_market_cost(a["shares_per_side"], spread)
+
+            # How much more can this market absorb?
+            headroom = per_market_cap - current_cost
+            if headroom <= 0:
+                continue
+
+            # Score-proportional share of the surplus
+            share_of_surplus = remaining_capital * (s / total_score)
+            extra_capital = min(share_of_surplus, headroom)
+            if extra_capital < est_price * 2:
+                continue  # not enough for even 1 extra share per side
+
+            extra_shares = int(extra_capital / (est_price * 2))
+            if extra_shares < 1:
+                continue
+
+            new_shares = a["shares_per_side"] + extra_shares
+            new_cost = _est_market_cost(new_shares, spread)
+            actual_extra = _est_market_cost(extra_shares, spread)
+
+            allocations[idx]["shares_per_side"] = new_shares
+            allocations[idx]["reason"] += f" (+{extra_shares}sh redistrib)"
+            remaining_capital -= actual_extra
+            redistrib_count += 1
+
+        if redistrib_count > 0:
+            log.info(
+                f"Redistribution: boosted {redistrib_count} markets, "
+                f"${total_capital - remaining_capital:.0f} now deployed"
+            )
 
     deployed = [a for a in allocations if a["action"] == "deploy"]
     avoided = [a for a in allocations if a["action"] == "avoid"]

@@ -124,7 +124,9 @@ def run_once(
     log.info(f"Computing allocations (${available_capital:.0f} available)...")
     allocations = compute_allocations(scored, total_capital=available_capital)
     total_deployed = sum(
-        a.get("shares_per_side", 0) * 0.30 * 2
+        a.get("shares_per_side", 0)
+        * max(0.10, (1.0 - 2 * a.get("max_spread", 0.045)) / 2)
+        * 2
         for a in allocations if a["action"] == "deploy"
     )
 

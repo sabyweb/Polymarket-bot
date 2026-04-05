@@ -89,6 +89,8 @@ class OrderLifecycle:
                         ms.unknown_count[side] = ms.unknown_count.get(side, 0) + 1
                         if ms.unknown_count[side] >= cfg("RF_UNKNOWN_RETRY_THRESHOLD"):
                             log.warning(f"BUY order stuck UNKNOWN {cfg('RF_UNKNOWN_RETRY_THRESHOLD')}x, clearing | {ms.question[:30]}")
+                            # Reconcile: check exchange balance to detect silent fills
+                            self._reconcile_after_unknown(ms, side, slot)
                             slot.order_id = None
                             ms.unknown_count[side] = 0
                         else:
@@ -333,6 +335,33 @@ class OrderLifecycle:
         if ms.dump_failures >= cfg("RF_DUMP_MAX_FAILURES"):
             return False, "dump_failures"
         return True, ""
+
+    def _reconcile_after_unknown(self, ms: MarketState, side: str, slot: OrderSlot):
+        """Check exchange balance when clearing an UNKNOWN order.
+
+        If the order silently filled, the exchange will have more shares than
+        we're tracking. Detect this and record the fill so position tracking
+        stays in sync.
+        """
+        try:
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            tid = ms.yes_tid if side == "yes" else ms.no_tid
+            bal = self.client.get_balance_allowance(
+                BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=tid)
+            )
+            actual = float(bal.get("balance", 0)) / 1e6
+            tracked = self.positions.get_shares(ms.cid, side)
+            surplus = actual - tracked
+            if surplus >= 1.0:
+                log.warning(
+                    f"UNKNOWN reconcile: exchange has {actual:.0f} but tracking {tracked:.0f} "
+                    f"({surplus:.0f} surplus) — recording as fill | {ms.question[:30]}"
+                )
+                self.handle_fill(ms, side, slot, actual_shares=surplus, actual_price=slot.price)
+            else:
+                log.info(f"UNKNOWN reconcile: no surplus (exchange={actual:.0f} tracked={tracked:.0f}) | {ms.question[:30]}")
+        except Exception as e:
+            log.warning(f"UNKNOWN reconcile balance check failed {side} {ms.question[:25]}: {e}")
 
     def total_exposure(self) -> float:
         """Sum of all open position USD values."""
