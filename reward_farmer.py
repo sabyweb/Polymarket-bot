@@ -507,15 +507,12 @@ class RewardFarmer:
                         self.db.delete_active_order(slot.order_id)
                     slot.order_id = None
 
-        # ── Step 4: Place orders on batch ────────────────────────────
+        # ── Step 4: Place orders on batch (priority: empty slots first) ──
         market_list = list(self.markets.values())
         if not market_list:
             return
 
-        batch_start = self._batch_idx
-        batch_end = min(batch_start + BATCH_SIZE(), len(market_list))
-        batch = market_list[batch_start:batch_end]
-        self._batch_idx = batch_end if batch_end < len(market_list) else 0
+        batch = self._get_priority_batch(market_list)
 
         for ms in batch:
             self._place_orders_for_market(ms)
@@ -573,7 +570,9 @@ class RewardFarmer:
         ms.last_book_fetch = time.time()
 
         if best_ask - best_bid > cfg("RF_MAX_BOOK_SPREAD"):
-            return  # too wide
+            self.db.write_placement_feedback(ms.cid, "yes", "skipped", "wide_spread")
+            self.db.write_placement_feedback(ms.cid, "no", "skipped", "wide_spread")
+            return
 
         # Edge prices
         tick = ms.tick_size
@@ -615,9 +614,9 @@ class RewardFarmer:
         can_exit_no = no_exit_depth >= effective_shares
 
         if not can_exit_yes:
-            log.debug(f"Skip YES {ms.question[:25]}: exit depth {yes_exit_depth:.0f} < {effective_shares}")
+            self.db.write_placement_feedback(ms.cid, "yes", "skipped", "exit_liquidity")
         if not can_exit_no:
-            log.debug(f"Skip NO {ms.question[:25]}: exit depth {no_exit_depth:.0f} < {effective_shares}")
+            self.db.write_placement_feedback(ms.cid, "no", "skipped", "exit_liquidity")
 
         # Shares — use agent's per-market sizing if available, else default
         shares_target = ms.agent_shares if ms.agent_shares > 0 else SHARES_PER_SIDE()
@@ -627,55 +626,100 @@ class RewardFarmer:
         no_shares = max(ms.min_size, shares_target)
 
         # Place YES bid (only if exit liquidity exists)
-        if can_exit_yes and self._can_place(ms.cid, "yes", yes_shares * edge_bid):
-            if self.dry_run:
-                log.info(f"[DRY] BID YES @ {edge_bid:.3f} ({yes_shares:.0f}sh) | {ms.question[:30]}")
-                ms.orders["yes"] = OrderSlot(order_id="dry_yes", price=edge_bid, shares=yes_shares, placed_at=time.time())
+        if can_exit_yes:
+            can, reason = self._can_place(ms.cid, "yes", yes_shares * edge_bid)
+            if can:
+                if self.dry_run:
+                    log.info(f"[DRY] BID YES @ {edge_bid:.3f} ({yes_shares:.0f}sh) | {ms.question[:30]}")
+                    ms.orders["yes"] = OrderSlot(order_id="dry_yes", price=edge_bid, shares=yes_shares, placed_at=time.time())
+                    self.db.write_placement_feedback(ms.cid, "yes", "placed", "")
+                else:
+                    try:
+                        args = OrderArgs(token_id=ms.yes_tid, price=edge_bid, size=float(yes_shares), side=BUY)
+                        resp = self.client.create_and_post_order(args)
+                        oid = resp.get("orderID") if isinstance(resp, dict) else None
+                        if oid:
+                            ms.orders["yes"] = OrderSlot(order_id=oid, price=edge_bid, shares=yes_shares, placed_at=time.time())
+                            self.db.log_order_placed(condition_id=ms.cid, side="yes", price=edge_bid, size=float(yes_shares), order_id=oid)
+                            self.db.save_active_order(oid, ms.cid, "yes", "buy", edge_bid, yes_shares)
+                            self.db.write_placement_feedback(ms.cid, "yes", "placed", "")
+                            if self.cycle_count <= 3:
+                                log.info(f"BID YES @ {edge_bid:.3f} ({yes_shares:.0f}sh) | {ms.question[:30]}")
+                    except Exception as e:
+                        err_str = str(e).lower()
+                        if "insufficient" in err_str or "balance" in err_str or "not enough" in err_str:
+                            log.warning(f"Capital exhausted (YES) — stopping placement this cycle | {ms.question[:30]}")
+                            self._capital_exhausted = True
+                            self.db.write_placement_feedback(ms.cid, "yes", "failed", "capital_exhausted")
+                            return
+                        self.db.write_placement_feedback(ms.cid, "yes", "failed", "order_error")
+                        log.debug(f"YES order failed {ms.question[:25]}: {e}")
             else:
-                try:
-                    args = OrderArgs(token_id=ms.yes_tid, price=edge_bid, size=float(yes_shares), side=BUY)
-                    resp = self.client.create_and_post_order(args)
-                    oid = resp.get("orderID") if isinstance(resp, dict) else None
-                    if oid:
-                        ms.orders["yes"] = OrderSlot(order_id=oid, price=edge_bid, shares=yes_shares, placed_at=time.time())
-                        self.db.log_order_placed(condition_id=ms.cid, side="yes", price=edge_bid, size=float(yes_shares), order_id=oid)
-                        self.db.save_active_order(oid, ms.cid, "yes", "buy", edge_bid, yes_shares)
-                        if self.cycle_count <= 3:
-                            log.info(f"BID YES @ {edge_bid:.3f} ({yes_shares:.0f}sh) | {ms.question[:30]}")
-                except Exception as e:
-                    err_str = str(e).lower()
-                    if "insufficient" in err_str or "balance" in err_str or "not enough" in err_str:
-                        log.warning(f"Capital exhausted (YES) — stopping placement this cycle | {ms.question[:30]}")
-                        self._capital_exhausted = True
-                        return
-                    log.debug(f"YES order failed {ms.question[:25]}: {e}")
+                self.db.write_placement_feedback(ms.cid, "yes", "skipped", reason)
 
         # Place NO ask (only if exit liquidity exists)
-        if can_exit_no and self._can_place(ms.cid, "no", no_shares * no_clob):
-            if self.dry_run:
-                log.info(f"[DRY] ASK NO @ {edge_ask:.3f} (clob={no_clob:.3f}, {no_shares:.0f}sh) | {ms.question[:30]}")
-                ms.orders["no"] = OrderSlot(order_id="dry_no", price=edge_ask, shares=no_shares, placed_at=time.time())
+        if can_exit_no:
+            can, reason = self._can_place(ms.cid, "no", no_shares * no_clob)
+            if can:
+                if self.dry_run:
+                    log.info(f"[DRY] ASK NO @ {edge_ask:.3f} (clob={no_clob:.3f}, {no_shares:.0f}sh) | {ms.question[:30]}")
+                    ms.orders["no"] = OrderSlot(order_id="dry_no", price=edge_ask, shares=no_shares, placed_at=time.time())
+                    self.db.write_placement_feedback(ms.cid, "no", "placed", "")
+                else:
+                    try:
+                        args = OrderArgs(token_id=ms.no_tid, price=no_clob, size=float(no_shares), side=BUY)
+                        resp = self.client.create_and_post_order(args)
+                        oid = resp.get("orderID") if isinstance(resp, dict) else None
+                        if oid:
+                            ms.orders["no"] = OrderSlot(order_id=oid, price=edge_ask, shares=no_shares, placed_at=time.time())
+                            self.db.log_order_placed(condition_id=ms.cid, side="no", price=edge_ask, size=float(no_shares), order_id=oid)
+                            self.db.save_active_order(oid, ms.cid, "no", "buy", edge_ask, no_shares)
+                            self.db.write_placement_feedback(ms.cid, "no", "placed", "")
+                            if self.cycle_count <= 3:
+                                log.info(f"ASK NO @ {edge_ask:.3f} (clob={no_clob:.3f}, {no_shares:.0f}sh) | {ms.question[:30]}")
+                    except Exception as e:
+                        err_str = str(e).lower()
+                        if "insufficient" in err_str or "balance" in err_str or "not enough" in err_str:
+                            log.warning(f"Capital exhausted (NO) — stopping placement this cycle | {ms.question[:30]}")
+                            self._capital_exhausted = True
+                            self.db.write_placement_feedback(ms.cid, "no", "failed", "capital_exhausted")
+                            return
+                        self.db.write_placement_feedback(ms.cid, "no", "failed", "order_error")
+                        log.debug(f"NO order failed {ms.question[:25]}: {e}")
             else:
-                try:
-                    args = OrderArgs(token_id=ms.no_tid, price=no_clob, size=float(no_shares), side=BUY)
-                    resp = self.client.create_and_post_order(args)
-                    oid = resp.get("orderID") if isinstance(resp, dict) else None
-                    if oid:
-                        ms.orders["no"] = OrderSlot(order_id=oid, price=edge_ask, shares=no_shares, placed_at=time.time())
-                        self.db.log_order_placed(condition_id=ms.cid, side="no", price=edge_ask, size=float(no_shares), order_id=oid)
-                        self.db.save_active_order(oid, ms.cid, "no", "buy", edge_ask, no_shares)
-                        if self.cycle_count <= 3:
-                            log.info(f"ASK NO @ {edge_ask:.3f} (clob={no_clob:.3f}, {no_shares:.0f}sh) | {ms.question[:30]}")
-                except Exception as e:
-                    err_str = str(e).lower()
-                    if "insufficient" in err_str or "balance" in err_str or "not enough" in err_str:
-                        log.warning(f"Capital exhausted (NO) — stopping placement this cycle | {ms.question[:30]}")
-                        self._capital_exhausted = True
-                        return
-                    log.debug(f"NO order failed {ms.question[:25]}: {e}")
+                self.db.write_placement_feedback(ms.cid, "no", "skipped", reason)
 
-    def _can_place(self, cid: str, side: str, est_cost: float) -> bool:
-        """All guards before placing an order.
+    def _get_priority_batch(self, market_list: list) -> list:
+        """Priority-based batch: empty slots first (highest daily_rate), then rotation."""
+        needs_orders = []
+        has_orders = []
+
+        for ms in market_list:
+            empty_slots = sum(
+                1 for s in ["yes", "no"]
+                if not ms.orders[s].order_id and not ms.dump_orders[s]
+            )
+            if empty_slots > 0:
+                needs_orders.append(ms)
+            else:
+                has_orders.append(ms)
+
+        # Highest-value empty slots first
+        needs_orders.sort(key=lambda x: x.daily_rate, reverse=True)
+        batch = needs_orders[:BATCH_SIZE()]
+
+        # Fill remaining slots with rotation for reprice checks
+        if len(batch) < BATCH_SIZE() and has_orders:
+            remaining = BATCH_SIZE() - len(batch)
+            start = self._batch_idx % max(len(has_orders), 1)
+            for i in range(remaining):
+                batch.append(has_orders[(start + i) % len(has_orders)])
+            self._batch_idx = (start + remaining) % max(len(has_orders), 1)
+
+        return batch
+
+    def _can_place(self, cid: str, side: str, est_cost: float) -> tuple[bool, str]:
+        """All guards before placing an order. Returns (can_place, reason).
 
         Capital gating is NOT done here. Polymarket allows limit orders
         even when they exceed available balance. We let the exchange reject
@@ -683,25 +727,20 @@ class RewardFarmer:
         """
         ms = self.markets.get(cid)
         if not ms:
-            return False
+            return False, "no_market"
         if self._capital_exhausted:
-            return False  # Exchange rejected an order this cycle for insufficient funds
+            return False, "capital_exhausted"
         if ms.orders[side].order_id:
-            log.debug(f"Skip {side} {ms.question[:20]}: already have order")
-            return False
+            return False, "already_has_order"
         if ms.dump_orders[side]:
-            log.debug(f"Skip {side} {ms.question[:20]}: dump pending")
-            return False
+            return False, "dump_pending"
         if self.positions.get_shares(cid, side) > 1:
-            log.debug(f"Skip {side} {ms.question[:20]}: have inventory")
-            return False
+            return False, "inventory"
         if not self.positions.can_quote(cid, side):
-            log.debug(f"Skip {side} {ms.question[:20]}: halted")
-            return False
+            return False, "halted"
         if ms.dump_failures >= cfg("RF_DUMP_MAX_FAILURES"):
-            log.debug(f"Skip {side} {ms.question[:20]}: 3+ dump failures")
-            return False
-        return True
+            return False, "dump_failures"
+        return True, ""
 
     def _total_exposure(self) -> float:
         """Sum of all open position USD values (actual, not estimated)."""
@@ -943,6 +982,47 @@ class RewardFarmer:
         except Exception as e:
             log.debug(f"Cancel failed {order_id[:16]}: {e}")
 
+    def _restore_dump_states(self):
+        """Restore dump states from DB after crash/restart.
+
+        Called after refresh_markets() and _reconcile_on_startup(). Resumes
+        dump decay from where it left off — does NOT reset started_at.
+        """
+        if self.dry_run:
+            return
+
+        saved = self.db.load_all_dump_states()
+        if not saved:
+            return
+
+        restored = 0
+        cleaned = 0
+        for (cid, side), state in saved.items():
+            ms = self.markets.get(cid)
+            if not ms:
+                self.db.delete_dump_state(cid, side)
+                cleaned += 1
+                continue
+
+            elapsed_min = (time.time() - state["started_at"]) / 60.0
+            if elapsed_min >= cfg("RF_DUMP_ABANDON_MINS"):
+                self.db.delete_dump_state(cid, side)
+                cleaned += 1
+                log.debug(f"Dump expired during downtime: {ms.question[:30]} {side} ({elapsed_min:.0f}m)")
+                continue
+
+            # Restore — order was cancelled on startup, will be re-placed next cycle
+            ms.dump_state[side] = state
+            ms.dump_orders[side] = None  # _dump_position will re-post the SELL
+            restored += 1
+            log.info(
+                f"Restored dump {side.upper()} {state['shares']:.0f}sh @ {state['fill_price']:.4f} "
+                f"({elapsed_min:.0f}m elapsed) | {ms.question[:30]}"
+            )
+
+        if restored or cleaned:
+            log.info(f"Dump state recovery: restored {restored}, cleaned {cleaned}")
+
     # ── Main Loop ────────────────────────────────────────────────────
 
     def run(self, duration_secs: int = 0):
@@ -961,6 +1041,9 @@ class RewardFarmer:
 
         # Verify positions against exchange (needs token IDs from market data)
         self._reconcile_positions()
+
+        # Restore any dump states from DB (resume from where we left off)
+        self._restore_dump_states()
 
         start = time.time()
         last_status = time.time()

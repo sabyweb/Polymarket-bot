@@ -256,30 +256,50 @@ def rank_markets(
     # Load historical adjustments for adaptive scoring
     historical = load_historical_adjustments(db_path)
 
-    # Filter stale/resolved markets before scoring
-    import re
+    # Filter stale/resolved/expiring markets before scoring
     from datetime import datetime, timezone, timedelta
     now = datetime.now(timezone.utc)
-    cutoff = now + timedelta(hours=12)
+    agent_cutoff = now + timedelta(hours=24)  # Agent is more conservative: 24h (bot uses 12h)
+
+    # Load placement feedback for closed-loop scoring
+    from .data_collector import query_placement_feedback
+    feedback = query_placement_feedback(db_path)
 
     active_metrics = []
+    filtered_reasons = {"zero_rate": 0, "expiring": 0, "both_skipped": 0}
     for m in metrics:
-        # Skip markets with zero daily rate (likely resolved)
         if m.daily_rate <= 0:
+            filtered_reasons["zero_rate"] += 1
             continue
-        # Skip markets with date references that have passed
-        # e.g. "by April 5" when today is April 5
-        q = m.question.lower()
-        # Quick date heuristic: if question contains today's or yesterday's date, likely resolving soon
-        # The full expiry check happens in _verify_order_books, this is a supplementary filter
+        # Expiry check using actual end_date_iso from CLOB
+        if m.end_date_iso:
+            try:
+                dt = datetime.fromisoformat(m.end_date_iso.replace("Z", "+00:00"))
+                if dt <= agent_cutoff:
+                    filtered_reasons["expiring"] += 1
+                    continue
+            except Exception:
+                pass
         active_metrics.append(m)
 
-    if len(active_metrics) < len(metrics):
-        log.info(f"Filtered {len(metrics) - len(active_metrics)} stale/zero-rate markets")
+    if sum(filtered_reasons.values()) > 0:
+        log.info(f"Filtered {sum(filtered_reasons.values())} markets: {dict(filtered_reasons)}")
 
     scored = []
     for m in active_metrics:
         s = score_market(m, hours, correction_factor=correction_factor)
+
+        # Penalize markets the bot persistently can't place on
+        fb = feedback.get(m.condition_id, {})
+        yes_skip = fb.get("yes", {}).get("status") == "skipped"
+        no_skip = fb.get("no", {}).get("status") == "skipped"
+        if yes_skip and no_skip:
+            skip_reason = fb.get("yes", {}).get("reason", "")
+            if skip_reason in ("wide_spread", "exit_liquidity"):
+                s *= 0.3  # Heavy penalty — bot can't trade this market
+                log.debug(f"Placement penalty {m.condition_id[:12]}: both sides skipped ({skip_reason})")
+            elif skip_reason not in ("capital_exhausted", "already_has_order"):
+                s *= 0.5  # Moderate penalty for other persistent skips
 
         # Apply historical adjustment if available
         hist = historical.get(m.condition_id)

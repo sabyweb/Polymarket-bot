@@ -133,6 +133,29 @@ def run_once(
         db_path, scored, metrics, correction_factor, hours
     )
 
+    # Step 5b: Closed-loop feedback — compare allocation vs what bot actually placed
+    from oversight.data_collector import query_placement_feedback
+    feedback = query_placement_feedback(db_path)
+    deploy_cids = {a["condition_id"] for a in allocations if a["action"] == "deploy"}
+    placed_count = 0
+    skip_reasons: dict[str, int] = {}
+    for cid in deploy_cids:
+        fb = feedback.get(cid, {})
+        yes_placed = fb.get("yes", {}).get("status") == "placed"
+        no_placed = fb.get("no", {}).get("status") == "placed"
+        if yes_placed or no_placed:
+            placed_count += 1
+        else:
+            # Both sides skipped or no feedback yet
+            for side in ["yes", "no"]:
+                reason = fb.get(side, {}).get("reason", "no_feedback")
+                skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+    if deploy_cids:
+        log.info(
+            f"Feedback: allocated {len(deploy_cids)}, bot placed {placed_count}, "
+            f"skipped {len(deploy_cids) - placed_count} ({dict(skip_reasons)})"
+        )
+
     # Step 6: Summary
     summary = generate_summary(allocations)
     print(summary)

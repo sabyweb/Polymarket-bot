@@ -14,6 +14,60 @@ from dataclasses import dataclass
 log = logging.getLogger("oversight.collector")
 
 
+def _fetch_reward_market_expiries() -> dict[str, str]:
+    """Fetch end_date_iso for current reward markets from CLOB (single page, fast)."""
+    import requests
+    result = {}
+    try:
+        # Paginate through all reward markets to get expiry dates
+        cursor = ""
+        for _ in range(20):
+            params = {"limit": 500}
+            if cursor:
+                params["next_cursor"] = cursor
+            resp = requests.get(
+                "https://clob.polymarket.com/rewards/markets/current",
+                params=params, timeout=15,
+            )
+            if resp.status_code != 200:
+                break
+            data = resp.json()
+            items = data.get("data", [])
+            for m in items:
+                cid = m.get("condition_id", "")
+                # end_date_iso may be in the rewards config or fetched separately
+                # The rewards endpoint doesn't always include end_date_iso directly
+                # but it does include condition_id which we can cross-reference
+                if cid:
+                    result[cid] = m.get("end_date_iso", "")
+            cursor = data.get("next_cursor", "")
+            if not cursor or not items or cursor == "LTE=":
+                break
+        log.debug(f"Fetched expiry data for {len(result)} reward markets")
+    except Exception as e:
+        log.debug(f"Expiry fetch failed: {e}")
+    return result
+
+
+def query_placement_feedback(db_path: str) -> dict[str, dict]:
+    """Read placement feedback from bot. Returns {cid: {"yes": {status, reason}, "no": ...}}."""
+    try:
+        db = sqlite3.connect(db_path, timeout=5)
+        db.row_factory = sqlite3.Row
+        rows = db.execute("SELECT * FROM placement_feedback").fetchall()
+        db.close()
+        result: dict[str, dict] = {}
+        for r in rows:
+            cid = r["condition_id"]
+            if cid not in result:
+                result[cid] = {}
+            result[cid][r["side"]] = {"status": r["status"], "reason": r["reason"], "ts": r["ts"]}
+        return result
+    except Exception as e:
+        log.debug(f"Placement feedback query failed: {e}")
+        return {}
+
+
 @dataclass
 class MarketMetrics:
     """Per-market performance data from all sources."""
@@ -28,6 +82,7 @@ class MarketMetrics:
     current_position_usd: float    # open position value (from DB)
     on_book_hours: float           # time with orders on book (from reward_tracker)
     q_share_pct: float             # our share of Q-score pool
+    end_date_iso: str = ""         # market expiry (from CLOB rewards data)
 
 
 def fetch_actual_rewards() -> dict[str, float]:
@@ -359,6 +414,9 @@ def collect_all(
     positions = query_positions(db_path)
     stats = query_reward_stats(db_path)
 
+    # Fetch expiry dates from CLOB rewards endpoint (single page, fast)
+    expiry_map = _fetch_reward_market_expiries()
+
     # Build unified set of all known condition_ids
     all_cids = set()
     all_cids.update(actual_rewards.keys())
@@ -377,10 +435,7 @@ def collect_all(
         question = stat_data.get("question") or pos_data.get("question", "")
         fill_cost = fill_data["cost"]
         dump_rev = dump_data["revenue"]
-
-        # Net P&L: positive = profitable
-        # We don't have reward delta (would need previous snapshot), use total for now
-        net_pnl = dump_rev - fill_cost  # trading P&L only (excludes rewards)
+        net_pnl = dump_rev - fill_cost
 
         metrics.append(MarketMetrics(
             condition_id=cid,
@@ -394,6 +449,7 @@ def collect_all(
             current_position_usd=pos_data.get("total", 0),
             on_book_hours=stat_data.get("on_book_hrs", 0),
             q_share_pct=stat_data.get("q_share", 0),
+            end_date_iso=expiry_map.get(cid, ""),
         ))
 
     # Compute correction factor: actual total paid / sum of estimates

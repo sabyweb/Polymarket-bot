@@ -220,6 +220,16 @@ CREATE TABLE IF NOT EXISTS market_performance (
 CREATE INDEX IF NOT EXISTS idx_mp_cid ON market_performance(condition_id);
 CREATE INDEX IF NOT EXISTS idx_mp_ts ON market_performance(ts);
 
+-- Placement feedback (bot → agent closed loop)
+CREATE TABLE IF NOT EXISTS placement_feedback (
+    ts              REAL    NOT NULL,
+    condition_id    TEXT    NOT NULL,
+    side            TEXT    NOT NULL,
+    status          TEXT    NOT NULL,
+    reason          TEXT    NOT NULL DEFAULT '',
+    PRIMARY KEY (condition_id, side)
+);
+
 -- Active dump state (persisted for crash recovery)
 CREATE TABLE IF NOT EXISTS dump_states (
     condition_id TEXT NOT NULL,
@@ -982,6 +992,41 @@ class BotDatabase:
             log.debug(f"DB get_fill_quality error: {e}")
             return {"total_fills": 0, "avg_slippage": 0, "adverse_pct": 0,
                     "total_adverse_usd": 0, "per_market": []}
+
+    # ── Placement Feedback (bot → agent closed loop) ──────────────────
+
+    def write_placement_feedback(self, condition_id: str, side: str,
+                                  status: str, reason: str = "") -> None:
+        """Write placement outcome for agent feedback. Upserts per (cid, side)."""
+        try:
+            self._get_conn().execute(
+                """INSERT OR REPLACE INTO placement_feedback
+                   (ts, condition_id, side, status, reason)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (time.time(), condition_id, side, status, reason),
+            )
+            self._get_conn().commit()
+        except Exception as e:
+            log.debug(f"write_placement_feedback error: {e}")
+
+    def query_all_placement_feedback(self) -> dict[str, dict]:
+        """Read all placement feedback. Returns {condition_id: {"yes": {status, reason, ts}, "no": ...}}."""
+        try:
+            rows = self._get_conn().execute("SELECT * FROM placement_feedback").fetchall()
+            result: dict[str, dict] = {}
+            for r in rows:
+                cid = r["condition_id"]
+                if cid not in result:
+                    result[cid] = {}
+                result[cid][r["side"]] = {
+                    "status": r["status"],
+                    "reason": r["reason"],
+                    "ts": r["ts"],
+                }
+            return result
+        except Exception as e:
+            log.debug(f"query_all_placement_feedback error: {e}")
+            return {}
 
     # ── Market Performance Tracking (adaptive agent) ──────────────────
 
