@@ -28,6 +28,8 @@ class ScoredMarket:
     fill_damage: float             # fill_cost - dump_revenue (recent)
     fill_count: int                # fills in recent window
     daily_rate: float              # pool rate
+    min_size: float = 50.0         # minimum order size for rewards
+    max_spread: float = 0.045      # maximum spread for rewards
 
 
 def score_market(m: MarketMetrics, hours: float = 24, correction_factor: float = 1.0) -> float:
@@ -161,6 +163,8 @@ def classify_market(
         fill_damage=fill_damage,
         fill_count=m.fill_count_recent,
         daily_rate=m.daily_rate,
+        min_size=m.min_size,
+        max_spread=m.max_spread,
     )
 
 
@@ -266,7 +270,7 @@ def rank_markets(
     feedback = query_placement_feedback(db_path)
 
     active_metrics = []
-    filtered_reasons = {"zero_rate": 0, "expiring": 0, "both_skipped": 0}
+    filtered_reasons = {"zero_rate": 0, "expiring": 0, "no_expiry": 0, "both_skipped": 0}
     for m in metrics:
         if m.daily_rate <= 0:
             filtered_reasons["zero_rate"] += 1
@@ -280,6 +284,13 @@ def rank_markets(
                     continue
             except Exception:
                 pass
+        elif m.on_book_hours == 0:
+            # Fail-closed: new market with no expiry data — skip until expiry is fetched
+            # Only skip markets we haven't tracked yet (on_book_hours=0).
+            # Markets the bot already tracks (on_book_hours>0) are allowed through
+            # because the bot's _verify_order_books already checked their expiry.
+            filtered_reasons["no_expiry"] += 1
+            continue
         active_metrics.append(m)
 
     if sum(filtered_reasons.values()) > 0:

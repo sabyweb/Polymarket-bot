@@ -220,6 +220,13 @@ CREATE TABLE IF NOT EXISTS market_performance (
 CREATE INDEX IF NOT EXISTS idx_mp_cid ON market_performance(condition_id);
 CREATE INDEX IF NOT EXISTS idx_mp_ts ON market_performance(ts);
 
+-- Market expiry cache (avoid 671 CLOB calls per agent cycle)
+CREATE TABLE IF NOT EXISTS market_expiry_cache (
+    condition_id TEXT PRIMARY KEY,
+    end_date_iso TEXT NOT NULL,
+    fetched_at   REAL NOT NULL
+);
+
 -- Placement feedback (bot → agent closed loop)
 CREATE TABLE IF NOT EXISTS placement_feedback (
     ts              REAL    NOT NULL,

@@ -90,6 +90,8 @@ def _to_dict(
         "fill_damage": round(sm.fill_damage, 2),
         "fill_count": sm.fill_count,
         "daily_rate": sm.daily_rate,
+        "min_size": sm.min_size,
+        "max_spread": sm.max_spread,
     }
 
 

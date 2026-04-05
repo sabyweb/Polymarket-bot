@@ -199,6 +199,28 @@ class RewardFarmer:
         self.all_market_data = fetch_all_reward_markets()
         self._apply_market_changes()
 
+    def _check_allocation_update(self):
+        """Check if allocation file changed since last read. Apply if so.
+
+        Called every cycle (30s). Only does a file stat + parse if modified.
+        This makes the bot responsive to agent changes within seconds,
+        not waiting for the 30-minute market refresh.
+        """
+        alloc_path = os.path.join(os.path.dirname(__file__) or ".", "market_allocations.json")
+        try:
+            if not os.path.exists(alloc_path):
+                return
+            mtime = os.path.getmtime(alloc_path)
+            if not hasattr(self, '_alloc_mtime'):
+                self._alloc_mtime = 0
+            if mtime <= self._alloc_mtime:
+                return  # File unchanged
+            self._alloc_mtime = mtime
+            log.info("Allocation file updated — applying changes")
+            self._apply_market_changes()
+        except Exception as e:
+            log.debug(f"Allocation check error: {e}")
+
     def _load_allocations(self) -> list[dict] | None:
         """Load oversight agent allocations if available and fresh.
 
@@ -275,9 +297,9 @@ class RewardFarmer:
                                     "question": mkt.get("question", ""),
                                     "token_ids": [tokens_data[0]["token_id"], tokens_data[1]["token_id"]],
                                     "yes_price": float(tokens_data[0].get("price", 0.5)),
-                                    "daily_rate": alloc.get("score", 0),
-                                    "min_size": alloc.get("min_size", 50),
-                                    "max_spread": alloc.get("max_spread", 0.045),
+                                    "daily_rate": alloc.get("daily_rate", 0),
+                                    "min_size": alloc.get("min_size", float(mkt.get("minimum_order_size") or 50)),
+                                    "max_spread": alloc.get("max_spread", float(mkt.get("minimum_tick_size") or 0.01) * 4.5),
                                     "tick_size": float(mkt.get("minimum_tick_size") or 0.01),
                                     "liquidity": 0,
                                     "volume_24h": 0,
@@ -664,9 +686,11 @@ class RewardFarmer:
         can_exit_yes = yes_exit_depth >= effective_shares
         can_exit_no = no_exit_depth >= effective_shares
 
-        if not can_exit_yes:
+        # Only write exit_liquidity feedback if we don't already have an order
+        # (avoid overwriting "placed" status for markets with existing orders)
+        if not can_exit_yes and not ms.orders["yes"].order_id:
             self.db.write_placement_feedback(ms.cid, "yes", "skipped", "exit_liquidity")
-        if not can_exit_no:
+        if not can_exit_no and not ms.orders["no"].order_id:
             self.db.write_placement_feedback(ms.cid, "no", "skipped", "exit_liquidity")
 
         # Shares — use agent's per-market sizing if available, else default
@@ -1148,6 +1172,9 @@ class RewardFarmer:
                     apply_now = False
             if apply_now:
                 self._apply_market_changes()
+
+            # Check allocation file every cycle (fast — just stat + JSON parse if changed)
+            self._check_allocation_update()
 
             # Run cycle
             cycle_t0 = time.time()

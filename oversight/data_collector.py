@@ -52,16 +52,45 @@ def _fetch_all_clob_reward_markets(min_rate: float = 10.0) -> dict[str, dict]:
     return result
 
 
-def _fetch_reward_market_expiries(condition_ids: list[str] | None = None) -> dict[str, str]:
-    """Fetch end_date_iso for markets. Uses Gamma bulk + CLOB fallback for misses.
+def _fetch_reward_market_expiries(condition_ids: list[str] | None = None,
+                                   db_path: str = "bot_history.db") -> dict[str, str]:
+    """Fetch end_date_iso for markets. Uses DB cache + Gamma + CLOB fallback.
 
-    If condition_ids is provided, only fetch for those specific markets.
-    Otherwise fetches from Gamma in bulk (misses CLOB-only markets).
+    Cache-first: loads from market_expiry_cache table, only fetches
+    for CIDs not in cache or with stale entries (>24h old).
+    Reduces ~671 CLOB calls to ~10-20 per cycle (only new markets).
     """
     import requests
     result = {}
+    cache_ttl = 24 * 3600  # 24h cache validity
 
-    # Step 1: Bulk fetch from Gamma (fast, but misses CLOB-only markets)
+    # Step 0: Load from DB cache
+    try:
+        db = sqlite3.connect(db_path, timeout=5)
+        db.row_factory = sqlite3.Row
+        cutoff = time.time() - cache_ttl
+        rows = db.execute(
+            "SELECT condition_id, end_date_iso FROM market_expiry_cache WHERE fetched_at > ?",
+            (cutoff,)
+        ).fetchall()
+        for r in rows:
+            result[r["condition_id"]] = r["end_date_iso"]
+        db.close()
+        if result:
+            log.debug(f"Expiry cache: {len(result)} markets loaded from DB")
+    except Exception:
+        pass  # Table may not exist yet
+
+    # Determine which CIDs still need fetching
+    need_fetch = []
+    if condition_ids:
+        need_fetch = [cid for cid in condition_ids if cid not in result]
+    if not need_fetch:
+        log.info(f"Expiry: {len(result)} from cache, 0 to fetch")
+        return result
+
+    # Step 1: Bulk fetch from Gamma (fast, covers most markets)
+    gamma_fetched = {}
     try:
         for offset in range(0, 10000, 100):
             resp = requests.get(
@@ -78,29 +107,49 @@ def _fetch_reward_market_expiries(condition_ids: list[str] | None = None) -> dic
                 cid = m.get("conditionId", "")
                 end_date = m.get("endDateIso") or m.get("end_date_iso", "")
                 if cid and end_date:
-                    result[cid] = end_date
+                    gamma_fetched[cid] = end_date
     except Exception as e:
         log.debug(f"Gamma expiry fetch failed: {e}")
 
-    # Step 2: For requested CIDs missing from Gamma, check CLOB /markets/{cid}
-    if condition_ids:
-        missing = [cid for cid in condition_ids if cid not in result]
-        if missing:
-            log.debug(f"Fetching expiry for {len(missing)} CLOB-only markets")
-            for cid in missing:  # Fetch all — ~0.1s each, acceptable for hourly agent
-                try:
-                    resp = requests.get(
-                        f"https://clob.polymarket.com/markets/{cid}", timeout=10
-                    )
-                    if resp.status_code == 200:
-                        mkt = resp.json()
-                        end_date = mkt.get("end_date_iso", "")
-                        if end_date:
-                            result[cid] = end_date
-                except Exception:
-                    pass
+    # Apply Gamma results
+    for cid in need_fetch:
+        if cid in gamma_fetched:
+            result[cid] = gamma_fetched[cid]
 
-    log.info(f"Fetched expiry data for {len(result)} markets")
+    # Step 2: CLOB fallback for markets still missing
+    still_missing = [cid for cid in need_fetch if cid not in result]
+    if still_missing:
+        log.info(f"Fetching expiry for {len(still_missing)} CLOB-only markets")
+        for cid in still_missing:
+            try:
+                resp = requests.get(
+                    f"https://clob.polymarket.com/markets/{cid}", timeout=10
+                )
+                if resp.status_code == 200:
+                    mkt = resp.json()
+                    end_date = mkt.get("end_date_iso", "")
+                    if end_date:
+                        result[cid] = end_date
+            except Exception:
+                pass
+
+    # Step 3: Write new results to cache
+    new_entries = {cid: result[cid] for cid in need_fetch if cid in result}
+    if new_entries:
+        try:
+            db = sqlite3.connect(db_path, timeout=5)
+            now = time.time()
+            db.executemany(
+                "INSERT OR REPLACE INTO market_expiry_cache (condition_id, end_date_iso, fetched_at) VALUES (?, ?, ?)",
+                [(cid, end_date, now) for cid, end_date in new_entries.items()],
+            )
+            db.commit()
+            db.close()
+        except Exception:
+            pass
+
+    cached = len(result) - len(new_entries)
+    log.info(f"Expiry: {cached} cached + {len(new_entries)} fetched = {len(result)} total")
     return result
 
 
@@ -138,6 +187,8 @@ class MarketMetrics:
     on_book_hours: float           # time with orders on book (from reward_tracker)
     q_share_pct: float             # our share of Q-score pool
     end_date_iso: str = ""         # market expiry (from CLOB rewards data)
+    min_size: float = 50.0         # minimum order size for rewards
+    max_spread: float = 0.045      # maximum spread for rewards
 
 
 def fetch_actual_rewards() -> dict[str, float]:
@@ -484,12 +535,11 @@ def collect_all(
         if cid not in all_cids:
             all_cids.add(cid)
             new_discovered += 1
-            # Inject basic stats for new markets (no Q-share data yet)
             stats[cid] = {
                 "rate": mkt_data["daily_rate"],
-                "q_share": 0,  # unknown — will get default scoring as trial
+                "q_share": 0,
                 "on_book_hrs": 0,
-                "question": "",  # will be filled by bot on first placement
+                "question": "",
             }
     if new_discovered:
         log.info(f"Discovery: {new_discovered} new markets from CLOB (not yet tracked by bot)")
@@ -524,6 +574,8 @@ def collect_all(
             on_book_hours=stat_data.get("on_book_hrs", 0),
             q_share_pct=stat_data.get("q_share", 0),
             end_date_iso=expiry_map.get(cid, ""),
+            min_size=clob_reward_markets.get(cid, {}).get("min_size", 50.0),
+            max_spread=clob_reward_markets.get(cid, {}).get("max_spread", 0.045),
         ))
 
     # Compute correction factor: actual total paid / sum of estimates
