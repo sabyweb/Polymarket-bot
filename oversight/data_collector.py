@@ -275,6 +275,33 @@ class MarketMetrics:
     end_date_iso: str = ""         # market expiry (from CLOB rewards data)
     min_size: float = 50.0         # minimum order size for rewards
     max_spread: float = 0.045      # maximum spread for rewards
+    question_group: str = ""       # grouping key for portfolio concentration limits
+
+
+def _question_group_key(question: str) -> str:
+    """Extract a grouping key from a market question.
+
+    Polymarket often has multiple markets on the same event, e.g.:
+      "Will Bitcoin reach $100k by June?"
+      "Will Bitcoin reach $150k by June?"
+    These share the topic "bitcoin" and concentrating on all of them
+    is risky — one fill event can hit all simultaneously.
+
+    Strategy: normalize to lowercase, strip punctuation, take the first
+    4 non-stopword tokens. This groups related questions together while
+    keeping genuinely different topics separate.
+    """
+    import re
+    stops = {"will", "the", "a", "an", "be", "by", "in", "on", "to", "of",
+             "at", "is", "it", "or", "and", "for", "this", "that", "what",
+             "how", "do", "does", "has", "have", "was", "were"}
+    # Strip punctuation, normalize to lowercase
+    text = re.sub(r"[^a-z0-9\s]", "", question.lower())
+    # Strip numbers — they're the variable part (e.g., $100k vs $150k)
+    text = re.sub(r"\b\d+\w*\b", "", text)
+    words = text.split()
+    key_words = [w for w in words if w not in stops and len(w) > 1]
+    return " ".join(key_words[:4])
 
 
 def fetch_actual_rewards() -> dict[str, float]:
@@ -744,6 +771,7 @@ def collect_all(
             end_date_iso=expiry_map.get(cid, ""),
             min_size=clob_reward_markets.get(cid, {}).get("min_size", 50.0),
             max_spread=clob_reward_markets.get(cid, {}).get("max_spread", 0.045),
+            question_group=_question_group_key(question) if question else "",
         ))
 
     # Compute correction factor: actual total paid / sum of estimates

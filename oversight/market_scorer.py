@@ -30,6 +30,9 @@ class ScoredMarket:
     daily_rate: float              # pool rate
     min_size: float = 50.0         # minimum order size for rewards
     max_spread: float = 0.045      # maximum spread for rewards
+    est_capital_cost: float = 0.0  # estimated $ to deploy (both sides)
+    locked_position_usd: float = 0.0  # $ currently locked in open positions
+    question_group: str = ""       # topic group for concentration limits
 
 
 def score_market(m: MarketMetrics, hours: float = 24, correction_factor: float = 1.0) -> float:
@@ -197,6 +200,9 @@ def classify_market(
         shares = 0
         reason = f"Net negative: score={score:.4f}, dmg=${fill_damage:.2f}"
 
+    # Compute estimated capital cost for this allocation
+    est_capital = shares * cost_per_share_both if shares > 0 else 0.0
+
     return ScoredMarket(
         condition_id=m.condition_id,
         question=m.question,
@@ -211,6 +217,9 @@ def classify_market(
         daily_rate=m.daily_rate,
         min_size=m.min_size,
         max_spread=m.max_spread,
+        est_capital_cost=est_capital,
+        locked_position_usd=m.current_position_usd,
+        question_group=getattr(m, "question_group", ""),
     )
 
 

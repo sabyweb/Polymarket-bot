@@ -396,6 +396,123 @@ class TestCapitalRedistribution(unittest.TestCase):
             self.assertLessEqual(cost, 2000.0 * 0.15 + 1.0)  # allow $1 rounding
 
 
+class TestRebalanceCredit(unittest.TestCase):
+    """Test that avoided markets with locked capital free budget for new deploys."""
+
+    def test_avoid_with_position_frees_capital(self):
+        """Avoided market's locked capital should become available (discounted)."""
+        from oversight.allocation_writer import compute_allocations
+        scored = [
+            # Avoided market has $100 locked in positions
+            ScoredMarket(condition_id="bad", question="Bad?", score=-10.0,
+                         action="avoid", recommended_shares=0, reason="test",
+                         confidence="high", actual_reward_total=0,
+                         fill_damage=50, fill_count=5, daily_rate=50,
+                         min_size=50, max_spread=0.045,
+                         locked_position_usd=100.0),
+            # Good market wants deployment
+            ScoredMarket(condition_id="good", question="Good?", score=50.0,
+                         action="deploy", recommended_shares=50, reason="test",
+                         confidence="high", actual_reward_total=10.0,
+                         fill_damage=0, fill_count=0, daily_rate=80,
+                         min_size=50, max_spread=0.045),
+        ]
+        # With only $10 budget, normally can't deploy $45 market.
+        # But $100 locked × 80% = $80 rebalance credit → $90 available.
+        allocs = compute_allocations(scored, total_capital=10.0)
+        good_alloc = next(a for a in allocs if a["condition_id"] == "good")
+        self.assertEqual(good_alloc["action"], "deploy")
+
+    def test_no_credit_without_locked_positions(self):
+        """Avoided market with no position doesn't add fake capital."""
+        from oversight.allocation_writer import compute_allocations
+        scored = [
+            ScoredMarket(condition_id="bad", question="Bad?", score=-10.0,
+                         action="avoid", recommended_shares=0, reason="test",
+                         confidence="high", actual_reward_total=0,
+                         fill_damage=50, fill_count=5, daily_rate=50,
+                         min_size=50, max_spread=0.045,
+                         locked_position_usd=0.0),
+            ScoredMarket(condition_id="good", question="Good?", score=50.0,
+                         action="deploy", recommended_shares=50, reason="test",
+                         confidence="high", actual_reward_total=10.0,
+                         fill_damage=0, fill_count=0, daily_rate=80,
+                         min_size=50, max_spread=0.045),
+        ]
+        # Only $10 budget, no credit → can't deploy
+        allocs = compute_allocations(scored, total_capital=10.0)
+        good_alloc = next(a for a in allocs if a["condition_id"] == "good")
+        self.assertEqual(good_alloc["action"], "avoid")
+
+
+class TestGroupConcentration(unittest.TestCase):
+    """Test portfolio concentration limits per question group."""
+
+    def test_group_cap_limits_allocation(self):
+        """Markets sharing a question group are capped at max_group_pct."""
+        from oversight.allocation_writer import compute_allocations
+        # 3 Bitcoin markets, all high scoring, same group
+        scored = [
+            ScoredMarket(condition_id=f"btc{i}", question=f"Will Bitcoin reach ${p}k?",
+                         score=80.0 - i*5, action="deploy", recommended_shares=100,
+                         reason="test", confidence="high", actual_reward_total=10.0,
+                         fill_damage=0, fill_count=0, daily_rate=80,
+                         min_size=50, max_spread=0.045,
+                         question_group="bitcoin reach")
+            for i, p in enumerate([100, 150, 200])
+        ]
+        # Budget=$500, group_cap=30% → $150 max for Bitcoin group
+        # Each market costs 100sh × $0.91 ≈ $91. Only ~1.6 fit in $150 cap.
+        allocs = compute_allocations(scored, total_capital=500.0, max_group_pct=0.30)
+        deployed_btc = [a for a in allocs if a["action"] == "deploy"]
+        total_btc_cost = sum(
+            a["shares_per_side"] * max(0.10, (1.0 - 2*0.045)/2) * 2
+            for a in deployed_btc
+        )
+        self.assertLessEqual(total_btc_cost, 500 * 0.30 + 5)  # allow rounding
+
+    def test_different_groups_independent(self):
+        """Markets in different groups don't interfere with each other."""
+        from oversight.allocation_writer import compute_allocations
+        scored = [
+            ScoredMarket(condition_id="btc1", question="Will Bitcoin reach $100k?",
+                         score=80.0, action="deploy", recommended_shares=50,
+                         reason="test", confidence="high", actual_reward_total=10.0,
+                         fill_damage=0, fill_count=0, daily_rate=80,
+                         min_size=50, max_spread=0.045,
+                         question_group="bitcoin reach"),
+            ScoredMarket(condition_id="eth1", question="Will Ethereum flip Bitcoin?",
+                         score=70.0, action="deploy", recommended_shares=50,
+                         reason="test", confidence="high", actual_reward_total=10.0,
+                         fill_damage=0, fill_count=0, daily_rate=80,
+                         min_size=50, max_spread=0.045,
+                         question_group="ethereum flip bitcoin"),
+        ]
+        allocs = compute_allocations(scored, total_capital=500.0, max_group_pct=0.30)
+        deployed = [a for a in allocs if a["action"] == "deploy"]
+        self.assertEqual(len(deployed), 2)
+
+
+class TestQuestionGrouping(unittest.TestCase):
+    """Test the question grouping heuristic."""
+
+    def test_related_questions_same_group(self):
+        from oversight.data_collector import _question_group_key
+        g1 = _question_group_key("Will Bitcoin reach $100k by June?")
+        g2 = _question_group_key("Will Bitcoin reach $150k by June?")
+        self.assertEqual(g1, g2)
+
+    def test_different_topics_different_groups(self):
+        from oversight.data_collector import _question_group_key
+        g1 = _question_group_key("Will Bitcoin reach $100k?")
+        g2 = _question_group_key("Will the Lakers win the championship?")
+        self.assertNotEqual(g1, g2)
+
+    def test_empty_question_empty_group(self):
+        from oversight.data_collector import _question_group_key
+        self.assertEqual(_question_group_key(""), "")
+
+
 class TestCorrectionFactorSmoothing(unittest.TestCase):
     """Test EMA smoothing of correction factor."""
 

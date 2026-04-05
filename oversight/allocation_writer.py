@@ -32,31 +32,55 @@ def compute_allocations(
     total_capital: float = 1500.0,
     max_per_market: float = MAX_PER_MARKET,
     max_capital_pct: float = 0.15,
+    max_group_pct: float = 0.30,
 ) -> list[dict]:
     """Apply capital constraints and compute final allocations.
 
-    Two-pass algorithm:
-    1. **Base pass** — each deploy market gets its recommended shares (from scorer).
-       Markets are funded in score order until budget runs out.
-    2. **Redistribution pass** — if surplus capital remains, redistribute it
-       proportionally to top-scoring deployed markets (by score weight).
-       This ensures capital isn't left idle when we have profitable markets
-       that could absorb more. Each market is capped at max_per_market and
-       max_capital_pct of total to prevent over-concentration.
+    Three-pass algorithm:
+    1. **Rebalance credit** — markets switching from deploy→avoid that have
+       locked positions get an unwind signal. Their locked capital is added
+       back as "freeing soon" credit (discounted 20% for dump slippage).
+    2. **Base pass** — fund each deploy market in score order, enforcing:
+       - Per-market cap (max_per_market or max_capital_pct of budget)
+       - Per-group cap (max_group_pct of budget) — prevents over-concentration
+         on related markets (e.g., 5 "Bitcoin" markets all in one event)
+    3. **Redistribution pass** — surplus capital spread across top markets
+       proportionally by score, respecting all caps.
 
     Args:
         scored_markets: Pre-sorted by score descending from rank_markets.
         total_capital: Total deployable capital.
         max_per_market: Hard cap on capital per market.
         max_capital_pct: Max fraction of total capital per market (default 15%).
+        max_group_pct: Max fraction of total capital per question group (default 30%).
 
     Returns list of allocation dicts ready for JSON serialization.
     """
     per_market_cap = min(max_per_market, total_capital * max_capital_pct)
+    per_group_cap = total_capital * max_group_pct
     allocations = []
     remaining_capital = total_capital
 
-    # ── Pass 1: Base allocation ──
+    # ── Pass 0: Rebalance credit ──
+    # Markets that are being avoided but have locked capital = capital that
+    # will be freed when the bot unwinds. Credit 80% of it (20% slippage
+    # haircut on dumps) so we don't under-allocate while waiting for unwinds.
+    rebalance_credit = 0.0
+    for sm in scored_markets:
+        locked = getattr(sm, "locked_position_usd", 0)
+        if sm.action == "avoid" and locked > 1.0:
+            credit = locked * 0.80
+            rebalance_credit += credit
+    if rebalance_credit > 0:
+        remaining_capital += rebalance_credit
+        log.info(
+            f"Rebalance credit: ${rebalance_credit:.0f} freeing from "
+            f"unwinding avoided positions (80% of locked)"
+        )
+
+    # ── Pass 1: Base allocation with concentration limits ──
+    group_capital: dict[str, float] = {}  # group_key → capital allocated
+
     for sm in scored_markets:
         if sm.action == "avoid":
             allocations.append(_to_dict(sm, shares=0))
@@ -64,7 +88,34 @@ def compute_allocations(
 
         shares = sm.recommended_shares if sm.recommended_shares > 0 else DEFAULT_SHARES
         spread = getattr(sm, "max_spread", 0.045)
-        est_cost = min(_est_market_cost(shares, spread), per_market_cap)
+        est_cost = _est_market_cost(shares, spread)
+
+        # If this market exceeds per-market cap, reduce shares to fit
+        if est_cost > per_market_cap:
+            est_price_per_side = max(0.10, (1.0 - 2 * spread) / 2)
+            shares = max(int(sm.min_size), int(per_market_cap / (est_price_per_side * 2)))
+            est_cost = _est_market_cost(shares, spread)
+
+        # Check portfolio concentration limit
+        group_key = getattr(sm, "question_group", "")
+        if group_key:
+            group_used = group_capital.get(group_key, 0)
+            group_headroom = per_group_cap - group_used
+            if group_headroom <= 0:
+                allocations.append(_to_dict(sm, shares=0, action_override="avoid",
+                                            reason_override=f"Group cap reached ({group_key[:25]})"))
+                continue
+            # If this market would blow the group cap, reduce shares to fit
+            if est_cost > group_headroom:
+                est_price_per_side = max(0.10, (1.0 - 2 * spread) / 2)
+                capped_shares = int(group_headroom / (est_price_per_side * 2))
+                if capped_shares < int(sm.min_size):
+                    # Can't even fit min_size within group headroom — skip
+                    allocations.append(_to_dict(sm, shares=0, action_override="avoid",
+                                                reason_override=f"Group cap reached ({group_key[:25]})"))
+                    continue
+                shares = capped_shares
+                est_cost = _est_market_cost(shares, spread)
 
         if est_cost > remaining_capital:
             allocations.append(_to_dict(sm, shares=0, action_override="avoid",
@@ -72,11 +123,11 @@ def compute_allocations(
             continue
 
         remaining_capital -= est_cost
+        if group_key:
+            group_capital[group_key] = group_capital.get(group_key, 0) + est_cost
         allocations.append(_to_dict(sm, shares=shares))
 
     # ── Pass 2: Redistribute surplus capital ──
-    # If >10% of budget is undeployed and we have deployed markets, spread
-    # the surplus across top markets proportional to their score.
     deployed_indices = [
         i for i, a in enumerate(allocations)
         if a["action"] == "deploy" and a["score"] > 0
@@ -84,7 +135,6 @@ def compute_allocations(
     surplus_threshold = total_capital * 0.10
 
     if remaining_capital > surplus_threshold and deployed_indices:
-        # Weight by score (min 0.01 to avoid division by zero)
         scores = [max(allocations[i]["score"], 0.01) for i in deployed_indices]
         total_score = sum(scores)
 
@@ -95,28 +145,34 @@ def compute_allocations(
             est_price = max(0.10, (1.0 - 2 * spread) / 2)
             current_cost = _est_market_cost(a["shares_per_side"], spread)
 
-            # How much more can this market absorb?
+            # Per-market headroom
             headroom = per_market_cap - current_cost
             if headroom <= 0:
                 continue
 
-            # Score-proportional share of the surplus
+            # Per-group headroom
+            group_key = a.get("question_group", "")
+            if group_key:
+                group_used = group_capital.get(group_key, 0)
+                headroom = min(headroom, per_group_cap - group_used)
+                if headroom <= 0:
+                    continue
+
             share_of_surplus = remaining_capital * (s / total_score)
             extra_capital = min(share_of_surplus, headroom)
             if extra_capital < est_price * 2:
-                continue  # not enough for even 1 extra share per side
+                continue
 
             extra_shares = int(extra_capital / (est_price * 2))
             if extra_shares < 1:
                 continue
 
-            new_shares = a["shares_per_side"] + extra_shares
-            new_cost = _est_market_cost(new_shares, spread)
             actual_extra = _est_market_cost(extra_shares, spread)
-
-            allocations[idx]["shares_per_side"] = new_shares
+            allocations[idx]["shares_per_side"] += extra_shares
             allocations[idx]["reason"] += f" (+{extra_shares}sh redistrib)"
             remaining_capital -= actual_extra
+            if group_key:
+                group_capital[group_key] = group_capital.get(group_key, 0) + actual_extra
             redistrib_count += 1
 
         if redistrib_count > 0:
@@ -124,6 +180,13 @@ def compute_allocations(
                 f"Redistribution: boosted {redistrib_count} markets, "
                 f"${total_capital - remaining_capital:.0f} now deployed"
             )
+
+    # Log concentration info
+    if group_capital:
+        top_groups = sorted(group_capital.items(), key=lambda x: x[1], reverse=True)[:5]
+        for gk, gv in top_groups:
+            if gv > per_group_cap * 0.5:
+                log.info(f"Group concentration: '{gk}' = ${gv:.0f} ({gv/total_capital:.0%} of budget)")
 
     deployed = [a for a in allocations if a["action"] == "deploy"]
     avoided = [a for a in allocations if a["action"] == "avoid"]
@@ -158,6 +221,9 @@ def _to_dict(
         "daily_rate": sm.daily_rate,
         "min_size": sm.min_size,
         "max_spread": sm.max_spread,
+        "est_capital_cost": round(getattr(sm, "est_capital_cost", 0), 2),
+        "locked_position_usd": round(getattr(sm, "locked_position_usd", 0), 2),
+        "question_group": getattr(sm, "question_group", ""),
     }
 
 
