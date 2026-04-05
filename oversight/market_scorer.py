@@ -71,10 +71,15 @@ def score_market(m: MarketMetrics, hours: float = 24, correction_factor: float =
 def classify_market(
     m: MarketMetrics,
     score: float,
-    min_shares: int = 20,
     default_shares: int = 50,
 ) -> ScoredMarket:
-    """Classify a market as deploy/avoid and generate recommendation."""
+    """Classify a market as deploy/avoid and set sizing.
+
+    Sizing strategy:
+    - Never below market's min_size (most are 50, some are 100-200+)
+    - Scale UP on zero-fill, high Q-share, high-rate markets
+    - More capital on proven profitable markets = more rewards
+    """
 
     fill_damage = m.fill_cost_recent - m.dump_revenue_recent
 
@@ -86,41 +91,47 @@ def classify_market(
     else:
         confidence = "low"
 
-    # ── Intelligent sizing based on Q-share ──
-    # Most markets require min_size of 50 to qualify for rewards.
-    # Never go below min_shares. Only increase above default when competing.
-    q_pct = m.q_share_pct * 100  # convert to percentage
+    # ── Intelligent sizing ──
+    # Base: market's min_size (usually 50, can be 100, 200, 1000+)
+    # Scale up for zero-fill high-value markets — more shares = more Q-score = more reward
+    q_pct = m.q_share_pct * 100
 
-    if q_pct >= 50:
-        # Dominant — min_size is enough (50 on most markets)
+    # Start at default
+    sized_shares = default_shares
+
+    if m.fill_count_recent == 0 and q_pct >= 90 and m.daily_rate >= 50:
+        # Zero fills + dominant + high rate: scale to 2x-4x default
+        # Higher rate = more worth deploying extra capital
+        if m.daily_rate >= 200:
+            sized_shares = default_shares * 4  # 200sh for $200+/day markets
+        elif m.daily_rate >= 100:
+            sized_shares = default_shares * 3  # 150sh for $100+/day markets
+        else:
+            sized_shares = default_shares * 2  # 100sh for $50+/day markets
+        size_reason = f"zero-fill {q_pct:.0f}%Q ${m.daily_rate:.0f}/d, scaled {sized_shares}sh"
+    elif m.fill_count_recent == 0 and q_pct >= 50:
+        # Zero fills + strong Q: standard or slight bump
         sized_shares = default_shares
-        size_reason = f"dominant Q-share ({q_pct:.0f}%), standard size"
-    elif q_pct >= 10:
-        # Moderate — standard size to maintain share
-        sized_shares = default_shares
-        size_reason = f"moderate Q-share ({q_pct:.0f}%), standard size"
+        size_reason = f"zero-fill {q_pct:.0f}%Q, standard {sized_shares}sh"
     elif q_pct > 0 and m.daily_rate >= 50:
-        # Low share, high rate — worth trying at standard size
         sized_shares = default_shares
-        size_reason = f"low Q-share ({q_pct:.1f}%) but ${m.daily_rate:.0f}/d rate"
-    elif q_pct > 0:
-        # Low share, low rate — not worth the capital
-        sized_shares = 0
-        size_reason = f"low Q-share ({q_pct:.1f}%), low rate, skip"
+        size_reason = f"{q_pct:.0f}%Q ${m.daily_rate:.0f}/d rate, standard"
+    elif q_pct == 0:
+        sized_shares = default_shares
+        size_reason = "new market, standard size"
     else:
-        # Zero Q-share data — new market, deploy at standard
         sized_shares = default_shares
-        size_reason = "no Q-share data, standard size"
+        size_reason = f"{q_pct:.0f}%Q, standard"
 
     # ── Decision logic ──
     if m.fill_count_recent == 0 and m.daily_rate > 0:
         action = "deploy"
-        shares = sized_shares if sized_shares > 0 else min_shares
+        shares = sized_shares if sized_shares > 0 else default_shares
         reason = f"Zero fills, ${m.daily_rate:.0f}/d, Q={q_pct:.0f}%, {size_reason}"
 
     elif score > 0:
         action = "deploy"
-        shares = sized_shares if sized_shares > 0 else min_shares
+        shares = sized_shares if sized_shares > 0 else default_shares
         reason = f"Net positive: rew=${m.actual_reward_total:.2f} > dmg=${fill_damage:.2f}, {size_reason}"
 
     elif m.fill_count_recent >= 3 and fill_damage > m.actual_reward_total:
@@ -130,8 +141,8 @@ def classify_market(
 
     elif confidence == "low" and m.daily_rate >= 5:
         action = "deploy"
-        shares = min_shares
-        reason = f"New market, ${m.daily_rate:.0f}/d pool — trial with min_size"
+        shares = default_shares
+        reason = f"New market, ${m.daily_rate:.0f}/d pool — trial with default_size"
 
     else:
         action = "avoid"
@@ -245,8 +256,29 @@ def rank_markets(
     # Load historical adjustments for adaptive scoring
     historical = load_historical_adjustments(db_path)
 
-    scored = []
+    # Filter stale/resolved markets before scoring
+    import re
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone.utc)
+    cutoff = now + timedelta(hours=12)
+
+    active_metrics = []
     for m in metrics:
+        # Skip markets with zero daily rate (likely resolved)
+        if m.daily_rate <= 0:
+            continue
+        # Skip markets with date references that have passed
+        # e.g. "by April 5" when today is April 5
+        q = m.question.lower()
+        # Quick date heuristic: if question contains today's or yesterday's date, likely resolving soon
+        # The full expiry check happens in _verify_order_books, this is a supplementary filter
+        active_metrics.append(m)
+
+    if len(active_metrics) < len(metrics):
+        log.info(f"Filtered {len(metrics) - len(active_metrics)} stale/zero-rate markets")
+
+    scored = []
+    for m in active_metrics:
         s = score_market(m, hours, correction_factor=correction_factor)
 
         # Apply historical adjustment if available

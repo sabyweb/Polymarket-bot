@@ -111,6 +111,7 @@ class RewardFarmer:
         self.cycle_count = 0
         self._batch_idx = 0
         self._shutdown = False
+        self._capital_exhausted = False  # Set True when exchange rejects for insufficient funds
         self._pending_market_data: list[dict] | None = None
         self._last_market_refresh = 0.0
         self._last_reconcile = 0.0
@@ -284,11 +285,7 @@ class RewardFarmer:
                 continue
             if MAX_LIQUIDITY() > 0 and m.get("liquidity", 0) > MAX_LIQUIDITY():
                 continue
-            if MAX_COST_PER_MARKET() > 0:
-                yes_p = m.get("yes_price") or 0.5
-                min_sz = m.get("min_size", 50)
-                if min_sz * max(yes_p, 1 - yes_p) > MAX_COST_PER_MARKET():
-                    continue
+            # No per-market cost cap — let the exchange reject if insufficient funds
             tokens = m.get("token_ids", [])
             if len(tokens) < 2:
                 continue
@@ -359,6 +356,7 @@ class RewardFarmer:
         5. Record reward tracking
         """
         self.cycle_count += 1
+        self._capital_exhausted = False  # reset each cycle
 
         # ── Step 1: Fetch all exchange orders ────────────────────────
         if self.dry_run:
@@ -645,6 +643,11 @@ class RewardFarmer:
                         if self.cycle_count <= 3:
                             log.info(f"BID YES @ {edge_bid:.3f} ({yes_shares:.0f}sh) | {ms.question[:30]}")
                 except Exception as e:
+                    err_str = str(e).lower()
+                    if "insufficient" in err_str or "balance" in err_str or "not enough" in err_str:
+                        log.warning(f"Capital exhausted (YES) — stopping placement this cycle | {ms.question[:30]}")
+                        self._capital_exhausted = True
+                        return
                     log.debug(f"YES order failed {ms.question[:25]}: {e}")
 
         # Place NO ask (only if exit liquidity exists)
@@ -664,13 +667,25 @@ class RewardFarmer:
                         if self.cycle_count <= 3:
                             log.info(f"ASK NO @ {edge_ask:.3f} (clob={no_clob:.3f}, {no_shares:.0f}sh) | {ms.question[:30]}")
                 except Exception as e:
+                    err_str = str(e).lower()
+                    if "insufficient" in err_str or "balance" in err_str or "not enough" in err_str:
+                        log.warning(f"Capital exhausted (NO) — stopping placement this cycle | {ms.question[:30]}")
+                        self._capital_exhausted = True
+                        return
                     log.debug(f"NO order failed {ms.question[:25]}: {e}")
 
     def _can_place(self, cid: str, side: str, est_cost: float) -> bool:
-        """All guards before placing an order."""
+        """All guards before placing an order.
+
+        Capital gating is NOT done here. Polymarket allows limit orders
+        even when they exceed available balance. We let the exchange reject
+        if funds are insufficient (caught in _place_orders_for_market).
+        """
         ms = self.markets.get(cid)
         if not ms:
             return False
+        if self._capital_exhausted:
+            return False  # Exchange rejected an order this cycle for insufficient funds
         if ms.orders[side].order_id:
             log.debug(f"Skip {side} {ms.question[:20]}: already have order")
             return False
@@ -685,9 +700,6 @@ class RewardFarmer:
             return False
         if ms.dump_failures >= cfg("RF_DUMP_MAX_FAILURES"):
             log.debug(f"Skip {side} {ms.question[:20]}: 3+ dump failures")
-            return False
-        if self._total_exposure() > MAX_TOTAL_EXPOSURE():
-            log.debug(f"Skip {side} {ms.question[:20]}: exposure limit")
             return False
         return True
 
