@@ -376,8 +376,10 @@ class RewardFarmer:
             for side in ["yes", "no"]:
                 oid = ms.orders[side].order_id
                 if oid:
-                    self._cancel_order(oid, reason="market_removed")
-                    ms.orders[side].order_id = None
+                    if self._cancel_order(oid, reason="market_removed"):
+                        ms.orders[side].order_id = None
+                    else:
+                        log.warning(f"Orphaned order {oid[:16]} — cancel failed on market drop")
             for side in ["yes", "no"]:
                 shares = self.positions.get_shares(cid, side)
                 if shares > 1:
@@ -664,13 +666,13 @@ class RewardFarmer:
                 continue
             order_dist = abs(slot.price - midpoint)
             if order_dist >= ms.max_spread:
-                # Order is outside reward window — cancel it
-                self._cancel_order(slot.order_id, reason="outside_reward_window")
-                log.info(
-                    f"REPRICE {side.upper()} | old={slot.price:.3f} dist={order_dist:.3f} >= spread={ms.max_spread:.3f} | "
-                    f"new={edge_price:.3f} | {ms.question[:30]}"
-                )
-                slot.order_id = None  # will be re-placed below
+                # Order is outside reward window — cancel and re-place
+                if self._cancel_order(slot.order_id, reason="outside_reward_window"):
+                    log.info(
+                        f"REPRICE {side.upper()} | old={slot.price:.3f} dist={order_dist:.3f} >= spread={ms.max_spread:.3f} | "
+                        f"new={edge_price:.3f} | {ms.question[:30]}"
+                    )
+                    slot.order_id = None  # will be re-placed below
 
         # ── Exit liquidity check: only place if we can dump within buffer ──
         exit_buf = cfg("RF_DUMP_EXIT_DEPTH_BUFFER")
@@ -995,8 +997,10 @@ class RewardFarmer:
                 ms.dump_state[side] = None
                 self.db.delete_dump_state(ms.cid, side)
                 if ms.dump_orders[side]:
-                    self._cancel_order(ms.dump_orders[side], reason="dump_30m_timeout")
-                    ms.dump_orders[side] = None
+                    if self._cancel_order(ms.dump_orders[side], reason="dump_30m_timeout"):
+                        ms.dump_orders[side] = None
+                    else:
+                        log.warning(f"Orphaned dump order — cancel failed on abandon")
                 return
 
             elif elapsed_min >= cfg("RF_DUMP_AGGRESSIVE_MINS"):
@@ -1029,7 +1033,8 @@ class RewardFarmer:
 
             # Cancel existing dump order if any (repricing)
             if ms.dump_orders[side]:
-                self._cancel_order(ms.dump_orders[side], reason="dump_reprice")
+                if not self._cancel_order(ms.dump_orders[side], reason="dump_reprice"):
+                    return  # Don't post new order if old one is still live
                 ms.dump_orders[side] = None
 
             args = OrderArgs(token_id=tid, price=sell_price, size=float(dump_shares), side=SELL)

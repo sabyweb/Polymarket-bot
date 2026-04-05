@@ -221,7 +221,7 @@ def main():
     )
     parser.add_argument("--loop", action="store_true", help="Run continuously")
     parser.add_argument("--dry-run", action="store_true", help="Analyze only, don't write")
-    parser.add_argument("--interval", type=int, default=3600, help="Loop interval in seconds")
+    parser.add_argument("--interval", type=int, default=1800, help="Loop interval in seconds (default: 30min)")
     parser.add_argument("--hours", type=float, default=24, help="Lookback window in hours")
     parser.add_argument("--capital", type=float, default=1500.0, help="Total capital available")
     parser.add_argument("--db", default="bot_history.db", help="Path to bot_history.db")
