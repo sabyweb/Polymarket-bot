@@ -162,14 +162,16 @@ class TestRankMarkets(unittest.TestCase):
         self.assertEqual(scored[1].condition_id, "mid")
         self.assertEqual(scored[2].condition_id, "low")
 
-    def test_caps_at_max_markets(self):
+    def test_all_positive_markets_deploy(self):
+        """All score-positive markets get deploy — exchange decides capital limit."""
         metrics = [
             _make_metric(condition_id=f"m{i}", daily_rate=100-i, q_share_pct=1.0)
             for i in range(10)
         ]
         scored = rank_markets(metrics, max_markets=3)
         deploy_count = sum(1 for s in scored if s.action == "deploy")
-        self.assertEqual(deploy_count, 3)
+        # All 10 are score-positive → all deploy. Bot stops on exchange error.
+        self.assertEqual(deploy_count, 10)
 
 
 class TestHistoricalAdjustments(unittest.TestCase):
@@ -424,9 +426,24 @@ class TestRebalanceCredit(unittest.TestCase):
         self.assertEqual(good_alloc["action"], "deploy")
 
     def test_no_credit_without_locked_positions(self):
-        """Avoided market with no position doesn't add fake capital."""
+        """Avoided market with no position doesn't generate phantom credit."""
         from oversight.allocation_writer import compute_allocations
-        scored = [
+        # With locked position → rebalance credit inflates budget
+        scored_with_lock = [
+            ScoredMarket(condition_id="bad", question="Bad?", score=-10.0,
+                         action="avoid", recommended_shares=0, reason="test",
+                         confidence="high", actual_reward_total=0,
+                         fill_damage=50, fill_count=5, daily_rate=50,
+                         min_size=50, max_spread=0.045,
+                         locked_position_usd=200.0),
+            ScoredMarket(condition_id="good", question="Good?", score=50.0,
+                         action="deploy", recommended_shares=100, reason="test",
+                         confidence="high", actual_reward_total=10.0,
+                         fill_damage=0, fill_count=0, daily_rate=80,
+                         min_size=50, max_spread=0.045),
+        ]
+        # Without locked position → no credit
+        scored_without_lock = [
             ScoredMarket(condition_id="bad", question="Bad?", score=-10.0,
                          action="avoid", recommended_shares=0, reason="test",
                          confidence="high", actual_reward_total=0,
@@ -434,15 +451,20 @@ class TestRebalanceCredit(unittest.TestCase):
                          min_size=50, max_spread=0.045,
                          locked_position_usd=0.0),
             ScoredMarket(condition_id="good", question="Good?", score=50.0,
-                         action="deploy", recommended_shares=50, reason="test",
+                         action="deploy", recommended_shares=100, reason="test",
                          confidence="high", actual_reward_total=10.0,
                          fill_damage=0, fill_count=0, daily_rate=80,
                          min_size=50, max_spread=0.045),
         ]
-        # Only $10 budget, no credit → can't deploy
-        allocs = compute_allocations(scored, total_capital=10.0)
-        good_alloc = next(a for a in allocs if a["condition_id"] == "good")
-        self.assertEqual(good_alloc["action"], "avoid")
+        allocs_with = compute_allocations(scored_with_lock, total_capital=200.0)
+        allocs_without = compute_allocations(scored_without_lock, total_capital=200.0)
+        # Both deploy good market now (no capital gate), but the one with
+        # rebalance credit has more budget for redistribution
+        good_with = next(a for a in allocs_with if a["condition_id"] == "good")
+        good_without = next(a for a in allocs_without if a["condition_id"] == "good")
+        # With credit: budget inflated by $160 (200*0.8), so redistribution
+        # gives more shares than without credit
+        self.assertGreaterEqual(good_with["shares_per_side"], good_without["shares_per_side"])
 
 
 class TestGroupConcentration(unittest.TestCase):

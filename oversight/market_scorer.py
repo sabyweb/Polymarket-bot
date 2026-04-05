@@ -449,15 +449,16 @@ def rank_markets(
     # Sort by score descending
     scored.sort(key=lambda x: x.score, reverse=True)
 
-    # Cap at max_markets deployments
-    deploy_count = 0
-    for sm in scored:
-        if sm.action == "deploy":
-            deploy_count += 1
-            if deploy_count > max_markets:
-                sm.action = "avoid"
-                sm.recommended_shares = 0
-                sm.reason = f"Beyond top {max_markets} — capital budget exhausted"
+    # Log how many are beyond the soft max (informational only).
+    # Do NOT demote deploy→avoid based on estimated capital — the bot
+    # places orders in score order and stops when the exchange returns
+    # an insufficient-balance error. That's the real capital gate.
+    deploy_count = sum(1 for sm in scored if sm.action == "deploy")
+    if deploy_count > max_markets:
+        log.info(
+            f"Note: {deploy_count} markets marked deploy (soft cap={max_markets}). "
+            f"Bot will place in score order and stop on exchange balance error."
+        )
 
     deploy = [s for s in scored if s.action == "deploy"]
     avoid = [s for s in scored if s.action == "avoid"]

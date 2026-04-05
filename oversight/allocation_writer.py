@@ -117,11 +117,10 @@ def compute_allocations(
                 shares = capped_shares
                 est_cost = _est_market_cost(shares, spread)
 
-        if est_cost > remaining_capital:
-            allocations.append(_to_dict(sm, shares=0, action_override="avoid",
-                                        reason_override="Capital budget exhausted"))
-            continue
-
+        # Track capital for informational logging and redistribution,
+        # but do NOT reject markets based on estimated capital. The bot
+        # places orders in score order and stops only when the exchange
+        # returns an insufficient-balance error — that's the real gate.
         remaining_capital -= est_cost
         if group_key:
             group_capital[group_key] = group_capital.get(group_key, 0) + est_cost
