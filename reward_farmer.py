@@ -258,7 +258,38 @@ class RewardFarmer:
                     m["_agent_shares"] = alloc.get("shares_per_side", SHARES_PER_SIDE())
                     eligible.append(m)
                 else:
-                    log.debug(f"Agent market {cid[:16]} not in market data — skipping")
+                    # Agent discovered a market the bot doesn't have — fetch from CLOB
+                    try:
+                        import requests
+                        mkt_resp = requests.get(
+                            f"https://clob.polymarket.com/markets/{cid}", timeout=10
+                        )
+                        if mkt_resp.status_code == 200:
+                            mkt = mkt_resp.json()
+                            tokens_data = mkt.get("tokens", [])
+                            if len(tokens_data) >= 2:
+                                fetched = {
+                                    "condition_id": cid,
+                                    "question": mkt.get("question", ""),
+                                    "token_ids": [tokens_data[0]["token_id"], tokens_data[1]["token_id"]],
+                                    "yes_price": float(tokens_data[0].get("price", 0.5)),
+                                    "daily_rate": alloc.get("score", 0),
+                                    "min_size": alloc.get("min_size", 50),
+                                    "max_spread": alloc.get("max_spread", 0.045),
+                                    "tick_size": float(mkt.get("minimum_tick_size") or 0.01),
+                                    "liquidity": 0,
+                                    "volume_24h": 0,
+                                    "end_date_iso": mkt.get("end_date_iso", ""),
+                                    "_agent_shares": alloc.get("shares_per_side", SHARES_PER_SIDE()),
+                                }
+                                eligible.append(fetched)
+                                log.info(f"Agent market fetched from CLOB: {fetched['question'][:40]}")
+                            else:
+                                log.debug(f"Agent market {cid[:16]}: <2 tokens in CLOB")
+                        else:
+                            log.debug(f"Agent market {cid[:16]}: CLOB returned {mkt_resp.status_code}")
+                    except Exception as e:
+                        log.debug(f"Agent market {cid[:16]} CLOB fetch failed: {e}")
 
             # Minimal validation — agent markets still need basic sanity checks
             validated = []
