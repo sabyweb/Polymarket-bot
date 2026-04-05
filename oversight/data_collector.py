@@ -14,6 +14,44 @@ from dataclasses import dataclass
 log = logging.getLogger("oversight.collector")
 
 
+def _fetch_all_clob_reward_markets(min_rate: float = 10.0) -> dict[str, dict]:
+    """Fetch all reward markets from CLOB endpoint. Independent of bot's tracking.
+
+    Returns {condition_id: {"daily_rate": float, "min_size": float, "max_spread": float}}.
+    Only includes markets with daily_rate >= min_rate.
+    """
+    import requests
+    result = {}
+    cursor = ""
+    for _ in range(20):
+        params = {"limit": 500}
+        if cursor:
+            params["next_cursor"] = cursor
+        try:
+            resp = requests.get(
+                "https://clob.polymarket.com/rewards/markets/current",
+                params=params, timeout=15,
+            )
+            if resp.status_code != 200:
+                break
+            data = resp.json()
+        except Exception:
+            break
+        items = data.get("data", [])
+        for m in items:
+            rate = float(m.get("total_daily_rate") or 0)
+            if rate >= min_rate:
+                result[m["condition_id"]] = {
+                    "daily_rate": rate,
+                    "min_size": float(m.get("rewards_min_size") or 50),
+                    "max_spread": float(m.get("rewards_max_spread") or 4.5) / 100.0,
+                }
+        cursor = data.get("next_cursor", "")
+        if not cursor or not items or cursor == "LTE=":
+            break
+    return result
+
+
 def _fetch_reward_market_expiries(condition_ids: list[str] | None = None) -> dict[str, str]:
     """Fetch end_date_iso for markets. Uses Gamma bulk + CLOB fallback for misses.
 
@@ -431,12 +469,31 @@ def collect_all(
     positions = query_positions(db_path)
     stats = query_reward_stats(db_path)
 
-    # Build unified set of all known condition_ids
+    # Build unified set of all known condition_ids (from bot's DB)
     all_cids = set()
     all_cids.update(actual_rewards.keys())
     all_cids.update(fills.keys())
     all_cids.update(positions.keys())
     all_cids.update(stats.keys())
+
+    # Independent discovery: fetch ALL CLOB reward markets so the agent
+    # can score markets the bot hasn't tracked yet (closes discovery gap)
+    clob_reward_markets = _fetch_all_clob_reward_markets()
+    new_discovered = 0
+    for cid, mkt_data in clob_reward_markets.items():
+        if cid not in all_cids:
+            all_cids.add(cid)
+            new_discovered += 1
+            # Inject basic stats for new markets (no Q-share data yet)
+            stats[cid] = {
+                "rate": mkt_data["daily_rate"],
+                "q_share": 0,  # unknown — will get default scoring as trial
+                "on_book_hrs": 0,
+                "question": "",  # will be filled by bot on first placement
+            }
+    if new_discovered:
+        log.info(f"Discovery: {new_discovered} new markets from CLOB (not yet tracked by bot)")
+    log.info(f"Total: {len(clob_reward_markets)} CLOB reward markets, {len(all_cids)} CIDs")
 
     # Fetch expiry dates (Gamma bulk + CLOB fallback for CLOB-only markets)
     expiry_map = _fetch_reward_market_expiries(condition_ids=list(all_cids))
