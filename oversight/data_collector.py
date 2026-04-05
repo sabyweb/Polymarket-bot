@@ -240,7 +240,7 @@ def _fetch_reward_market_expiries(condition_ids: list[str] | None = None,
 
 
 def query_placement_feedback(db_path: str) -> dict[str, dict]:
-    """Read placement feedback from bot. Returns {cid: {"yes": {status, reason}, "no": ...}}."""
+    """Read placement feedback from bot. Returns {cid: {"yes": {status, reason, ts}, "no": ...}}."""
     try:
         db = sqlite3.connect(db_path, timeout=5)
         db.row_factory = sqlite3.Row
@@ -256,6 +256,83 @@ def query_placement_feedback(db_path: str) -> dict[str, dict]:
     except Exception as e:
         log.debug(f"Placement feedback query failed: {e}")
         return {}
+
+
+def query_short_term_performance(db_path: str, hours: float = 4.0) -> dict[str, dict]:
+    """Query recent performance snapshots for fast adaptation.
+
+    Bridges the gap between immediate fast-react (THIS cycle's fills) and
+    the 7-day historical adjustments (needs 3+ snapshots over days).
+
+    Returns {condition_id: {
+        "snapshots": int,
+        "avg_score": float,
+        "fill_snapshots": int,     -- snapshots where fills > 0
+        "total_fills": int,        -- total fills across all snapshots
+        "q_share_trend": float,    -- latest q_share / earliest q_share (< 1 = declining)
+        "score_trend": float,      -- latest score / earliest score (< 1 = worsening)
+        "latest_action": str,      -- most recent action ("deploy" or "avoid")
+    }}
+    """
+    cutoff_ts = time.time() - hours * 3600
+    result = {}
+    try:
+        db = sqlite3.connect(db_path, timeout=5)
+        db.row_factory = sqlite3.Row
+        rows = db.execute(
+            """SELECT condition_id, ts, net_score, fill_count, q_share_pct, action
+               FROM market_performance
+               WHERE ts > ?
+               ORDER BY condition_id, ts""",
+            (cutoff_ts,),
+        ).fetchall()
+        db.close()
+
+        # Group by condition_id
+        per_market: dict[str, list] = {}
+        for r in rows:
+            per_market.setdefault(r["condition_id"], []).append(dict(r))
+
+        for cid, snaps in per_market.items():
+            if len(snaps) < 2:
+                continue
+
+            fill_snaps = sum(1 for s in snaps if s["fill_count"] > 0)
+            total_fills = sum(s["fill_count"] for s in snaps)
+            avg_score = sum(s["net_score"] for s in snaps) / len(snaps)
+
+            # Q-share trend: compare latest to earliest
+            first_q = snaps[0].get("q_share_pct", 0)
+            last_q = snaps[-1].get("q_share_pct", 0)
+            q_trend = (last_q / first_q) if first_q > 0.001 else 1.0
+
+            # Score trend: compare latest to earliest
+            first_s = snaps[0].get("net_score", 0)
+            last_s = snaps[-1].get("net_score", 0)
+            if first_s > 0.01:
+                score_trend = last_s / first_s
+            elif first_s < -0.01:
+                score_trend = last_s / first_s  # both negative → >1 if improving
+            else:
+                score_trend = 1.0
+
+            result[cid] = {
+                "snapshots": len(snaps),
+                "avg_score": avg_score,
+                "fill_snapshots": fill_snaps,
+                "total_fills": total_fills,
+                "q_share_trend": q_trend,
+                "score_trend": score_trend,
+                "latest_action": snaps[-1].get("action", "deploy"),
+            }
+
+        if result:
+            log.debug(f"Short-term performance: {len(result)} markets with 2+ recent snapshots")
+
+    except Exception as e:
+        log.debug(f"Short-term performance query failed: {e}")
+
+    return result
 
 
 @dataclass
@@ -276,6 +353,12 @@ class MarketMetrics:
     min_size: float = 50.0         # minimum order size for rewards
     max_spread: float = 0.045      # maximum spread for rewards
     question_group: str = ""       # grouping key for portfolio concentration limits
+    # Regime detection fields
+    avg_bid: float = 0.0           # average bid price (from reward_tracker)
+    avg_ask: float = 0.0           # average ask price (from reward_tracker)
+    adverse_fills: int = 0         # fills where we lost to adverse selection
+    reward_window_pct: float = 0.0 # fraction of cycles in reward spread window
+    total_market_q: float = 0.0    # total market Q-score (competition depth)
 
 
 def _question_group_key(question: str) -> str:
@@ -552,9 +635,12 @@ def query_positions(db_path: str) -> dict[str, dict]:
 
 
 def query_reward_stats(db_path: str) -> dict[str, dict]:
-    """Query reward_market_stats for Q-score and on-book data.
+    """Query reward_market_stats for Q-score, on-book data, and regime signals.
 
-    Returns {condition_id: {"rate": float, "q_share": float, "on_book_hrs": float, "question": str}}.
+    Returns {condition_id: {rate, q_share, on_book_hrs, question, fills,
+    cycles_with_orders, total_cycles, avg_bid, avg_ask, adverse_fills,
+    spread_capture_usd, cycles_in_reward_window, cycles_both_in_window,
+    total_market_q}}.
     """
     try:
         db = sqlite3.connect(db_path, timeout=5)
@@ -565,8 +651,9 @@ def query_reward_stats(db_path: str) -> dict[str, dict]:
         for r in rows:
             d = json.loads(r["data"])
             q_share = 0.0
-            if d.get("total_market_q", 0) > 0 and d.get("q_score_samples", 0) > 0:
-                q_share = d["total_q_score"] / d["total_market_q"]
+            total_market_q = d.get("total_market_q", 0)
+            if total_market_q > 0 and d.get("q_score_samples", 0) > 0:
+                q_share = d["total_q_score"] / total_market_q
             on_book = d.get("time_on_book_secs", 0) / 3600
             result[d["condition_id"]] = {
                 "rate": d.get("daily_rate", 0),
@@ -576,6 +663,14 @@ def query_reward_stats(db_path: str) -> dict[str, dict]:
                 "fills": d.get("buy_fills", 0),
                 "cycles_with_orders": d.get("cycles_with_orders", 0),
                 "total_cycles": d.get("total_cycles", 0),
+                # Regime detection signals
+                "avg_bid": d.get("avg_bid_price", 0),
+                "avg_ask": d.get("avg_ask_price", 0),
+                "adverse_fills": d.get("adverse_fills", 0),
+                "spread_capture_usd": d.get("spread_capture_usd", 0),
+                "cycles_in_reward_window": d.get("cycles_in_reward_window", 0),
+                "cycles_both_in_window": d.get("cycles_both_in_window", 0),
+                "total_market_q": total_market_q,
             }
         return result
     except Exception as e:
@@ -766,6 +861,11 @@ def collect_all(
         dump_rev = dump_data["revenue"]
         net_pnl = dump_rev - fill_cost
 
+        # Compute reward window utilization (what % of cycles are in reward spread)
+        total_cyc = stat_data.get("total_cycles", 0)
+        reward_window_cyc = stat_data.get("cycles_in_reward_window", 0)
+        reward_window_pct = reward_window_cyc / total_cyc if total_cyc > 0 else 0.0
+
         metrics.append(MarketMetrics(
             condition_id=cid,
             question=question,
@@ -782,6 +882,12 @@ def collect_all(
             min_size=clob_reward_markets.get(cid, {}).get("min_size", 50.0),
             max_spread=clob_reward_markets.get(cid, {}).get("max_spread", 0.045),
             question_group=_question_group_key(question) if question else "",
+            # Regime detection
+            avg_bid=stat_data.get("avg_bid", 0),
+            avg_ask=stat_data.get("avg_ask", 0),
+            adverse_fills=stat_data.get("adverse_fills", 0),
+            reward_window_pct=reward_window_pct,
+            total_market_q=stat_data.get("total_market_q", 0),
         ))
 
     # Compute correction factor: actual total paid / sum of estimates

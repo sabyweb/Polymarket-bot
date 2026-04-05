@@ -264,16 +264,13 @@ def classify_market(
 def load_historical_adjustments(db_path: str, days: int = 7) -> dict[str, dict]:
     """Load historical performance data to adjust scoring.
 
-    For markets with 3+ historical snapshots, computes:
-    - trend: is the market getting better or worse over time?
-    - reliability: how consistent is the score across snapshots?
-    - fill_rate: what fraction of snapshots had fills (recency-weighted)?
+    For markets with 2+ historical snapshots (lowered from 3 for faster learning),
+    computes recency-weighted fill rate and trend multiplier.
 
-    Recent snapshots are weighted more heavily via exponential decay
-    (half-life = 2 days). A fill yesterday counts ~3.5x more than a
-    fill 5 days ago.
+    Recent snapshots weighted via exponential decay (half-life = 2 days).
 
-    Returns {condition_id: {"trend_mult": float, "fill_rate": float, "snapshots": int}}
+    Returns {condition_id: {"trend_mult": float, "fill_rate": float, "snapshots": int,
+                            "avg_score": float, "q_share_trend": float}}
     """
     import sqlite3
     import math
@@ -286,9 +283,8 @@ def load_historical_adjustments(db_path: str, days: int = 7) -> dict[str, dict]:
         db = sqlite3.connect(db_path, timeout=5)
         db.row_factory = sqlite3.Row
 
-        # Fetch individual snapshots for recency-weighted fill rate
         rows = db.execute(
-            """SELECT condition_id, ts, fill_count, net_score
+            """SELECT condition_id, ts, fill_count, net_score, q_share_pct
                FROM market_performance
                WHERE ts > ?
                ORDER BY condition_id, ts""",
@@ -296,18 +292,14 @@ def load_historical_adjustments(db_path: str, days: int = 7) -> dict[str, dict]:
         ).fetchall()
         db.close()
 
-        # Group by condition_id
         per_market: dict[str, list] = {}
         for r in rows:
-            cid = r["condition_id"]
-            per_market.setdefault(cid, []).append(dict(r))
+            per_market.setdefault(r["condition_id"], []).append(dict(r))
 
         for cid, snaps in per_market.items():
-            if len(snaps) < 3:
+            if len(snaps) < 2:  # lowered from 3 → 2 for faster onset
                 continue
 
-            # Recency-weighted fill rate: each snapshot weighted by
-            # 2^(-age_days / half_life_days)
             weighted_fills = 0.0
             total_weight = 0.0
             worst_score = float("inf")
@@ -325,27 +317,95 @@ def load_historical_adjustments(db_path: str, days: int = 7) -> dict[str, dict]:
             fill_rate = weighted_fills / total_weight if total_weight > 0 else 0
 
             # Trend multiplier: penalize markets that fill frequently
-            # fill_rate 0% → 1.2 bonus, fill_rate 50% → 0.8 penalty, fill_rate 100% → 0.5
+            # fill_rate 0% → 1.2 bonus, 50% → 0.8 penalty, 100% → 0.5
             trend_mult = max(0.5, 1.2 - fill_rate * 0.7)
 
-            # Extra penalty if worst score is very negative (risky market)
             if worst_score < -5.0:
                 trend_mult *= 0.8
+
+            # Q-share trend: detect competition changes
+            # Compare latest 25% of snapshots to earliest 25%
+            q_share_trend = 1.0
+            if len(snaps) >= 4:
+                quarter = max(1, len(snaps) // 4)
+                early_q = [s.get("q_share_pct", 0) for s in snaps[:quarter]]
+                late_q = [s.get("q_share_pct", 0) for s in snaps[-quarter:]]
+                avg_early = sum(early_q) / len(early_q) if early_q else 0
+                avg_late = sum(late_q) / len(late_q) if late_q else 0
+                if avg_early > 0.001:
+                    q_share_trend = avg_late / avg_early  # < 1 = losing share
 
             result[cid] = {
                 "trend_mult": trend_mult,
                 "fill_rate": fill_rate,
                 "avg_score": score_sum / total_weight if total_weight > 0 else 0,
                 "snapshots": len(snaps),
+                "q_share_trend": q_share_trend,
             }
 
         if result:
-            log.info(f"Historical adjustments: {len(result)} markets with 3+ snapshots")
+            log.info(f"Historical adjustments: {len(result)} markets with 2+ snapshots")
 
     except Exception as e:
         log.debug(f"Historical adjustments load failed: {e}")
 
     return result
+
+
+def _detect_regime_signals(m: MarketMetrics) -> dict:
+    """Detect structural market regime changes from available data.
+
+    Returns dict of detected signals with multiplier and reason.
+    Each signal is a multiplier on score (< 1.0 = penalty, > 1.0 = bonus).
+    """
+    signals = {}
+
+    # ── Resolution proximity: price near 0 or 1 ──
+    # When avg_bid and avg_ask are both very high (>0.92) or very low (<0.08),
+    # the market is likely near resolution. Fills become catastrophic here
+    # because the losing side goes to 0.
+    if m.avg_bid > 0 and m.avg_ask > 0:
+        mid = (m.avg_bid + m.avg_ask) / 2
+        if mid > 0.92 or mid < 0.08:
+            signals["resolution_proximity"] = {
+                "mult": 0.3,
+                "reason": f"Price near resolution ({mid:.2f})"
+            }
+        elif mid > 0.85 or mid < 0.15:
+            signals["resolution_proximity"] = {
+                "mult": 0.6,
+                "reason": f"Price drifting to resolution ({mid:.2f})"
+            }
+
+    # ── Low reward window utilization ──
+    # If the bot's orders are rarely within the reward spread window,
+    # the market is structurally hard to earn on (competition pushes
+    # prices outside the reward band). Only trigger for established markets.
+    if m.on_book_hours >= 4 and m.reward_window_pct > 0:
+        if m.reward_window_pct < 0.20:
+            signals["low_reward_window"] = {
+                "mult": 0.5,
+                "reason": f"Orders in reward window only {m.reward_window_pct:.0%} of cycles"
+            }
+        elif m.reward_window_pct < 0.40:
+            signals["low_reward_window"] = {
+                "mult": 0.7,
+                "reason": f"Low reward window utilization ({m.reward_window_pct:.0%})"
+            }
+
+    # ── Adverse selection signal ──
+    # If most fills are adverse (we get picked off by informed traders),
+    # this market has structural adverse selection. Penalty scales with severity.
+    total_fills = m.fill_count_recent + getattr(m, "adverse_fills", 0)
+    if m.adverse_fills > 0 and total_fills >= 3:
+        adverse_pct = m.adverse_fills / total_fills
+        if adverse_pct > 0.60:
+            signals["adverse_selection"] = {
+                "mult": 0.4,
+                "reason": f"High adverse fill rate ({adverse_pct:.0%} of {total_fills} fills)"
+            }
+
+    return signals
 
 
 def rank_markets(
@@ -357,10 +417,14 @@ def rank_markets(
 ) -> list[ScoredMarket]:
     """Score all markets, rank by score descending, return recommendations.
 
-    Uses historical performance data (when available) to adjust scores:
-    - Markets with zero fills historically get a reliability bonus
-    - Markets with frequent fills get penalized
-    - New markets (< 3 snapshots) scored purely on current data
+    Adaptation layers (fastest → slowest):
+    1. Regime detection: structural signals (resolution, adverse selection) — immediate
+    2. Fast-react: THIS cycle's fill count → compound penalty — immediate
+    3. Placement feedback: bot's skip/fail signals → score + size penalty — 1 cycle lag
+    4. Short-term trend: 4h performance snapshots → persistent-fill detection — 1-2h
+    5. Historical adjustments: 7-day trend with 2-day half-life — 2+ snapshots
+    6. Q-share trend: competition shift detection from historical data — 4+ snapshots
+    7. Confidence ramp: new markets start at 50% sizing — linear ramp to 8h
 
     Args:
         metrics: Raw per-market data from data_collector
@@ -371,23 +435,25 @@ def rank_markets(
 
     Returns:
         List of ScoredMarket sorted by score (highest first).
-        Markets beyond max_markets are set to "avoid" even if positive.
     """
-    # Load historical adjustments for adaptive scoring
+    import time as _time
+
+    # Load adaptation data sources
     historical = load_historical_adjustments(db_path)
+
+    from .data_collector import query_placement_feedback, query_short_term_performance
+    feedback = query_placement_feedback(db_path)
+    short_term = query_short_term_performance(db_path, hours=4.0)
 
     # Filter stale/resolved/expiring markets before scoring
     from datetime import datetime, timezone, timedelta
-    now = datetime.now(timezone.utc)
-    agent_cutoff = now + timedelta(hours=24)  # Agent is more conservative: 24h (bot uses 12h)
-
-    # Load placement feedback for closed-loop scoring
-    from .data_collector import query_placement_feedback
-    feedback = query_placement_feedback(db_path)
+    now_dt = datetime.now(timezone.utc)
+    now_ts = _time.time()
+    agent_cutoff = now_dt + timedelta(hours=24)
 
     active_metrics = []
-    min_rate = 5.0  # minimum $/day to consider — matches discovery filter
-    filtered_reasons = {"zero_rate": 0, "low_rate": 0, "expiring": 0, "no_expiry": 0, "both_skipped": 0}
+    min_rate = 5.0
+    filtered_reasons = {"zero_rate": 0, "low_rate": 0, "expiring": 0, "no_expiry": 0}
     for m in metrics:
         if m.daily_rate <= 0:
             filtered_reasons["zero_rate"] += 1
@@ -395,7 +461,6 @@ def rank_markets(
         if m.daily_rate < min_rate:
             filtered_reasons["low_rate"] += 1
             continue
-        # Expiry check using actual end_date_iso from CLOB
         if m.end_date_iso:
             try:
                 dt = datetime.fromisoformat(m.end_date_iso.replace("Z", "+00:00"))
@@ -405,10 +470,6 @@ def rank_markets(
             except Exception:
                 pass
         elif m.on_book_hours == 0:
-            # Fail-closed: new market with no expiry data — skip until expiry is fetched
-            # Only skip markets we haven't tracked yet (on_book_hours=0).
-            # Markets the bot already tracks (on_book_hours>0) are allowed through
-            # because the bot's _verify_order_books already checked their expiry.
             filtered_reasons["no_expiry"] += 1
             continue
         active_metrics.append(m)
@@ -416,56 +477,128 @@ def rank_markets(
     if sum(filtered_reasons.values()) > 0:
         log.info(f"Filtered {sum(filtered_reasons.values())} markets: {dict(filtered_reasons)}")
 
+    regime_detections = 0
+    short_term_penalties = 0
+    feedback_penalties = 0
+
     scored = []
     for m in active_metrics:
         s = score_market(m, hours, correction_factor=correction_factor)
 
-        # ── Fast-react: immediate penalty for recent fills ──
-        # If a market had fills in THIS window, apply a circuit-breaker
-        # penalty proportional to fill count. Don't wait for historical
-        # data to accumulate — react NOW. This is the single biggest
-        # adaptation speed improvement.
+        # ── Layer 1: Regime detection (immediate) ──
+        # Detect structural market changes: resolution proximity, adverse
+        # selection, low reward window utilization.
+        regime = _detect_regime_signals(m)
+        regime_mult = 1.0
+        for sig_name, sig in regime.items():
+            regime_mult *= sig["mult"]
+        if regime_mult < 1.0:
+            s *= regime_mult
+            regime_detections += 1
+
+        # ── Layer 2: Fast-react (immediate) ──
+        # Each fill in THIS window reduces score by 15% (compounds).
         if m.fill_count_recent > 0:
-            # Each fill in the window reduces score by 15% (compounds)
-            # 1 fill → 0.85x, 2 fills → 0.72x, 3+ fills → 0.61x or worse
-            fast_react_mult = 0.85 ** m.fill_count_recent
-            fast_react_mult = max(fast_react_mult, 0.3)  # floor at 30%
+            fast_react_mult = max(0.3, 0.85 ** m.fill_count_recent)
             s *= fast_react_mult
 
-        # ── Confidence ramp-up for new markets ──
-        # Markets with < 8h on-book get a graduated confidence discount
-        # on their sizing (not score). This prevents the agent from
-        # over-allocating to unproven markets. Ramps linearly:
-        #   0h → 50%, 4h → 75%, 8h+ → 100%
+        # ── Layer 3: Placement feedback (1 cycle lag) ──
+        # Enhanced: handles one-sided skips, checks feedback freshness,
+        # adjusts both score AND sizing.
+        placement_penalty = 1.0
+        fb = feedback.get(m.condition_id, {})
+        yes_fb = fb.get("yes", {})
+        no_fb = fb.get("no", {})
+        yes_skip = yes_fb.get("status") == "skipped"
+        no_skip = no_fb.get("status") == "skipped"
+        yes_fail = yes_fb.get("status") == "failed"
+        no_fail = no_fb.get("status") == "failed"
+
+        # Check feedback freshness (ignore stale feedback > 2h old)
+        feedback_fresh = True
+        fb_ts = max(yes_fb.get("ts", 0), no_fb.get("ts", 0))
+        if fb_ts > 0 and (now_ts - fb_ts) > 7200:
+            feedback_fresh = False
+
+        if feedback_fresh:
+            if yes_skip and no_skip:
+                # Both sides can't place — heavy penalty
+                skip_reason = yes_fb.get("reason", "")
+                if skip_reason in ("wide_spread", "exit_liquidity"):
+                    s *= 0.3
+                    placement_penalty = 0.3
+                    feedback_penalties += 1
+                elif skip_reason not in ("capital_exhausted", "already_has_order"):
+                    s *= 0.5
+                    placement_penalty = 0.5
+                    feedback_penalties += 1
+            elif yes_skip or no_skip:
+                # One side can't place — moderate penalty (still earning half rewards)
+                skip_side = "yes" if yes_skip else "no"
+                skip_reason = fb.get(skip_side, {}).get("reason", "")
+                if skip_reason in ("wide_spread", "exit_liquidity"):
+                    s *= 0.6  # 40% penalty for one-sided structural skip
+                    placement_penalty = 0.6
+                    feedback_penalties += 1
+            if yes_fail and no_fail:
+                # Both sides failed — something fundamentally broken
+                fail_reason = yes_fb.get("reason", "")
+                if fail_reason not in ("capital_exhausted",):
+                    s *= 0.4
+                    placement_penalty = 0.4
+                    feedback_penalties += 1
+
+        # ── Layer 4: Short-term trend (1-2h) ──
+        # Bridges gap between immediate fast-react and 7-day historical.
+        # If fills are persistent across multiple recent snapshots, apply
+        # extra penalty on top of fast-react (which only sees this cycle).
+        st = short_term.get(m.condition_id)
+        short_term_mult = 1.0
+        if st and st["snapshots"] >= 2:
+            # Persistent fills: if 50%+ of recent snapshots had fills, penalize
+            fill_persistence = st["fill_snapshots"] / st["snapshots"]
+            if fill_persistence >= 0.75:
+                short_term_mult = 0.5  # 75%+ snapshots with fills → heavy
+                short_term_penalties += 1
+            elif fill_persistence >= 0.50:
+                short_term_mult = 0.7  # 50%+ snapshots with fills → moderate
+                short_term_penalties += 1
+
+            # Score declining rapidly (latest < 50% of earliest)
+            if st["score_trend"] < 0.5 and st["avg_score"] < 0:
+                short_term_mult *= 0.7  # compounding penalty
+
+            s *= short_term_mult
+
+        # ── Layer 5: Confidence ramp-up for new markets ──
         confidence_mult = 1.0
         if m.on_book_hours < 8:
             confidence_mult = 0.5 + 0.5 * (m.on_book_hours / 8.0)
 
-        # Penalize markets the bot persistently can't place on
-        placement_penalty = 1.0
-        fb = feedback.get(m.condition_id, {})
-        yes_skip = fb.get("yes", {}).get("status") == "skipped"
-        no_skip = fb.get("no", {}).get("status") == "skipped"
-        if yes_skip and no_skip:
-            skip_reason = fb.get("yes", {}).get("reason", "")
-            if skip_reason in ("wide_spread", "exit_liquidity"):
-                s *= 0.3  # Heavy penalty — bot can't trade this market
-                placement_penalty = 0.3
-                log.debug(f"Placement penalty {m.condition_id[:12]}: both sides skipped ({skip_reason})")
-            elif skip_reason not in ("capital_exhausted", "already_has_order"):
-                s *= 0.5  # Moderate penalty for other persistent skips
-                placement_penalty = 0.5
-
-        # Apply historical adjustment if available
+        # ── Layer 6: Historical adjustments (7-day) ──
         hist = historical.get(m.condition_id)
         if hist:
             original_score = s
             s *= hist["trend_mult"]
+
+            # Layer 6b: Q-share trend — competition shift detection
+            # If our Q-share is dropping (new competitors entering),
+            # apply additional penalty proportional to the decline.
+            q_trend = hist.get("q_share_trend", 1.0)
+            if q_trend < 0.5:
+                # Q-share halved or worse → heavy penalty (losing competition)
+                s *= 0.6
+                log.debug(f"Q-share declining {m.condition_id[:12]}: trend={q_trend:.2f}")
+            elif q_trend < 0.75:
+                # Q-share declining meaningfully → moderate penalty
+                s *= 0.8
+
             if abs(s - original_score) > 0.01:
                 log.debug(
                     f"Historical adj {m.condition_id[:12]}: "
-                    f"{original_score:.4f} × {hist['trend_mult']:.2f} = {s:.4f} "
-                    f"(fill_rate={hist['fill_rate']:.0%}, {hist['snapshots']} snapshots)"
+                    f"{original_score:.4f} → {s:.4f} "
+                    f"(fill_rate={hist['fill_rate']:.0%}, q_trend={q_trend:.2f}, "
+                    f"{hist['snapshots']} snapshots)"
                 )
 
         sm = classify_market(m, s)
@@ -477,13 +610,18 @@ def rank_markets(
                 int(sm.recommended_shares * confidence_mult),
             )
 
-        # Reduce allocation size when bot can't place — don't just penalize
-        # the score, also shrink the order so the bot doesn't keep failing
-        # with the same oversized order next cycle.
+        # Apply placement penalty to sizing too
         if placement_penalty < 1.0 and sm.recommended_shares > 0:
             sm.recommended_shares = max(
                 int(m.min_size),
                 int(sm.recommended_shares * placement_penalty),
+            )
+
+        # Apply short-term penalty to sizing (persistent fills → shrink orders)
+        if short_term_mult < 1.0 and sm.recommended_shares > 0:
+            sm.recommended_shares = max(
+                int(m.min_size),
+                int(sm.recommended_shares * short_term_mult),
             )
 
         scored.append(sm)
@@ -491,10 +629,6 @@ def rank_markets(
     # Sort by score descending
     scored.sort(key=lambda x: x.score, reverse=True)
 
-    # Log how many are beyond the soft max (informational only).
-    # Do NOT demote deploy→avoid based on estimated capital — the bot
-    # places orders in score order and stops when the exchange returns
-    # an insufficient-balance error. That's the real capital gate.
     deploy_count = sum(1 for sm in scored if sm.action == "deploy")
     if deploy_count > max_markets:
         log.info(
@@ -510,5 +644,11 @@ def rank_markets(
         f"Scored {len(scored)} markets: {len(deploy)} deploy, {len(avoid)} avoid | "
         f"top score={top_score}"
     )
+    if regime_detections or short_term_penalties or feedback_penalties:
+        log.info(
+            f"Adaptation: {regime_detections} regime signals, "
+            f"{short_term_penalties} short-term penalties, "
+            f"{feedback_penalties} feedback penalties"
+        )
 
     return scored
