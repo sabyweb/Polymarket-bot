@@ -15,35 +15,28 @@ log = logging.getLogger("oversight.collector")
 
 
 def _fetch_reward_market_expiries() -> dict[str, str]:
-    """Fetch end_date_iso for current reward markets from CLOB (single page, fast)."""
+    """Fetch end_date_iso from Gamma API (CLOB rewards endpoint doesn't have it)."""
     import requests
     result = {}
     try:
-        # Paginate through all reward markets to get expiry dates
-        cursor = ""
-        for _ in range(20):
-            params = {"limit": 500}
-            if cursor:
-                params["next_cursor"] = cursor
+        # Gamma API has endDateIso — fetch in bulk
+        for offset in range(0, 10000, 100):
             resp = requests.get(
-                "https://clob.polymarket.com/rewards/markets/current",
-                params=params, timeout=15,
+                "https://gamma-api.polymarket.com/markets",
+                params={"limit": 100, "offset": offset, "closed": "false"},
+                timeout=15,
             )
             if resp.status_code != 200:
                 break
-            data = resp.json()
-            items = data.get("data", [])
-            for m in items:
-                cid = m.get("condition_id", "")
-                # end_date_iso may be in the rewards config or fetched separately
-                # The rewards endpoint doesn't always include end_date_iso directly
-                # but it does include condition_id which we can cross-reference
-                if cid:
-                    result[cid] = m.get("end_date_iso", "")
-            cursor = data.get("next_cursor", "")
-            if not cursor or not items or cursor == "LTE=":
+            batch = resp.json()
+            if not batch:
                 break
-        log.debug(f"Fetched expiry data for {len(result)} reward markets")
+            for m in batch:
+                cid = m.get("conditionId", "")
+                end_date = m.get("endDateIso") or m.get("end_date_iso", "")
+                if cid and end_date:
+                    result[cid] = end_date
+        log.info(f"Fetched expiry data for {len(result)} markets from Gamma")
     except Exception as e:
         log.debug(f"Expiry fetch failed: {e}")
     return result
