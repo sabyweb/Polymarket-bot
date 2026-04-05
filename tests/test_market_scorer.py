@@ -292,11 +292,36 @@ class TestContinuousSizing(unittest.TestCase):
         sm = classify_market(m, score=-50.0)
         self.assertEqual(sm.recommended_shares, 0)
 
-    def test_capped_at_4x(self):
-        """Even an amazing market can't exceed 4x default shares."""
+    def test_capped_at_4x_capital(self):
+        """Even an amazing market can't exceed 4x base capital worth of shares."""
         m = _make_metric(daily_rate=1000, q_share_pct=1.0)
         sm = classify_market(m, score=1000.0)
-        self.assertLessEqual(sm.recommended_shares, 50 * 4)
+        # 4x base capital = 4 * 50 * 0.91 = $182, at $0.91/share = 200 shares
+        self.assertLessEqual(sm.recommended_shares, 200)
+
+    def test_price_awareness_cheap_market_gets_more_shares(self):
+        """A cheap market (wide spread) should get more shares for the same capital."""
+        # Wide spread → lower cost per share → more shares for same capital
+        cheap = _make_metric(daily_rate=50, q_share_pct=1.0, max_spread=0.20)
+        # Narrow spread → higher cost per share → fewer shares
+        expensive = _make_metric(daily_rate=50, q_share_pct=1.0, max_spread=0.02)
+        sm_cheap = classify_market(cheap, score=50.0)
+        sm_expensive = classify_market(expensive, score=50.0)
+        # Same score, same multiplier, but cheap market should get more shares
+        self.assertGreater(sm_cheap.recommended_shares, sm_expensive.recommended_shares)
+
+    def test_price_awareness_equal_capital(self):
+        """Different-priced markets at same score deploy roughly equal capital."""
+        cheap = _make_metric(daily_rate=50, q_share_pct=1.0, max_spread=0.20)
+        expensive = _make_metric(daily_rate=50, q_share_pct=1.0, max_spread=0.02)
+        sm_cheap = classify_market(cheap, score=50.0)
+        sm_expensive = classify_market(expensive, score=50.0)
+        # Compute actual capital deployed
+        cheap_cost = sm_cheap.recommended_shares * max(0.05, (1 - 2*0.20)/2) * 2
+        expensive_cost = sm_expensive.recommended_shares * max(0.05, (1 - 2*0.02)/2) * 2
+        # Capital should be within 20% of each other (same score → same target capital)
+        ratio = max(cheap_cost, expensive_cost) / min(cheap_cost, expensive_cost)
+        self.assertLess(ratio, 1.25)
 
 
 class TestFastReactAndConfidence(unittest.TestCase):

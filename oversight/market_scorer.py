@@ -98,47 +98,67 @@ def classify_market(
     else:
         confidence = "low"
 
-    # ── Continuous ROI-based sizing ──
-    # Instead of discrete tiers, compute a multiplier from the score itself.
-    # Score already incorporates daily_rate × q_share - fill_damage, so
-    # sizing by score automatically rewards profitable markets and penalizes
-    # risky ones. The multiplier is continuous: no cliff edges.
+    # ── Capital-aware continuous sizing ──
+    # Think in DOLLARS, not shares. A share at $0.02 costs 50× less than one
+    # at $0.95, so raw share counts are meaningless without price context.
     #
-    # Formula: multiplier = 1 + log2(1 + score / scale_param)
-    #   score=0  → 1.0x (default)
-    #   score=25 → ~1.7x
-    #   score=50 → ~2.0x
-    #   score=100 → ~2.3x
-    #   score=200 → ~2.6x
-    # Logarithmic so diminishing returns prevent over-concentration.
+    # Step 1: Compute cost per share for this market.
+    #   For symmetric reward LPs quoting both sides, cost per side ≈ (1 - 2*spread)/2.
+    #   Combined cost = cost_per_share_per_side × 2 (YES + NO).
+    # Step 2: Decide a TARGET CAPITAL amount based on score (continuous log curve).
+    # Step 3: Convert target capital → shares via actual cost.
+    #
+    # This means a $0.02 market gets ~10× more shares than a $0.20 market
+    # for the same capital, which is correct — cheap shares are cheap to deploy.
     q_pct = m.q_share_pct * 100
     import math
 
-    scale_param = 25.0  # score at which we roughly double shares
+    spread = m.max_spread if m.max_spread > 0 else 0.045
+    cost_per_share_per_side = max(0.05, (1.0 - 2 * spread) / 2)
+    cost_per_share_both = cost_per_share_per_side * 2  # YES + NO side
+
+    # Base capital is a FIXED dollar amount — what default_shares costs at
+    # a typical spread (0.045). This is the anchor; actual share count then
+    # varies by market price. Cheap markets get more shares for the same $.
+    typical_cost_both = 2 * max(0.05, (1.0 - 2 * 0.045) / 2)  # ~$0.91
+    base_capital = default_shares * typical_cost_both  # ~$45.50
+
+    # Score-based capital multiplier (continuous log curve):
+    #   score=0   → 1.0× base capital
+    #   score=25  → ~1.7× base capital
+    #   score=50  → ~2.0× base capital
+    #   score=100 → ~2.3× base capital
+    # Logarithmic = diminishing returns, prevents over-concentration.
+    scale_param = 25.0  # score at which we roughly double capital allocation
     if score > 0 and m.fill_count_recent == 0:
         raw_mult = 1.0 + math.log2(1 + score / scale_param)
-        # Cap at 4x to prevent over-concentration on a single market
-        multiplier = min(raw_mult, 4.0)
-        sized_shares = int(default_shares * multiplier)
-        size_reason = (
-            f"zero-fill {q_pct:.0f}%Q ${m.daily_rate:.0f}/d, "
-            f"ROI-mult={multiplier:.1f}x → {sized_shares}sh"
-        )
+        multiplier = min(raw_mult, 4.0)  # cap at 4× base capital
     elif score > 0:
-        # Has fills but still net positive — conservative 1.0-1.5x
+        # Has fills but still net positive — conservative 1.0–1.5×
         raw_mult = 1.0 + 0.5 * math.log2(1 + score / scale_param)
         multiplier = min(raw_mult, 1.5)
-        sized_shares = int(default_shares * multiplier)
+    else:
+        multiplier = 1.0
+
+    target_capital = base_capital * multiplier
+    sized_shares = max(default_shares, int(target_capital / cost_per_share_both))
+
+    if score > 0 and m.fill_count_recent == 0:
+        size_reason = (
+            f"zero-fill {q_pct:.0f}%Q ${m.daily_rate:.0f}/d, "
+            f"${cost_per_share_per_side:.2f}/sh, "
+            f"cap-mult={multiplier:.1f}x → {sized_shares}sh (${target_capital:.0f})"
+        )
+    elif score > 0:
         size_reason = (
             f"{q_pct:.0f}%Q, fills={m.fill_count_recent}, "
-            f"conservative-mult={multiplier:.1f}x → {sized_shares}sh"
+            f"${cost_per_share_per_side:.2f}/sh, "
+            f"cons-mult={multiplier:.1f}x → {sized_shares}sh (${target_capital:.0f})"
         )
     elif q_pct == 0:
-        sized_shares = default_shares
-        size_reason = "new market, standard size"
+        size_reason = f"new market, ${cost_per_share_per_side:.2f}/sh, standard {sized_shares}sh"
     else:
-        sized_shares = default_shares
-        size_reason = f"{q_pct:.0f}%Q, score≤0, standard"
+        size_reason = f"{q_pct:.0f}%Q, score≤0, ${cost_per_share_per_side:.2f}/sh, standard"
 
     # ── Decision logic ──
     # Primary gate: score > 0 means reward exceeds damage. Deploy.
