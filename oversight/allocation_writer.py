@@ -223,6 +223,7 @@ def _to_dict(
         "est_capital_cost": round(getattr(sm, "est_capital_cost", 0), 2),
         "locked_position_usd": round(getattr(sm, "locked_position_usd", 0), 2),
         "question_group": getattr(sm, "question_group", ""),
+        "q_share_pct": round(getattr(sm, "q_share_pct", 0.0), 6),
     }
 
 
@@ -275,9 +276,10 @@ def generate_summary(allocations: list[dict]) -> str:
     if deploy:
         lines.append("TOP DEPLOY:")
         for a in deploy[:10]:
+            q_pct = a.get("q_share_pct", 0) * 100
             lines.append(
                 f"  {a['question'][:45]:<45s} | ${a['daily_rate']:>4.0f}/d | "
-                f"score={a['score']:.4f} | {a['shares_per_side']}sh | "
+                f"Q={q_pct:>4.1f}% | score={a['score']:.4f} | {a['shares_per_side']}sh | "
                 f"fills={a['fill_count']} | {a['confidence']}"
             )
 

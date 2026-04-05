@@ -140,12 +140,13 @@ class TestClassifyMarket(unittest.TestCase):
         self.assertEqual(sm.action, "avoid")
 
     def test_new_market_trial(self):
-        """New market with low confidence gets trial deployment."""
+        """New market with low confidence gets trial deployment at min_size."""
         m = _make_metric(daily_rate=20, q_share_pct=0, on_book_hours=1)
         sm = classify_market(m, score=-1.0)
-        # Should deploy as trial if rate >= 5
+        # Should deploy as trial if rate >= 5, at min_size (not default_shares)
         self.assertEqual(sm.action, "deploy")
         self.assertEqual(sm.confidence, "low")
+        self.assertEqual(sm.recommended_shares, int(m.min_size))
 
 
 class TestRankMarkets(unittest.TestCase):
@@ -563,6 +564,62 @@ class TestCapitalEfficiency(unittest.TestCase):
         cids = {s.condition_id for s in scored}
         self.assertNotIn("cheap", cids)
         self.assertIn("good", cids)
+
+
+class TestCompetitionAwareness(unittest.TestCase):
+    """Test that competition (q_share) flows through scoring, efficiency, and output."""
+
+    def test_competition_adjusted_efficiency_gate(self):
+        """High pool rate but tiny q_share → competition inefficient → avoid."""
+        # $50/day pool, but 0.5% q_share = $0.25/day effective
+        # $0.25/day vs ~$45 deployed = 0.55% → below 0.5% threshold? No, 0.55% > 0.5%.
+        # Use smaller q_share: 0.1% = $0.05/day vs ~$45 = 0.11% < 0.5% → avoid
+        m = _make_metric(daily_rate=50, q_share_pct=0.001, max_spread=0.045)
+        sm = classify_market(m, score=0.05)  # low positive score
+        self.assertEqual(sm.action, "avoid")
+        self.assertIn("Competition inefficient", sm.reason)
+
+    def test_high_qshare_passes_competition_check(self):
+        """High q_share → good effective return → deploy."""
+        m = _make_metric(daily_rate=50, q_share_pct=0.5, max_spread=0.045)
+        sm = classify_market(m, score=25.0)
+        self.assertEqual(sm.action, "deploy")
+
+    def test_unknown_competition_uses_pool_rate_only(self):
+        """q_share=0 (unknown) → only pool rate check, no competition gate."""
+        # $20/day pool, q_share=0, low confidence trial path
+        m = _make_metric(daily_rate=20, q_share_pct=0, on_book_hours=1)
+        sm = classify_market(m, score=-0.5)
+        # Should deploy as trial (pool rate $20 is fine), not rejected by competition gate
+        self.assertEqual(sm.action, "deploy")
+
+    def test_trial_uses_min_size_not_default(self):
+        """Trial deployments use min_size to minimize exposure on unknown markets."""
+        m = _make_metric(daily_rate=15, q_share_pct=0, on_book_hours=1, min_size=100)
+        sm = classify_market(m, score=-0.5)
+        self.assertEqual(sm.action, "deploy")
+        self.assertEqual(sm.recommended_shares, 100)  # min_size, not default_shares=50
+
+    def test_qshare_pct_in_scored_market(self):
+        """q_share_pct propagates from MarketMetrics to ScoredMarket."""
+        m = _make_metric(daily_rate=50, q_share_pct=0.42)
+        sm = classify_market(m, score=20.0)
+        self.assertAlmostEqual(sm.q_share_pct, 0.42)
+
+    def test_qshare_pct_in_allocation_output(self):
+        """q_share_pct appears in the allocation JSON output."""
+        from oversight.allocation_writer import compute_allocations
+        scored = [
+            ScoredMarket(condition_id="test", question="Test?", score=50.0,
+                         action="deploy", recommended_shares=50, reason="test",
+                         confidence="high", actual_reward_total=10.0,
+                         fill_damage=0, fill_count=0, daily_rate=50,
+                         min_size=50, max_spread=0.045,
+                         q_share_pct=0.35),
+        ]
+        allocs = compute_allocations(scored, total_capital=500.0)
+        self.assertIn("q_share_pct", allocs[0])
+        self.assertAlmostEqual(allocs[0]["q_share_pct"], 0.35, places=4)
 
 
 class TestCorrectionFactorSmoothing(unittest.TestCase):

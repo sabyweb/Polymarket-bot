@@ -33,6 +33,7 @@ class ScoredMarket:
     est_capital_cost: float = 0.0  # estimated $ to deploy (both sides)
     locked_position_usd: float = 0.0  # $ currently locked in open positions
     question_group: str = ""       # topic group for concentration limits
+    q_share_pct: float = 0.0       # our share of Q-score pool (competition signal)
 
 
 def score_market(m: MarketMetrics, hours: float = 24, correction_factor: float = 1.0) -> float:
@@ -182,18 +183,20 @@ def classify_market(
         reason = f"High fills ({m.fill_count_recent}), dmg=${fill_damage:.2f} > rew=${m.actual_reward_total:.2f}"
 
     elif confidence == "low" and m.daily_rate >= 5:
-        # New market with no data — small trial to gather signal
+        # New market with no data — small trial to gather signal.
+        # Use min_size (not default_shares) when competition is unknown
+        # to minimize exposure while we learn the market's q_share.
         action = "deploy"
-        shares = default_shares
-        reason = f"New market, ${m.daily_rate:.0f}/d pool — trial with default_size"
+        shares = int(m.min_size)
+        reason = f"Trial (competition unknown), ${m.daily_rate:.0f}/d pool, min_size={shares}sh"
 
     elif m.fill_count_recent == 0 and m.daily_rate >= 10:
-        # Score <= 0 but zero fills and decent rate — trial at default size.
-        # Could be a market where q_share is low (hidden competition)
-        # but no fill risk. Worth a small probe.
+        # Score <= 0 but zero fills and decent rate — trial at min_size.
+        # Competition likely high (q_share is low / unknown).
+        # Worth a small probe but cap at min_size until we have data.
         action = "deploy"
-        shares = default_shares
-        reason = f"Zero fills but low Q-share, trial at {default_shares}sh"
+        shares = int(m.min_size)
+        reason = f"Zero fills, trial at min_size={shares}sh (competition unknown)"
 
     else:
         action = "avoid"
@@ -204,12 +207,15 @@ def classify_market(
     est_capital = shares * cost_per_share_both if shares > 0 else 0.0
 
     # ── Capital efficiency gate ──
-    # If the total pool reward is too low relative to capital deployed,
-    # this market can never be capital-efficient regardless of Q-share.
-    # Example: $0.14/day pool, $186 deployed → 0.075%/day even at 100% Q.
-    # Threshold: pool rate must be at least 1% of deployed capital per day
-    # (i.e., payback in <100 days at 100% Q-share, which is already generous).
+    # Two checks:
+    # 1. Pool-rate check: even at 100% Q, pool must justify capital.
+    #    Catches tiny pools ($0.14/day) that can never be profitable.
+    # 2. Competition-adjusted check: when q_share is KNOWN (> 0), use
+    #    our REALISTIC daily earnings (rate × q_share), not the pool rate.
+    #    A $50/day pool where we have 0.1% Q means $0.05/day actual earnings
+    #    — the pool rate looks fine but the real return is terrible.
     if action == "deploy" and est_capital > 0 and m.daily_rate > 0:
+        # Check 1: Pool rate floor (regardless of competition)
         max_daily_return_pct = m.daily_rate / est_capital
         if max_daily_return_pct < 0.01:  # < 1% of capital/day even at 100% Q
             reason = (
@@ -219,6 +225,20 @@ def classify_market(
             action = "avoid"
             shares = 0
             est_capital = 0.0
+
+        # Check 2: Competition-adjusted efficiency (only when q_share known)
+        elif m.q_share_pct > 0:
+            effective_daily = m.daily_rate * m.q_share_pct
+            effective_return_pct = effective_daily / est_capital
+            if effective_return_pct < 0.005:  # < 0.5% of capital/day with competition
+                reason = (
+                    f"Competition inefficient: ${effective_daily:.2f}/d effective "
+                    f"(${m.daily_rate:.0f}/d × {m.q_share_pct:.1%} Q-share) vs "
+                    f"${est_capital:.0f} deployed = {effective_return_pct:.4%}/d"
+                )
+                action = "avoid"
+                shares = 0
+                est_capital = 0.0
 
     return ScoredMarket(
         condition_id=m.condition_id,
@@ -237,6 +257,7 @@ def classify_market(
         est_capital_cost=est_capital,
         locked_position_usd=m.current_position_usd,
         question_group=getattr(m, "question_group", ""),
+        q_share_pct=m.q_share_pct,
     )
 
 
