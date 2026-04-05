@@ -87,7 +87,7 @@ def _fetch_reward_market_expiries(condition_ids: list[str] | None = None) -> dic
         missing = [cid for cid in condition_ids if cid not in result]
         if missing:
             log.debug(f"Fetching expiry for {len(missing)} CLOB-only markets")
-            for cid in missing[:50]:  # Cap at 50 to limit API calls
+            for cid in missing:  # Fetch all — ~0.1s each, acceptable for hourly agent
                 try:
                     resp = requests.get(
                         f"https://clob.polymarket.com/markets/{cid}", timeout=10
