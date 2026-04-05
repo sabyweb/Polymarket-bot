@@ -14,12 +14,17 @@ from dataclasses import dataclass
 log = logging.getLogger("oversight.collector")
 
 
-def _fetch_reward_market_expiries() -> dict[str, str]:
-    """Fetch end_date_iso from Gamma API (CLOB rewards endpoint doesn't have it)."""
+def _fetch_reward_market_expiries(condition_ids: list[str] | None = None) -> dict[str, str]:
+    """Fetch end_date_iso for markets. Uses Gamma bulk + CLOB fallback for misses.
+
+    If condition_ids is provided, only fetch for those specific markets.
+    Otherwise fetches from Gamma in bulk (misses CLOB-only markets).
+    """
     import requests
     result = {}
+
+    # Step 1: Bulk fetch from Gamma (fast, but misses CLOB-only markets)
     try:
-        # Gamma API has endDateIso — fetch in bulk
         for offset in range(0, 10000, 100):
             resp = requests.get(
                 "https://gamma-api.polymarket.com/markets",
@@ -36,9 +41,28 @@ def _fetch_reward_market_expiries() -> dict[str, str]:
                 end_date = m.get("endDateIso") or m.get("end_date_iso", "")
                 if cid and end_date:
                     result[cid] = end_date
-        log.info(f"Fetched expiry data for {len(result)} markets from Gamma")
     except Exception as e:
-        log.debug(f"Expiry fetch failed: {e}")
+        log.debug(f"Gamma expiry fetch failed: {e}")
+
+    # Step 2: For requested CIDs missing from Gamma, check CLOB /markets/{cid}
+    if condition_ids:
+        missing = [cid for cid in condition_ids if cid not in result]
+        if missing:
+            log.debug(f"Fetching expiry for {len(missing)} CLOB-only markets")
+            for cid in missing[:50]:  # Cap at 50 to limit API calls
+                try:
+                    resp = requests.get(
+                        f"https://clob.polymarket.com/markets/{cid}", timeout=10
+                    )
+                    if resp.status_code == 200:
+                        mkt = resp.json()
+                        end_date = mkt.get("end_date_iso", "")
+                        if end_date:
+                            result[cid] = end_date
+                except Exception:
+                    pass
+
+    log.info(f"Fetched expiry data for {len(result)} markets")
     return result
 
 
@@ -407,15 +431,15 @@ def collect_all(
     positions = query_positions(db_path)
     stats = query_reward_stats(db_path)
 
-    # Fetch expiry dates from CLOB rewards endpoint (single page, fast)
-    expiry_map = _fetch_reward_market_expiries()
-
     # Build unified set of all known condition_ids
     all_cids = set()
     all_cids.update(actual_rewards.keys())
     all_cids.update(fills.keys())
     all_cids.update(positions.keys())
     all_cids.update(stats.keys())
+
+    # Fetch expiry dates (Gamma bulk + CLOB fallback for CLOB-only markets)
+    expiry_map = _fetch_reward_market_expiries(condition_ids=list(all_cids))
 
     metrics = []
     for cid in all_cids:
