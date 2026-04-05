@@ -112,6 +112,7 @@ class RewardFarmer:
         self._batch_idx = 0
         self._shutdown = False
         self._capital_exhausted = False  # Set True when exchange rejects for insufficient funds
+        self._agent_mode = False  # Set True when first valid agent allocation loads
         self._pending_market_data: list[dict] | None = None
         self._last_market_refresh = 0.0
         self._last_reconcile = 0.0
@@ -247,6 +248,7 @@ class RewardFarmer:
         # Check for oversight agent allocations
         agent_alloc = self._load_allocations()
         if agent_alloc is not None:
+            self._agent_mode = True  # Agent is active — never fall back to default
             # Build eligible list from agent's recommendations
             raw_by_cid = {m["condition_id"]: m for m in self.all_market_data}
             eligible = []
@@ -307,9 +309,18 @@ class RewardFarmer:
             self._update_market_states(validated)
             return
 
+        # B2 fix: If agent was previously active but allocation is now stale/missing,
+        # keep current markets. Don't revert to default filtering.
+        if self._agent_mode:
+            log.warning(
+                "Agent allocation stale/missing but agent was active — "
+                f"keeping current {len(self.markets)} markets (not reverting to default)"
+            )
+            return
+
         raw = self.all_market_data
 
-        # Default filtering (when no agent)
+        # Default filtering (only when agent has NEVER been active)
         eligible = []
         for m in raw:
             if m["daily_rate"] < MIN_DAILY_RATE():
@@ -351,10 +362,19 @@ class RewardFarmer:
                     self._dump_position(ms, side, shares)
             del self.markets[cid]
 
-        # Add new markets
+        # Add new markets + update sizing for existing ones
         for m in eligible:
             cid = m["condition_id"]
-            if cid not in self.markets:
+            if cid in self.markets:
+                # B3 fix: Update agent sizing for existing markets
+                new_shares = float(m.get("_agent_shares", 0))
+                if new_shares > 0 and new_shares != self.markets[cid].agent_shares:
+                    log.info(
+                        f"Resizing {self.markets[cid].question[:30]}: "
+                        f"{self.markets[cid].agent_shares:.0f} → {new_shares:.0f}sh"
+                    )
+                    self.markets[cid].agent_shares = new_shares
+            else:
                 self.markets[cid] = MarketState(
                     cid=cid,
                     question=m["question"],
@@ -676,6 +696,10 @@ class RewardFarmer:
                             self.db.write_placement_feedback(ms.cid, "yes", "placed", "")
                             if self.cycle_count <= 3:
                                 log.info(f"BID YES @ {edge_bid:.3f} ({yes_shares:.0f}sh) | {ms.question[:30]}")
+                        else:
+                            # B8: Exchange returned response but no orderID
+                            self.db.write_placement_feedback(ms.cid, "yes", "failed", "no_order_id")
+                            log.warning(f"YES order got no orderID | {ms.question[:25]}")
                     except Exception as e:
                         err_str = str(e).lower()
                         if "insufficient" in err_str or "balance" in err_str or "not enough" in err_str:
@@ -686,7 +710,9 @@ class RewardFarmer:
                         self.db.write_placement_feedback(ms.cid, "yes", "failed", "order_error")
                         log.debug(f"YES order failed {ms.question[:25]}: {e}")
             else:
-                self.db.write_placement_feedback(ms.cid, "yes", "skipped", reason)
+                # B1 fix: Don't overwrite "placed" with transient per-cycle guards
+                if reason not in ("already_has_order", "dump_pending"):
+                    self.db.write_placement_feedback(ms.cid, "yes", "skipped", reason)
 
         # Place NO ask (only if exit liquidity exists)
         if can_exit_no:
@@ -708,6 +734,9 @@ class RewardFarmer:
                             self.db.write_placement_feedback(ms.cid, "no", "placed", "")
                             if self.cycle_count <= 3:
                                 log.info(f"ASK NO @ {edge_ask:.3f} (clob={no_clob:.3f}, {no_shares:.0f}sh) | {ms.question[:30]}")
+                        else:
+                            self.db.write_placement_feedback(ms.cid, "no", "failed", "no_order_id")
+                            log.warning(f"NO order got no orderID | {ms.question[:25]}")
                     except Exception as e:
                         err_str = str(e).lower()
                         if "insufficient" in err_str or "balance" in err_str or "not enough" in err_str:
@@ -718,7 +747,9 @@ class RewardFarmer:
                         self.db.write_placement_feedback(ms.cid, "no", "failed", "order_error")
                         log.debug(f"NO order failed {ms.question[:25]}: {e}")
             else:
-                self.db.write_placement_feedback(ms.cid, "no", "skipped", reason)
+                # B1 fix: Don't overwrite "placed" with transient per-cycle guards
+                if reason not in ("already_has_order", "dump_pending"):
+                    self.db.write_placement_feedback(ms.cid, "no", "skipped", reason)
 
     def _get_priority_batch(self, market_list: list) -> list:
         """Priority-based batch: empty slots first (highest daily_rate), then rotation."""
@@ -1003,15 +1034,17 @@ class RewardFarmer:
 
     # ── Utility ──────────────────────────────────────────────────────
 
-    def _cancel_order(self, order_id: str, reason: str = ""):
-        """Cancel an order on the exchange."""
+    def _cancel_order(self, order_id: str, reason: str = "") -> bool:
+        """Cancel an order on the exchange. Returns True on success."""
         if self.dry_run:
-            return
+            return True
         try:
             self.client.cancel(order_id)
             log.debug(f"Cancelled {order_id[:16]} ({reason})")
+            return True
         except Exception as e:
-            log.debug(f"Cancel failed {order_id[:16]}: {e}")
+            log.warning(f"Cancel FAILED {order_id[:16]} ({reason}): {e}")
+            return False
 
     def _restore_dump_states(self):
         """Restore dump states from DB after crash/restart.
