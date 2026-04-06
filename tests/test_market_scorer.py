@@ -1482,5 +1482,86 @@ class TestRecentPriceRegimeDetection(unittest.TestCase):
             os.unlink(path)
 
 
+class TestSportsSizeCap(unittest.TestCase):
+    """Test sports and short-duration market size caps."""
+
+    def test_sports_vs_pattern_capped_at_min_size(self):
+        """Market with 'vs.' in question should be capped at min_size."""
+        m = _make_metric(
+            question="Los Angeles Dodgers vs. Washington Nationals",
+            daily_rate=100, q_share_pct=1.0, min_size=50,
+            on_book_hours=24,
+        )
+        score = score_market(m)
+        sm = classify_market(m, score)
+        self.assertEqual(sm.action, "deploy")
+        self.assertEqual(sm.recommended_shares, 50)  # capped at min_size
+
+    def test_non_sports_not_capped(self):
+        """Normal market should get score-based sizing, not min_size cap."""
+        m = _make_metric(
+            question="Will Bitcoin reach $100k by June?",
+            daily_rate=100, q_share_pct=1.0, min_size=50,
+            on_book_hours=24,
+        )
+        score = score_market(m)
+        sm = classify_market(m, score)
+        self.assertEqual(sm.action, "deploy")
+        self.assertGreater(sm.recommended_shares, 50)
+
+    def test_ipl_league_pattern_capped(self):
+        """IPL market should be capped at min_size (sports pattern detected)."""
+        m = _make_metric(
+            question="Indian Premier League: Kolkata Knight Riders vs Punjab Kings",
+            daily_rate=100, q_share_pct=1.0, min_size=50,
+            on_book_hours=24,
+        )
+        score = score_market(m)
+        sm = classify_market(m, score)
+        self.assertEqual(sm.action, "deploy")
+        # Sports cap prevents sizing above min_size
+        self.assertEqual(sm.recommended_shares, 50)
+
+    def test_short_duration_capped(self):
+        """Market expiring in 48h should be capped at min_size."""
+        from datetime import datetime, timezone, timedelta
+        expiry = (datetime.now(timezone.utc) + timedelta(hours=48)).isoformat()
+        m = _make_metric(
+            question="Will it rain tomorrow?",
+            daily_rate=100, q_share_pct=1.0, min_size=50,
+            end_date_iso=expiry, on_book_hours=24,
+        )
+        score = score_market(m)
+        sm = classify_market(m, score)
+        self.assertEqual(sm.action, "deploy")
+        self.assertEqual(sm.recommended_shares, 50)
+
+    def test_long_duration_not_capped(self):
+        """Market expiring in 10 days should NOT be capped."""
+        from datetime import datetime, timezone, timedelta
+        expiry = (datetime.now(timezone.utc) + timedelta(days=10)).isoformat()
+        m = _make_metric(
+            question="Will it rain next month?",
+            daily_rate=100, q_share_pct=1.0, min_size=50,
+            end_date_iso=expiry, on_book_hours=24,
+        )
+        score = score_market(m)
+        sm = classify_market(m, score)
+        self.assertEqual(sm.action, "deploy")
+        self.assertGreater(sm.recommended_shares, 50)
+
+    def test_avoided_market_not_affected(self):
+        """Sports cap should not affect markets already classified as avoid."""
+        m = _make_metric(
+            question="Team A vs. Team B",
+            daily_rate=10, q_share_pct=0.1,
+            fill_count_recent=5, fill_cost_recent=50, dump_revenue_recent=0,
+            on_book_hours=24,
+        )
+        sm = classify_market(m, score=-100.0)
+        self.assertEqual(sm.action, "avoid")
+        self.assertEqual(sm.recommended_shares, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

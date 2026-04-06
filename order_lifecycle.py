@@ -173,6 +173,26 @@ class OrderLifecycle:
             self.db.write_placement_feedback(ms.cid, "no", "skipped", "wide_spread")
             return
 
+        # ── Resolution proximity guard (real-time) ──
+        # The agent detects this every ~30min, but markets can move fast.
+        # Block placement if midpoint suggests the market is near resolution.
+        # This closes the gap between agent cycles and prevents placing on
+        # markets that moved to 0.95 after the last agent run.
+        if midpoint > 0.90 or midpoint < 0.10:
+            log.info(
+                f"SKIP resolution proximity | mid={midpoint:.3f} | {ms.question[:30]}"
+            )
+            self.db.write_placement_feedback(ms.cid, "yes", "skipped", "resolution_proximity")
+            self.db.write_placement_feedback(ms.cid, "no", "skipped", "resolution_proximity")
+            # Also cancel any existing orders — don't stay exposed
+            for side in ("yes", "no"):
+                slot = ms.orders[side]
+                if slot.order_id:
+                    if self.cancel_order(slot.order_id, reason="resolution_proximity"):
+                        self.db.delete_active_order(slot.order_id)
+                        slot.order_id = None
+            return
+
         tick = ms.tick_size
         decimals = max(2, len(str(tick).rstrip('0').split('.')[-1]))
         edge_bid = round(midpoint - ms.max_spread + tick * PLACEMENT_TICKS_INSIDE(), decimals)

@@ -208,6 +208,42 @@ def classify_market(
     # Compute estimated capital cost for this allocation
     est_capital = shares * cost_per_share_both if shares > 0 else 0.0
 
+    # ── Short-duration / sports size cap ──
+    # Sports and event markets resolve quickly and have high adverse
+    # selection risk (informed bettors). Cap sizing at min_size to
+    # limit exposure. Triggers:
+    # 1. Market expires within 72 hours (short-duration)
+    # 2. Question matches sports patterns ("vs", league names)
+    _is_short_duration = False
+    if m.end_date_iso and action == "deploy":
+        from datetime import datetime, timezone, timedelta
+        try:
+            dt = datetime.fromisoformat(m.end_date_iso.replace("Z", "+00:00"))
+            hours_to_expiry = (dt - datetime.now(timezone.utc)).total_seconds() / 3600
+            if 0 < hours_to_expiry <= 72:
+                _is_short_duration = True
+        except Exception:
+            pass
+
+    _is_sports = False
+    if m.question and action == "deploy":
+        q_lower = m.question.lower()
+        # "vs" / "vs." is the strongest sports signal
+        if " vs " in q_lower or " vs. " in q_lower:
+            _is_sports = True
+        # League names
+        elif any(kw in q_lower for kw in (
+            "premier league", "serie a", "la liga", "bundesliga",
+            "champions league", "nba", "nfl", "mlb", "nhl",
+            "ipl", "cricket", "grand prix", "masters",
+        )):
+            _is_sports = True
+
+    if (_is_short_duration or _is_sports) and shares > int(m.min_size):
+        shares = int(m.min_size)
+        tag = "sports" if _is_sports else "short-duration"
+        size_reason = f"{tag} cap → min_size={shares}sh"
+
     # ── Capital efficiency gate ──
     # Two checks:
     # 1. Pool-rate check: even at 100% Q, pool must justify capital.
