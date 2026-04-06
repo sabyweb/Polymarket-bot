@@ -426,7 +426,13 @@ class TestRebalanceCredit(unittest.TestCase):
     """Test that avoided markets with locked capital free budget for new deploys."""
 
     def test_avoid_with_position_frees_capital(self):
-        """Avoided market's locked capital should become available (discounted)."""
+        """Avoided market's locked capital should become available (discounted).
+
+        With $250 base + $80 rebalance credit = $330 effective.
+        per_market_cap = min(200, 330 * 0.15) = $49.50 → enough for
+        a 50-share market (est_cost ~$45.50).
+        Without credit: per_market_cap = min(200, 250 * 0.15) = $37.50 → too small.
+        """
         from oversight.allocation_writer import compute_allocations
         scored = [
             # Avoided market has $100 locked in positions
@@ -443,9 +449,25 @@ class TestRebalanceCredit(unittest.TestCase):
                          fill_damage=0, fill_count=0, daily_rate=80,
                          min_size=50, max_spread=0.045),
         ]
-        # With only $10 budget, normally can't deploy $45 market.
-        # But $100 locked × 80% = $80 rebalance credit → $90 available.
-        allocs = compute_allocations(scored, total_capital=10.0)
+        # Without credit: per_market_cap = 250 * 0.15 = $37.50 < $45.50 est → avoided.
+        # With credit: effective = 250 + 80 = $330, cap = $49.50 > $45.50 → deployed.
+        allocs_no_credit = compute_allocations(scored[:1] + [scored[1]], total_capital=250.0)
+        # Verify without credit it would be avoided (locked=0 → no credit)
+        scored_no_lock = [
+            ScoredMarket(condition_id="bad", question="Bad?", score=-10.0,
+                         action="avoid", recommended_shares=0, reason="test",
+                         confidence="high", actual_reward_total=0,
+                         fill_damage=50, fill_count=5, daily_rate=50,
+                         min_size=50, max_spread=0.045,
+                         locked_position_usd=0.0),
+            scored[1],
+        ]
+        allocs_without = compute_allocations(scored_no_lock, total_capital=250.0)
+        good_without = next(a for a in allocs_without if a["condition_id"] == "good")
+        self.assertEqual(good_without["action"], "avoid")
+
+        # With credit it should deploy
+        allocs = compute_allocations(scored, total_capital=250.0)
         good_alloc = next(a for a in allocs if a["condition_id"] == "good")
         self.assertEqual(good_alloc["action"], "deploy")
 
@@ -489,6 +511,45 @@ class TestRebalanceCredit(unittest.TestCase):
         # With credit: budget inflated by $160 (200*0.8), so redistribution
         # gives more shares than without credit
         self.assertGreaterEqual(good_with["shares_per_side"], good_without["shares_per_side"])
+
+
+class TestCapInversionRegression(unittest.TestCase):
+    """Regression test: $0 available capital must NOT deploy markets at min_size."""
+
+    def test_zero_capital_avoids_high_min_size_trials(self):
+        """With $0 capital, trial markets with min_size=1000 must be avoided,
+        not deployed at 1000 shares (the old cap-inversion bug)."""
+        from oversight.allocation_writer import compute_allocations
+        scored = [
+            ScoredMarket(condition_id="trial1", question="Sports Match A?",
+                         score=0.0, action="deploy", recommended_shares=50,
+                         reason="Trial", confidence="low",
+                         actual_reward_total=0, fill_damage=0, fill_count=0,
+                         daily_rate=113, min_size=1000, max_spread=0.025),
+        ]
+        allocs = compute_allocations(scored, total_capital=0.0)
+        trial = next(a for a in allocs if a["condition_id"] == "trial1")
+        # Must be avoided, NOT deployed at 1000 shares
+        self.assertEqual(trial["action"], "avoid")
+        self.assertEqual(trial["shares_per_side"], 0)
+
+    def test_low_capital_avoids_expensive_markets(self):
+        """With $50 capital, a market needing $45.50 should deploy (fits
+        within 15% cap of $50 = $7.50? No — too small). Only deploy when
+        per_market_cap >= est_cost."""
+        from oversight.allocation_writer import compute_allocations
+        scored = [
+            ScoredMarket(condition_id="m1", question="Test?", score=10.0,
+                         action="deploy", recommended_shares=50,
+                         reason="test", confidence="high",
+                         actual_reward_total=5, fill_damage=0, fill_count=0,
+                         daily_rate=80, min_size=50, max_spread=0.045),
+        ]
+        # per_market_cap = min(200, 50*0.15) = $7.50, est_cost ~$45.50
+        # capped_shares = int(7.50 / 0.91) = 8, which is < min_size (50)
+        allocs = compute_allocations(scored, total_capital=50.0)
+        m1 = next(a for a in allocs if a["condition_id"] == "m1")
+        self.assertEqual(m1["action"], "avoid")
 
 
 class TestGroupConcentration(unittest.TestCase):

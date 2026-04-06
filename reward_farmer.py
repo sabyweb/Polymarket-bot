@@ -262,6 +262,9 @@ class RewardFarmer:
                 m = raw_by_cid.get(cid)
                 if m:
                     m["_agent_shares"] = alloc.get("shares_per_side", SHARES_PER_SIDE())
+                    # Carry end_date_iso from agent allocation (agent has Gamma API data)
+                    if alloc.get("end_date_iso") and not m.get("end_date_iso"):
+                        m["end_date_iso"] = alloc["end_date_iso"]
                     eligible.append(m)
                 else:
                     # Agent discovered a market the bot doesn't have — fetch from CLOB

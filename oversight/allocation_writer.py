@@ -56,8 +56,6 @@ def compute_allocations(
 
     Returns list of allocation dicts ready for JSON serialization.
     """
-    per_market_cap = min(max_per_market, total_capital * max_capital_pct)
-    per_group_cap = total_capital * max_group_pct
     allocations = []
     remaining_capital = total_capital
 
@@ -78,6 +76,12 @@ def compute_allocations(
             f"unwinding avoided positions (80% of locked)"
         )
 
+    # Compute caps using effective capital (including rebalance credit)
+    # so that freeing capital from unwinds actually allows deployment.
+    effective_capital = total_capital + rebalance_credit
+    per_market_cap = min(max_per_market, effective_capital * max_capital_pct)
+    per_group_cap = effective_capital * max_group_pct
+
     # ── Pass 1: Base allocation with concentration limits ──
     group_capital: dict[str, float] = {}  # group_key → capital allocated
 
@@ -90,10 +94,17 @@ def compute_allocations(
         spread = getattr(sm, "max_spread", 0.045)
         est_cost = _est_market_cost(shares, spread)
 
-        # If this market exceeds per-market cap, reduce shares to fit
+        # If this market exceeds per-market cap, reduce shares to fit.
+        # If the capped shares fall below min_size, avoid the market entirely
+        # (exchange won't accept orders below min_size anyway).
         if est_cost > per_market_cap:
             est_price_per_side = max(0.10, (1.0 - 2 * spread) / 2)
-            shares = max(int(sm.min_size), int(per_market_cap / (est_price_per_side * 2)))
+            capped_shares = int(per_market_cap / (est_price_per_side * 2))
+            if capped_shares < int(sm.min_size):
+                allocations.append(_to_dict(sm, shares=0, action_override="avoid",
+                                            reason_override=f"Per-market cap (${per_market_cap:.0f}) < min_size ({int(sm.min_size)})"))
+                continue
+            shares = capped_shares
             est_cost = _est_market_cost(shares, spread)
 
         # Check portfolio concentration limit
@@ -224,6 +235,7 @@ def _to_dict(
         "locked_position_usd": round(getattr(sm, "locked_position_usd", 0), 2),
         "question_group": getattr(sm, "question_group", ""),
         "q_share_pct": round(getattr(sm, "q_share_pct", 0.0), 6),
+        "end_date_iso": getattr(sm, "end_date_iso", ""),
     }
 
 

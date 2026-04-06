@@ -77,7 +77,16 @@ class OrderLifecycle:
 
                     if matched > 0 and order_status in ("MATCHED", "CANCELLED"):
                         fill_type = "FULL" if matched >= slot.shares - 0.5 else "PARTIAL"
-                        actual_price = float(status.get("price", slot.price))
+                        # API returns token-specific CLOB price; convert to
+                        # YES-equiv so all internal pricing is consistent.
+                        # For YES orders CLOB==YES-equiv; for NO orders
+                        # CLOB price is 1-YES-equiv, so to_yes_equiv flips it.
+                        raw_api_price = float(status.get("price", 0))
+                        if raw_api_price > 0:
+                            from price import to_yes_equiv
+                            actual_price = to_yes_equiv(raw_api_price, side)
+                        else:
+                            actual_price = slot.price  # already YES-equiv
                         if fill_type == "PARTIAL":
                             log.info(
                                 f"PARTIAL fill {side.upper()} {matched:.0f}/{slot.shares:.0f}sh "

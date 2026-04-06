@@ -34,6 +34,7 @@ class ScoredMarket:
     locked_position_usd: float = 0.0  # $ currently locked in open positions
     question_group: str = ""       # topic group for concentration limits
     q_share_pct: float = 0.0       # our share of Q-score pool (competition signal)
+    end_date_iso: str = ""         # market expiry date (ISO format)
 
 
 def score_market(m: MarketMetrics, hours: float = 24, correction_factor: float = 1.0) -> float:
@@ -299,6 +300,7 @@ def classify_market(
         locked_position_usd=m.current_position_usd,
         question_group=getattr(m, "question_group", ""),
         q_share_pct=m.q_share_pct,
+        end_date_iso=getattr(m, "end_date_iso", ""),
     )
 
 
