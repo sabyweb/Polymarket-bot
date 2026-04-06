@@ -33,3 +33,4 @@ class MarketState:
     last_fill_price: dict = field(default_factory=dict)
     agent_shares: float = 0
     fill_times: dict = field(default_factory=lambda: {"yes": [], "no": []})
+    end_date_iso: str = ""

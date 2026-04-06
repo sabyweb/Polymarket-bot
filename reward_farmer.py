@@ -370,6 +370,7 @@ class RewardFarmer:
                     tick_size=m.get("tick_size", 0.01),
                     yes_price=m.get("yes_price"),
                     agent_shares=float(m.get("_agent_shares", 0)),
+                    end_date_iso=m.get("end_date_iso") or "",
                 )
                 self.positions.register_market(cid, m["question"])
 

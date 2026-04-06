@@ -193,6 +193,43 @@ class OrderLifecycle:
                         slot.order_id = None
             return
 
+        # ── Live sports guard ──
+        # Sports markets (detected by "vs" pattern) expiring within 12 hours
+        # are likely live or imminent — extreme adverse selection risk from
+        # informed bettors watching the event. Skip placement AND cancel
+        # any existing orders. Future sports markets (days away) are fine.
+        if ms.question and ms.end_date_iso:
+            q_lower = ms.question.lower()
+            _is_sports_q = (
+                " vs " in q_lower or " vs. " in q_lower
+                or any(kw in q_lower for kw in (
+                    "premier league", "serie a", "la liga", "bundesliga",
+                    "champions league", "nba", "nfl", "mlb", "nhl",
+                    "ipl", "cricket", "grand prix", "masters",
+                    "atp", "wta", "ufc", "formula 1",
+                ))
+            )
+            if _is_sports_q:
+                try:
+                    from datetime import datetime, timezone
+                    dt = datetime.fromisoformat(ms.end_date_iso.replace("Z", "+00:00"))
+                    hours_to_expiry = (dt - datetime.now(timezone.utc)).total_seconds() / 3600
+                    if 0 < hours_to_expiry <= 12:
+                        log.info(
+                            f"SKIP live sports | expires in {hours_to_expiry:.1f}h | {ms.question[:40]}"
+                        )
+                        self.db.write_placement_feedback(ms.cid, "yes", "skipped", "live_sports")
+                        self.db.write_placement_feedback(ms.cid, "no", "skipped", "live_sports")
+                        for side in ("yes", "no"):
+                            slot = ms.orders[side]
+                            if slot.order_id:
+                                if self.cancel_order(slot.order_id, reason="live_sports"):
+                                    self.db.delete_active_order(slot.order_id)
+                                    slot.order_id = None
+                        return
+                except Exception:
+                    pass  # Can't parse date — continue normally
+
         tick = ms.tick_size
         decimals = max(2, len(str(tick).rstrip('0').split('.')[-1]))
         edge_bid = round(midpoint - ms.max_spread + tick * PLACEMENT_TICKS_INSIDE(), decimals)
