@@ -357,15 +357,19 @@ class OrderLifecycle:
             return False, "halted"
         if ms.dump_failures >= cfg("RF_DUMP_MAX_FAILURES"):
             return False, "dump_failures"
-        # Fill-rate breaker: if this market has been filled 2+ times on
-        # EITHER side in the last 5 minutes, stop placing to prevent cascade
-        # fills on fast-moving markets (sports events, resolution spikes).
+        # Fill-rate breaker: block placement if fills are clustering.
+        # Per-side check catches directional cascades (same side hit repeatedly).
+        # Total check catches broad activity across both sides.
         now = time.time()
-        fill_window = 300  # 5 minutes
+        fill_window = cfg("RF_FILL_BREAKER_WINDOW")
         for s in ("yes", "no"):
             ms.fill_times[s] = [t for t in ms.fill_times[s] if now - t < fill_window]
+        side_threshold = cfg("RF_FILL_BREAKER_SIDE_THRESHOLD")
+        for s in ("yes", "no"):
+            if len(ms.fill_times[s]) >= side_threshold:
+                return False, "fill_rate_breaker"
         recent_fills = len(ms.fill_times["yes"]) + len(ms.fill_times["no"])
-        if recent_fills >= 2:
+        if recent_fills >= cfg("RF_FILL_BREAKER_THRESHOLD"):
             return False, "fill_rate_breaker"
         return True, ""
 

@@ -616,12 +616,12 @@ class TestCompetitionAwareness(unittest.TestCase):
         # Should deploy as trial (pool rate $20 is fine), not rejected by competition gate
         self.assertEqual(sm.action, "deploy")
 
-    def test_trial_uses_min_size_not_default(self):
-        """Trial deployments use min_size to minimize exposure on unknown markets."""
+    def test_trial_capped_at_default_shares(self):
+        """Trial deployments capped at min(min_size, default_shares) to limit exposure."""
         m = _make_metric(daily_rate=15, q_share_pct=0, on_book_hours=1, min_size=100)
         sm = classify_market(m, score=-0.5)
         self.assertEqual(sm.action, "deploy")
-        self.assertEqual(sm.recommended_shares, 100)  # min_size, not default_shares=50
+        self.assertEqual(sm.recommended_shares, 50)  # capped at default_shares, not inflated to min_size=100
 
     def test_qshare_pct_in_scored_market(self):
         """q_share_pct propagates from MarketMetrics to ScoredMarket."""
@@ -978,7 +978,7 @@ class TestMultiplierComposition(unittest.TestCase):
 
     def test_all_layers_compound_multiplicatively(self):
         """Regime + fast-react + historical should all multiply the score."""
-        # Market with near-resolution price (regime 0.3x) + 3 fills (fast-react 0.85^3)
+        # Market with near-resolution price (regime 0.3x) + 3 fills (fast-react 0.88^3)
         m_penalized = _make_metric(
             condition_id="penalized", daily_rate=50, q_share_pct=1.0,
             avg_bid=0.93, avg_ask=0.95, fill_count_recent=3,
@@ -993,7 +993,7 @@ class TestMultiplierComposition(unittest.TestCase):
         scored = rank_markets([m_penalized, m_clean], max_markets=10, db_path=self.db_path)
         scores = {s.condition_id: s.score for s in scored}
 
-        # Penalized should be much lower: base * 0.3 (regime) * 0.614 (fast-react)
+        # Penalized should be much lower: base * 0.3 (regime) * 0.681 (fast-react)
         self.assertGreater(scores["clean"], scores["penalized"] * 3)
 
     def test_heavily_penalized_market_classified_correctly(self):
@@ -1001,7 +1001,7 @@ class TestMultiplierComposition(unittest.TestCase):
         m = _make_metric(
             condition_id="doomed", daily_rate=10, q_share_pct=0.1,
             avg_bid=0.93, avg_ask=0.95,  # regime: 0.3x
-            fill_count_recent=5,          # fast-react: 0.85^5 = 0.44x
+            fill_count_recent=5,          # fast-react: 0.88^5 = 0.53x
             fill_cost_recent=5.0, dump_revenue_recent=0.0,
             on_book_hours=24,
         )
@@ -1234,7 +1234,7 @@ class TestFastReactCompounding(unittest.TestCase):
         os.unlink(self.db_path)
 
     def test_fast_react_5_fills_compounds(self):
-        """5 fills → 0.85^5 ≈ 0.444x multiplier."""
+        """5 fills → 0.88^5 ≈ 0.528x multiplier."""
         m5 = _make_metric(
             condition_id="five_fills", daily_rate=50, q_share_pct=1.0,
             fill_count_recent=5, fill_cost_recent=5.0, dump_revenue_recent=0.0,
@@ -1247,13 +1247,13 @@ class TestFastReactCompounding(unittest.TestCase):
         scored = rank_markets([m5, m0], max_markets=10, db_path=self.db_path)
         scores = {s.condition_id: s.score for s in scored}
         # m0 score includes zero-fill bonus, m5 has fill damage + fast-react
-        # Fast-react alone: 0.85^5 = 0.4437
-        # Score for m5 = (50 - 5) * 0.4437 ≈ 19.97
+        # Fast-react alone: 0.88^5 = 0.528
+        # Score for m5 = (50 - 5) * 0.528 ≈ 23.8
         # Score for m0 = 52 (with bonus)
-        self.assertLess(scores["five_fills"], scores["zero_fills"] * 0.5)
+        self.assertLess(scores["five_fills"], scores["zero_fills"] * 0.6)
 
-    def test_fast_react_floors_at_0_3(self):
-        """20 fills → 0.85^20 = 0.039, but floored at 0.3."""
+    def test_fast_react_floors_at_0_35(self):
+        """20 fills → 0.88^20 = 0.078, but floored at 0.35."""
         m20 = _make_metric(
             condition_id="twenty_fills", daily_rate=100, q_share_pct=1.0,
             fill_count_recent=20, fill_cost_recent=10.0, dump_revenue_recent=0.0,
@@ -1266,8 +1266,8 @@ class TestFastReactCompounding(unittest.TestCase):
         )
         scored = rank_markets([m20, m3], max_markets=10, db_path=self.db_path)
         scores = {s.condition_id: s.score for s in scored}
-        # 20 fills: (100 - 10) * 0.3 = 27
-        # 3 fills:  (100 - 3) * 0.614 = 59.6
+        # 20 fills: (100 - 10) * 0.35 = 31.5
+        # 3 fills:  (100 - 3) * 0.681 = 66.1
         # 20 fills score should be significantly lower but not zero
         self.assertGreater(scores["twenty_fills"], 0)
         self.assertLess(scores["twenty_fills"], scores["three_fills"])
@@ -1561,6 +1561,33 @@ class TestSportsSizeCap(unittest.TestCase):
         sm = classify_market(m, score=-100.0)
         self.assertEqual(sm.action, "avoid")
         self.assertEqual(sm.recommended_shares, 0)
+
+    def test_sports_high_min_size_not_hard_capped(self):
+        """Sports market with high min_size: sports cap only fires if shares > min_size.
+        Score-based sizing may be below min_size, so no cap needed."""
+        m = _make_metric(
+            question="Copa Colsanitas: Marie Bouzkova vs Panna Udvardy",
+            daily_rate=100, q_share_pct=1.0, min_size=1000,
+            on_book_hours=24,
+        )
+        score = score_market(m)
+        sm = classify_market(m, score)
+        self.assertEqual(sm.action, "deploy")
+        # Score-based sizing produces ~200 shares (below min_size=1000),
+        # so sports cap (shares > min_size) doesn't fire.
+        # Bot will enforce max(min_size, agent_shares) at placement time.
+        self.assertGreater(sm.recommended_shares, 50)
+
+    def test_trial_min_size_1000_capped(self):
+        """Trial market with min_size=1000 should NOT deploy 1000 shares."""
+        m = _make_metric(
+            question="",  # empty question — CLOB-only discovery
+            daily_rate=100, q_share_pct=0.0, min_size=1000,
+            on_book_hours=0,  # brand new
+        )
+        sm = classify_market(m, score=0.0)
+        self.assertEqual(sm.action, "deploy")  # still a trial
+        self.assertLessEqual(sm.recommended_shares, 50)  # capped, not 1000
 
 
 if __name__ == "__main__":

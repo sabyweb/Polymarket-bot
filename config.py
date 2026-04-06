@@ -238,6 +238,9 @@ RF_UNKNOWN_RETRY_THRESHOLD: int = 2         # Retries before clearing UNKNOWN st
 RF_DUMP_MAX_FAILURES: int = 3               # Dump failures before blocking placement
 RF_MAX_BOOK_SPREAD: float = 0.15            # Skip if merged book spread exceeds this
 RF_ALLOCATION_TTL_HOURS: float = 2.0        # Max age of oversight agent allocations
+RF_FILL_BREAKER_WINDOW: int = 180            # Fill-rate breaker window (seconds)
+RF_FILL_BREAKER_THRESHOLD: int = 3           # Total fills (both sides) to trigger block
+RF_FILL_BREAKER_SIDE_THRESHOLD: int = 2      # Same-side fills to trigger block
 
 # ── Credential Validation ───────────────────────────────────��───────────────
 def validate_credentials() -> None:

@@ -184,21 +184,23 @@ def classify_market(
 
     elif confidence == "low" and m.daily_rate >= 5 and m.fill_count_recent == 0:
         # New market with NO fills and no data — small trial to gather signal.
-        # Use min_size (not default_shares) when competition is unknown
-        # to minimize exposure while we learn the market's q_share.
+        # Use CAPPED min_size to limit exposure on markets with huge min_size
+        # (e.g., sports markets with min_size=1000 would be $500+ per trial).
         # CRITICAL: only trial if zero fills — if we already have fills and
         # score <= 0, the market is actively losing money regardless of confidence.
         action = "deploy"
-        shares = int(m.min_size)
-        reason = f"Trial (competition unknown), ${m.daily_rate:.0f}/d pool, min_size={shares}sh"
+        trial_size = min(int(m.min_size), default_shares)
+        shares = max(trial_size, 20)  # at least 20 shares
+        reason = f"Trial (competition unknown), ${m.daily_rate:.0f}/d pool, trial_size={shares}sh"
 
     elif m.fill_count_recent == 0 and m.daily_rate >= 10:
-        # Score <= 0 but zero fills and decent rate — trial at min_size.
+        # Score <= 0 but zero fills and decent rate — trial at capped min_size.
         # Competition likely high (q_share is low / unknown).
-        # Worth a small probe but cap at min_size until we have data.
+        # Worth a small probe but cap exposure until we have data.
         action = "deploy"
-        shares = int(m.min_size)
-        reason = f"Zero fills, trial at min_size={shares}sh (competition unknown)"
+        trial_size = min(int(m.min_size), default_shares)
+        shares = max(trial_size, 20)  # at least 20 shares
+        reason = f"Zero fills, trial_size={shares}sh (competition unknown)"
 
     else:
         action = "avoid"
@@ -239,10 +241,11 @@ def classify_market(
         )):
             _is_sports = True
 
-    if (_is_short_duration or _is_sports) and shares > int(m.min_size):
+    if (_is_short_duration or _is_sports) and action == "deploy" and shares > int(m.min_size):
         shares = int(m.min_size)
+        est_capital = shares * cost_per_share_both
         tag = "sports" if _is_sports else "short-duration"
-        size_reason = f"{tag} cap → min_size={shares}sh"
+        size_reason = f"{tag} cap → min_size={shares}sh (${est_capital:.0f})"
 
     # ── Capital efficiency gate ──
     # Two checks:
@@ -537,9 +540,11 @@ def rank_markets(
             regime_detections += 1
 
         # ── Layer 2: Fast-react (immediate) ──
-        # Each fill in THIS window reduces score by 15% (compounds).
+        # Each fill reduces score by 12% (compounds). Adverse fills count 1.5×.
         if m.fill_count_recent > 0:
-            fast_react_mult = max(0.3, 0.85 ** m.fill_count_recent)
+            adverse = getattr(m, "adverse_fills", 0)
+            effective_fills = m.fill_count_recent + adverse * 0.5
+            fast_react_mult = max(0.35, 0.88 ** effective_fills)
             s *= fast_react_mult
 
         # ── Layer 3: Placement feedback (1 cycle lag) ──
