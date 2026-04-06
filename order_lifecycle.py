@@ -91,6 +91,7 @@ class OrderLifecycle:
                             log.warning(f"BUY order stuck UNKNOWN {cfg('RF_UNKNOWN_RETRY_THRESHOLD')}x, clearing | {ms.question[:30]}")
                             # Reconcile: check exchange balance to detect silent fills
                             self._reconcile_after_unknown(ms, side, slot)
+                            self.db.delete_active_order(slot.order_id)
                             slot.order_id = None
                             ms.unknown_count[side] = 0
                         else:
@@ -136,6 +137,7 @@ class OrderLifecycle:
         )
 
         ms.last_fill_price[side] = fill_price
+        ms.fill_times[side].append(time.time())
 
         yes_shares = self.positions.get_shares(cid, "yes")
         no_shares = self.positions.get_shares(cid, "no")
@@ -190,6 +192,7 @@ class OrderLifecycle:
                         f"REPRICE {side.upper()} | old={slot.price:.3f} dist={order_dist:.3f} >= spread={ms.max_spread:.3f} | "
                         f"new={edge_price:.3f} | {ms.question[:30]}"
                     )
+                    self.db.delete_active_order(slot.order_id)
                     slot.order_id = None
 
         # Exit liquidity check
@@ -334,6 +337,16 @@ class OrderLifecycle:
             return False, "halted"
         if ms.dump_failures >= cfg("RF_DUMP_MAX_FAILURES"):
             return False, "dump_failures"
+        # Fill-rate breaker: if this market has been filled 2+ times on
+        # EITHER side in the last 5 minutes, stop placing to prevent cascade
+        # fills on fast-moving markets (sports events, resolution spikes).
+        now = time.time()
+        fill_window = 300  # 5 minutes
+        for s in ("yes", "no"):
+            ms.fill_times[s] = [t for t in ms.fill_times[s] if now - t < fill_window]
+        recent_fills = len(ms.fill_times["yes"]) + len(ms.fill_times["no"])
+        if recent_fills >= 2:
+            return False, "fill_rate_breaker"
         return True, ""
 
     def _reconcile_after_unknown(self, ms: MarketState, side: str, slot: OrderSlot):

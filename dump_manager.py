@@ -81,6 +81,8 @@ class DumpManager:
                             market_question=ms.question,
                         )
 
+                        if ms.dump_orders[side]:
+                            self.db.delete_active_order(ms.dump_orders[side])
                         ms.dump_orders[side] = None
                         ms.dump_state[side] = None
                         ms.dump_failures = 0
@@ -89,6 +91,8 @@ class DumpManager:
                         ms.unknown_count[side] = ms.unknown_count.get(side, 0) + 1
                         if ms.unknown_count[side] >= cfg("RF_UNKNOWN_RETRY_THRESHOLD"):
                             log.warning(f"Dump order stuck UNKNOWN {cfg('RF_UNKNOWN_RETRY_THRESHOLD')}x, clearing | {ms.question[:30]}")
+                            if ms.dump_orders[side]:
+                                self.db.delete_active_order(ms.dump_orders[side])
                             ms.dump_orders[side] = None
                             # Also clear dump_state so we don't keep retrying
                             # with stale state. The position still exists and
@@ -97,6 +101,8 @@ class DumpManager:
                             self.db.delete_dump_state(ms.cid, side)
                     else:
                         log.warning(f"Dump order {dump_status} — will retry | {ms.question[:30]}")
+                        if ms.dump_orders[side]:
+                            self.db.delete_active_order(ms.dump_orders[side])
                         ms.dump_orders[side] = None
 
     def reprice_active_dumps(self, markets: dict, open_ids: set):
@@ -208,10 +214,14 @@ class DumpManager:
                 ms.dump_state[side] = None
                 self.db.delete_dump_state(ms.cid, side)
                 if ms.dump_orders[side]:
-                    if self.cancel_order(ms.dump_orders[side], reason="dump_30m_timeout"):
+                    oid = ms.dump_orders[side]
+                    if self.cancel_order(oid, reason="dump_30m_timeout"):
+                        self.db.delete_active_order(oid)
                         ms.dump_orders[side] = None
                     else:
-                        log.warning(f"Orphaned dump order — cancel failed on abandon")
+                        log.warning(f"Orphaned dump order {oid[:16]} — cancel failed on abandon, force-cleaning DB")
+                        self.db.delete_active_order(oid)
+                        ms.dump_orders[side] = None
                 return
 
             elif elapsed_min >= cfg("RF_DUMP_AGGRESSIVE_MINS"):
@@ -241,8 +251,10 @@ class DumpManager:
 
             # Cancel existing dump order if any (repricing)
             if ms.dump_orders[side]:
-                if not self.cancel_order(ms.dump_orders[side], reason="dump_reprice"):
+                old_oid = ms.dump_orders[side]
+                if not self.cancel_order(old_oid, reason="dump_reprice"):
                     return  # Don't post new order if old one is still live
+                self.db.delete_active_order(old_oid)
                 ms.dump_orders[side] = None
 
             args = OrderArgs(token_id=tid, price=sell_price, size=float(dump_shares), side=SELL)

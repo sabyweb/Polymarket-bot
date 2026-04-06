@@ -359,6 +359,9 @@ class MarketMetrics:
     adverse_fills: int = 0         # fills where we lost to adverse selection
     reward_window_pct: float = 0.0 # fraction of cycles in reward spread window
     total_market_q: float = 0.0    # total market Q-score (competition depth)
+    # Recent prices (from cycle_snapshots, last few hours — fresher than lifetime avg)
+    recent_bid: float = 0.0        # median best_bid over recent cycles
+    recent_ask: float = 0.0        # median best_ask over recent cycles
 
 
 def _question_group_key(question: str) -> str:
@@ -678,6 +681,45 @@ def query_reward_stats(db_path: str) -> dict[str, dict]:
         return {}
 
 
+def query_recent_prices(db_path: str, lookback_hours: float = 3.0) -> dict[str, dict]:
+    """Query cycle_snapshots for recent best_bid/best_ask per market.
+
+    Returns {condition_id: {"recent_bid": float, "recent_ask": float, "samples": int}}.
+    Uses median of last N hours to resist outlier cycles.
+    """
+    import statistics
+
+    cutoff = time.time() - lookback_hours * 3600
+    try:
+        db = sqlite3.connect(db_path, timeout=5)
+        rows = db.execute(
+            "SELECT condition_id, best_bid, best_ask FROM cycle_snapshots "
+            "WHERE ts >= ? AND best_bid IS NOT NULL AND best_bid > 0 "
+            "AND best_ask IS NOT NULL AND best_ask > 0",
+            (cutoff,),
+        ).fetchall()
+        db.close()
+    except Exception as e:
+        log.warning(f"Recent prices query failed: {e}")
+        return {}
+
+    # Group by condition_id
+    by_cid: dict[str, list[tuple[float, float]]] = {}
+    for cid, bid, ask in rows:
+        by_cid.setdefault(cid, []).append((bid, ask))
+
+    result = {}
+    for cid, prices in by_cid.items():
+        bids = [p[0] for p in prices]
+        asks = [p[1] for p in prices]
+        result[cid] = {
+            "recent_bid": statistics.median(bids),
+            "recent_ask": statistics.median(asks),
+            "samples": len(prices),
+        }
+    return result
+
+
 def compute_available_capital(db_path: str, total_capital: float = 1500.0) -> float:
     """Compute available capital by subtracting locked positions, pending dumps,
     AND pending (unfilled) BUY orders.
@@ -712,6 +754,20 @@ def compute_available_capital(db_path: str, total_capital: float = 1500.0) -> fl
         pass  # tables may not exist yet
 
     locked = locked_positions + locked_dumps + locked_pending
+
+    # Sanity check: if locked capital exceeds total by a wide margin,
+    # the active_orders table likely has stale records (the bot purges
+    # them on startup, but if it hasn't restarted, ghosts accumulate).
+    # In this case, only trust positions (exchange-verified) + dumps,
+    # not the potentially-stale pending orders.
+    if locked_pending > total_capital * 2:
+        log.warning(
+            f"Capital: pending orders (${locked_pending:.0f}) exceed 2× budget "
+            f"(${total_capital:.0f}) — likely stale DB records. "
+            f"Ignoring pending orders for capital calculation."
+        )
+        locked = locked_positions + locked_dumps
+
     available = max(0, total_capital - locked)
     log.info(
         f"Capital: ${total_capital:.0f} total - ${locked_positions:.0f} positions "
@@ -809,6 +865,7 @@ def collect_all(
     dumps = query_dump_revenue(db_path, hours)
     positions = query_positions(db_path)
     stats = query_reward_stats(db_path)
+    recent_prices = query_recent_prices(db_path)
 
     # Build unified set of all known condition_ids (from bot's DB)
     all_cids = set()
@@ -888,6 +945,8 @@ def collect_all(
             adverse_fills=stat_data.get("adverse_fills", 0),
             reward_window_pct=reward_window_pct,
             total_market_q=stat_data.get("total_market_q", 0),
+            recent_bid=recent_prices.get(cid, {}).get("recent_bid", 0.0),
+            recent_ask=recent_prices.get(cid, {}).get("recent_ask", 0.0),
         ))
 
     # Compute correction factor: actual total paid / sum of estimates

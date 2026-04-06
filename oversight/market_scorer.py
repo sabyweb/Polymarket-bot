@@ -182,10 +182,12 @@ def classify_market(
         shares = 0
         reason = f"High fills ({m.fill_count_recent}), dmg=${fill_damage:.2f} > rew=${m.actual_reward_total:.2f}"
 
-    elif confidence == "low" and m.daily_rate >= 5:
-        # New market with no data — small trial to gather signal.
+    elif confidence == "low" and m.daily_rate >= 5 and m.fill_count_recent == 0:
+        # New market with NO fills and no data — small trial to gather signal.
         # Use min_size (not default_shares) when competition is unknown
         # to minimize exposure while we learn the market's q_share.
+        # CRITICAL: only trial if zero fills — if we already have fills and
+        # score <= 0, the market is actively losing money regardless of confidence.
         action = "deploy"
         shares = int(m.min_size)
         reason = f"Trial (competition unknown), ${m.daily_rate:.0f}/d pool, min_size={shares}sh"
@@ -361,11 +363,13 @@ def _detect_regime_signals(m: MarketMetrics) -> dict:
     signals = {}
 
     # ── Resolution proximity: price near 0 or 1 ──
-    # When avg_bid and avg_ask are both very high (>0.92) or very low (<0.08),
-    # the market is likely near resolution. Fills become catastrophic here
-    # because the losing side goes to 0.
-    if m.avg_bid > 0 and m.avg_ask > 0:
-        mid = (m.avg_bid + m.avg_ask) / 2
+    # Prefer recent prices (last ~3h from cycle_snapshots) over lifetime
+    # averages. A market at 0.50 for weeks that moves to 0.95 would show
+    # avg ~0.55 — the recent median catches this immediately.
+    bid = m.recent_bid if m.recent_bid > 0 else m.avg_bid
+    ask = m.recent_ask if m.recent_ask > 0 else m.avg_ask
+    if bid > 0 and ask > 0:
+        mid = (bid + ask) / 2
         if mid > 0.92 or mid < 0.08:
             signals["resolution_proximity"] = {
                 "mult": 0.3,
@@ -628,6 +632,23 @@ def rank_markets(
 
     # Sort by score descending
     scored.sort(key=lambda x: x.score, reverse=True)
+
+    # ── Cap trial deployments ──
+    # Trial markets (score <= 0, deployed for discovery) are valuable but
+    # must be limited. Without a cap, all ~1000 CLOB reward markets with
+    # no history get deployed, flooding the bot with unknown markets and
+    # consuming all capital on min_size orders.
+    # Sort trials by daily_rate desc so the richest pools get trialed first.
+    max_trials = 10
+    trials = [(i, sm) for i, sm in enumerate(scored) if sm.action == "deploy" and sm.score <= 0]
+    trials.sort(key=lambda x: x[1].daily_rate, reverse=True)
+    for rank, (idx, sm) in enumerate(trials):
+        if rank >= max_trials:
+            sm.action = "avoid"
+            sm.recommended_shares = 0
+            sm.reason = f"Trial cap reached ({max_trials} max)"
+    if len(trials) > max_trials:
+        log.info(f"Trial cap: kept {max_trials} of {len(trials)} trial markets (by daily_rate)")
 
     deploy_count = sum(1 for sm in scored if sm.action == "deploy")
     if deploy_count > max_markets:

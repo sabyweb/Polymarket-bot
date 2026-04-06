@@ -114,7 +114,7 @@ class RewardFarmer:
     # ── Startup ─────────────────────────────────────────────────────
 
     def _reconcile_on_startup(self):
-        """Cancel all existing orders on startup."""
+        """Cancel all existing orders on startup and purge stale DB records."""
         if self.dry_run:
             log.info("[DRY] Skipping startup reconciliation")
             return
@@ -134,6 +134,15 @@ class RewardFarmer:
                 log.info("No existing orders found — starting clean.")
         except Exception as e:
             log.warning(f"Startup order check failed: {e}")
+
+        # Purge ALL active_orders from DB — we just cancelled everything on
+        # the exchange, so any DB records are stale by definition.
+        try:
+            purged = self.db.purge_all_active_orders()
+            if purged > 0:
+                log.info(f"Startup: purged {purged} stale active_orders from DB")
+        except Exception as e:
+            log.warning(f"Startup active_orders purge failed: {e}")
 
     def _reconcile_positions(self):
         """Verify tracked positions against actual exchange balances."""
@@ -331,10 +340,9 @@ class RewardFarmer:
             for side in ["yes", "no"]:
                 oid = ms.orders[side].order_id
                 if oid:
-                    if self.order_lifecycle.cancel_order(oid, reason="market_removed"):
-                        ms.orders[side].order_id = None
-                    else:
-                        log.warning(f"Orphaned order {oid[:16]} — cancel failed on market drop")
+                    self.order_lifecycle.cancel_order(oid, reason="market_removed")
+                    self.db.delete_active_order(oid)
+                    ms.orders[side].order_id = None
             for side in ["yes", "no"]:
                 shares = self.positions.get_shares(cid, side)
                 if shares > 1:

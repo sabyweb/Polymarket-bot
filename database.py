@@ -266,6 +266,7 @@ CREATE INDEX IF NOT EXISTS idx_fills_ts ON fills(ts);
 CREATE INDEX IF NOT EXISTS idx_unwinds_cid ON unwinds(condition_id);
 CREATE INDEX IF NOT EXISTS idx_unwinds_ts ON unwinds(ts);
 CREATE INDEX IF NOT EXISTS idx_cycle_ts ON cycle_snapshots(ts);
+CREATE INDEX IF NOT EXISTS idx_cycle_cid_ts ON cycle_snapshots(condition_id, ts);
 CREATE INDEX IF NOT EXISTS idx_daily_date ON daily_pnl(date);
 CREATE INDEX IF NOT EXISTS idx_hourly_ts ON hourly_snapshots(ts);
 CREATE INDEX IF NOT EXISTS idx_msl_ts ON market_selection_log(ts);
@@ -1218,6 +1219,19 @@ class BotDatabase:
             self._get_conn().commit()
         except Exception as e:
             log.debug(f"clear_all_active_orders error: {e}")
+
+    def purge_all_active_orders(self) -> int:
+        """Purge all active orders and dump states. Returns count deleted."""
+        try:
+            conn = self._get_conn()
+            count = conn.execute("SELECT COUNT(*) FROM active_orders").fetchone()[0]
+            conn.execute("DELETE FROM active_orders")
+            conn.execute("DELETE FROM dump_states")
+            conn.commit()
+            return count
+        except Exception as e:
+            log.debug(f"purge_all_active_orders error: {e}")
+            return 0
 
     def close(self) -> None:
         """Close the thread-local connection."""

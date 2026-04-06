@@ -123,12 +123,16 @@ def run_once(
     # Step 4: Allocate with ACTUAL available capital
     log.info(f"Computing allocations (${available_capital:.0f} available)...")
     allocations = compute_allocations(scored, total_capital=available_capital)
-    total_deployed = sum(
+    raw_deployed = sum(
         a.get("shares_per_side", 0)
         * max(0.10, (1.0 - 2 * a.get("max_spread", 0.045)) / 2)
         * 2
         for a in allocations if a["action"] == "deploy"
     )
+    # Cap at available capital — the allocator doesn't enforce budget
+    # (bot stops on exchange balance error), but the written total should
+    # reflect reality, not the sum of all deploy markets.
+    total_deployed = min(raw_deployed, available_capital)
 
     # Step 5: Write performance snapshots (adaptive tracking)
     _write_performance_snapshots(
