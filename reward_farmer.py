@@ -420,6 +420,22 @@ class RewardFarmer:
         for ms in batch:
             self.order_lifecycle.place_orders_for_market(ms)
 
+        # Step 4b: Remove dead markets (3+ consecutive book failures = resolved/delisted)
+        BOOK_FAILURE_LIMIT = 3
+        dead_cids = [
+            cid for cid, ms in self.markets.items()
+            if ms.book_failures >= BOOK_FAILURE_LIMIT
+        ]
+        for cid in dead_cids:
+            ms = self.markets[cid]
+            log.info(f"Removing dead market ({ms.book_failures} book failures): {ms.question[:50]}")
+            for side in ["yes", "no"]:
+                oid = ms.orders[side].order_id
+                if oid:
+                    self.order_lifecycle.cancel_order(oid, reason="dead_market")
+                    self.db.delete_active_order(oid)
+            del self.markets[cid]
+
         # Step 5: Record rewards
         for ms in market_list:
             has_yes = ms.orders["yes"].order_id is not None

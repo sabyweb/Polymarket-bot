@@ -169,8 +169,10 @@ class OrderLifecycle:
 
         merged = get_merged_book(self.client, ms.yes_tid, ms.no_tid)
         if not merged or not merged["bids"] or not merged["asks"]:
+            ms.book_failures += 1
             return
 
+        ms.book_failures = 0  # reset on success
         best_bid = float(merged["bids"][0]["price"])
         best_ask = float(merged["asks"][0]["price"])
         midpoint = (best_bid + best_ask) / 2
