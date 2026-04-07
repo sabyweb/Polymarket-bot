@@ -196,7 +196,8 @@ def compute_allocations(
         top_groups = sorted(group_capital.items(), key=lambda x: x[1], reverse=True)[:5]
         for gk, gv in top_groups:
             if gv > per_group_cap * 0.5:
-                log.info(f"Group concentration: '{gk}' = ${gv:.0f} ({gv/total_capital:.0%} of budget)")
+                pct = gv / total_capital if total_capital > 0 else 0
+                log.info(f"Group concentration: '{gk}' = ${gv:.0f} ({pct:.0%} of budget)")
 
     deployed = [a for a in allocations if a["action"] == "deploy"]
     avoided = [a for a in allocations if a["action"] == "avoid"]
