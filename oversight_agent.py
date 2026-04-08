@@ -111,7 +111,7 @@ def run_once(
     from database import get_db
     exchange_bal = None
     try:
-        _db = get_db(db_path)
+        _db = get_db()
         _bal, _ts = _db.load_usdc_balance()
         if _bal is not None:
             import time as _time
