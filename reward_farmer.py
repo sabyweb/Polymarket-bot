@@ -110,6 +110,7 @@ class RewardFarmer:
         self._last_market_refresh = 0.0
         self._last_reward_log = 0.0
         self._alloc_mtime = 0.0
+        self._last_reconcile = 0.0
 
     # ── Startup ─────────────────────────────────────────────────────
 
@@ -143,6 +144,19 @@ class RewardFarmer:
                 log.info(f"Startup: purged {purged} stale active_orders from DB")
         except Exception as e:
             log.warning(f"Startup active_orders purge failed: {e}")
+
+    def _save_usdc_balance(self):
+        """Query exchange for USDC balance and save to DB."""
+        try:
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            bal = self.client.get_balance_allowance(
+                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            )
+            usdc = float(bal.get("balance", 0)) / 1e6
+            self.db.save_usdc_balance(usdc)
+            log.debug(f"USDC balance: ${usdc:.2f}")
+        except Exception as e:
+            log.debug(f"USDC balance save failed: {e}")
 
     def _reconcile_positions(self):
         """Verify tracked positions against actual exchange balances."""
@@ -390,7 +404,7 @@ class RewardFarmer:
         """One cycle: check dumps → detect fills → place orders → record rewards."""
         self.cycle_count += 1
         self.order_lifecycle.cycle_count = self.cycle_count
-        self.order_lifecycle.capital_exhausted = False
+        self.order_lifecycle.capital_ceiling = None
 
         # Step 1: Fetch exchange orders
         if self.dry_run:
@@ -530,7 +544,7 @@ class RewardFarmer:
                 log.error(f"Cycle error: {e}")
             cycle_duration = time.time() - t0
 
-            # Metrics every 10 cycles
+            # Metrics + USDC balance snapshot every 10 cycles (~5 min)
             if self.cycle_count % 10 == 0 and self.cycle_count > 0:
                 on_book = sum(1 for ms in self.markets.values()
                               if ms.orders["yes"].order_id or ms.orders["no"].order_id)
@@ -538,11 +552,20 @@ class RewardFarmer:
                                    if ms.dump_orders["yes"] or ms.dump_orders["no"])
                 log.info(f"[metrics] cycle={self.cycle_count} | {cycle_duration:.1f}s | on_book={on_book}/{len(self.markets)} | dumps={active_dumps}")
 
+                # Write actual USDC balance to DB for oversight agent
+                if not self.dry_run:
+                    self._save_usdc_balance()
+
             # Hourly reward log
             if time.time() - self._last_reward_log >= 3600:
                 self._last_reward_log = time.time()
                 self.rewards.maybe_log_hourly(self.all_market_data[:MAX_MARKETS()])
                 self.rewards._last_hourly_log = 0
+
+            # Position reconciliation every 15 min (exchange → DB sync)
+            if not self.dry_run and time.time() - self._last_reconcile >= 900:
+                self._reconcile_positions()
+                self._last_reconcile = time.time()
 
             # Status every 5 min
             if time.time() - last_status >= 300:

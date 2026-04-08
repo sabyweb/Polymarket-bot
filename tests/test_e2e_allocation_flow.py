@@ -293,13 +293,13 @@ class TestE2EAllocationFlow(unittest.TestCase):
         markets[ms.cid] = ms
         lc.place_orders_for_market(ms)
 
-        # capital_exhausted flag should be set
-        self.assertTrue(lc.capital_exhausted)
+        # capital_ceiling should be set (tracks failed order cost)
+        self.assertIsNotNone(lc.capital_ceiling)
 
         feedback = query_placement_feedback(self.db_path)
         cid = DEPLOY_MARKETS[0]["condition_id"]
         self.assertIn(cid, feedback)
-        # YES side fails first, triggers early return before NO side
+        # YES side fails, sets ceiling; NO side skipped (cost >= ceiling)
         self.assertEqual(feedback[cid]["yes"]["status"], "failed")
         self.assertEqual(feedback[cid]["yes"]["reason"], "capital_exhausted")
 

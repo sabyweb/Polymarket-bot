@@ -28,7 +28,7 @@ def _make_lifecycle(ms):
         client=MagicMock(), db=MagicMock(), positions=positions,
         rewards=MagicMock(), markets={ms.cid: ms}, dry_run=True,
     )
-    ol.capital_exhausted = False
+    ol.capital_ceiling = None
     return ol
 
 

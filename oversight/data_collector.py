@@ -720,9 +720,21 @@ def query_recent_prices(db_path: str, lookback_hours: float = 3.0) -> dict[str, 
     return result
 
 
-def compute_available_capital(db_path: str, total_capital: float = 1500.0) -> float:
-    """Compute available capital by subtracting locked positions, pending dumps,
-    AND pending (unfilled) BUY orders.
+def compute_available_capital(
+    db_path: str,
+    total_capital: float = 1500.0,
+    exchange_balance: float | None = None,
+) -> float:
+    """Compute available capital for new order deployment.
+
+    When ``exchange_balance`` is provided (real USDC balance from the
+    exchange, written to DB by the bot every ~5 min), the function uses
+    it directly as the available capital — the exchange already accounts
+    for pending orders.  Positions and dumps are still logged for
+    transparency and used to reconstruct total portfolio value.
+
+    When ``exchange_balance`` is None (no bot data yet), falls back to
+    the legacy behaviour: ``total_capital`` minus DB-derived locked items.
 
     Returns actual deployable capital (never negative, floors at 0).
     """
@@ -753,6 +765,23 @@ def compute_available_capital(db_path: str, total_capital: float = 1500.0) -> fl
     except Exception:
         pass  # tables may not exist yet
 
+    # ── Exchange-balance path (preferred) ──
+    if exchange_balance is not None:
+        # The exchange USDC balance already reflects pending orders
+        # (exchange deducts collateral when an order is placed).
+        # Available = free USDC on exchange.
+        available = exchange_balance
+        # Reconstruct total portfolio value for logging.
+        total_portfolio = exchange_balance + locked_positions + locked_dumps + locked_pending
+        log.info(
+            f"Capital (exchange): ${exchange_balance:.0f} USDC + "
+            f"${locked_positions:.0f} positions + ${locked_dumps:.0f} dumps "
+            f"+ ${locked_pending:.0f} orders = ${total_portfolio:.0f} portfolio | "
+            f"${available:.0f} available"
+        )
+        return max(0, available)
+
+    # ── Legacy path: hardcoded total minus DB-derived locked ──
     locked = locked_positions + locked_dumps + locked_pending
 
     # Sanity check: if locked capital exceeds total by a wide margin,
@@ -770,7 +799,7 @@ def compute_available_capital(db_path: str, total_capital: float = 1500.0) -> fl
 
     available = max(0, total_capital - locked)
     log.info(
-        f"Capital: ${total_capital:.0f} total - ${locked_positions:.0f} positions "
+        f"Capital (hardcoded): ${total_capital:.0f} total - ${locked_positions:.0f} positions "
         f"- ${locked_dumps:.0f} dumps - ${locked_pending:.0f} pending = ${available:.0f} available"
     )
     return available

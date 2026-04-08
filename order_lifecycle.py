@@ -37,7 +37,7 @@ class OrderLifecycle:
         self.rewards = rewards
         self.markets = markets  # shared reference — mutations visible to caller
         self.dry_run = dry_run
-        self.capital_exhausted = False
+        self.capital_ceiling: float | None = None  # lowest cost that hit "insufficient balance"
         self.cycle_count = 0
         self._batch_idx = 0
 
@@ -166,6 +166,14 @@ class OrderLifecycle:
         """Fetch book + place edge orders for one market."""
         from py_clob_client.clob_types import OrderArgs
         from py_clob_client.order_builder.constants import BUY
+
+        # Skip book fetch if both sides already have orders — saves 2 API calls.
+        # Still fetch if a book refresh is due (every 5 min) so repricing and
+        # resolution-proximity guards stay active.
+        has_both = ms.orders["yes"].order_id and ms.orders["no"].order_id
+        book_age = time.time() - ms.last_book_fetch
+        if has_both and book_age < 300:
+            return
 
         merged = get_merged_book(self.client, ms.yes_tid, ms.no_tid)
         if not merged or not merged["bids"] or not merged["asks"]:
@@ -315,12 +323,18 @@ class OrderLifecycle:
                     except Exception as e:
                         err_str = str(e).lower()
                         if "insufficient" in err_str or "balance" in err_str or "not enough" in err_str:
-                            log.warning(f"Capital exhausted (YES) — stopping placement this cycle | {ms.question[:30]}")
-                            self.capital_exhausted = True
+                            failed_cost = yes_shares * edge_bid
+                            prev = self.capital_ceiling
+                            self.capital_ceiling = min(prev if prev is not None else float('inf'), failed_cost)
+                            log.warning(
+                                f"Insufficient balance (YES, ${failed_cost:.1f}) — "
+                                f"ceiling=${self.capital_ceiling:.1f} | {ms.question[:30]}"
+                            )
                             self.db.write_placement_feedback(ms.cid, "yes", "failed", "capital_exhausted")
-                            return
-                        self.db.write_placement_feedback(ms.cid, "yes", "failed", "order_error")
-                        log.debug(f"YES order failed {ms.question[:25]}: {e}")
+                            # Don't return — let NO side try if it's cheaper
+                        else:
+                            self.db.write_placement_feedback(ms.cid, "yes", "failed", "order_error")
+                            log.debug(f"YES order failed {ms.question[:25]}: {e}")
             else:
                 if reason not in ("already_has_order", "dump_pending"):
                     self.db.write_placement_feedback(ms.cid, "yes", "skipped", reason)
@@ -351,12 +365,17 @@ class OrderLifecycle:
                     except Exception as e:
                         err_str = str(e).lower()
                         if "insufficient" in err_str or "balance" in err_str or "not enough" in err_str:
-                            log.warning(f"Capital exhausted (NO) — stopping placement this cycle | {ms.question[:30]}")
-                            self.capital_exhausted = True
+                            failed_cost = no_shares * no_clob
+                            prev = self.capital_ceiling
+                            self.capital_ceiling = min(prev if prev is not None else float('inf'), failed_cost)
+                            log.warning(
+                                f"Insufficient balance (NO, ${failed_cost:.1f}) — "
+                                f"ceiling=${self.capital_ceiling:.1f} | {ms.question[:30]}"
+                            )
                             self.db.write_placement_feedback(ms.cid, "no", "failed", "capital_exhausted")
-                            return
-                        self.db.write_placement_feedback(ms.cid, "no", "failed", "order_error")
-                        log.debug(f"NO order failed {ms.question[:25]}: {e}")
+                        else:
+                            self.db.write_placement_feedback(ms.cid, "no", "failed", "order_error")
+                            log.debug(f"NO order failed {ms.question[:25]}: {e}")
             else:
                 if reason not in ("already_has_order", "dump_pending"):
                     self.db.write_placement_feedback(ms.cid, "no", "skipped", reason)
@@ -393,7 +412,7 @@ class OrderLifecycle:
         ms = self.markets.get(cid)
         if not ms:
             return False, "no_market"
-        if self.capital_exhausted:
+        if self.capital_ceiling is not None and est_cost >= self.capital_ceiling:
             return False, "capital_exhausted"
         if ms.orders[side].order_id:
             return False, "already_has_order"

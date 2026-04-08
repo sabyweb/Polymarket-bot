@@ -105,8 +105,33 @@ def run_once(
         compute_allocations, write_allocations, generate_summary,
     )
 
-    # Step 1: Compute available capital (total minus locked positions)
-    available_capital = compute_available_capital(db_path, total_capital=capital)
+    # Step 1: Compute available capital
+    # Prefer actual USDC balance from exchange (written by bot every ~5 min)
+    # over the hardcoded --capital flag. This makes the agent balance-aware.
+    from database import get_db
+    exchange_bal = None
+    try:
+        _db = get_db(db_path)
+        _bal, _ts = _db.load_usdc_balance()
+        if _bal is not None:
+            import time as _time
+            age_min = (_time.time() - _ts) / 60
+            if age_min < 30:  # only trust balance data < 30 min old
+                exchange_bal = _bal
+                log.info(
+                    f"Exchange USDC balance: ${_bal:.2f} (age={age_min:.0f}m)"
+                )
+            else:
+                log.warning(
+                    f"Exchange balance stale ({age_min:.0f}m old) — "
+                    f"falling back to --capital=${capital:.0f}"
+                )
+    except Exception as e:
+        log.warning(f"Could not read exchange balance: {e}")
+
+    available_capital = compute_available_capital(
+        db_path, total_capital=capital, exchange_balance=exchange_bal,
+    )
 
     # Step 2: Collect metrics + correction factor
     log.info(f"Collecting metrics (lookback={hours:.0f}h, db={db_path})...")

@@ -815,6 +815,40 @@ class BotDatabase:
             log.debug(f"DB load_reward_state error: {e}")
             return {}
 
+    def save_usdc_balance(self, balance: float) -> None:
+        """Save USDC balance from exchange (for oversight agent to read)."""
+        try:
+            conn = self._get_conn()
+            now = time.time()
+            conn.execute(
+                "INSERT OR REPLACE INTO reward_tracker_state (key, value) "
+                "VALUES (?, ?)", ("usdc_balance", str(balance)),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO reward_tracker_state (key, value) "
+                "VALUES (?, ?)", ("usdc_balance_at", str(now)),
+            )
+            conn.commit()
+        except Exception as e:
+            log.debug(f"DB save_usdc_balance error: {e}")
+
+    def load_usdc_balance(self) -> tuple[float | None, float]:
+        """Load USDC balance written by bot. Returns (balance, timestamp)."""
+        try:
+            conn = self._get_conn()
+            row = conn.execute(
+                "SELECT value FROM reward_tracker_state WHERE key = 'usdc_balance'"
+            ).fetchone()
+            ts_row = conn.execute(
+                "SELECT value FROM reward_tracker_state WHERE key = 'usdc_balance_at'"
+            ).fetchone()
+            if row:
+                return float(row["value"]), float(ts_row["value"]) if ts_row else 0.0
+            return None, 0.0
+        except Exception as e:
+            log.debug(f"DB load_usdc_balance error: {e}")
+            return None, 0.0
+
     def save_all_reward_stats(self, markets: dict) -> None:
         """Batch UPSERT all market stats as JSON blobs.
 
