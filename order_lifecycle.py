@@ -212,42 +212,63 @@ class OrderLifecycle:
                         slot.order_id = None
             return
 
-        # ── Live sports guard ──
-        # Sports markets (detected by "vs" pattern) expiring within 12 hours
-        # are likely live or imminent — extreme adverse selection risk from
-        # informed bettors watching the event. Skip placement AND cancel
-        # any existing orders. Future sports markets (days away) are fine.
-        if ms.question and ms.end_date_iso:
+        # ── Live sports guard (Layer 2) ──
+        # Sports markets near expiry have extreme adverse selection risk.
+        # Block if: sports + (< 4h to expiry OR missing end_date).
+        # This is defense-in-depth — the agent (Layer 1) should have
+        # already avoided these, but if one slips through, block here.
+        if ms.question:
+            from config import SPORTS_KEYWORDS, RF_SPORTS_BLOCK_HOURS
             q_lower = ms.question.lower()
-            _is_sports_q = (
-                " vs " in q_lower or " vs. " in q_lower
-                or any(kw in q_lower for kw in (
-                    "premier league", "serie a", "la liga", "bundesliga",
-                    "champions league", "nba", "nfl", "mlb", "nhl",
-                    "ipl", "cricket", "grand prix", "masters",
-                    "atp", "wta", "ufc", "formula 1",
-                ))
-            )
+            _is_sports_q = any(kw in q_lower for kw in SPORTS_KEYWORDS)
+
             if _is_sports_q:
-                try:
-                    from datetime import datetime, timezone
-                    dt = datetime.fromisoformat(ms.end_date_iso.replace("Z", "+00:00"))
-                    hours_to_expiry = (dt - datetime.now(timezone.utc)).total_seconds() / 3600
-                    if 0 < hours_to_expiry <= 12:
+                _block_sports = False
+                _block_reason = ""
+
+                if not ms.end_date_iso:
+                    # No end_date on a sports market = no proof it's safe
+                    _block_sports = True
+                    _block_reason = "sports_no_expiry"
+                    log.info(
+                        f"BLOCK sports (no expiry date) | {ms.question[:40]}"
+                    )
+                else:
+                    try:
+                        from datetime import datetime, timezone
+                        dt = datetime.fromisoformat(ms.end_date_iso.replace("Z", "+00:00"))
+                        hours_to_expiry = (dt - datetime.now(timezone.utc)).total_seconds() / 3600
+                        if hours_to_expiry <= 0:
+                            _block_sports = True
+                            _block_reason = "sports_expired"
+                            log.info(
+                                f"BLOCK sports (already expired) | {ms.question[:40]}"
+                            )
+                        elif hours_to_expiry <= RF_SPORTS_BLOCK_HOURS:
+                            _block_sports = True
+                            _block_reason = "live_sports"
+                            log.info(
+                                f"BLOCK live sports | expires in {hours_to_expiry:.1f}h "
+                                f"(< {RF_SPORTS_BLOCK_HOURS}h) | {ms.question[:40]}"
+                            )
+                    except Exception:
+                        # Can't parse date on sports market — block to be safe
+                        _block_sports = True
+                        _block_reason = "sports_bad_date"
                         log.info(
-                            f"SKIP live sports | expires in {hours_to_expiry:.1f}h | {ms.question[:40]}"
+                            f"BLOCK sports (unparseable date) | {ms.question[:40]}"
                         )
-                        self.db.write_placement_feedback(ms.cid, "yes", "skipped", "live_sports")
-                        self.db.write_placement_feedback(ms.cid, "no", "skipped", "live_sports")
-                        for side in ("yes", "no"):
-                            slot = ms.orders[side]
-                            if slot.order_id:
-                                if self.cancel_order(slot.order_id, reason="live_sports"):
-                                    self.db.delete_active_order(slot.order_id)
-                                    slot.order_id = None
-                        return
-                except Exception:
-                    pass  # Can't parse date — continue normally
+
+                if _block_sports:
+                    self.db.write_placement_feedback(ms.cid, "yes", "skipped", _block_reason)
+                    self.db.write_placement_feedback(ms.cid, "no", "skipped", _block_reason)
+                    for side in ("yes", "no"):
+                        slot = ms.orders[side]
+                        if slot.order_id:
+                            if self.cancel_order(slot.order_id, reason=_block_reason):
+                                self.db.delete_active_order(slot.order_id)
+                                slot.order_id = None
+                    return
 
         tick = ms.tick_size
         decimals = max(2, len(str(tick).rstrip('0').split('.')[-1]))

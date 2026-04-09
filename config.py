@@ -241,6 +241,36 @@ RF_ALLOCATION_TTL_HOURS: float = 2.0        # Max age of oversight agent allocat
 RF_FILL_BREAKER_WINDOW: int = 180            # Fill-rate breaker window (seconds)
 RF_FILL_BREAKER_THRESHOLD: int = 3           # Total fills (both sides) to trigger block
 RF_FILL_BREAKER_SIDE_THRESHOLD: int = 2      # Same-side fills to trigger block
+RF_SPORTS_BLOCK_HOURS: float = 4.0           # Block sports markets expiring within this many hours
+
+# ── Sports Keywords ──────────────────────────────────────────────────────────
+# Unified list used by agent (market_scorer), bot (order_lifecycle), and
+# pre-cycle sweep (reward_farmer). Define once, import everywhere.
+# Sports markets near expiry have extreme adverse selection risk from
+# informed bettors watching the event.
+SPORTS_KEYWORDS: tuple = (
+    " vs ", " vs. ",
+    # Soccer
+    "premier league", "serie a", "la liga", "bundesliga",
+    "champions league", "europa league", "mls",
+    # US Sports
+    "nba", "nfl", "mlb", "nhl", "wnba",
+    # Combat
+    "ufc", "boxing",
+    # Tennis
+    "atp", "wta", "grand slam", "wimbledon", "us open tennis",
+    "french open", "australian open",
+    # Racing
+    "grand prix", "formula 1", "f1", "nascar", "indycar",
+    # Cricket
+    "ipl", "cricket", "t20", "odi",
+    # Golf
+    "masters", "pga", "ryder cup",
+    # College
+    "march madness", "ncaa",
+    # Esports
+    "esports", "league of legends", "dota",
+)
 
 # ── Credential Validation ───────────────────────────────────��───────────────
 def validate_credentials() -> None:

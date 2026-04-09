@@ -530,6 +530,61 @@ class RewardFarmer:
 
         self._last_market_refresh = time.time()
 
+    # ── Expiry Sweep ───────────────────────────────────────────────
+
+    def _sweep_expiring_markets(self):
+        """Layer 3: Cancel orders + dump shares on markets expiring within 1 hour.
+
+        Runs every cycle. Only checks markets that have end_date_iso set.
+        This catches markets that were safe at allocation time but resolved
+        during the session — particularly sports markets where game time
+        can be uncertain.
+        """
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc)
+        swept = 0
+
+        for cid, ms in list(self.markets.items()):
+            if not ms.end_date_iso:
+                continue
+            try:
+                dt = datetime.fromisoformat(ms.end_date_iso.replace("Z", "+00:00"))
+                hours_to_expiry = (dt - now).total_seconds() / 3600
+            except Exception:
+                continue
+
+            if hours_to_expiry > 1.0:
+                continue
+
+            # Market expiring within 1 hour — cancel all orders
+            for side in ("yes", "no"):
+                slot = ms.orders[side]
+                if slot.order_id:
+                    self.order_lifecycle.cancel_order(slot.order_id, reason="expiry_sweep")
+                    self.db.delete_active_order(slot.order_id)
+                    ms.orders[side] = OrderSlot()
+
+                # Cancel dump orders too — no point selling into a resolving market
+                dump_oid = ms.dump_orders[side]
+                if dump_oid:
+                    self.order_lifecycle.cancel_order(dump_oid, reason="expiry_sweep")
+                    self.db.delete_active_order(dump_oid)
+                    ms.dump_orders[side] = None
+                    ms.dump_state[side] = None
+                    self.db.delete_dump_state(cid, side)
+
+            # Block future placement
+            ms.agent_approved = False
+            swept += 1
+            log.warning(
+                f"EXPIRY SWEEP: {hours_to_expiry:.1f}h to expiry — "
+                f"cancelled all orders, blocked placement | {ms.question[:40]}"
+            )
+
+        if swept:
+            log.info(f"Expiry sweep: cleared {swept} market(s) approaching resolution")
+
     # ── Core Cycle ──────────────────────────────────────────────────
 
     def run_cycle(self):
@@ -557,6 +612,12 @@ class RewardFarmer:
 
         # Step 3: Detect BUY fills
         self.order_lifecycle.detect_fills(open_ids)
+
+        # Step 3.5: Pre-cycle expiry sweep (Layer 3)
+        # Catches markets that were safe at allocation time but are now
+        # about to resolve. Cancel orders + dump shares for any market
+        # expiring within 1 hour.
+        self._sweep_expiring_markets()
 
         # Step 4: Place orders on priority batch
         market_list = list(self.markets.values())
