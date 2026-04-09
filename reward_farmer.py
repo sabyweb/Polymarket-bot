@@ -115,29 +115,124 @@ class RewardFarmer:
     # ── Startup ─────────────────────────────────────────────────────
 
     def _reconcile_on_startup(self):
-        """Cancel all existing orders on startup and purge stale DB records."""
+        """Check all existing orders for partial fills, then cancel and purge.
+
+        Previous behaviour: cancel everything blindly, losing any partial
+        fills that happened while the bot was offline. Now:
+        1. Load tracked orders from DB (order_id → condition_id, side, etc.)
+        2. Get exchange orders → build open_ids
+        3. For each DB-tracked order, check if it was filled:
+           - Still on exchange: read size_matched from get_order()
+           - Gone from exchange: also check via get_order() (may have filled)
+        4. Record fills (buy) or unwinds (dump) in PositionStore
+        5. Cancel all remaining exchange orders
+        6. Purge DB
+        """
         if self.dry_run:
             log.info("[DRY] Skipping startup reconciliation")
             return
+
+        # Step 1: Load tracked orders from DB BEFORE purging
+        tracked = {}
+        try:
+            db_orders = self.db.load_active_orders()
+            tracked = {o["order_id"]: o for o in db_orders}
+            if tracked:
+                log.info(f"Startup: {len(tracked)} tracked orders in DB")
+        except Exception as e:
+            log.debug(f"Load active orders failed: {e}")
+
+        # Step 2: Get exchange orders
+        existing = []
         try:
             existing = self.client.get_orders() or []
-            if existing:
-                cancelled = 0
-                for order in existing:
-                    oid = order.get("id", "")
-                    try:
-                        self.client.cancel(oid)
-                        cancelled += 1
-                    except Exception as e:
-                        log.debug(f"Cancel failed for {oid[:16]}: {e}")
-                log.info(f"Startup: cancelled {cancelled}/{len(existing)} existing orders")
-            else:
-                log.info("No existing orders found — starting clean.")
         except Exception as e:
-            log.warning(f"Startup order check failed: {e}")
+            log.warning(f"Startup get_orders failed: {e}")
 
-        # Purge ALL active_orders from DB — we just cancelled everything on
-        # the exchange, so any DB records are stale by definition.
+        open_ids = {o.get("id", "") for o in existing}
+
+        # Step 3: Check ALL tracked orders for fills (on-exchange + off-exchange)
+        fills_recovered = 0
+        unwinds_recovered = 0
+
+        for oid, info in tracked.items():
+            cid = info.get("condition_id", "")
+            side = info.get("side", "")
+            order_type = info.get("order_type", "buy")
+            db_price = float(info.get("price", 0))
+
+            if not cid or not side:
+                continue
+
+            # Check order status via API
+            try:
+                status = self.client.get_order(oid)
+                matched = float(status.get("size_matched", 0))
+                order_status = status.get("status", "")
+                api_price = float(status.get("price", 0))
+            except Exception as e:
+                log.debug(f"Startup order check failed {oid[:16]}: {e}")
+                continue
+
+            if matched <= 0:
+                continue
+
+            # Determine price (prefer API, fall back to DB)
+            fill_price = api_price if api_price > 0 else db_price
+
+            if order_type == "buy":
+                # Convert CLOB price to YES-equiv for PositionStore
+                from price import to_yes_equiv
+                yes_equiv_price = to_yes_equiv(fill_price, side)
+
+                self.positions.register_market(cid, f"startup-recovery-{cid[:12]}")
+                self.positions.record_fill(cid, side, matched, yes_equiv_price)
+                self.db.log_fill(
+                    condition_id=cid, question=f"startup-recovery",
+                    side=side, fill_type="STARTUP",
+                    shares=matched, price=yes_equiv_price,
+                    clob_cost=fill_price, usd_value=matched * fill_price,
+                )
+                fills_recovered += 1
+                log.warning(
+                    f"STARTUP FILL RECOVERED: {side.upper()} {matched:.0f}sh "
+                    f"@ {fill_price:.4f} (order {order_status}) | cid={cid[:16]}"
+                )
+            elif order_type == "dump_sell":
+                self.positions.record_unwind(cid, side, matched)
+                self.db.log_unwind(
+                    condition_id=cid, question=f"startup-recovery",
+                    side=side, shares=matched,
+                    sell_price=fill_price, usd_value=matched * fill_price,
+                )
+                unwinds_recovered += 1
+                log.warning(
+                    f"STARTUP UNWIND RECOVERED: {side.upper()} {matched:.0f}sh "
+                    f"@ {fill_price:.4f} (order {order_status}) | cid={cid[:16]}"
+                )
+
+        if fills_recovered or unwinds_recovered:
+            log.info(
+                f"Startup recovery: {fills_recovered} fill(s), "
+                f"{unwinds_recovered} unwind(s) recovered from offline orders"
+            )
+
+        # Step 4: Cancel all remaining exchange orders
+        if existing:
+            cancelled = 0
+            for order in existing:
+                oid = order.get("id", "")
+                try:
+                    self.client.cancel(oid)
+                    cancelled += 1
+                except Exception as e:
+                    log.debug(f"Cancel failed for {oid[:16]}: {e}")
+            log.info(f"Startup: cancelled {cancelled}/{len(existing)} existing orders")
+        else:
+            log.info("No existing orders found — starting clean.")
+
+        # Step 5: Purge ALL active_orders from DB (everything is now
+        # either recovered or cancelled — DB records are stale)
         try:
             purged = self.db.purge_all_active_orders()
             if purged > 0:
