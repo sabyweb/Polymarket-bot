@@ -188,6 +188,100 @@ class RewardFarmer:
         except Exception as e:
             log.warning(f"Position reconciliation failed: {e}")
 
+    def _reconcile_orders(self):
+        """Verify tracked orders actually exist on the exchange.
+
+        Fetches the current open_ids from the exchange and cross-references
+        every tracked buy order and dump order. Clears any that the exchange
+        doesn't know about — these are ghost orders from cancelled orders
+        where the bot missed the cancellation (API timeout, manual cancel,
+        exchange-side cancel).
+
+        Without this, a ghost order blocks the slot forever: no new order
+        can be placed, no fill can be detected, and the market side is dead.
+
+        For ghost dump orders, clears dump_orders but preserves dump_state
+        so reprice_active_dumps can re-initiate the dump.
+        """
+        if self.dry_run:
+            return
+        try:
+            exchange_orders = self.client.get_orders() or []
+            open_ids = {o["id"] for o in exchange_orders}
+        except Exception as e:
+            log.warning(f"Order reconciliation: get_orders failed: {e}")
+            return
+
+        ghost_buys = 0
+        ghost_dumps = 0
+
+        for cid, ms in list(self.markets.items()):
+            # Check buy orders
+            for side in ("yes", "no"):
+                slot = ms.orders[side]
+                if slot.order_id and slot.order_id not in open_ids:
+                    # Order exists in our state but NOT on exchange.
+                    # Before clearing, check if it was filled (not just cancelled).
+                    filled = False
+                    try:
+                        status = self.client.get_order(slot.order_id)
+                        matched = float(status.get("size_matched", 0))
+                        order_status = status.get("status", "")
+                        if matched > 0 and order_status in ("MATCHED", "CANCELLED"):
+                            # Silent fill — record it before clearing
+                            raw_api_price = float(status.get("price", 0))
+                            if raw_api_price > 0:
+                                from price import to_yes_equiv
+                                actual_price = to_yes_equiv(raw_api_price, side)
+                            else:
+                                actual_price = slot.price
+                            log.warning(
+                                f"ORDER RECONCILE: ghost {side.upper()} order was filled "
+                                f"{matched:.0f}sh — recording | {ms.question[:30]}"
+                            )
+                            self.order_lifecycle.handle_fill(
+                                ms, side, slot,
+                                actual_shares=matched, actual_price=actual_price,
+                            )
+                            filled = True
+                    except Exception as e:
+                        log.debug(f"Ghost order status check failed {slot.order_id[:16]}: {e}")
+
+                    if not filled:
+                        log.warning(
+                            f"ORDER RECONCILE: ghost {side.upper()} buy order "
+                            f"{slot.order_id[:16]} — not on exchange, clearing | "
+                            f"{ms.question[:30]}"
+                        )
+                    self.db.delete_active_order(slot.order_id)
+                    ms.orders[side] = OrderSlot()
+                    ghost_buys += 1
+
+            # Check dump orders
+            for side in ("yes", "no"):
+                dump_oid = ms.dump_orders[side]
+                if dump_oid and dump_oid not in open_ids:
+                    # Dump order gone from exchange — clear order ref but
+                    # preserve dump_state so reprice_active_dumps re-initiates.
+                    log.warning(
+                        f"ORDER RECONCILE: ghost {side.upper()} dump order "
+                        f"{dump_oid[:16]} — not on exchange, clearing | "
+                        f"{ms.question[:30]}"
+                    )
+                    self.db.delete_active_order(dump_oid)
+                    ms.dump_orders[side] = None
+                    # dump_state preserved — reprice_active_dumps will
+                    # detect (dump_state exists, dump_orders=None) and re-post
+                    ghost_dumps += 1
+
+        if ghost_buys or ghost_dumps:
+            log.info(
+                f"Order reconciliation: cleared {ghost_buys} ghost buy(s), "
+                f"{ghost_dumps} ghost dump(s)"
+            )
+        else:
+            log.info("Order reconciliation: all tracked orders match exchange")
+
     def _scan_orphaned_positions(self):
         """Scan exchange for orphaned positions the bot lost track of.
 
@@ -756,9 +850,12 @@ class RewardFarmer:
                 self.rewards.maybe_log_hourly(self.all_market_data[:MAX_MARKETS()])
                 self.rewards._last_hourly_log = 0
 
-            # Position reconciliation every 15 min (exchange → DB sync)
+            # Full reconciliation every 15 min (exchange → DB sync)
+            # Positions: verify share balances against exchange
+            # Orders: verify tracked orders actually exist on exchange
             if not self.dry_run and time.time() - self._last_reconcile >= 900:
                 self._reconcile_positions()
+                self._reconcile_orders()
                 self._last_reconcile = time.time()
 
             # Status every 5 min
