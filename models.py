@@ -9,6 +9,7 @@ class OrderSlot:
     price: float = 0.0
     shares: float = 0.0
     placed_at: float = 0.0
+    last_stale_check: float = 0.0  # last time we force-checked this order for partial fills
 
 
 @dataclass

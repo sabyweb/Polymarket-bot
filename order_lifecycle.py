@@ -112,6 +112,14 @@ class OrderLifecycle:
                         self.db.delete_active_order(slot.order_id)
                     slot.order_id = None
 
+                else:
+                    # Order IS in open_ids (exchange says it's live).
+                    # Periodically force-check for partial fills that the
+                    # exchange hasn't removed from open_ids yet. Without this,
+                    # a partially filled order sits forever — shares accumulate
+                    # untracked and the slot stays occupied at a stale price.
+                    self._check_stale_order(ms, side, slot)
+
     def handle_fill(self, ms: MarketState, side: str, slot: OrderSlot,
                     actual_shares: float = 0, actual_price: float = 0.0):
         """Process a detected fill: record, then merge or dump."""
@@ -489,6 +497,60 @@ class OrderLifecycle:
                 log.info(f"UNKNOWN reconcile: no surplus (exchange={actual:.0f} tracked={tracked:.0f}) | {ms.question[:30]}")
         except Exception as e:
             log.warning(f"UNKNOWN reconcile balance check failed {side} {ms.question[:25]}: {e}")
+
+    def _check_stale_order(self, ms: MarketState, side: str, slot: OrderSlot):
+        """Force-check an order still in open_ids for partial fills.
+
+        Called when the exchange reports an order as live, but it's been
+        alive longer than RF_ORDER_STALE_CHECK_SECS. Catches partial fills
+        that the exchange hasn't removed from open_ids.
+
+        If partially filled: record fill, cancel remainder, clear slot.
+        If clean: update last_stale_check so we don't re-check every cycle.
+        """
+        stale_secs = cfg("RF_ORDER_STALE_CHECK_SECS")
+        check_ref = max(slot.placed_at, slot.last_stale_check)
+        if time.time() - check_ref < stale_secs:
+            return  # Not stale yet
+
+        try:
+            status = self.client.get_order(slot.order_id)
+            matched = float(status.get("size_matched", 0))
+            order_status = status.get("status", "")
+        except Exception as e:
+            log.debug(f"Stale order check failed {slot.order_id[:16]}: {e}")
+            slot.last_stale_check = time.time()  # Backoff — retry after next interval
+            return
+
+        slot.last_stale_check = time.time()
+
+        if matched > 0:
+            # Partial fill on a "live" order — the exchange still has the
+            # remainder open, but we have untracked shares. Cancel the
+            # remainder, record the fill, clear the slot for fresh placement.
+            fill_type = "PARTIAL" if matched < slot.shares - 0.5 else "FULL"
+            raw_api_price = float(status.get("price", 0))
+            if raw_api_price > 0:
+                from price import to_yes_equiv
+                actual_price = to_yes_equiv(raw_api_price, side)
+            else:
+                actual_price = slot.price
+
+            age_min = (time.time() - slot.placed_at) / 60.0
+            log.info(
+                f"STALE CHECK: {fill_type} fill {side.upper()} "
+                f"{matched:.0f}/{slot.shares:.0f}sh after {age_min:.0f}m | "
+                f"{ms.question[:30]}"
+            )
+
+            # Cancel the remaining order first
+            self.cancel_order(slot.order_id, reason="stale_partial_fill")
+            self.db.delete_active_order(slot.order_id)
+
+            # Record the fill
+            self.handle_fill(ms, side, slot, actual_shares=matched, actual_price=actual_price)
+            ms.unknown_count[side] = 0
+            slot.order_id = None
 
     def total_exposure(self) -> float:
         """Sum of all open position USD values."""

@@ -242,6 +242,7 @@ RF_FILL_BREAKER_WINDOW: int = 180            # Fill-rate breaker window (seconds
 RF_FILL_BREAKER_THRESHOLD: int = 3           # Total fills (both sides) to trigger block
 RF_FILL_BREAKER_SIDE_THRESHOLD: int = 2      # Same-side fills to trigger block
 RF_SPORTS_BLOCK_HOURS: float = 4.0           # Block sports markets expiring within this many hours
+RF_ORDER_STALE_CHECK_SECS: int = 300         # Force-check orders still in open_ids after this many seconds
 
 # ── Sports Keywords ──────────────────────────────────────────────────────────
 # Unified list used by agent (market_scorer), bot (order_lifecycle), and
