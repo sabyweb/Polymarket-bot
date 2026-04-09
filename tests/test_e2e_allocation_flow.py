@@ -56,6 +56,7 @@ def _make_market_state(alloc: dict) -> MarketState:
         tick_size=0.01,
         yes_price=0.50,
         agent_shares=alloc.get("shares_per_side", 50),
+        agent_approved=True,
     )
 
 

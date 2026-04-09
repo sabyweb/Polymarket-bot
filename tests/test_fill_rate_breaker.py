@@ -12,7 +12,7 @@ def _make_ms(cid="test_cid"):
     return MarketState(
         cid=cid, question="Test?", yes_tid="y", no_tid="n",
         daily_rate=20.0, max_spread=0.10, min_size=10, tick_size=0.01,
-        yes_price=0.50,
+        yes_price=0.50, agent_approved=True,
     )
 
 

@@ -32,6 +32,7 @@ class MarketState:
     midpoint: float = 0.0
     last_fill_price: dict = field(default_factory=dict)
     agent_shares: float = 0
+    agent_approved: bool = False
     fill_times: dict = field(default_factory=lambda: {"yes": [], "no": []})
     end_date_iso: str = ""
     book_failures: int = 0  # consecutive get_merged_book failures (404/timeout)

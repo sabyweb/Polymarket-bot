@@ -55,6 +55,37 @@ class DumpManager:
                     if dump_status == "MATCHED":
                         actual_price = float(status.get("price", 0))
                         actual_matched = float(status.get("size_matched", 0))
+
+                        # Verify exchange balance actually decreased before recording unwind
+                        phantom = False
+                        if actual_matched > 0:
+                            try:
+                                from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+                                tid = ms.yes_tid if side == "yes" else ms.no_tid
+                                bal = self.client.get_balance_allowance(
+                                    BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=tid)
+                                )
+                                on_exchange = float(bal.get("balance", 0)) / 1e6
+                                tracked = self.positions.get_shares(ms.cid, side)
+                                if on_exchange >= tracked - 0.5:
+                                    log.critical(
+                                        f"PHANTOM FILL: status=MATCHED size_matched={actual_matched:.0f}sh "
+                                        f"but exchange still holds {on_exchange:.0f} (tracked={tracked:.0f}) | "
+                                        f"{ms.question[:30]}"
+                                    )
+                                    phantom = True
+                            except Exception as e:
+                                log.warning(f"Dump fill verification failed: {e} — proceeding with record_unwind")
+
+                        if phantom:
+                            # Don't record unwind — clear state for fresh retry
+                            if ms.dump_orders[side]:
+                                self.db.delete_active_order(ms.dump_orders[side])
+                            ms.dump_orders[side] = None
+                            ms.dump_state[side] = None
+                            self.db.delete_dump_state(ms.cid, side)
+                            continue
+
                         sell_revenue = actual_matched * actual_price if actual_price > 0 else 0
 
                         from price import to_clob
@@ -90,15 +121,14 @@ class DumpManager:
                     elif dump_status == "UNKNOWN":
                         ms.unknown_count[side] = ms.unknown_count.get(side, 0) + 1
                         if ms.unknown_count[side] >= cfg("RF_UNKNOWN_RETRY_THRESHOLD"):
-                            log.warning(f"Dump order stuck UNKNOWN {cfg('RF_UNKNOWN_RETRY_THRESHOLD')}x, clearing | {ms.question[:30]}")
+                            log.warning(f"Dump order stuck UNKNOWN {cfg('RF_UNKNOWN_RETRY_THRESHOLD')}x — clearing order, will retry | {ms.question[:30]}")
                             if ms.dump_orders[side]:
                                 self.db.delete_active_order(ms.dump_orders[side])
                             ms.dump_orders[side] = None
-                            # Also clear dump_state so we don't keep retrying
-                            # with stale state. The position still exists and
-                            # will be re-dumped on the next cycle if needed.
-                            ms.dump_state[side] = None
-                            self.db.delete_dump_state(ms.cid, side)
+                            ms.unknown_count[side] = 0
+                            # Preserve dump_state so reprice_active_dumps
+                            # detects (dump_state exists, dump_orders=None)
+                            # and re-initiates the dump via dump_position()
                     else:
                         log.warning(f"Dump order {dump_status} — will retry | {ms.question[:30]}")
                         if ms.dump_orders[side]:
@@ -123,6 +153,21 @@ class DumpManager:
                     shares = ms.dump_state[side]["shares"]
                     self.dump_position(ms, side, shares)
 
+        # Safety sweep: catch positions with shares but no dump/buy state
+        for cid, ms in list(markets.items()):
+            for side in ["yes", "no"]:
+                if ms.dump_state[side] or ms.dump_orders[side]:
+                    continue
+                if ms.orders[side].order_id:
+                    continue
+                shares = self.positions.get_shares(cid, side)
+                if shares >= 1.0:
+                    log.warning(
+                        f"LOST POSITION detected: {side.upper()} {shares:.0f}sh "
+                        f"with no dump or buy order — re-initiating dump | {ms.question[:30]}"
+                    )
+                    self.dump_position(ms, side, shares)
+
     def try_merge(self, ms: MarketState, amount: float):
         """Merge YES + NO positions for $1 each. Falls back to dual dump."""
         if self.dry_run:
@@ -137,7 +182,29 @@ class DumpManager:
                 self.client.update_balance_allowance(
                     BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=tid)
                 )
+
+            # Snapshot YES balance before merge so we can verify it actually happened
+            pre_bal = self.client.get_balance_allowance(
+                BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=ms.yes_tid)
+            )
+            pre_yes = float(pre_bal.get("balance", 0)) / 1e6
+
             result = self.client.merge_positions(ms.cid, amount)
+
+            # Verify merge actually reduced the exchange balance
+            post_bal = self.client.get_balance_allowance(
+                BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=ms.yes_tid)
+            )
+            post_yes = float(post_bal.get("balance", 0)) / 1e6
+
+            if post_yes >= pre_yes - 0.5:
+                log.critical(
+                    f"PHANTOM MERGE: API returned but exchange YES balance unchanged "
+                    f"(pre={pre_yes:.0f} post={post_yes:.0f}, expected -{amount:.0f}) | "
+                    f"{ms.question[:30]}"
+                )
+                raise RuntimeError("Merge balance verification failed")
+
             log.info(f"MERGE {amount:.0f} pairs | {ms.question[:30]}")
             self.positions.record_unwind(ms.cid, "yes", amount)
             self.positions.record_unwind(ms.cid, "no", amount)

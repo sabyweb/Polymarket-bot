@@ -431,11 +431,24 @@ class RewardFarmer:
 
             log.info(f"Using agent allocations: {len(validated)}/{len(eligible)} markets (after validation)")
             self._update_market_states(validated)
+            # Mark agent-approved markets; cancel buy orders on unapproved leftovers
+            validated_cids = {m["condition_id"] for m in validated}
+            for cid, ms in self.markets.items():
+                ms.agent_approved = cid in validated_cids
+                if not ms.agent_approved:
+                    for side in ("yes", "no"):
+                        slot = ms.orders[side]
+                        if slot.order_id:
+                            self.order_lifecycle.cancel_order(slot.order_id, reason="not_in_allocation")
+                            self.db.delete_active_order(slot.order_id)
+                            ms.orders[side] = OrderSlot()
             return
 
-        # If agent was previously active but allocation is now stale/missing, keep current markets
+        # If agent was previously active but allocation is now stale/missing, block new orders
         if self._agent_mode:
-            log.warning(f"Agent allocation stale/missing — keeping current {len(self.markets)} markets")
+            log.warning(f"Agent allocation stale/missing — blocking new orders on {len(self.markets)} markets")
+            for ms in self.markets.values():
+                ms.agent_approved = False
             return
 
         # Default filtering (only when agent has NEVER been active)
@@ -481,10 +494,18 @@ class RewardFarmer:
             cid = m["condition_id"]
             if cid in self.markets:
                 # Update agent sizing for existing markets
+                self.markets[cid].agent_approved = True
                 new_shares = float(m.get("_agent_shares", 0))
                 if new_shares > 0 and new_shares != self.markets[cid].agent_shares:
                     log.info(f"Resizing {self.markets[cid].question[:30]}: {self.markets[cid].agent_shares:.0f} → {new_shares:.0f}sh")
                     self.markets[cid].agent_shares = new_shares
+                    # Cancel stale orders so next cycle replaces at new size
+                    for side in ("yes", "no"):
+                        slot = self.markets[cid].orders[side]
+                        if slot.order_id:
+                            self.order_lifecycle.cancel_order(slot.order_id, reason="resize")
+                            self.db.delete_active_order(slot.order_id)
+                            self.markets[cid].orders[side] = OrderSlot()
             else:
                 self.markets[cid] = MarketState(
                     cid=cid,
@@ -498,6 +519,7 @@ class RewardFarmer:
                     yes_price=m.get("yes_price"),
                     agent_shares=float(m.get("_agent_shares", 0)),
                     end_date_iso=m.get("end_date_iso") or "",
+                    agent_approved=True,
                 )
                 self.positions.register_market(cid, m["question"])
 

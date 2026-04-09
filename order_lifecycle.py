@@ -412,6 +412,8 @@ class OrderLifecycle:
         ms = self.markets.get(cid)
         if not ms:
             return False, "no_market"
+        if not ms.agent_approved:
+            return False, "not_agent_approved"
         if self.capital_ceiling is not None and est_cost >= self.capital_ceiling:
             return False, "capital_exhausted"
         if ms.orders[side].order_id:
