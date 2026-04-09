@@ -188,6 +188,116 @@ class RewardFarmer:
         except Exception as e:
             log.warning(f"Position reconciliation failed: {e}")
 
+    def _scan_orphaned_positions(self):
+        """Scan exchange for orphaned positions the bot lost track of.
+
+        Queries all condition_ids from recent fills, checks exchange balance
+        for any that aren't currently tracked in self.markets or positions.
+        Re-registers orphans so the bot can dump them.
+        """
+        if self.dry_run:
+            return
+        try:
+            import sqlite3
+            import requests
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+
+            conn = sqlite3.connect(self.db._db_path, timeout=5)
+            conn.row_factory = sqlite3.Row
+
+            # Get all condition_ids from fills in last 7 days
+            cutoff = time.time() - 7 * 86400
+            rows = conn.execute(
+                "SELECT DISTINCT condition_id, question FROM fills WHERE ts > ?",
+                (cutoff,),
+            ).fetchall()
+            conn.close()
+
+            tracked_cids = set(self.markets.keys())
+            candidates = [
+                (r["condition_id"], r["question"])
+                for r in rows
+                if r["condition_id"] not in tracked_cids
+            ]
+
+            if not candidates:
+                log.info("Orphan scan: no untracked fills found")
+                return
+
+            log.info(f"Orphan scan: checking {len(candidates)} untracked markets from recent fills")
+            orphans_found = 0
+
+            for cid, question in candidates:
+                # Fetch token_ids from CLOB API
+                try:
+                    mkt_resp = requests.get(
+                        f"https://clob.polymarket.com/markets/{cid}", timeout=10,
+                    )
+                    if mkt_resp.status_code != 200:
+                        continue
+                    mkt = mkt_resp.json()
+                    tokens = mkt.get("tokens", [])
+                    if len(tokens) < 2:
+                        continue
+                except Exception:
+                    continue
+
+                yes_tid = tokens[0]["token_id"]
+                no_tid = tokens[1]["token_id"]
+                tick = float(mkt.get("minimum_tick_size") or 0.01)
+                orphan_sides = {}  # {side: actual_shares}
+
+                # Check exchange balance for each side
+                for side, tid in [("yes", yes_tid), ("no", no_tid)]:
+                    try:
+                        bal = self.client.get_balance_allowance(
+                            BalanceAllowanceParams(
+                                asset_type=AssetType.CONDITIONAL, token_id=tid,
+                            )
+                        )
+                        actual = float(bal.get("balance", 0)) / 1e6
+                        if actual >= 1.0:
+                            orphan_sides[side] = actual
+                    except Exception as e:
+                        log.debug(f"Orphan balance check failed {cid[:16]} {side}: {e}")
+
+                if not orphan_sides:
+                    continue
+
+                # Re-register in positions DB
+                q = question or f"orphan-{cid[:12]}"
+                self.positions.register_market(cid, q)
+                for side, actual in orphan_sides.items():
+                    self.positions.set_shares(cid, side, actual)
+                    log.warning(
+                        f"ORPHAN FOUND: {side.upper()} {actual:.0f}sh on exchange | "
+                        f"{q[:50]}"
+                    )
+                    orphans_found += 1
+
+                # Add to active markets so the bot can dump them
+                if cid not in self.markets:
+                    ms = MarketState(
+                        cid=cid, question=q,
+                        yes_tid=yes_tid, no_tid=no_tid,
+                        daily_rate=0, max_spread=0.05,
+                        min_size=1, tick_size=tick,
+                        yes_price=None,
+                    )
+                    self.markets[cid] = ms
+                    # Trigger immediate dump for each orphaned side
+                    for side, actual in orphan_sides.items():
+                        log.info(f"Triggering dump for orphan {side.upper()} {actual:.0f}sh | {q[:40]}")
+                        self.dump_mgr.dump_position(ms, side, actual)
+
+            if orphans_found:
+                log.info(f"Orphan scan: re-registered {orphans_found} orphaned position(s)")
+            else:
+                log.info("Orphan scan: no orphans on exchange")
+
+        except Exception as e:
+            log.warning(f"Orphan scan failed: {e}")
+
     def _restore_dump_states(self):
         """Restore dump states from DB after crash/restart."""
         if self.dry_run:
@@ -494,6 +604,7 @@ class RewardFarmer:
             return
 
         self._reconcile_positions()
+        self._scan_orphaned_positions()
         self._restore_dump_states()
 
         start = time.time()
