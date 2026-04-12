@@ -111,6 +111,7 @@ class RewardFarmer:
         self._last_reward_log = 0.0
         self._alloc_mtime = 0.0
         self._last_reconcile = 0.0
+        self._last_exchange_sync = 0.0
 
     # ── Startup ─────────────────────────────────────────────────────
 
@@ -486,6 +487,149 @@ class RewardFarmer:
 
         except Exception as e:
             log.warning(f"Orphan scan failed: {e}")
+
+    def _sync_exchange_positions(self):
+        """Full position sync: Data API -> register orphans + clean stale DB entries.
+
+        Queries the Data API for all real exchange positions, compares with the
+        bot's tracked positions, registers any orphans, and removes DB entries
+        for markets that no longer have exchange balances.
+        """
+        if self.dry_run:
+            return
+        try:
+            import requests as req
+            from config import FUNDER
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+
+            if not FUNDER:
+                log.warning("Position sync skipped: FUNDER not set")
+                return
+
+            resp = req.get(
+                "https://data-api.polymarket.com/positions",
+                params={"user": FUNDER, "sizeThreshold": "0.1"},
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                log.warning(f"Position sync: Data API returned {resp.status_code}")
+                return
+
+            exchange_data = resp.json()
+            if not isinstance(exchange_data, list):
+                log.warning("Position sync: unexpected Data API response format")
+                return
+
+            # Build lookup: condition_id -> {side: {shares, token_id, question}}
+            exchange_by_cid: dict[str, dict] = {}
+            for pos in exchange_data:
+                cid = pos.get("conditionId", "")
+                side = pos.get("outcome", "").lower()
+                if not cid or side not in ("yes", "no"):
+                    continue
+                if cid not in exchange_by_cid:
+                    exchange_by_cid[cid] = {}
+                exchange_by_cid[cid][side] = {
+                    "shares": float(pos.get("size", 0)),
+                    "token_id": str(pos.get("asset", "")),
+                    "question": pos.get("title", ""),
+                    "avg_price": float(pos.get("avgPrice", 0)),
+                }
+
+            exchange_cids = set(exchange_by_cid.keys())
+            tracked_cids = set(self.markets.keys())
+
+            # ── Register orphans (on exchange but not tracked) ──
+            orphan_cids = exchange_cids - tracked_cids
+            orphans_found = 0
+            for cid in orphan_cids:
+                sides = exchange_by_cid[cid]
+                question = next(iter(sides.values()))["question"]
+
+                # Need both YES and NO token_ids to create MarketState
+                try:
+                    mkt_resp = req.get(
+                        f"https://clob.polymarket.com/markets/{cid}", timeout=10,
+                    )
+                    if mkt_resp.status_code != 200:
+                        continue
+                    mkt = mkt_resp.json()
+                    tokens = mkt.get("tokens", [])
+                    if len(tokens) < 2:
+                        continue
+                except Exception:
+                    continue
+
+                yes_tid = tokens[0]["token_id"]
+                no_tid = tokens[1]["token_id"]
+                tick = float(mkt.get("minimum_tick_size") or 0.01)
+
+                q = question or f"orphan-{cid[:12]}"
+                self.positions.register_market(cid, q)
+                for side, info in sides.items():
+                    self.positions.set_shares(cid, side, info["shares"])
+                    log.warning(
+                        f"EXCHANGE SYNC: found {side.upper()} {info['shares']:.1f}sh "
+                        f"not tracked | {q[:50]}"
+                    )
+                    orphans_found += 1
+
+                # Add to active markets for dumping
+                if cid not in self.markets:
+                    ms = MarketState(
+                        cid=cid, question=q,
+                        yes_tid=yes_tid, no_tid=no_tid,
+                        daily_rate=0, max_spread=0.05,
+                        min_size=1, tick_size=tick,
+                        yes_price=None,
+                    )
+                    self.markets[cid] = ms
+                    for side, info in sides.items():
+                        log.info(
+                            f"Triggering dump for synced orphan {side.upper()} "
+                            f"{info['shares']:.0f}sh | {q[:40]}"
+                        )
+                        self.dump_mgr.dump_position(ms, side, info["shares"])
+
+            # ── Clean stale positions (in DB but not on exchange) ──
+            db_positions = self.positions.get_all_positions()
+            stale_removed = 0
+            for cid in list(db_positions.keys()):
+                if cid in exchange_cids:
+                    continue
+                # Position is in DB but not on exchange — check if it's being
+                # actively dumped before removing
+                is_dumping = (
+                    cid in self.dump_mgr.dump_states
+                    if hasattr(self.dump_mgr, "dump_states")
+                    else False
+                )
+                if is_dumping:
+                    continue
+                db_yes = db_positions[cid].get("yes_shares", 0)
+                db_no = db_positions[cid].get("no_shares", 0)
+                if db_yes < 0.5 and db_no < 0.5:
+                    # Already near-zero, just clean up
+                    self.positions.remove_market(cid)
+                    stale_removed += 1
+                else:
+                    # Non-trivial shares in DB but gone from exchange
+                    # (market resolved, shares redeemed, or sold externally)
+                    q = db_positions[cid].get("question", cid[:16])
+                    log.info(
+                        f"STALE CLEANUP: removing {q[:40]} "
+                        f"(YES={db_yes:.0f} NO={db_no:.0f}) — not on exchange"
+                    )
+                    self.positions.remove_market(cid)
+                    stale_removed += 1
+
+            log.info(
+                f"Exchange position sync: {len(exchange_cids)} on exchange, "
+                f"{orphans_found} orphans registered, {stale_removed} stale removed"
+            )
+
+        except Exception as e:
+            log.warning(f"Exchange position sync failed: {e}")
 
     def _restore_dump_states(self):
         """Restore dump states from DB after crash/restart."""
@@ -877,6 +1021,7 @@ class RewardFarmer:
 
         self._reconcile_positions()
         self._scan_orphaned_positions()
+        self._sync_exchange_positions()
         self._restore_dump_states()
 
         start = time.time()
@@ -952,6 +1097,11 @@ class RewardFarmer:
                 self._reconcile_positions()
                 self._reconcile_orders()
                 self._last_reconcile = time.time()
+
+            # Exchange position sync every 30 min (Data API → orphans + stale cleanup)
+            if not self.dry_run and time.time() - self._last_exchange_sync >= 1800:
+                self._sync_exchange_positions()
+                self._last_exchange_sync = time.time()
 
             # Status every 5 min
             if time.time() - last_status >= 300:
