@@ -91,6 +91,12 @@ def compute_allocations(
             continue
 
         shares = sm.recommended_shares if sm.recommended_shares > 0 else DEFAULT_SHARES
+        # Enforce exchange minimum: orders below min_size earn no rewards.
+        # This ensures est_cost reflects what the bot will actually place,
+        # preventing capital budget mismatch (bot was silently inflating to
+        # min_size via max(min_size, shares_target) in order_lifecycle.py).
+        if int(sm.min_size) > 0:
+            shares = max(shares, int(sm.min_size))
         spread = getattr(sm, "max_spread", 0.045)
         est_cost = _est_market_cost(shares, spread)
 

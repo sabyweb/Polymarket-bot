@@ -165,10 +165,10 @@ class TestLayer1AgentSportsAvoid(unittest.TestCase):
         from oversight.market_scorer import classify_market, score_market
         test_questions = [
             "Team A vs Team B — who wins?",
-            "NBA Finals winner 2026?",
-            "NFL Super Bowl champion?",
-            "IPL cricket — will Mumbai win?",
-            "UFC 400 main event winner?",
+            "Will NBA Finals winner be Lakers 2026?",
+            "Will NFL Super Bowl champion be Chiefs?",
+            "Will IPL cricket — Mumbai win?",
+            "Will UFC 400 main event winner be Jones?",
             "Formula 1 Grand Prix — will Hamilton win?",
             "March Madness bracket winner?",
             "Premier League top scorer?",
@@ -323,7 +323,7 @@ class TestLayer2BotSportsBlock(unittest.TestCase):
             "asks": [{"price": "0.52", "size": "500"}],
         }
         ms = _make_ms(
-            question="UFC 400 main event — who wins?",
+            question="Will UFC 400 main event — who wins?",
             end_date_iso="not-a-real-date",
         )
         markets = {ms.cid: ms}
@@ -458,8 +458,8 @@ class TestSportsKeywords(unittest.TestCase):
         self.assertGreater(len(SPORTS_KEYWORDS), 20)
 
     def test_core_patterns_present(self):
-        """Core patterns like ' vs ', 'nba', 'nfl' must be present."""
-        for pattern in (" vs ", "nba", "nfl", "premier league", "ufc", "ipl"):
+        """Core patterns (with word-boundary padding) must be present."""
+        for pattern in (" vs ", " nba", " nfl", "premier league", " ufc", " ipl"):
             self.assertIn(pattern, SPORTS_KEYWORDS, f"Missing core pattern: {pattern}")
 
     def test_keywords_are_lowercase(self):

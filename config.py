@@ -253,20 +253,21 @@ SPORTS_KEYWORDS: tuple = (
     " vs ", " vs. ",
     # Soccer
     "premier league", "serie a", "la liga", "bundesliga",
-    "champions league", "europa league", "mls",
-    # US Sports
-    "nba", "nfl", "mlb", "nhl", "wnba",
+    "champions league", "europa league", "mls ",
+    # US Sports — word-boundary padded to avoid substring matches
+    # ("nfl" matched "conflict", "ipl" matched "diplomatic", "odi" matched "Coding")
+    " nba", " nfl", " mlb", " nhl", " wnba",
     # Combat
-    "ufc", "boxing",
+    " ufc", "boxing",
     # Tennis
-    "atp", "wta", "grand slam", "wimbledon", "us open tennis",
+    " atp", " wta", "grand slam", "wimbledon", "us open tennis",
     "french open", "australian open",
     # Racing
-    "grand prix", "formula 1", "f1", "nascar", "indycar",
-    # Cricket
-    "ipl", "cricket", "t20", "odi",
+    "grand prix", "formula 1", " f1 ", "nascar", "indycar",
+    # Cricket — word-boundary padded to avoid substring matches
+    " ipl", "cricket", " t20", " odi ",
     # Golf
-    "masters", "pga", "ryder cup",
+    "masters", " pga", "ryder cup",
     # College
     "march madness", "ncaa",
     # Esports
