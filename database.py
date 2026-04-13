@@ -261,6 +261,78 @@ CREATE TABLE IF NOT EXISTS active_orders (
     placed_at    REAL NOT NULL
 );
 
+-- Phase 0: Order book snapshots (one row per market per book fetch)
+CREATE TABLE IF NOT EXISTS book_snapshots (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts              REAL    NOT NULL,
+    condition_id    TEXT    NOT NULL,
+    best_bid        REAL    NOT NULL,
+    best_ask        REAL    NOT NULL,
+    midpoint        REAL    NOT NULL,
+    spread          REAL    NOT NULL,
+    bid_depth_5c    REAL    NOT NULL DEFAULT 0,
+    ask_depth_5c    REAL    NOT NULL DEFAULT 0,
+    bid_depth_10c   REAL    NOT NULL DEFAULT 0,
+    ask_depth_10c   REAL    NOT NULL DEFAULT 0,
+    total_bid_depth REAL    NOT NULL DEFAULT 0,
+    total_ask_depth REAL    NOT NULL DEFAULT 0,
+    num_bid_levels  INTEGER NOT NULL DEFAULT 0,
+    num_ask_levels  INTEGER NOT NULL DEFAULT 0,
+    our_bid_price   REAL    NOT NULL DEFAULT 0,
+    our_ask_price   REAL    NOT NULL DEFAULT 0,
+    our_bid_depth_ahead REAL NOT NULL DEFAULT 0,
+    our_ask_depth_ahead REAL NOT NULL DEFAULT 0,
+    daily_rate      REAL    NOT NULL DEFAULT 0,
+    max_spread      REAL    NOT NULL DEFAULT 0,
+    agent_shares    REAL    NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_bs_cid_ts ON book_snapshots(condition_id, ts);
+CREATE INDEX IF NOT EXISTS idx_bs_ts ON book_snapshots(ts);
+
+-- Phase 0: Per-order scoring snapshots (from are_orders_scoring API)
+CREATE TABLE IF NOT EXISTS scoring_snapshots (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts              REAL    NOT NULL,
+    order_id        TEXT    NOT NULL,
+    condition_id    TEXT    NOT NULL,
+    side            TEXT    NOT NULL,
+    scoring         INTEGER NOT NULL,
+    price           REAL    NOT NULL DEFAULT 0,
+    shares          REAL    NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_ss_cid_ts ON scoring_snapshots(condition_id, ts);
+CREATE INDEX IF NOT EXISTS idx_ss_ts ON scoring_snapshots(ts);
+
+-- Phase 0: Daily reward payout (exact totals from Data API)
+CREATE TABLE IF NOT EXISTS reward_daily (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    date                TEXT    NOT NULL,
+    total_reward_usd    REAL    NOT NULL DEFAULT 0,
+    total_rebate_usd    REAL    NOT NULL DEFAULT 0,
+    total_combined_usd  REAL    NOT NULL DEFAULT 0,
+    num_markets_active  INTEGER NOT NULL DEFAULT 0,
+    est_daily_total     REAL    NOT NULL DEFAULT 0,
+    correction_factor   REAL    NOT NULL DEFAULT 0,
+    UNIQUE(date)
+);
+
+-- Phase 0: Per-market context for each reward day
+CREATE TABLE IF NOT EXISTS reward_daily_markets (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    date                TEXT    NOT NULL,
+    condition_id        TEXT    NOT NULL,
+    scoring_seconds     REAL    NOT NULL DEFAULT 0,
+    avg_bid_size        REAL    NOT NULL DEFAULT 0,
+    avg_ask_size        REAL    NOT NULL DEFAULT 0,
+    avg_spread          REAL    NOT NULL DEFAULT 0,
+    avg_midpoint        REAL    NOT NULL DEFAULT 0,
+    daily_rate          REAL    NOT NULL DEFAULT 0,
+    max_spread_cfg      REAL    NOT NULL DEFAULT 0,
+    fill_count          INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(date, condition_id)
+);
+CREATE INDEX IF NOT EXISTS idx_rdm_date ON reward_daily_markets(date);
+
 CREATE INDEX IF NOT EXISTS idx_fills_cid ON fills(condition_id);
 CREATE INDEX IF NOT EXISTS idx_fills_ts ON fills(ts);
 CREATE INDEX IF NOT EXISTS idx_unwinds_cid ON unwinds(condition_id);
@@ -1265,6 +1337,86 @@ class BotDatabase:
             return count
         except Exception as e:
             log.debug(f"purge_all_active_orders error: {e}")
+            return 0
+
+    # ── Phase 0: Data Collection Methods ──────────────────────────────────
+
+    def log_book_snapshot(
+        self, condition_id: str, merged: dict, best_bid: float,
+        best_ask: float, midpoint: float, our_bid: float, our_ask: float,
+        daily_rate: float, max_spread: float, agent_shares: float,
+    ) -> None:
+        """Record order book summary features for ML training."""
+        try:
+            bids = merged.get("bids", [])
+            asks = merged.get("asks", [])
+            spread = best_ask - best_bid
+
+            bid_depth_5c = sum(float(b["size"]) for b in bids if float(b["price"]) >= midpoint - 0.05)
+            ask_depth_5c = sum(float(a["size"]) for a in asks if float(a["price"]) <= midpoint + 0.05)
+            bid_depth_10c = sum(float(b["size"]) for b in bids if float(b["price"]) >= midpoint - 0.10)
+            ask_depth_10c = sum(float(a["size"]) for a in asks if float(a["price"]) <= midpoint + 0.10)
+            total_bid = sum(float(b["size"]) for b in bids)
+            total_ask = sum(float(a["size"]) for a in asks)
+
+            our_bid_ahead = sum(float(b["size"]) for b in bids if float(b["price"]) > our_bid) if our_bid > 0 else 0
+            our_ask_ahead = sum(float(a["size"]) for a in asks if float(a["price"]) < our_ask) if our_ask > 0 else 0
+
+            conn = self._get_conn()
+            conn.execute(
+                "INSERT INTO book_snapshots "
+                "(ts, condition_id, best_bid, best_ask, midpoint, spread, "
+                "bid_depth_5c, ask_depth_5c, bid_depth_10c, ask_depth_10c, "
+                "total_bid_depth, total_ask_depth, num_bid_levels, num_ask_levels, "
+                "our_bid_price, our_ask_price, our_bid_depth_ahead, our_ask_depth_ahead, "
+                "daily_rate, max_spread, agent_shares) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (time.time(), condition_id, best_bid, best_ask, midpoint, spread,
+                 bid_depth_5c, ask_depth_5c, bid_depth_10c, ask_depth_10c,
+                 total_bid, total_ask, len(bids), len(asks),
+                 our_bid, our_ask, our_bid_ahead, our_ask_ahead,
+                 daily_rate, max_spread, agent_shares),
+            )
+            conn.commit()
+        except Exception as e:
+            log.debug(f"DB log_book_snapshot error: {e}")
+
+    def log_scoring_snapshot(self, scoring_data: list[tuple]) -> None:
+        """Batch-insert scoring status for all orders.
+
+        Args:
+            scoring_data: list of (order_id, condition_id, side, scoring_bool, price, shares)
+        """
+        if not scoring_data:
+            return
+        try:
+            now = time.time()
+            conn = self._get_conn()
+            conn.executemany(
+                "INSERT INTO scoring_snapshots "
+                "(ts, order_id, condition_id, side, scoring, price, shares) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [(now, oid, cid, side, int(scoring), price, shares)
+                 for oid, cid, side, scoring, price, shares in scoring_data],
+            )
+            conn.commit()
+        except Exception as e:
+            log.debug(f"DB log_scoring_snapshot error: {e}")
+
+    def prune_phase0_data(self, retention_days: int = 7) -> int:
+        """Delete book_snapshots and scoring_snapshots older than retention window."""
+        cutoff = time.time() - (retention_days * 86400)
+        try:
+            conn = self._get_conn()
+            d1 = conn.execute("DELETE FROM book_snapshots WHERE ts < ?", (cutoff,)).rowcount
+            d2 = conn.execute("DELETE FROM scoring_snapshots WHERE ts < ?", (cutoff,)).rowcount
+            conn.commit()
+            total = d1 + d2
+            if total:
+                log.info(f"Phase0 pruning: removed {d1} book + {d2} scoring snapshots (>{retention_days}d)")
+            return total
+        except Exception as e:
+            log.debug(f"DB prune_phase0_data error: {e}")
             return 0
 
     def close(self) -> None:

@@ -1005,6 +1005,30 @@ class RewardFarmer:
         if self.cycle_count % 5 == 0:
             self.rewards._save()
 
+        # Step 6: Phase 0 — record per-order scoring status (1 API call)
+        # Only check every 5th cycle (~2.5 min) to avoid rate limit pressure
+        if self.cycle_count % 5 == 0 and not self.dry_run:
+            try:
+                from py_clob_client.clob_types import OrdersScoringParams
+                # Gather all live order IDs with their market context
+                order_map = {}  # {order_id: (cid, side, price, shares)}
+                for ms in market_list:
+                    for side in ("yes", "no"):
+                        slot = ms.orders[side]
+                        if slot.order_id:
+                            order_map[slot.order_id] = (ms.cid, side, slot.price, slot.shares)
+                if order_map:
+                    scoring_result = self.client.are_orders_scoring(
+                        OrdersScoringParams(orderIds=list(order_map.keys()))
+                    )
+                    scoring_data = []
+                    for oid, (cid, side, price, shares) in order_map.items():
+                        is_scoring = scoring_result.get(oid, False)
+                        scoring_data.append((oid, cid, side, is_scoring, price, shares))
+                    self.db.log_scoring_snapshot(scoring_data)
+            except Exception as e:
+                log.debug(f"Phase0 scoring snapshot failed: {e}")
+
     # ── Main Loop ───────────────────────────────────────────────────
 
     def run(self, duration_secs: int = 0):

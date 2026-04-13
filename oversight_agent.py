@@ -88,6 +88,133 @@ def _write_performance_snapshots(
         log.warning(f"Performance snapshot write failed: {e}")
 
 
+def _phase0_daily_attribution(
+    db_path: str,
+    metrics: list,
+    correction_factor: float,
+) -> None:
+    """Phase 0: Write daily reward payout + per-market portfolio context.
+
+    Uses exact totals from Data API (REWARD + MAKER_REBATE) and records
+    what the portfolio looked like that day. No circular attribution —
+    the model learns the mapping from portfolio context → total payout.
+    """
+    import sqlite3
+    from datetime import datetime, timezone
+
+    try:
+        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+        # Fetch today's actual payouts (both streams)
+        from oversight.data_collector import fetch_reward_correction_factor
+        total_combined = fetch_reward_correction_factor(hours=24)
+
+        # Split REWARD vs MAKER_REBATE for the record
+        import requests as rq
+        funder = os.getenv("FUNDER", "") or os.getenv("WALLET_ADDRESS", "")
+        cutoff_ts = time.time() - 24 * 3600
+        reward_total = 0.0
+        rebate_total = 0.0
+        for ptype, accumulator_name in [("REWARD", "reward_total"), ("MAKER_REBATE", "rebate_total")]:
+            off = 0
+            while True:
+                resp = rq.get(
+                    "https://data-api.polymarket.com/activity",
+                    params={"user": funder, "type": ptype, "limit": 500, "offset": off},
+                    timeout=15,
+                )
+                if resp.status_code != 200:
+                    break
+                data = resp.json()
+                if not data:
+                    break
+                for item in data:
+                    ts = float(item.get("timestamp", 0))
+                    if ts < cutoff_ts:
+                        continue
+                    amount = float(item.get("usdcSize", 0) or item.get("amount", 0))
+                    if amount > 0:
+                        if ptype == "REWARD":
+                            reward_total += amount
+                        else:
+                            rebate_total += amount
+                if len(data) < 500:
+                    break
+                off += 500
+                time.sleep(0.2)
+
+        # Estimated daily total from Q-score model
+        est_total = sum(m.daily_rate * m.q_share_pct for m in metrics if m.q_share_pct > 0)
+        num_active = sum(1 for m in metrics if m.on_book_hours > 0)
+
+        conn = sqlite3.connect(db_path, timeout=10)
+        conn.execute(
+            "INSERT OR REPLACE INTO reward_daily "
+            "(date, total_reward_usd, total_rebate_usd, total_combined_usd, "
+            "num_markets_active, est_daily_total, correction_factor) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (date_str, reward_total, rebate_total, reward_total + rebate_total,
+             num_active, est_total, correction_factor),
+        )
+
+        # Per-market portfolio context
+        # Use scoring_snapshots from today if available for scoring_seconds
+        scoring_by_cid = {}
+        try:
+            today_start = time.time() - 24 * 3600
+            rows = conn.execute(
+                "SELECT condition_id, SUM(scoring) as scoring_cycles, COUNT(*) as total_cycles "
+                "FROM scoring_snapshots WHERE ts >= ? GROUP BY condition_id",
+                (today_start,),
+            ).fetchall()
+            for r in rows:
+                cid = r[0]
+                # Each snapshot is ~2.5 min apart (every 5 cycles × 30s)
+                scoring_by_cid[cid] = r[1] * 150  # scoring_cycles × 150 seconds
+        except Exception:
+            pass  # table may not exist yet
+
+        market_rows = []
+        for m in metrics:
+            if m.on_book_hours <= 0:
+                continue
+            market_rows.append((
+                date_str, m.condition_id,
+                scoring_by_cid.get(m.condition_id, 0),
+                0, 0,  # avg_bid_size, avg_ask_size (enriched later from book_snapshots)
+                0, 0,  # avg_spread, avg_midpoint (enriched later)
+                m.daily_rate, m.max_spread,
+                m.fill_count_recent,
+            ))
+        if market_rows:
+            conn.executemany(
+                "INSERT OR REPLACE INTO reward_daily_markets "
+                "(date, condition_id, scoring_seconds, avg_bid_size, avg_ask_size, "
+                "avg_spread, avg_midpoint, daily_rate, max_spread_cfg, fill_count) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                market_rows,
+            )
+
+        conn.commit()
+        conn.close()
+        log.info(
+            f"Phase0 attribution: ${reward_total:.2f} reward + ${rebate_total:.2f} rebate "
+            f"= ${reward_total + rebate_total:.2f} | {num_active} markets | {date_str}"
+        )
+    except Exception as e:
+        log.warning(f"Phase0 daily attribution failed: {e}")
+
+
+def _phase0_prune(db_path: str) -> None:
+    """Phase 0: Prune old book/scoring snapshots (keep 7 days)."""
+    try:
+        from database import BotDatabase
+        db = BotDatabase(db_path)
+        db.prune_phase0_data(retention_days=7)
+    except Exception as e:
+        log.debug(f"Phase0 prune failed: {e}")
+
+
 def run_once(
     db_path: str = "bot_history.db",
     output_path: str = "market_allocations.json",
@@ -187,11 +314,15 @@ def run_once(
             f"skipped {len(deploy_cids) - placed_count} ({dict(skip_reasons)})"
         )
 
-    # Step 6: Summary
+    # Step 6: Phase 0 — daily reward attribution + pruning
+    _phase0_daily_attribution(db_path, metrics, correction_factor)
+    _phase0_prune(db_path)
+
+    # Step 7: Summary
     summary = generate_summary(allocations)
     print(summary)
 
-    # Step 7: Write allocations (unless dry-run)
+    # Step 8: Write allocations (unless dry-run)
     if dry_run:
         log.info("[DRY RUN] Would write allocations — skipping")
     else:

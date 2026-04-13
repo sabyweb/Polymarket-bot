@@ -408,8 +408,10 @@ def fetch_actual_rewards() -> dict[str, float]:
 def fetch_reward_correction_factor(hours: float = 24) -> float:
     """Compute correction factor: actual_daily_payout / estimated_daily_total.
 
-    Fetches actual reward payouts from Data API (lump sums), computes total
-    paid in the lookback window, and returns a scaling factor for Q-score estimates.
+    Fetches actual reward payouts AND maker rebates from Data API (lump sums),
+    computes total paid in the lookback window, and returns a scaling factor
+    for Q-score estimates. Both REWARD and MAKER_REBATE are separate payout
+    streams that contribute to total income from reward farming.
 
     Returns:
         Correction factor (e.g. 0.5 means estimates are 2× too high).
@@ -433,37 +435,40 @@ def fetch_reward_correction_factor(hours: float = 24) -> float:
         limit = 500
         payout_count = 0
 
-        while True:
-            resp = requests.get(
-                "https://data-api.polymarket.com/activity",
-                params={
-                    "user": funder,
-                    "type": "REWARD",
-                    "limit": limit,
-                    "offset": offset,
-                },
-                timeout=15,
-            )
-            if resp.status_code != 200:
-                break
+        # Fetch both REWARD and MAKER_REBATE — they are separate payout streams
+        for payout_type in ("REWARD", "MAKER_REBATE"):
+            type_offset = 0
+            while True:
+                resp = requests.get(
+                    "https://data-api.polymarket.com/activity",
+                    params={
+                        "user": funder,
+                        "type": payout_type,
+                        "limit": limit,
+                        "offset": type_offset,
+                    },
+                    timeout=15,
+                )
+                if resp.status_code != 200:
+                    break
 
-            data = resp.json()
-            if not data:
-                break
+                data = resp.json()
+                if not data:
+                    break
 
-            for item in data:
-                ts = float(item.get("timestamp", 0))
-                if ts < cutoff_ts:
-                    continue
-                amount = float(item.get("usdcSize", 0) or item.get("amount", 0))
-                if amount > 0:
-                    total_paid += amount
-                    payout_count += 1
+                for item in data:
+                    ts = float(item.get("timestamp", 0))
+                    if ts < cutoff_ts:
+                        continue
+                    amount = float(item.get("usdcSize", 0) or item.get("amount", 0))
+                    if amount > 0:
+                        total_paid += amount
+                        payout_count += 1
 
-            if len(data) < limit:
-                break
-            offset += limit
-            time.sleep(0.2)
+                if len(data) < limit:
+                    break
+                type_offset += limit
+                time.sleep(0.2)
 
         if total_paid > 0:
             log.info(

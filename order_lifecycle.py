@@ -139,11 +139,27 @@ class OrderLifecycle:
 
         from price import to_clob
         clob_cost = to_clob(fill_price, side)
+        # Compute enrichment data for Phase 0 learning
+        _order_age = time.time() - slot.placed_at if slot.placed_at > 0 else 0
+        _pos_usd = 0.0
+        try:
+            _yes_sh = self.positions.get_shares(cid, "yes")
+            _no_sh = self.positions.get_shares(cid, "no")
+            _yes_cost = _yes_sh * self.positions.get_avg_price(cid, "yes")
+            _no_cost = _no_sh * (1 - self.positions.get_avg_price(cid, "no")) if _no_sh > 0 else 0
+            _pos_usd = _yes_cost + _no_cost
+        except Exception:
+            pass
         self.db.log_fill(
             condition_id=cid, question=ms.question,
             side=side, fill_type="FULL",
             shares=filled_shares, price=fill_price,
             clob_cost=clob_cost, usd_value=filled_shares * clob_cost,
+            midpoint=ms.midpoint,
+            slippage=clob_cost - ms.midpoint if ms.midpoint > 0 else 0,
+            order_age_secs=_order_age,
+            position_usd_after=_pos_usd,
+            reward_rate_hr=ms.daily_rate / 24.0 if ms.daily_rate > 0 else 0,
         )
 
         alert_fill(
@@ -194,6 +210,19 @@ class OrderLifecycle:
         midpoint = (best_bid + best_ask) / 2
         ms.midpoint = midpoint
         ms.last_book_fetch = time.time()
+
+        # ── Phase 0: Log book snapshot (zero extra API calls) ──
+        try:
+            self.db.log_book_snapshot(
+                condition_id=ms.cid, merged=merged,
+                best_bid=best_bid, best_ask=best_ask, midpoint=midpoint,
+                our_bid=ms.orders["yes"].price if ms.orders["yes"].order_id else 0,
+                our_ask=ms.orders["no"].price if ms.orders["no"].order_id else 0,
+                daily_rate=ms.daily_rate, max_spread=ms.max_spread,
+                agent_shares=ms.agent_shares,
+            )
+        except Exception:
+            pass  # never break production
 
         if best_ask - best_bid > cfg("RF_MAX_BOOK_SPREAD"):
             self.db.write_placement_feedback(ms.cid, "yes", "skipped", "wide_spread")
