@@ -222,7 +222,7 @@ def run_once(
     capital: float = 1500.0,
     dry_run: bool = False,
 ) -> dict:
-    """One full cycle: collect → score → allocate → write.
+    """One full cycle: collect → score → allocate → safety check → write.
 
     Returns summary dict for logging/testing.
     """
@@ -231,6 +231,10 @@ def run_once(
     from oversight.allocation_writer import (
         compute_allocations, write_allocations, generate_summary,
     )
+    from oversight.safety_controller import SafetyController
+
+    # Initialize safety controller (loads persisted state from DB)
+    safety = SafetyController(db_path=db_path)
 
     # Step 1: Compute available capital
     # Prefer actual USDC balance from exchange (written by bot every ~5 min)
@@ -262,28 +266,91 @@ def run_once(
 
     # Step 2: Collect metrics + correction factor
     log.info(f"Collecting metrics (lookback={hours:.0f}h, db={db_path})...")
-    metrics, correction_factor = collect_all(db_path=db_path, hours=hours)
+    collect_result = collect_all(db_path=db_path, hours=hours)
+
+    # collect_all now returns 4 values: (metrics, cf, rate_delta, completeness)
+    if len(collect_result) == 4:
+        metrics, correction_factor, clob_rate_delta, data_completeness = collect_result
+    else:
+        # Backward compat if old collect_all returns 2
+        metrics, correction_factor = collect_result[0], collect_result[1]
+        clob_rate_delta, data_completeness = 0.0, 1.0
 
     if not metrics:
         log.warning("No market data collected — skipping allocation")
         return {"status": "no_data", "markets": 0}
 
+    # Step 2b: Safety evaluation — check system state BEFORE scoring
+    # GAP 1 FIX: Use DEPLOYED markets only for est/actual ratio.
+    # collect_all() already computes this internally. We replicate the
+    # logic here for the safety controller's independent check.
+    from oversight.data_collector import _load_deployed_cids
+    deployed_cids = _load_deployed_cids(db_path)
+    if deployed_cids:
+        estimated_daily_total = sum(
+            m.daily_rate * min(m.q_share_pct, 0.5)
+            for m in metrics
+            if m.q_share_pct > 0 and m.condition_id in deployed_cids
+        )
+    else:
+        # No deployment data — use on-book markets as proxy
+        estimated_daily_total = sum(
+            m.daily_rate * min(m.q_share_pct, 0.5)
+            for m in metrics
+            if m.q_share_pct > 0 and m.on_book_hours > 0
+        )
+    actual_daily_payout = 0.0
+    try:
+        from oversight.data_collector import fetch_reward_correction_factor
+        actual_daily_payout = fetch_reward_correction_factor(hours=24)
+    except Exception:
+        pass
+    fill_damage_24h = safety.query_24h_fill_damage()
+    fill_damage_7d = safety.query_7d_fill_damage()
+    num_scoring = safety.count_scoring_markets()
+
+    # Compute raw CF for safety evaluation (before smoothing)
+    raw_cf = 0.0
+    if actual_daily_payout > 0 and estimated_daily_total > 0:
+        actual_per_day = actual_daily_payout / max(hours / 24, 0.1)
+        raw_cf = actual_per_day / estimated_daily_total
+
+    safety_state = safety.evaluate(
+        correction_factor_raw=raw_cf,
+        estimated_daily_total=estimated_daily_total,
+        actual_daily_payout=actual_daily_payout,
+        fill_damage_24h=fill_damage_24h,
+        reward_payout_24h=actual_daily_payout,
+        num_scoring_markets=num_scoring,
+        fill_damage_7d=fill_damage_7d,
+        clob_rate_delta_pct=clob_rate_delta,
+        data_completeness=data_completeness,
+    )
+    log.info(
+        f"Safety state: {safety_state} | CF_raw={raw_cf:.4f} | "
+        f"est_daily=${estimated_daily_total:.2f} | actual=${actual_daily_payout:.2f} | "
+        f"fill_damage_24h=${fill_damage_24h:.2f} | fill_damage_7d=${fill_damage_7d:.2f} | "
+        f"scoring_markets={num_scoring} | rate_delta={clob_rate_delta:+.1%} | "
+        f"data_completeness={data_completeness:.0%}"
+    )
+
     # Step 3: Score (with correction factor from actual payouts)
-    log.info(f"Scoring {len(metrics)} markets (reward correction={correction_factor:.2f})...")
+    log.info(f"Scoring {len(metrics)} markets (reward correction={correction_factor:.4f})...")
     scored = rank_markets(metrics, hours=hours, correction_factor=correction_factor, db_path=db_path)
 
     # Step 4: Allocate with ACTUAL available capital
     log.info(f"Computing allocations (${available_capital:.0f} available)...")
     allocations = compute_allocations(scored, total_capital=available_capital)
+
+    # Step 4b: SAFETY GATE — filter allocations based on system state
+    allocations = safety.filter_allocations(allocations, available_capital)
+
     raw_deployed = sum(
         a.get("shares_per_side", 0)
         * max(0.10, (1.0 - 2 * a.get("max_spread", 0.045)) / 2)
         * 2
         for a in allocations if a["action"] == "deploy"
     )
-    # Cap at available capital — the allocator doesn't enforce budget
-    # (bot stops on exchange balance error), but the written total should
-    # reflect reality, not the sum of all deploy markets.
     total_deployed = min(raw_deployed, available_capital)
 
     # Step 5: Write performance snapshots (adaptive tracking)
@@ -304,7 +371,6 @@ def run_once(
         if yes_placed or no_placed:
             placed_count += 1
         else:
-            # Both sides skipped or no feedback yet
             for side in ["yes", "no"]:
                 reason = fb.get(side, {}).get("reason", "no_feedback")
                 skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
@@ -321,6 +387,7 @@ def run_once(
     # Step 7: Summary
     summary = generate_summary(allocations)
     print(summary)
+    print(f"\n[Safety: {safety_state}]")
 
     # Step 8: Write allocations (unless dry-run)
     if dry_run:
@@ -337,6 +404,7 @@ def run_once(
         "markets_deploy": deploy_count,
         "markets_avoid": avoid_count,
         "correction_factor": correction_factor,
+        "safety_state": safety_state,
         "dry_run": dry_run,
     }
 

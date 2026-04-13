@@ -112,6 +112,9 @@ class RewardFarmer:
         self._alloc_mtime = 0.0
         self._last_reconcile = 0.0
         self._last_exchange_sync = 0.0
+        # Issue 3: Cross-market fill storm detector
+        self._global_fill_times: list[float] = []  # timestamps of all fills across all markets
+        self._fill_storm_until: float = 0.0  # if > time.time(), halt new placements
 
     # ── Startup ─────────────────────────────────────────────────────
 
@@ -952,13 +955,49 @@ class RewardFarmer:
         # expiring within 1 hour.
         self._sweep_expiring_markets()
 
+        # Step 3.6: Cross-market fill storm detection (Issue 3)
+        # If ≥5 fills across ALL markets within 5 minutes, halt new
+        # placements for 10 minutes. Catches correlated fill events
+        # that per-market breakers miss.
+        STORM_WINDOW_SECS = 300  # 5 minutes
+        STORM_THRESHOLD = 5     # fills across all markets
+        STORM_HALT_SECS = 600   # 10-minute halt
+        now = time.time()
+        # Count recent fills from all markets' fill_times
+        global_recent = 0
+        for ms in self.markets.values():
+            for side in ("yes", "no"):
+                global_recent += sum(1 for t in ms.fill_times.get(side, []) if now - t < STORM_WINDOW_SECS)
+        if global_recent >= STORM_THRESHOLD and now >= self._fill_storm_until:
+            self._fill_storm_until = now + STORM_HALT_SECS
+            log.warning(
+                f"FILL STORM DETECTED: {global_recent} fills in {STORM_WINDOW_SECS}s "
+                f"across all markets. Halting new placements for {STORM_HALT_SECS}s."
+            )
+            # Log to DB so agent can see it
+            try:
+                self.db.execute_sql(
+                    "INSERT INTO fills (ts, condition_id, side, fill_type, shares, price, clob_cost, usd_value) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (now, "__FILL_STORM__", "both", "STORM_ALERT", 0, 0, 0, 0),
+                )
+            except Exception:
+                pass
+
         # Step 4: Place orders on priority batch
         market_list = list(self.markets.values())
         if not market_list:
             return
-        batch = self.order_lifecycle.get_priority_batch(market_list)
-        for ms in batch:
-            self.order_lifecycle.place_orders_for_market(ms)
+
+        # If fill storm active, skip all new placements
+        if time.time() < self._fill_storm_until:
+            remaining = self._fill_storm_until - time.time()
+            if self.cycle_count % 10 == 0:  # log every ~5min
+                log.warning(f"Fill storm halt active — {remaining:.0f}s remaining, skipping placements")
+        else:
+            batch = self.order_lifecycle.get_priority_batch(market_list)
+            for ms in batch:
+                self.order_lifecycle.place_orders_for_market(ms)
 
         # Step 4b: Remove dead markets (3+ consecutive book failures = resolved/delisted)
         BOOK_FAILURE_LIMIT = 3

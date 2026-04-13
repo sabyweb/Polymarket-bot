@@ -49,18 +49,21 @@ def score_market(m: MarketMetrics, hours: float = 24, correction_factor: float =
             > 1.0 means our estimates are too low.
             1.0 means no correction data available.
 
-    Score = corrected_daily_reward - daily_fill_damage + zero_fill_bonus
-    Zero-fill bonus is capped at $2/day so low-rate markets can't outrank
-    genuinely profitable ones purely on fill luck.
+    Score = corrected_daily_reward - daily_fill_damage
     """
+    # Cap q_share at 0.5 — no market sustainably yields >50% of the Q pool.
+    # Cumulative q_share_pct can be 1.0 from early entry with no competition;
+    # this cap prevents that stale data from inflating estimates.
+    q_share = min(m.q_share_pct, 0.5)
+
     # Estimated daily reward, corrected by actual payout data
-    estimated_daily = m.daily_rate * m.q_share_pct
+    estimated_daily = m.daily_rate * q_share
     effective_daily = estimated_daily * correction_factor
 
     if correction_factor != 1.0 and estimated_daily > 0:
         log.debug(
             f"Score {m.condition_id[:12]}: est=${estimated_daily:.2f}/d "
-            f"× {correction_factor:.2f} = ${effective_daily:.2f}/d"
+            f"× {correction_factor:.4f} = ${effective_daily:.4f}/d"
         )
 
     # Fill penalty: total damage in the window, scaled to daily
@@ -70,12 +73,11 @@ def score_market(m: MarketMetrics, hours: float = 24, correction_factor: float =
     # Score: what we earn minus what we lose, per day
     score = effective_daily - daily_damage
 
-    # Bonus for zero fills — capped so a $0.01/day market with zero fills
-    # can't outscore a $50/day market with minor fill damage.
-    # Cap: min(50% of effective, $2/day) — meaningful for real markets,
-    # negligible for dust-rate ones.
-    if m.fill_count_recent == 0 and effective_daily > 0:
-        score += min(effective_daily * 0.5, 2.0)
+    # Zero-fill bonus REMOVED. The old bonus added up to $2/day for markets
+    # with zero fills, which rewarded lack of data rather than proven safety.
+    # With inflated q_share estimates, it amplified scores of unproven
+    # markets by 50%. Markets prove themselves through actual earnings,
+    # not by avoiding fills while no one is watching.
 
     return score
 
@@ -84,6 +86,7 @@ def classify_market(
     m: MarketMetrics,
     score: float,
     default_shares: int = 50,
+    correction_factor: float = 1.0,
 ) -> ScoredMarket:
     """Classify a market as deploy/avoid and set sizing.
 
@@ -102,6 +105,31 @@ def classify_market(
         confidence = "medium"
     else:
         confidence = "low"
+
+    # ── Minimum effective reward gate ──
+    # After correction, if a market's expected daily reward is below $0.10/day,
+    # it cannot justify the fill risk and capital lockup. This gate catches
+    # markets where q_share is near-zero or correction_factor is very low,
+    # regardless of score positivity.
+    q_share = min(m.q_share_pct, 0.5)
+    effective_daily = m.daily_rate * q_share * correction_factor
+    MIN_EFFECTIVE_DAILY = 0.10  # $0.10/day minimum
+    if effective_daily < MIN_EFFECTIVE_DAILY and m.on_book_hours > 2 and q_share > 0:
+        spread = m.max_spread if m.max_spread > 0 else 0.045
+        cost_per_share_both = 2 * max(0.05, (1.0 - 2 * spread) / 2)
+        return ScoredMarket(
+            condition_id=m.condition_id, question=m.question,
+            score=score, action="avoid",
+            recommended_shares=0,
+            reason=f"Effective reward ${effective_daily:.3f}/d < ${MIN_EFFECTIVE_DAILY}/d min",
+            confidence=confidence,
+            actual_reward_total=m.actual_reward_total,
+            fill_damage=fill_damage, fill_count=m.fill_count_recent,
+            daily_rate=m.daily_rate, min_size=m.min_size, max_spread=m.max_spread,
+            est_capital_cost=0.0, locked_position_usd=m.current_position_usd,
+            question_group=getattr(m, "question_group", ""),
+            q_share_pct=m.q_share_pct, end_date_iso=getattr(m, "end_date_iso", ""),
+        )
 
     # ── Capital-aware continuous sizing ──
     # Think in DOLLARS, not shares. A share at $0.02 costs 50× less than one
@@ -670,7 +698,7 @@ def rank_markets(
                     f"{hist['snapshots']} snapshots)"
                 )
 
-        sm = classify_market(m, s)
+        sm = classify_market(m, s, correction_factor=correction_factor)
 
         # Apply confidence ramp-up to sizing (not score)
         if confidence_mult < 1.0 and sm.recommended_shares > 0:

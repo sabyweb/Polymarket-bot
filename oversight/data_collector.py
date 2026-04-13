@@ -17,6 +17,50 @@ log = logging.getLogger("oversight.collector")
 _REWARD_MARKETS_CACHE_TTL = 2 * 3600  # 2h — stale cache is better than no data
 
 
+def _connect_db(db_path: str, timeout: int = 10) -> sqlite3.Connection:
+    """Open a SQLite connection with WAL mode and retry on lock.
+
+    The bot process writes to bot_history.db every 30s. The agent reads
+    every 30min. Without WAL, concurrent access causes
+    'database is locked' errors that silently return empty data.
+    WAL allows concurrent readers + single writer.
+    """
+    db = sqlite3.connect(db_path, timeout=timeout)
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA busy_timeout=10000")  # 10s wait on lock
+    db.row_factory = sqlite3.Row
+    return db
+
+
+def _query_with_retry(db_path: str, query: str, params: tuple = (),
+                       fetch: str = "all") -> list | None:
+    """Execute a read query with one retry on lock failure.
+
+    Returns list of rows, or None on failure (never empty-as-failure).
+    Callers MUST distinguish None (query failed) from [] (no results).
+    """
+    for attempt in range(2):
+        try:
+            db = _connect_db(db_path)
+            if fetch == "all":
+                result = db.execute(query, params).fetchall()
+            else:
+                result = db.execute(query, params).fetchone()
+            db.close()
+            return result if result is not None else []
+        except sqlite3.OperationalError as e:
+            if attempt == 0 and "locked" in str(e).lower():
+                log.warning(f"DB locked on read, retrying in 2s: {e}")
+                time.sleep(2)
+                continue
+            log.warning(f"DB query failed after retry: {e}")
+            return None
+        except Exception as e:
+            log.warning(f"DB query error: {e}")
+            return None
+    return None
+
+
 def _fetch_all_clob_reward_markets(
     min_rate: float = 5.0,
     db_path: str = "bot_history.db",
@@ -113,6 +157,47 @@ def _save_reward_markets_cache(markets: dict[str, dict], db_path: str) -> None:
         db.close()
     except Exception as e:
         log.debug(f"Failed to cache reward markets: {e}")
+
+
+def compute_clob_rate_delta(
+    current_markets: dict[str, dict],
+    db_path: str = "bot_history.db",
+) -> float:
+    """Compare current CLOB total reward rate against previous cache.
+
+    Returns percentage change: (current - previous) / previous.
+    Positive = rates increased, negative = rates decreased.
+    Returns 0.0 if no previous cache exists.
+
+    This is a FORWARD-LOOKING indicator: CLOB rates change immediately
+    when Polymarket adjusts rewards, while Data API payouts lag by 24h.
+    A -30% delta means the payout window is stale and the correction
+    factor will be wrong for the next 24h.
+    """
+    current_total = sum(m.get("daily_rate", 0) for m in current_markets.values())
+    if current_total <= 0:
+        return 0.0
+
+    try:
+        db = sqlite3.connect(db_path, timeout=5)
+        row = db.execute(
+            "SELECT SUM(daily_rate) as total FROM reward_markets_cache"
+        ).fetchone()
+        db.close()
+        previous_total = row[0] if row and row[0] else 0
+    except Exception:
+        return 0.0
+
+    if previous_total <= 0:
+        return 0.0
+
+    delta_pct = (current_total - previous_total) / previous_total
+    if abs(delta_pct) > 0.10:
+        log.info(
+            f"CLOB rate delta: {delta_pct:+.1%} "
+            f"(${previous_total:.0f}/d → ${current_total:.0f}/d)"
+        )
+    return delta_pct
 
 
 def _load_reward_markets_cache(db_path: str, min_rate: float) -> dict[str, dict]:
@@ -406,16 +491,18 @@ def fetch_actual_rewards() -> dict[str, float]:
 
 
 def fetch_reward_correction_factor(hours: float = 24) -> float:
-    """Compute correction factor: actual_daily_payout / estimated_daily_total.
+    """Fetch actual REWARD payouts from Data API for correction factor computation.
 
-    Fetches actual reward payouts AND maker rebates from Data API (lump sums),
-    computes total paid in the lookback window, and returns a scaling factor
-    for Q-score estimates. Both REWARD and MAKER_REBATE are separate payout
-    streams that contribute to total income from reward farming.
+    Only uses REWARD type for correction factor — NOT MAKER_REBATE.
+    MAKER_REBATE is earned on ALL trades including damage-control unwinds,
+    so including it would inflate the correction factor with revenue that
+    comes from losing trades (double-counting: loss in fill_damage,
+    partial recovery in rebate). MAKER_REBATE is still tracked separately
+    in Phase 0 daily attribution for total income reporting.
 
     Returns:
-        Correction factor (e.g. 0.5 means estimates are 2× too high).
-        Returns 1.0 if no data available (no correction).
+        Total REWARD amount paid in the lookback window (raw, not a factor).
+        Returns 0.0 if no data available.
     """
     import requests
 
@@ -426,16 +513,17 @@ def fetch_reward_correction_factor(hours: float = 24) -> float:
         funder = os.getenv("WALLET_ADDRESS", "")
     if not funder:
         log.debug("No FUNDER or WALLET_ADDRESS — cannot compute correction factor")
-        return 1.0
+        return 0.0
 
     try:
         cutoff_ts = time.time() - hours * 3600
-        total_paid = 0.0
-        offset = 0
+        reward_total = 0.0
+        rebate_total = 0.0
         limit = 500
-        payout_count = 0
+        reward_count = 0
+        rebate_count = 0
 
-        # Fetch both REWARD and MAKER_REBATE — they are separate payout streams
+        # Fetch REWARD and MAKER_REBATE separately for clean accounting
         for payout_type in ("REWARD", "MAKER_REBATE"):
             type_offset = 0
             while True:
@@ -462,23 +550,30 @@ def fetch_reward_correction_factor(hours: float = 24) -> float:
                         continue
                     amount = float(item.get("usdcSize", 0) or item.get("amount", 0))
                     if amount > 0:
-                        total_paid += amount
-                        payout_count += 1
+                        if payout_type == "REWARD":
+                            reward_total += amount
+                            reward_count += 1
+                        else:
+                            rebate_total += amount
+                            rebate_count += 1
 
                 if len(data) < limit:
                     break
                 type_offset += limit
                 time.sleep(0.2)
 
-        if total_paid > 0:
+        if reward_total > 0 or rebate_total > 0:
             log.info(
-                f"Reward correction: ${total_paid:.2f} paid in {payout_count} payouts "
-                f"over {hours:.0f}h"
+                f"Payouts ({hours:.0f}h): REWARD=${reward_total:.2f} ({reward_count}), "
+                f"MAKER_REBATE=${rebate_total:.2f} ({rebate_count}), "
+                f"combined=${reward_total + rebate_total:.2f}"
             )
         else:
             log.debug(f"No reward payouts found in {hours:.0f}h window")
 
-        return total_paid  # Return raw total; caller computes the factor
+        # Return ONLY reward total for correction factor computation.
+        # MAKER_REBATE is excluded to prevent inflation from unwind rebates.
+        return reward_total
 
     except Exception as e:
         log.warning(f"Reward correction factor fetch failed: {e}")
@@ -642,28 +737,231 @@ def query_positions(db_path: str) -> dict[str, dict]:
         return {}
 
 
+def _detect_book_depth_changes(db_path: str) -> set[str]:
+    """Issue 10: Detect markets with rapid book depth changes.
+
+    Returns set of condition_ids where depth changed >3x between the
+    latest two book_snapshots. These markets need a shorter scoring
+    window because a competitor may have just entered or exited.
+    """
+    try:
+        db = sqlite3.connect(db_path, timeout=5)
+        db.row_factory = sqlite3.Row
+        # Compare latest vs second-latest snapshot per market
+        rows = db.execute(
+            """WITH ranked AS (
+                SELECT condition_id, bid_depth_5c, ask_depth_5c, ts,
+                       ROW_NUMBER() OVER (PARTITION BY condition_id ORDER BY ts DESC) as rn
+                FROM book_snapshots
+                WHERE ts > ?
+            )
+            SELECT a.condition_id,
+                   a.bid_depth_5c as bid_new, a.ask_depth_5c as ask_new,
+                   b.bid_depth_5c as bid_old, b.ask_depth_5c as ask_old
+            FROM ranked a JOIN ranked b
+                ON a.condition_id = b.condition_id
+            WHERE a.rn = 1 AND b.rn = 2""",
+            (time.time() - 3600,),  # last 1h of snapshots
+        ).fetchall()
+        db.close()
+
+        changed = set()
+        for r in rows:
+            old_depth = (r["bid_old"] or 0) + (r["ask_old"] or 0)
+            new_depth = (r["bid_new"] or 0) + (r["ask_new"] or 0)
+            if old_depth > 10 and new_depth > 10:
+                ratio = new_depth / old_depth if old_depth > 0 else 1.0
+                if ratio > 3.0 or ratio < 0.33:
+                    changed.add(r["condition_id"])
+        if changed:
+            log.info(f"Book depth shift detected on {len(changed)} markets (>3x change)")
+        return changed
+    except Exception:
+        return set()
+
+
+def _query_windowed_scoring(db_path: str, window_hours: float = 4.0) -> dict[str, dict]:
+    """Compute q_share from scoring_snapshots (Phase 0 data) over a recent window.
+
+    Returns {condition_id: {"scoring_ratio": float, "samples": int}}.
+
+    scoring_ratio = count(scoring=True) / count(total) for each market.
+    This measures what fraction of the time our orders are actually scoring,
+    which is an upper bound on our Q-share. Unlike the cumulative
+    total_q_score / total_market_q from reward_tracker, this decays
+    naturally as the window slides — no stale 1.0 values from Day 1.
+
+    Issue 10: Markets with rapid book depth changes get a 1h window
+    instead of 4h, so q_share reflects the new competitive landscape
+    within minutes instead of hours.
+    """
+    # Detect markets needing short window
+    depth_changed = _detect_book_depth_changes(db_path)
+
+    cutoff_normal = time.time() - window_hours * 3600
+    cutoff_fast = time.time() - 1.0 * 3600  # 1h for fast-react markets
+
+    try:
+        db = sqlite3.connect(db_path, timeout=5)
+        db.row_factory = sqlite3.Row
+
+        # Fetch ALL scoring data in the wider window
+        rows = db.execute(
+            """SELECT condition_id, ts,
+                      COUNT(*) as total,
+                      SUM(CASE WHEN scoring = 1 THEN 1 ELSE 0 END) as scoring_count
+               FROM scoring_snapshots
+               WHERE ts > ?
+               GROUP BY condition_id""",
+            (cutoff_normal,),
+        ).fetchall()
+
+        # Also fetch narrow window for fast-react markets
+        fast_rows = {}
+        if depth_changed:
+            for r in db.execute(
+                """SELECT condition_id,
+                          COUNT(*) as total,
+                          SUM(CASE WHEN scoring = 1 THEN 1 ELSE 0 END) as scoring_count
+                   FROM scoring_snapshots
+                   WHERE ts > ?
+                   GROUP BY condition_id""",
+                (cutoff_fast,),
+            ).fetchall():
+                if r["condition_id"] in depth_changed:
+                    fast_rows[r["condition_id"]] = r
+
+        db.close()
+
+        result = {}
+        fast_used = 0
+        for r in rows:
+            cid = r["condition_id"]
+            # Issue 10: prefer narrow window for depth-changed markets
+            if cid in fast_rows and fast_rows[cid]["total"] >= 2:
+                fr = fast_rows[cid]
+                total = fr["total"]
+                scoring = fr["scoring_count"]
+                fast_used += 1
+            else:
+                total = r["total"]
+                scoring = r["scoring_count"]
+
+            if total >= 2:
+                result[cid] = {
+                    "scoring_ratio": scoring / total,
+                    "samples": total,
+                }
+
+        if result:
+            log.debug(
+                f"Windowed scoring: {len(result)} markets "
+                f"({fast_used} using 1h fast window, rest {window_hours}h)"
+            )
+        return result
+    except Exception as e:
+        log.debug(f"Windowed scoring query failed: {e}")
+        return {}
+
+
 def query_reward_stats(db_path: str) -> dict[str, dict]:
     """Query reward_market_stats for Q-score, on-book data, and regime signals.
+
+    Q-share computation strategy (prioritized):
+    1. Use windowed scoring_ratio from scoring_snapshots (Phase 0, last 4h)
+       — this naturally decays, preventing stale 1.0 values
+    2. Fall back to cumulative total_q_score / total_market_q
+       — but cap at 0.5 if on_book > 4h (stale cumulative data is suspect)
+    3. Default to 0.0 for unknown markets
 
     Returns {condition_id: {rate, q_share, on_book_hrs, question, fills,
     cycles_with_orders, total_cycles, avg_bid, avg_ask, adverse_fills,
     spread_capture_usd, cycles_in_reward_window, cycles_both_in_window,
     total_market_q}}.
     """
+    # Get windowed scoring data first (preferred source for q_share)
+    windowed = _query_windowed_scoring(db_path, window_hours=4.0)
+
+    # GAP 3: Get last-seen timestamps for stale market decay
+    last_seen_map: dict[str, float] = {}
+    try:
+        _lsdb = sqlite3.connect(db_path, timeout=5)
+        _lsdb.row_factory = sqlite3.Row
+        # Last scoring snapshot per market = last time bot had orders on this market
+        for r in _lsdb.execute(
+            "SELECT condition_id, MAX(ts) as last_ts FROM scoring_snapshots GROUP BY condition_id"
+        ).fetchall():
+            last_seen_map[r["condition_id"]] = r["last_ts"]
+        _lsdb.close()
+    except Exception:
+        pass
+    now_ts = time.time()
+
     try:
         db = sqlite3.connect(db_path, timeout=5)
         db.row_factory = sqlite3.Row
         rows = db.execute("SELECT * FROM reward_market_stats").fetchall()
         db.close()
         result = {}
+        windowed_used = 0
+        cumulative_capped = 0
+        stale_decayed = 0
+        stale_excluded = 0
         for r in rows:
             d = json.loads(r["data"])
-            q_share = 0.0
+            cid = d["condition_id"]
             total_market_q = d.get("total_market_q", 0)
-            if total_market_q > 0 and d.get("q_score_samples", 0) > 0:
-                q_share = d["total_q_score"] / total_market_q
             on_book = d.get("time_on_book_secs", 0) / 3600
-            result[d["condition_id"]] = {
+
+            # GAP 3: Stale market decay
+            # Markets not seen in >24h are excluded entirely (q_share=0, marked stale).
+            # Markets not seen in >6h get q_share forced to 0 (data too old to trust).
+            last_seen = last_seen_map.get(cid, 0)
+            hours_since_seen = (now_ts - last_seen) / 3600 if last_seen > 0 else float("inf")
+
+            if hours_since_seen > 24 and on_book > 1:
+                # Completely stale — exclude from all calculations
+                q_share = 0.0
+                stale_excluded += 1
+                result[cid] = {
+                    "rate": d.get("daily_rate", 0),
+                    "q_share": 0.0,
+                    "on_book_hrs": on_book,
+                    "question": d.get("question", ""),
+                    "fills": d.get("buy_fills", 0),
+                    "cycles_with_orders": d.get("cycles_with_orders", 0),
+                    "total_cycles": d.get("total_cycles", 0),
+                    "avg_bid": d.get("avg_bid_price", 0),
+                    "avg_ask": d.get("avg_ask_price", 0),
+                    "adverse_fills": d.get("adverse_fills", 0),
+                    "spread_capture_usd": d.get("spread_capture_usd", 0),
+                    "cycles_in_reward_window": d.get("cycles_in_reward_window", 0),
+                    "cycles_both_in_window": d.get("cycles_both_in_window", 0),
+                    "total_market_q": total_market_q,
+                    "_stale": True,
+                }
+                continue
+
+            if hours_since_seen > 6 and on_book > 1:
+                # Moderately stale — force q_share to 0 (no trust in old data)
+                q_share = 0.0
+                stale_decayed += 1
+            else:
+                # Priority 1: windowed scoring data from Phase 0
+                ws = windowed.get(cid)
+                if ws and ws["samples"] >= 3:
+                    q_share = min(ws["scoring_ratio"] * 0.5, 0.5)
+                    windowed_used += 1
+                else:
+                    # Priority 2: cumulative from reward_tracker
+                    q_share = 0.0
+                    if total_market_q > 0 and d.get("q_score_samples", 0) > 0:
+                        q_share = d["total_q_score"] / total_market_q
+                        if on_book > 4.0 and q_share > 0.5:
+                            q_share = 0.5
+                            cumulative_capped += 1
+
+            result[cid] = {
                 "rate": d.get("daily_rate", 0),
                 "q_share": q_share,
                 "on_book_hrs": on_book,
@@ -680,6 +978,11 @@ def query_reward_stats(db_path: str) -> dict[str, dict]:
                 "cycles_both_in_window": d.get("cycles_both_in_window", 0),
                 "total_market_q": total_market_q,
             }
+        if windowed_used or stale_decayed or stale_excluded:
+            log.info(
+                f"Q-share: {windowed_used} windowed, {cumulative_capped} cumulative capped, "
+                f"{stale_decayed} decayed (>6h), {stale_excluded} excluded (>24h)"
+            )
         return result
     except Exception as e:
         log.warning(f"Reward stats query failed: {e}")
@@ -821,6 +1124,10 @@ def _smooth_correction_factor(
     Stores each raw observation with timestamp. On read, computes an
     exponential moving average so a single noisy day doesn't whip the factor.
 
+    Circuit breaker: if raw_factor < 0.01 (estimates > 100x reality),
+    skip smoothing and use raw directly — the model is broken and EMA
+    would take 10+ cycles to converge, losing money the entire time.
+
     If no new observation this cycle, returns the last stored EMA (or 1.0).
     """
     try:
@@ -841,9 +1148,30 @@ def _smooth_correction_factor(
         prev_smoothed = row[0] if row else 1.0
 
         if has_new_observation:
-            # EMA: new_smoothed = alpha * raw + (1 - alpha) * prev_smoothed
-            smoothed = alpha * raw_factor + (1 - alpha) * prev_smoothed
-            smoothed = max(0.1, min(10.0, smoothed))
+            # Circuit breaker: if raw is extremely low, the model is broken.
+            # Don't smooth — jump directly to reality so the system reacts
+            # within 1 cycle instead of 10+.
+            if raw_factor < 0.01:
+                log.warning(
+                    f"CIRCUIT BREAKER: raw correction factor {raw_factor:.6f} "
+                    f"< 0.01 (estimates >100x reality). Skipping EMA, using raw."
+                )
+                smoothed = raw_factor
+            elif raw_factor < 0.05 and prev_smoothed > 0.2:
+                # Fast convergence mode: raw says severe miscalibration but
+                # EMA is still high from history. Use alpha=0.7 (fast adapt).
+                smoothed = 0.7 * raw_factor + 0.3 * prev_smoothed
+                log.warning(
+                    f"FAST ADAPT: raw={raw_factor:.4f} << prev={prev_smoothed:.4f}. "
+                    f"Using alpha=0.7 → smoothed={smoothed:.4f}"
+                )
+            else:
+                # Normal EMA: new_smoothed = alpha * raw + (1 - alpha) * prev_smoothed
+                smoothed = alpha * raw_factor + (1 - alpha) * prev_smoothed
+
+            # Clamp to [0.001, 10.0] — lower bound prevents division-by-zero
+            # downstream but no longer masks catastrophic errors (old: 0.10)
+            smoothed = max(0.001, min(10.0, smoothed))
 
             db.execute(
                 "INSERT INTO correction_factor_history (ts, raw, smoothed) VALUES (?, ?, ?)",
@@ -859,15 +1187,15 @@ def _smooth_correction_factor(
             )
             db.commit()
 
-            if abs(smoothed - raw_factor) > 0.05:
+            if abs(smoothed - raw_factor) > 0.01:
                 log.info(
-                    f"Correction factor smoothed: raw={raw_factor:.3f} → "
-                    f"EMA={smoothed:.3f} (prev={prev_smoothed:.3f}, α={alpha})"
+                    f"Correction factor smoothed: raw={raw_factor:.4f} → "
+                    f"EMA={smoothed:.4f} (prev={prev_smoothed:.4f}, α={alpha})"
                 )
         else:
             smoothed = prev_smoothed
             if smoothed != 1.0:
-                log.info(f"No new payout data — using last smoothed factor={smoothed:.3f}")
+                log.info(f"No new payout data — using last smoothed factor={smoothed:.4f}")
 
         db.close()
         return smoothed
@@ -875,6 +1203,49 @@ def _smooth_correction_factor(
     except Exception as e:
         log.debug(f"Correction factor smoothing failed: {e}")
         return raw_factor if has_new_observation else 1.0
+
+
+def _load_deployed_cids(db_path: str) -> set[str]:
+    """Load condition_ids of currently deployed markets from last allocation file.
+
+    GAP 1 fix: The correction factor must use ONLY deployed markets in
+    its denominator. This function reads the previous allocation output
+    to identify which markets have capital at risk.
+
+    Falls back to markets with active orders in DB if no allocation file.
+    Returns empty set on failure (safe: collect_all will use on-book fallback).
+    """
+    import os
+
+    # Primary: read allocation file
+    alloc_path = os.path.join(os.path.dirname(db_path) or ".", "market_allocations.json")
+    try:
+        if os.path.exists(alloc_path):
+            with open(alloc_path) as f:
+                data = json.load(f)
+            deployed = {
+                m["condition_id"]
+                for m in data.get("markets", [])
+                if m.get("action") == "deploy"
+            }
+            if deployed:
+                return deployed
+    except Exception as e:
+        log.debug(f"Could not load deployed CIDs from allocation file: {e}")
+
+    # Fallback: markets with active orders in DB
+    try:
+        db = sqlite3.connect(db_path, timeout=5)
+        rows = db.execute(
+            "SELECT DISTINCT condition_id FROM active_orders"
+        ).fetchall()
+        db.close()
+        if rows:
+            return {r[0] for r in rows}
+    except Exception:
+        pass
+
+    return set()
 
 
 def collect_all(
@@ -983,19 +1354,64 @@ def collect_all(
             recent_ask=recent_prices.get(cid, {}).get("recent_ask", 0.0),
         ))
 
-    # Compute correction factor: actual total paid / sum of estimates
-    # Uses EMA smoothing so a single noisy payout day doesn't whip the factor.
-    estimated_daily_total = sum(
-        m.daily_rate * m.q_share_pct for m in metrics if m.q_share_pct > 0
-    )
+    # ── GAP 1 FIX: Portfolio-only correction factor ──
+    # The correction factor must compare actual payouts against DEPLOYED
+    # markets only — not the entire tracked universe. Including all ~300+
+    # tracked markets (most with stale q_share=0.5) inflates the
+    # denominator by 100-1000x, making the ratio permanently broken and
+    # trapping the system in UNSAFE.
+    #
+    # Load deployed CIDs from previous allocation file.
+    deployed_cids = _load_deployed_cids(db_path)
+    deployed_count = len(deployed_cids)
+
+    if deployed_cids:
+        # Portfolio calibration: only deployed markets contribute
+        estimated_daily_total = sum(
+            m.daily_rate * m.q_share_pct
+            for m in metrics
+            if m.q_share_pct > 0 and m.condition_id in deployed_cids
+        )
+        log.info(
+            f"Portfolio CF denominator: {deployed_count} deployed markets, "
+            f"est=${estimated_daily_total:.2f}/d"
+        )
+    else:
+        # No previous allocation — use all markets with on_book > 0
+        # (first run or after DB reset). This is the "exploration" estimate.
+        estimated_daily_total = sum(
+            m.daily_rate * m.q_share_pct
+            for m in metrics
+            if m.q_share_pct > 0 and m.on_book_hours > 0
+        )
+        log.info(
+            f"No deployed market set — using {sum(1 for m in metrics if m.q_share_pct > 0 and m.on_book_hours > 0)} "
+            f"on-book markets for CF, est=${estimated_daily_total:.2f}/d"
+        )
+
     raw_factor = 1.0
+    est_actual_ratio = 0.0
     if actual_daily_total > 0 and estimated_daily_total > 0:
         actual_per_day = actual_daily_total / max(hours / 24, 0.1)
         raw_factor = actual_per_day / estimated_daily_total
-        raw_factor = max(0.1, min(10.0, raw_factor))  # clamp to reasonable range
+        est_actual_ratio = estimated_daily_total / actual_per_day
+        raw_factor = max(0.001, min(10.0, raw_factor))
         log.info(
             f"Reward correction: actual=${actual_per_day:.2f}/d vs "
-            f"estimated=${estimated_daily_total:.2f}/d → raw_factor={raw_factor:.2f}"
+            f"estimated=${estimated_daily_total:.2f}/d → raw_factor={raw_factor:.4f} "
+            f"(est/actual ratio={est_actual_ratio:.1f}x, "
+            f"based on {deployed_count} deployed markets)"
+        )
+        if est_actual_ratio > 10:
+            log.warning(
+                f"MISCALIBRATION: estimates {est_actual_ratio:.0f}x higher than actual "
+                f"(deployed portfolio only)."
+            )
+    elif actual_daily_total > 0 and estimated_daily_total == 0 and deployed_count < 3:
+        # Not enough deployed markets to compute ratio — don't penalize
+        log.info(
+            f"Reward correction: actual=${actual_daily_total:.2f} but <3 deployed "
+            f"markets — skipping ratio (insufficient signal)"
         )
     elif actual_daily_total > 0:
         log.info(f"Reward correction: actual=${actual_daily_total:.2f} but no estimates to compare")
@@ -1010,8 +1426,27 @@ def collect_all(
         has_new_observation=(actual_daily_total > 0 and estimated_daily_total > 0),
     )
 
+    # Issue 2+9: Compute forward-looking rate delta and data completeness
+    clob_rate_delta = compute_clob_rate_delta(clob_reward_markets, db_path)
+    data_completeness = 1.0
+    if len(clob_reward_markets) > 0:
+        # Compare against expected: if we got <80% of what cache had, data is partial
+        try:
+            _db = sqlite3.connect(db_path, timeout=5)
+            _row = _db.execute("SELECT COUNT(*) FROM reward_markets_cache").fetchone()
+            _db.close()
+            cached_count = _row[0] if _row else 0
+            if cached_count > 0:
+                data_completeness = len(clob_reward_markets) / cached_count
+        except Exception:
+            pass
+    elif len(stats) == 0:
+        # Both CLOB and stats empty — total data failure
+        data_completeness = 0.0
+
     log.info(
         f"Collected metrics for {len(metrics)} markets | "
-        f"fills={len(fills)} positions={len(positions)} correction={correction_factor:.2f}"
+        f"fills={len(fills)} positions={len(positions)} correction={correction_factor:.4f} | "
+        f"clob_rate_delta={clob_rate_delta:+.1%} data_completeness={data_completeness:.0%}"
     )
-    return metrics, correction_factor
+    return metrics, correction_factor, clob_rate_delta, data_completeness
