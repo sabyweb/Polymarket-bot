@@ -136,7 +136,7 @@ def _fetch_clob_reward_markets_api(requests, min_rate: float) -> dict[str, dict]
 def _save_reward_markets_cache(markets: dict[str, dict], db_path: str) -> None:
     """Cache CLOB reward markets to DB for fallback on API failure."""
     try:
-        db = sqlite3.connect(db_path, timeout=5)
+        db = _connect_db(db_path)
         db.execute(
             """CREATE TABLE IF NOT EXISTS reward_markets_cache (
                 condition_id TEXT PRIMARY KEY,
@@ -178,15 +178,13 @@ def compute_clob_rate_delta(
     if current_total <= 0:
         return 0.0
 
-    try:
-        db = sqlite3.connect(db_path, timeout=5)
-        row = db.execute(
-            "SELECT SUM(daily_rate) as total FROM reward_markets_cache"
-        ).fetchone()
-        db.close()
-        previous_total = row[0] if row and row[0] else 0
-    except Exception:
+    row = _query_with_retry(
+        db_path, "SELECT SUM(daily_rate) as total FROM reward_markets_cache",
+        fetch="one",
+    )
+    if row is None:
         return 0.0
+    previous_total = row[0] if row[0] else 0
 
     if previous_total <= 0:
         return 0.0
@@ -202,25 +200,22 @@ def compute_clob_rate_delta(
 
 def _load_reward_markets_cache(db_path: str, min_rate: float) -> dict[str, dict]:
     """Load cached CLOB reward markets from DB."""
-    try:
-        db = sqlite3.connect(db_path, timeout=5)
-        db.row_factory = sqlite3.Row
-        cutoff = time.time() - _REWARD_MARKETS_CACHE_TTL
-        rows = db.execute(
-            "SELECT * FROM reward_markets_cache WHERE fetched_at > ? AND daily_rate >= ?",
-            (cutoff, min_rate),
-        ).fetchall()
-        db.close()
-        return {
-            r["condition_id"]: {
-                "daily_rate": r["daily_rate"],
-                "min_size": r["min_size"],
-                "max_spread": r["max_spread"],
-            }
-            for r in rows
-        }
-    except Exception:
+    cutoff = time.time() - _REWARD_MARKETS_CACHE_TTL
+    rows = _query_with_retry(
+        db_path,
+        "SELECT * FROM reward_markets_cache WHERE fetched_at > ? AND daily_rate >= ?",
+        (cutoff, min_rate),
+    )
+    if rows is None:
         return {}
+    return {
+        r["condition_id"]: {
+            "daily_rate": r["daily_rate"],
+            "min_size": r["min_size"],
+            "max_spread": r["max_spread"],
+        }
+        for r in rows
+    }
 
 
 def _fetch_reward_market_expiries(condition_ids: list[str] | None = None,
@@ -236,21 +231,16 @@ def _fetch_reward_market_expiries(condition_ids: list[str] | None = None,
     cache_ttl = 24 * 3600  # 24h cache validity
 
     # Step 0: Load from DB cache
-    try:
-        db = sqlite3.connect(db_path, timeout=5)
-        db.row_factory = sqlite3.Row
-        cutoff = time.time() - cache_ttl
-        rows = db.execute(
-            "SELECT condition_id, end_date_iso FROM market_expiry_cache WHERE fetched_at > ?",
-            (cutoff,)
-        ).fetchall()
+    cutoff = time.time() - cache_ttl
+    rows = _query_with_retry(
+        db_path,
+        "SELECT condition_id, end_date_iso FROM market_expiry_cache WHERE fetched_at > ?",
+        (cutoff,),
+    )
+    if rows:
         for r in rows:
             result[r["condition_id"]] = r["end_date_iso"]
-        db.close()
-        if result:
-            log.debug(f"Expiry cache: {len(result)} markets loaded from DB")
-    except Exception:
-        pass  # Table may not exist yet
+        log.debug(f"Expiry cache: {len(result)} markets loaded from DB")
 
     # Determine which CIDs still need fetching
     need_fetch = []
@@ -308,7 +298,7 @@ def _fetch_reward_market_expiries(condition_ids: list[str] | None = None,
     new_entries = {cid: result[cid] for cid in need_fetch if cid in result}
     if new_entries:
         try:
-            db = sqlite3.connect(db_path, timeout=5)
+            db = _connect_db(db_path)
             now = time.time()
             db.executemany(
                 "INSERT OR REPLACE INTO market_expiry_cache (condition_id, end_date_iso, fetched_at) VALUES (?, ?, ?)",
@@ -326,21 +316,16 @@ def _fetch_reward_market_expiries(condition_ids: list[str] | None = None,
 
 def query_placement_feedback(db_path: str) -> dict[str, dict]:
     """Read placement feedback from bot. Returns {cid: {"yes": {status, reason, ts}, "no": ...}}."""
-    try:
-        db = sqlite3.connect(db_path, timeout=5)
-        db.row_factory = sqlite3.Row
-        rows = db.execute("SELECT * FROM placement_feedback").fetchall()
-        db.close()
-        result: dict[str, dict] = {}
-        for r in rows:
-            cid = r["condition_id"]
-            if cid not in result:
-                result[cid] = {}
-            result[cid][r["side"]] = {"status": r["status"], "reason": r["reason"], "ts": r["ts"]}
-        return result
-    except Exception as e:
-        log.debug(f"Placement feedback query failed: {e}")
+    rows = _query_with_retry(db_path, "SELECT * FROM placement_feedback")
+    if rows is None:
         return {}
+    result: dict[str, dict] = {}
+    for r in rows:
+        cid = r["condition_id"]
+        if cid not in result:
+            result[cid] = {}
+        result[cid][r["side"]] = {"status": r["status"], "reason": r["reason"], "ts": r["ts"]}
+    return result
 
 
 def query_short_term_performance(db_path: str, hours: float = 4.0) -> dict[str, dict]:
@@ -362,16 +347,16 @@ def query_short_term_performance(db_path: str, hours: float = 4.0) -> dict[str, 
     cutoff_ts = time.time() - hours * 3600
     result = {}
     try:
-        db = sqlite3.connect(db_path, timeout=5)
-        db.row_factory = sqlite3.Row
-        rows = db.execute(
+        rows = _query_with_retry(
+            db_path,
             """SELECT condition_id, ts, net_score, fill_count, q_share_pct, action
                FROM market_performance
                WHERE ts > ?
                ORDER BY condition_id, ts""",
             (cutoff_ts,),
-        ).fetchall()
-        db.close()
+        )
+        if rows is None:
+            return result
 
         # Group by condition_id
         per_market: dict[str, list] = {}
@@ -588,8 +573,7 @@ def query_per_market_pnl(db_path: str, hours: float = 24) -> dict[str, dict]:
     """
     cutoff = time.time() - hours * 3600
     try:
-        db = sqlite3.connect(db_path, timeout=5)
-        db.row_factory = sqlite3.Row
+        db = _connect_db(db_path)
 
         # Aggregate fills — use clob_cost for both sides (actual USDC spent)
         fills = {}
@@ -649,30 +633,26 @@ def query_fill_costs(db_path: str, hours: float = 24) -> dict[str, dict]:
     Returns {condition_id: {"cost": float, "count": int, "shares": float}}.
     """
     cutoff = time.time() - hours * 3600
-    try:
-        db = sqlite3.connect(db_path, timeout=5)
-        db.row_factory = sqlite3.Row
-        rows = db.execute(
-            """SELECT condition_id,
-                      SUM(shares * clob_cost) as cost,
-                      COUNT(*) as cnt,
-                      SUM(shares) as total_shares
-               FROM fills WHERE ts > ?
-               GROUP BY condition_id""",
-            (cutoff,),
-        ).fetchall()
-        db.close()
-        return {
-            r["condition_id"]: {
-                "cost": r["cost"] or 0,
-                "count": r["cnt"] or 0,
-                "shares": r["total_shares"] or 0,
-            }
-            for r in rows
-        }
-    except Exception as e:
-        log.warning(f"Fill query failed: {e}")
+    rows = _query_with_retry(
+        db_path,
+        """SELECT condition_id,
+                  SUM(shares * clob_cost) as cost,
+                  COUNT(*) as cnt,
+                  SUM(shares) as total_shares
+           FROM fills WHERE ts > ?
+           GROUP BY condition_id""",
+        (cutoff,),
+    )
+    if rows is None:
         return {}
+    return {
+        r["condition_id"]: {
+            "cost": r["cost"] or 0,
+            "count": r["cnt"] or 0,
+            "shares": r["total_shares"] or 0,
+        }
+        for r in rows
+    }
 
 
 def query_dump_revenue(db_path: str, hours: float = 24) -> dict[str, dict]:
@@ -681,30 +661,26 @@ def query_dump_revenue(db_path: str, hours: float = 24) -> dict[str, dict]:
     Returns {condition_id: {"revenue": float, "pnl": float, "count": int}}.
     """
     cutoff = time.time() - hours * 3600
-    try:
-        db = sqlite3.connect(db_path, timeout=5)
-        db.row_factory = sqlite3.Row
-        rows = db.execute(
-            """SELECT condition_id,
-                      SUM(usd_value) as revenue,
-                      SUM(pnl) as total_pnl,
-                      COUNT(*) as cnt
-               FROM unwinds WHERE ts > ?
-               GROUP BY condition_id""",
-            (cutoff,),
-        ).fetchall()
-        db.close()
-        return {
-            r["condition_id"]: {
-                "revenue": r["revenue"] or 0,
-                "pnl": r["total_pnl"] or 0,
-                "count": r["cnt"] or 0,
-            }
-            for r in rows
-        }
-    except Exception as e:
-        log.warning(f"Dump query failed: {e}")
+    rows = _query_with_retry(
+        db_path,
+        """SELECT condition_id,
+                  SUM(usd_value) as revenue,
+                  SUM(pnl) as total_pnl,
+                  COUNT(*) as cnt
+           FROM unwinds WHERE ts > ?
+           GROUP BY condition_id""",
+        (cutoff,),
+    )
+    if rows is None:
         return {}
+    return {
+        r["condition_id"]: {
+            "revenue": r["revenue"] or 0,
+            "pnl": r["total_pnl"] or 0,
+            "count": r["cnt"] or 0,
+        }
+        for r in rows
+    }
 
 
 def query_positions(db_path: str) -> dict[str, dict]:
@@ -712,29 +688,25 @@ def query_positions(db_path: str) -> dict[str, dict]:
 
     Returns {condition_id: {"yes_usd": float, "no_usd": float, "total": float, "question": str}}.
     """
-    try:
-        db = sqlite3.connect(db_path, timeout=5)
-        db.row_factory = sqlite3.Row
-        rows = db.execute(
-            "SELECT * FROM positions WHERE yes_shares > 0.5 OR no_shares > 0.5"
-        ).fetchall()
-        db.close()
-        result = {}
-        for r in rows:
-            # avg_price is YES-equivalent; CLOB cost for NO = (1 - avg_price)
-            yv = r["yes_shares"] * r["yes_avg_price"]
-            no_avg = r["no_avg_price"]
-            nv = r["no_shares"] * (1 - no_avg) if no_avg > 0 else 0
-            result[r["condition_id"]] = {
-                "yes_usd": yv,
-                "no_usd": nv,
-                "total": yv + nv,
-                "question": r["question"],
-            }
-        return result
-    except Exception as e:
-        log.warning(f"Position query failed: {e}")
+    rows = _query_with_retry(
+        db_path,
+        "SELECT * FROM positions WHERE yes_shares > 0.5 OR no_shares > 0.5",
+    )
+    if rows is None:
         return {}
+    result = {}
+    for r in rows:
+        # avg_price is YES-equivalent; CLOB cost for NO = (1 - avg_price)
+        yv = r["yes_shares"] * r["yes_avg_price"]
+        no_avg = r["no_avg_price"]
+        nv = r["no_shares"] * (1 - no_avg) if no_avg > 0 else 0
+        result[r["condition_id"]] = {
+            "yes_usd": yv,
+            "no_usd": nv,
+            "total": yv + nv,
+            "question": r["question"],
+        }
+    return result
 
 
 def _detect_book_depth_changes(db_path: str) -> set[str]:
@@ -744,27 +716,26 @@ def _detect_book_depth_changes(db_path: str) -> set[str]:
     latest two book_snapshots. These markets need a shorter scoring
     window because a competitor may have just entered or exited.
     """
-    try:
-        db = sqlite3.connect(db_path, timeout=5)
-        db.row_factory = sqlite3.Row
-        # Compare latest vs second-latest snapshot per market
-        rows = db.execute(
-            """WITH ranked AS (
-                SELECT condition_id, bid_depth_5c, ask_depth_5c, ts,
-                       ROW_NUMBER() OVER (PARTITION BY condition_id ORDER BY ts DESC) as rn
-                FROM book_snapshots
-                WHERE ts > ?
-            )
-            SELECT a.condition_id,
-                   a.bid_depth_5c as bid_new, a.ask_depth_5c as ask_new,
-                   b.bid_depth_5c as bid_old, b.ask_depth_5c as ask_old
-            FROM ranked a JOIN ranked b
-                ON a.condition_id = b.condition_id
-            WHERE a.rn = 1 AND b.rn = 2""",
-            (time.time() - 3600,),  # last 1h of snapshots
-        ).fetchall()
-        db.close()
+    rows = _query_with_retry(
+        db_path,
+        """WITH ranked AS (
+            SELECT condition_id, bid_depth_5c, ask_depth_5c, ts,
+                   ROW_NUMBER() OVER (PARTITION BY condition_id ORDER BY ts DESC) as rn
+            FROM book_snapshots
+            WHERE ts > ?
+        )
+        SELECT a.condition_id,
+               a.bid_depth_5c as bid_new, a.ask_depth_5c as ask_new,
+               b.bid_depth_5c as bid_old, b.ask_depth_5c as ask_old
+        FROM ranked a JOIN ranked b
+            ON a.condition_id = b.condition_id
+        WHERE a.rn = 1 AND b.rn = 2""",
+        (time.time() - 3600,),
+    )
+    if rows is None:
+        return set()
 
+    try:
         changed = set()
         for r in rows:
             old_depth = (r["bid_old"] or 0) + (r["ask_old"] or 0)
@@ -802,8 +773,7 @@ def _query_windowed_scoring(db_path: str, window_hours: float = 4.0) -> dict[str
     cutoff_fast = time.time() - 1.0 * 3600  # 1h for fast-react markets
 
     try:
-        db = sqlite3.connect(db_path, timeout=5)
-        db.row_factory = sqlite3.Row
+        db = _connect_db(db_path)
 
         # Fetch ALL scoring data in the wider window
         rows = db.execute(
@@ -884,24 +854,19 @@ def query_reward_stats(db_path: str) -> dict[str, dict]:
 
     # GAP 3: Get last-seen timestamps for stale market decay
     last_seen_map: dict[str, float] = {}
-    try:
-        _lsdb = sqlite3.connect(db_path, timeout=5)
-        _lsdb.row_factory = sqlite3.Row
-        # Last scoring snapshot per market = last time bot had orders on this market
-        for r in _lsdb.execute(
-            "SELECT condition_id, MAX(ts) as last_ts FROM scoring_snapshots GROUP BY condition_id"
-        ).fetchall():
+    _ls_rows = _query_with_retry(
+        db_path,
+        "SELECT condition_id, MAX(ts) as last_ts FROM scoring_snapshots GROUP BY condition_id",
+    )
+    if _ls_rows:
+        for r in _ls_rows:
             last_seen_map[r["condition_id"]] = r["last_ts"]
-        _lsdb.close()
-    except Exception:
-        pass
     now_ts = time.time()
 
     try:
-        db = sqlite3.connect(db_path, timeout=5)
-        db.row_factory = sqlite3.Row
-        rows = db.execute("SELECT * FROM reward_market_stats").fetchall()
-        db.close()
+        rows = _query_with_retry(db_path, "SELECT * FROM reward_market_stats")
+        if rows is None:
+            return {}
         result = {}
         windowed_used = 0
         cumulative_capped = 0
@@ -998,17 +963,14 @@ def query_recent_prices(db_path: str, lookback_hours: float = 3.0) -> dict[str, 
     import statistics
 
     cutoff = time.time() - lookback_hours * 3600
-    try:
-        db = sqlite3.connect(db_path, timeout=5)
-        rows = db.execute(
-            "SELECT condition_id, best_bid, best_ask FROM cycle_snapshots "
-            "WHERE ts >= ? AND best_bid IS NOT NULL AND best_bid > 0 "
-            "AND best_ask IS NOT NULL AND best_ask > 0",
-            (cutoff,),
-        ).fetchall()
-        db.close()
-    except Exception as e:
-        log.warning(f"Recent prices query failed: {e}")
+    rows = _query_with_retry(
+        db_path,
+        "SELECT condition_id, best_bid, best_ask FROM cycle_snapshots "
+        "WHERE ts >= ? AND best_bid IS NOT NULL AND best_bid > 0 "
+        "AND best_ask IS NOT NULL AND best_ask > 0",
+        (cutoff,),
+    )
+    if rows is None:
         return {}
 
     # Group by condition_id
@@ -1052,8 +1014,7 @@ def compute_available_capital(
     locked_dumps = 0.0
     locked_pending = 0.0
     try:
-        db = sqlite3.connect(db_path, timeout=5)
-        db.row_factory = sqlite3.Row
+        db = _connect_db(db_path)
 
         # Capital locked in pending dumps
         for r in db.execute("SELECT shares, fill_price FROM dump_states").fetchall():
@@ -1131,7 +1092,7 @@ def _smooth_correction_factor(
     If no new observation this cycle, returns the last stored EMA (or 1.0).
     """
     try:
-        db = sqlite3.connect(db_path, timeout=5)
+        db = _connect_db(db_path)
         db.execute(
             """CREATE TABLE IF NOT EXISTS correction_factor_history (
                 id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1217,33 +1178,35 @@ def _load_deployed_cids(db_path: str) -> set[str]:
     """
     import os
 
-    # Primary: read allocation file
-    alloc_path = os.path.join(os.path.dirname(db_path) or ".", "market_allocations.json")
-    try:
-        if os.path.exists(alloc_path):
-            with open(alloc_path) as f:
-                data = json.load(f)
-            deployed = {
-                m["condition_id"]
-                for m in data.get("markets", [])
-                if m.get("action") == "deploy"
-            }
-            if deployed:
-                return deployed
-    except Exception as e:
-        log.debug(f"Could not load deployed CIDs from allocation file: {e}")
+    # Primary: read allocation file — check alongside db_path first, then CWD
+    candidates = [
+        os.path.join(os.path.dirname(db_path) or ".", "market_allocations.json"),
+        "market_allocations.json",
+    ]
+    seen: set[str] = set()
+    for alloc_path in candidates:
+        real = os.path.realpath(alloc_path)
+        if real in seen:
+            continue
+        seen.add(real)
+        try:
+            if os.path.exists(alloc_path):
+                with open(alloc_path) as f:
+                    data = json.load(f)
+                deployed = {
+                    m["condition_id"]
+                    for m in data.get("markets", [])
+                    if m.get("action") == "deploy"
+                }
+                if deployed:
+                    return deployed
+        except Exception as e:
+            log.debug(f"Could not load deployed CIDs from {alloc_path}: {e}")
 
     # Fallback: markets with active orders in DB
-    try:
-        db = sqlite3.connect(db_path, timeout=5)
-        rows = db.execute(
-            "SELECT DISTINCT condition_id FROM active_orders"
-        ).fetchall()
-        db.close()
-        if rows:
-            return {r[0] for r in rows}
-    except Exception:
-        pass
+    rows = _query_with_retry(db_path, "SELECT DISTINCT condition_id FROM active_orders")
+    if rows:
+        return {r[0] for r in rows}
 
     return set()
 
@@ -1251,7 +1214,7 @@ def _load_deployed_cids(db_path: str) -> set[str]:
 def collect_all(
     db_path: str = "bot_history.db",
     hours: float = 24,
-) -> tuple[list, float, float, float]:
+) -> tuple[list, float, float, float, float]:
     """Main entry. Cross-references all data sources into per-market metrics.
 
     Args:
@@ -1259,10 +1222,12 @@ def collect_all(
         hours: Lookback window for fill/dump data
 
     Returns:
-        Tuple of (metrics, correction_factor, clob_rate_delta, data_completeness).
+        Tuple of (metrics, correction_factor, clob_rate_delta, data_completeness,
+        actual_daily_total).
         correction_factor: actual_daily / estimated_daily. Use to scale Q-score estimates.
         clob_rate_delta: % change in total CLOB rates vs cached (forward-looking).
         data_completeness: fraction of expected markets returned (0.0–1.0+).
+        actual_daily_total: raw REWARD payout from Data API (avoids re-fetching).
     """
     # Gather from all sources
     actual_rewards = fetch_actual_rewards()  # empty (per-market not available)
@@ -1432,15 +1397,11 @@ def collect_all(
     data_completeness = 1.0
     if len(clob_reward_markets) > 0:
         # Compare against expected: if we got <80% of what cache had, data is partial
-        try:
-            _db = sqlite3.connect(db_path, timeout=5)
-            _row = _db.execute("SELECT COUNT(*) FROM reward_markets_cache").fetchone()
-            _db.close()
-            cached_count = _row[0] if _row else 0
-            if cached_count > 0:
-                data_completeness = len(clob_reward_markets) / cached_count
-        except Exception:
-            pass
+        _row = _query_with_retry(
+            db_path, "SELECT COUNT(*) FROM reward_markets_cache", fetch="one",
+        )
+        if _row and _row[0]:
+            data_completeness = len(clob_reward_markets) / _row[0]
     elif len(stats) == 0:
         # Both CLOB and stats empty — total data failure
         data_completeness = 0.0
@@ -1450,4 +1411,4 @@ def collect_all(
         f"fills={len(fills)} positions={len(positions)} correction={correction_factor:.4f} | "
         f"clob_rate_delta={clob_rate_delta:+.1%} data_completeness={data_completeness:.0%}"
     )
-    return metrics, correction_factor, clob_rate_delta, data_completeness
+    return metrics, correction_factor, clob_rate_delta, data_completeness, actual_daily_total

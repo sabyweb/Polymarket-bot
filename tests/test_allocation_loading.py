@@ -156,12 +156,13 @@ class TestCorrectionFactor(unittest.TestCase):
         # Will return empty metrics + defaults with a nonexistent db
         result = collect_all(db_path="/nonexistent/db.sqlite", hours=24)
         self.assertIsInstance(result, tuple)
-        self.assertEqual(len(result), 4)
-        metrics, factor, rate_delta, completeness = result
+        self.assertEqual(len(result), 5)
+        metrics, factor, rate_delta, completeness, actual_daily = result
         self.assertIsInstance(metrics, list)
         self.assertIsInstance(factor, float)
         self.assertIsInstance(rate_delta, float)
         self.assertIsInstance(completeness, float)
+        self.assertIsInstance(actual_daily, float)
 
 
 if __name__ == "__main__":

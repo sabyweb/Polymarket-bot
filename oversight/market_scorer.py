@@ -9,7 +9,7 @@ matching, no heuristics. If a market earns and doesn't lose, it's in.
 
 import logging
 from dataclasses import dataclass
-from .data_collector import MarketMetrics
+from .data_collector import MarketMetrics, _connect_db
 
 log = logging.getLogger("oversight.scorer")
 
@@ -365,7 +365,6 @@ def load_historical_adjustments(db_path: str, days: int = 7) -> dict[str, dict]:
     Returns {condition_id: {"trend_mult": float, "fill_rate": float, "snapshots": int,
                             "avg_score": float, "q_share_trend": float}}
     """
-    import sqlite3
     import math
     now = __import__("time").time()
     cutoff_ts = now - days * 86400
@@ -373,8 +372,7 @@ def load_historical_adjustments(db_path: str, days: int = 7) -> dict[str, dict]:
     half_life_secs = 2 * 86400  # 2-day half-life
 
     try:
-        db = sqlite3.connect(db_path, timeout=5)
-        db.row_factory = sqlite3.Row
+        db = _connect_db(db_path)
 
         rows = db.execute(
             """SELECT condition_id, ts, fill_count, net_score, q_share_pct

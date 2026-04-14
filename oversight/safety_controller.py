@@ -19,6 +19,8 @@ import logging
 import sqlite3
 import time
 
+from .data_collector import _connect_db, _query_with_retry
+
 log = logging.getLogger("oversight.safety")
 
 # ── System states ──
@@ -353,7 +355,7 @@ class SafetyController:
     def _persist_state(self, reasons: list[str] | None = None):
         """Write state to DB so it survives restarts."""
         try:
-            db = sqlite3.connect(self.db_path, timeout=5)
+            db = _connect_db(self.db_path)
             db.execute(
                 """CREATE TABLE IF NOT EXISTS safety_state (
                     id       INTEGER PRIMARY KEY,
@@ -389,7 +391,7 @@ class SafetyController:
         instead of 3. Beyond 6h, start from scratch.
         """
         try:
-            db = sqlite3.connect(self.db_path, timeout=5)
+            db = _connect_db(self.db_path)
             db.execute(
                 """CREATE TABLE IF NOT EXISTS safety_state (
                     id       INTEGER PRIMARY KEY,
@@ -449,7 +451,7 @@ class SafetyController:
         """Query net fill damage in last 24h."""
         cutoff = time.time() - 86400
         try:
-            db = sqlite3.connect(self.db_path, timeout=5)
+            db = _connect_db(self.db_path)
             fill_row = db.execute(
                 "SELECT COALESCE(SUM(shares * clob_cost), 0) FROM fills WHERE ts > ?",
                 (cutoff,),
@@ -474,7 +476,7 @@ class SafetyController:
         """Query net fill damage over rolling 7 days. Catches slow bleeds."""
         cutoff = time.time() - 7 * 86400
         try:
-            db = sqlite3.connect(self.db_path, timeout=5)
+            db = _connect_db(self.db_path)
             fill_row = db.execute(
                 "SELECT COALESCE(SUM(shares * clob_cost), 0) FROM fills WHERE ts > ?",
                 (cutoff,),
@@ -498,13 +500,10 @@ class SafetyController:
     def count_scoring_markets(self, window_hours: float = 4.0) -> int:
         """Count markets with recent scoring data."""
         cutoff = time.time() - window_hours * 3600
-        try:
-            db = sqlite3.connect(self.db_path, timeout=5)
-            row = db.execute(
-                "SELECT COUNT(DISTINCT condition_id) FROM scoring_snapshots WHERE ts > ?",
-                (cutoff,),
-            ).fetchone()
-            db.close()
-            return row[0] if row else 0
-        except Exception:
-            return 0
+        row = _query_with_retry(
+            self.db_path,
+            "SELECT COUNT(DISTINCT condition_id) FROM scoring_snapshots WHERE ts > ?",
+            (cutoff,),
+            fetch="one",
+        )
+        return row[0] if row and row[0] else 0

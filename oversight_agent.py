@@ -268,13 +268,16 @@ def run_once(
     log.info(f"Collecting metrics (lookback={hours:.0f}h, db={db_path})...")
     collect_result = collect_all(db_path=db_path, hours=hours)
 
-    # collect_all now returns 4 values: (metrics, cf, rate_delta, completeness)
-    if len(collect_result) == 4:
+    # collect_all returns 5 values: (metrics, cf, rate_delta, completeness, actual_daily_total)
+    if len(collect_result) >= 5:
+        metrics, correction_factor, clob_rate_delta, data_completeness, actual_daily_payout = collect_result[:5]
+    elif len(collect_result) == 4:
         metrics, correction_factor, clob_rate_delta, data_completeness = collect_result
+        actual_daily_payout = 0.0
     else:
         # Backward compat if old collect_all returns 2
         metrics, correction_factor = collect_result[0], collect_result[1]
-        clob_rate_delta, data_completeness = 0.0, 1.0
+        clob_rate_delta, data_completeness, actual_daily_payout = 0.0, 1.0, 0.0
 
     if not metrics:
         log.warning("No market data collected — skipping allocation")
@@ -299,12 +302,7 @@ def run_once(
             for m in metrics
             if m.q_share_pct > 0 and m.on_book_hours > 0
         )
-    actual_daily_payout = 0.0
-    try:
-        from oversight.data_collector import fetch_reward_correction_factor
-        actual_daily_payout = fetch_reward_correction_factor(hours=24)
-    except Exception:
-        pass
+    # actual_daily_payout already available from collect_all (5th return value)
     fill_damage_24h = safety.query_24h_fill_damage()
     fill_damage_7d = safety.query_7d_fill_damage()
     num_scoring = safety.count_scoring_markets()
