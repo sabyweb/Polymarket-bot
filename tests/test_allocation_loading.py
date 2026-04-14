@@ -151,15 +151,17 @@ class TestCorrectionFactor(unittest.TestCase):
     """Test the reward correction factor computation."""
 
     def test_correction_returned_from_collect(self):
-        """collect_all should return a tuple (metrics, correction_factor)."""
+        """collect_all should return a tuple (metrics, cf, rate_delta, completeness)."""
         from oversight.data_collector import collect_all
-        # Will return empty metrics + 1.0 factor with a nonexistent db
+        # Will return empty metrics + defaults with a nonexistent db
         result = collect_all(db_path="/nonexistent/db.sqlite", hours=24)
         self.assertIsInstance(result, tuple)
-        self.assertEqual(len(result), 2)
-        metrics, factor = result
+        self.assertEqual(len(result), 4)
+        metrics, factor, rate_delta, completeness = result
         self.assertIsInstance(metrics, list)
         self.assertIsInstance(factor, float)
+        self.assertIsInstance(rate_delta, float)
+        self.assertIsInstance(completeness, float)
 
 
 if __name__ == "__main__":

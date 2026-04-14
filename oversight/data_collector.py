@@ -1251,7 +1251,7 @@ def _load_deployed_cids(db_path: str) -> set[str]:
 def collect_all(
     db_path: str = "bot_history.db",
     hours: float = 24,
-) -> tuple[list[MarketMetrics], float]:
+) -> tuple[list, float, float, float]:
     """Main entry. Cross-references all data sources into per-market metrics.
 
     Args:
@@ -1259,9 +1259,10 @@ def collect_all(
         hours: Lookback window for fill/dump data
 
     Returns:
-        Tuple of (list of MarketMetrics, reward_correction_factor).
+        Tuple of (metrics, correction_factor, clob_rate_delta, data_completeness).
         correction_factor: actual_daily / estimated_daily. Use to scale Q-score estimates.
-        Returns 1.0 if actual payout data is unavailable.
+        clob_rate_delta: % change in total CLOB rates vs cached (forward-looking).
+        data_completeness: fraction of expected markets returned (0.0–1.0+).
     """
     # Gather from all sources
     actual_rewards = fetch_actual_rewards()  # empty (per-market not available)

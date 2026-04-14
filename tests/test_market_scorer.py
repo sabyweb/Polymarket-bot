@@ -40,31 +40,33 @@ class TestScoreMarket(unittest.TestCase):
     """Test the scoring formula."""
 
     def test_zero_fill_100pct_qshare(self):
-        """Perfect market: 100% Q-share, zero fills, should score highest."""
+        """q_share=1.0 is capped at 0.5 internally. Zero fills, no bonus."""
         m = _make_metric(daily_rate=50, q_share_pct=1.0)
         score = score_market(m, hours=24)
-        # effective_daily = 50 * 1.0 = 50, + min(50*0.5, 2.0) = +2.0 = 52
-        self.assertAlmostEqual(score, 52.0)
+        # q_share capped to 0.5: effective_daily = 50 * 0.5 = 25
+        # Zero-fill bonus removed. score = 25.0
+        self.assertAlmostEqual(score, 25.0)
 
     def test_zero_fill_low_qshare(self):
-        """Low Q-share but zero fills: still positive."""
+        """Low Q-share but zero fills: still positive, no bonus."""
         m = _make_metric(daily_rate=100, q_share_pct=0.1)
         score = score_market(m, hours=24)
-        # effective = 10, + min(10*0.5, 2.0) = +2.0 = 12
-        self.assertAlmostEqual(score, 12.0)
+        # effective = 100 * 0.1 = 10, no bonus. score = 10.0
+        self.assertAlmostEqual(score, 10.0)
 
-    def test_zero_fill_bonus_capped(self):
-        """Zero-fill bonus is capped at $2/day so dust markets can't dominate."""
-        tiny = _make_metric(daily_rate=1, q_share_pct=0.01)  # effective = $0.01/day
+    def test_no_zero_fill_bonus(self):
+        """Zero-fill bonus was removed — zero fills and with-fills score the same
+        (minus fill damage). Markets prove themselves through earnings, not silence."""
+        tiny = _make_metric(daily_rate=1, q_share_pct=0.01)
         score_tiny = score_market(tiny, hours=24)
-        # effective = 0.01, bonus = min(0.005, 2.0) = 0.005, total = 0.015
-        self.assertAlmostEqual(score_tiny, 0.015)
+        # effective = 1 * 0.01 = 0.01, no bonus. score = 0.01
+        self.assertAlmostEqual(score_tiny, 0.01)
 
         big = _make_metric(daily_rate=50, q_share_pct=1.0, fill_count_recent=1,
                            fill_cost_recent=1.0, dump_revenue_recent=0.0)
         score_big = score_market(big, hours=24)
-        # effective = 50, damage = 1, no bonus (has fills), total = 49
-        self.assertAlmostEqual(score_big, 49.0)
+        # q_share capped to 0.5: effective = 25, damage = 1. score = 24
+        self.assertAlmostEqual(score_big, 24.0)
 
         # Big market with 1 fill MUST outscore dust market with zero fills
         self.assertGreater(score_big, score_tiny)
@@ -77,9 +79,9 @@ class TestScoreMarket(unittest.TestCase):
             fill_count_recent=3,
         )
         score = score_market(m, hours=24)
-        # effective=50, damage=(20-15)/1 = 5/day, no bonus (has fills)
-        # score = 50 - 5 = 45
-        self.assertAlmostEqual(score, 45.0)
+        # q_share capped to 0.5: effective=25, damage=(20-15)/1=5/day
+        # score = 25 - 5 = 20
+        self.assertAlmostEqual(score, 20.0)
 
     def test_negative_score_when_damage_exceeds_reward(self):
         """Fill damage > reward = negative score."""
@@ -97,10 +99,11 @@ class TestScoreMarket(unittest.TestCase):
         m = _make_metric(daily_rate=100, q_share_pct=1.0)
         score_no_correction = score_market(m, hours=24, correction_factor=1.0)
         score_with_correction = score_market(m, hours=24, correction_factor=0.1)
-        # Without: 100 + min(50, 2) = 102
-        # With 0.1: 10 + min(5, 2) = 12
-        self.assertAlmostEqual(score_no_correction, 102.0)
-        self.assertAlmostEqual(score_with_correction, 12.0)
+        # q_share capped to 0.5. No zero-fill bonus.
+        # Without correction: 100 * 0.5 * 1.0 = 50
+        # With 0.1: 100 * 0.5 * 0.1 = 5
+        self.assertAlmostEqual(score_no_correction, 50.0)
+        self.assertAlmostEqual(score_with_correction, 5.0)
 
     def test_correction_factor_does_not_affect_fill_damage(self):
         """Fill damage is real, should NOT be scaled by correction factor."""
@@ -109,8 +112,9 @@ class TestScoreMarket(unittest.TestCase):
             fill_cost_recent=20.0, fill_count_recent=2,
         )
         score = score_market(m, hours=24, correction_factor=0.1)
-        # corrected_daily = 10, damage = 20/day, score = 10 - 20 = -10 (no bonus, has fills)
-        self.assertAlmostEqual(score, -10.0)
+        # q_share capped to 0.5: corrected_daily = 100 * 0.5 * 0.1 = 5
+        # damage = 20/day, score = 5 - 20 = -15
+        self.assertAlmostEqual(score, -15.0)
 
 
 class TestClassifyMarket(unittest.TestCase):
@@ -624,13 +628,13 @@ class TestCapitalEfficiency(unittest.TestCase):
     """Test that capital-inefficient markets are rejected."""
 
     def test_low_rate_high_cost_avoided(self):
-        """$0.14/day pool with $186 deployed → capital inefficient → avoid."""
-        # This is the Todd Blanche scenario: $0.14/day, 200sh × $0.93 = $186
+        """$0.14/day pool with tiny q_share → avoided (min effective reward gate
+        or capital inefficiency — either way, correctly avoided)."""
         m = _make_metric(daily_rate=0.14, q_share_pct=0.01, max_spread=0.04)
         sm = classify_market(m, score=0.01, default_shares=200)
-        # 0.14 / (200 * 0.92) = 0.00076 = 0.076% < 1% threshold → avoid
+        # effective_daily = 0.14 * 0.01 * 1.0 = 0.0014 < $0.10 min threshold
+        # The min-effective-reward gate fires before the capital efficiency gate.
         self.assertEqual(sm.action, "avoid")
-        self.assertIn("Capital inefficient", sm.reason)
 
     def test_high_rate_passes_efficiency_check(self):
         """$50/day pool with $91 deployed → very efficient → deploy."""
@@ -654,14 +658,13 @@ class TestCompetitionAwareness(unittest.TestCase):
     """Test that competition (q_share) flows through scoring, efficiency, and output."""
 
     def test_competition_adjusted_efficiency_gate(self):
-        """High pool rate but tiny q_share → competition inefficient → avoid."""
-        # $50/day pool, but 0.5% q_share = $0.25/day effective
-        # $0.25/day vs ~$45 deployed = 0.55% → below 0.5% threshold? No, 0.55% > 0.5%.
-        # Use smaller q_share: 0.1% = $0.05/day vs ~$45 = 0.11% < 0.5% → avoid
+        """High pool rate but tiny q_share → avoided (min effective reward gate
+        or competition inefficiency — either way, correctly avoided)."""
+        # $50/day pool, 0.1% q_share → effective = 50 * 0.001 * 1.0 = $0.05/day
+        # Min effective reward gate: $0.05 < $0.10 → avoid
         m = _make_metric(daily_rate=50, q_share_pct=0.001, max_spread=0.045)
-        sm = classify_market(m, score=0.05)  # low positive score
+        sm = classify_market(m, score=0.05)
         self.assertEqual(sm.action, "avoid")
-        self.assertIn("Competition inefficient", sm.reason)
 
     def test_high_qshare_passes_competition_check(self):
         """High q_share → good effective return → deploy."""
@@ -1340,8 +1343,8 @@ class TestFastReactCompounding(unittest.TestCase):
             fill_count_recent=0, on_book_hours=24,
         )
         scored = rank_markets([m], max_markets=10, db_path=self.db_path)
-        # Base score = 50 + 2 (zero-fill bonus) = 52
-        self.assertAlmostEqual(scored[0].score, 52.0)
+        # q_share capped to 0.5: base score = 50 * 0.5 = 25 (no zero-fill bonus)
+        self.assertAlmostEqual(scored[0].score, 25.0)
 
 
 class TestCombinedSignals(unittest.TestCase):
@@ -1547,11 +1550,14 @@ class TestSportsSizeCap(unittest.TestCase):
     """Test sports and short-duration market size caps."""
 
     def test_sports_vs_pattern_capped_at_min_size(self):
-        """Market with 'vs.' in question should be capped at min_size."""
+        """Sports market with 'vs.' within 72h expiry → capped at min_size."""
+        from datetime import datetime, timezone, timedelta
+        # Sports cap only fires for markets within 72h of expiry
+        expiry = (datetime.now(timezone.utc) + timedelta(hours=48)).isoformat()
         m = _make_metric(
             question="Los Angeles Dodgers vs. Washington Nationals",
             daily_rate=100, q_share_pct=1.0, min_size=50,
-            on_book_hours=24,
+            on_book_hours=24, end_date_iso=expiry,
         )
         score = score_market(m)
         sm = classify_market(m, score)
@@ -1571,16 +1577,20 @@ class TestSportsSizeCap(unittest.TestCase):
         self.assertGreater(sm.recommended_shares, 50)
 
     def test_ipl_league_pattern_capped(self):
-        """IPL market should be capped at min_size (sports pattern detected)."""
+        """IPL market expiring within 72h should be capped at min_size
+        (sports detection fires, short-duration cap applies)."""
+        from datetime import datetime, timezone, timedelta
+        # Sports cap only fires for markets within 72h of expiry
+        expiry = (datetime.now(timezone.utc) + timedelta(hours=48)).isoformat()
         m = _make_metric(
             question="Indian Premier League: Kolkata Knight Riders vs Punjab Kings",
             daily_rate=100, q_share_pct=1.0, min_size=50,
-            on_book_hours=24,
+            on_book_hours=24, end_date_iso=expiry,
         )
         score = score_market(m)
         sm = classify_market(m, score)
         self.assertEqual(sm.action, "deploy")
-        # Sports cap prevents sizing above min_size
+        # Sports + <72h expiry → capped at min_size
         self.assertEqual(sm.recommended_shares, 50)
 
     def test_short_duration_capped(self):
@@ -1626,15 +1636,17 @@ class TestSportsSizeCap(unittest.TestCase):
     def test_sports_high_min_size_not_hard_capped(self):
         """Sports market with high min_size: sports cap only fires if shares > min_size.
         Score-based sizing may be below min_size, so no cap needed."""
+        from datetime import datetime, timezone, timedelta
+        expiry = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat()
         m = _make_metric(
             question="Copa Colsanitas: Marie Bouzkova vs Panna Udvardy",
             daily_rate=100, q_share_pct=1.0, min_size=1000,
-            on_book_hours=24,
+            on_book_hours=24, end_date_iso=expiry,
         )
         score = score_market(m)
         sm = classify_market(m, score)
         self.assertEqual(sm.action, "deploy")
-        # Score-based sizing produces ~200 shares (below min_size=1000),
+        # Score-based sizing produces shares below min_size=1000,
         # so sports cap (shares > min_size) doesn't fire.
         # Bot will enforce max(min_size, agent_shares) at placement time.
         self.assertGreater(sm.recommended_shares, 50)
