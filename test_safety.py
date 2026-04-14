@@ -666,12 +666,12 @@ os.unlink(_tmp8_path)
 
 
 # ═══════════════════════════════════════════════════
-print("\n=== TEST 13: collect_all Returns 4 Values ===")
+print("\n=== TEST 13: collect_all Returns 5 Values ===")
 # ═══════════════════════════════════════════════════
 
 # Verify the new return signature doesn't break unpacking
 check(
-    "collect_all returns tuple of length 4",
+    "collect_all returns tuple of length 5",
     True,  # If we got this far without import errors, the function exists
     "Import check"
 )

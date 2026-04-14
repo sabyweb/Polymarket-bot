@@ -391,12 +391,11 @@ class RewardFarmer:
         if self.dry_run:
             return
         try:
-            import sqlite3
             import requests
             from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            from oversight.data_collector import _connect_db
 
-            conn = sqlite3.connect(self.db._db_path, timeout=5)
-            conn.row_factory = sqlite3.Row
+            conn = _connect_db(self.db._db_path)
 
             # Get all condition_ids from fills in last 7 days
             cutoff = time.time() - 7 * 86400

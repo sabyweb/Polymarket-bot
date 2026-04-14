@@ -147,7 +147,8 @@ def _phase0_daily_attribution(
         est_total = sum(m.daily_rate * m.q_share_pct for m in metrics if m.q_share_pct > 0)
         num_active = sum(1 for m in metrics if m.on_book_hours > 0)
 
-        conn = sqlite3.connect(db_path, timeout=10)
+        from oversight.data_collector import _connect_db
+        conn = _connect_db(db_path)
         conn.execute(
             "INSERT OR REPLACE INTO reward_daily "
             "(date, total_reward_usd, total_rebate_usd, total_combined_usd, "
