@@ -82,6 +82,23 @@ def score_market(m: MarketMetrics, hours: float = 24, correction_factor: float =
     return score
 
 
+def score_market_ev(m: MarketMetrics, predictions, hours: float = 24) -> float:
+    """EV-based scoring using calibration layer predictions.
+
+    EV = (reward_rate_per_hour * E[time_on_book]) - (P_fill * E[loss|fill])
+
+    All values in $/day. `predictions` is a CalibrationPredictions instance.
+    The EV already includes uncertainty penalty and reward safety bias
+    from the CalibrationManager.
+    """
+    # predictions.ev_per_day already has:
+    #   - reward safety bias (80% cap)
+    #   - tail-risk adjusted loss
+    #   - uncertainty penalty (confidence scaling)
+    # Use it directly instead of recomputing.
+    return predictions.ev_per_day
+
+
 def classify_market(
     m: MarketMetrics,
     score: float,
@@ -507,6 +524,7 @@ def rank_markets(
     max_markets: int = 40,
     correction_factor: float = 1.0,
     db_path: str = "bot_history.db",
+    calibrator=None,
 ) -> list[ScoredMarket]:
     """Score all markets, rank by score descending, return recommendations.
 
@@ -575,8 +593,30 @@ def rank_markets(
     feedback_penalties = 0
 
     scored = []
+    _use_ev = calibrator is not None and calibrator.is_ready()
+    if _use_ev:
+        log.info("Using EV-based scoring from calibration layer")
+
     for m in active_metrics:
-        s = score_market(m, hours, correction_factor=correction_factor)
+        if _use_ev:
+            _preds = calibrator.get_predictions(
+                condition_id=m.condition_id,
+                daily_rate=m.daily_rate,
+                q_share_pct=m.q_share_pct,
+                on_book_hours=m.on_book_hours,
+                fill_count_recent=m.fill_count_recent,
+                fill_cost_recent=m.fill_cost_recent,
+                dump_revenue_recent=m.dump_revenue_recent,
+                agent_shares=getattr(m, "min_size", 50),
+                correction_factor=correction_factor,
+            )
+            s = score_market_ev(m, _preds, hours)
+            # Fix 5: MIN_EV_THRESHOLD — don't deploy marginal markets
+            from calibration.manager import MIN_EV_THRESHOLD
+            if s < MIN_EV_THRESHOLD and s > 0 and m.on_book_hours > 2:
+                s = 0.0  # force to zero → classify_market will avoid
+        else:
+            s = score_market(m, hours, correction_factor=correction_factor)
 
         # ── Layer 1: Regime detection (immediate) ──
         # Detect structural market changes: resolution proximity, adverse
@@ -679,8 +719,11 @@ def rank_markets(
             # Layer 6b: Q-share trend — competition shift detection
             # If our Q-share is dropping (new competitors entering),
             # apply additional penalty proportional to the decline.
+            # Suppressed when calibrator is active (reward_model handles this).
             q_trend = hist.get("q_share_trend", 1.0)
-            if q_trend < 0.5:
+            if _use_ev:
+                pass  # reward_model already incorporates competition dynamics
+            elif q_trend < 0.5:
                 # Q-share halved or worse → heavy penalty (losing competition)
                 s *= 0.6
                 log.debug(f"Q-share declining {m.condition_id[:12]}: trend={q_trend:.2f}")

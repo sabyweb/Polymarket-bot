@@ -232,7 +232,7 @@ def run_once(
     from oversight.allocation_writer import (
         compute_allocations, write_allocations, generate_summary,
     )
-    from oversight.safety_controller import SafetyController
+    from oversight.safety_controller import SafetyController, UNSAFE
 
     # Initialize safety controller (loads persisted state from DB)
     safety = SafetyController(db_path=db_path)
@@ -314,16 +314,21 @@ def run_once(
         actual_per_day = actual_daily_payout / max(hours / 24, 0.1)
         raw_cf = actual_per_day / estimated_daily_total
 
-    safety_state = safety.evaluate(
+    # Compute total portfolio value for safety layer drawdown tracking
+    _total_portfolio = safety._compute_portfolio_value(exchange_bal or 0.0)
+
+    safety_state = safety.evaluate_state(
         correction_factor_raw=raw_cf,
         estimated_daily_total=estimated_daily_total,
         actual_daily_payout=actual_daily_payout,
-        fill_damage_24h=fill_damage_24h,
         reward_payout_24h=actual_daily_payout,
         num_scoring_markets=num_scoring,
+        fill_damage_24h=fill_damage_24h,
         fill_damage_7d=fill_damage_7d,
         clob_rate_delta_pct=clob_rate_delta,
         data_completeness=data_completeness,
+        exchange_balance=exchange_bal or 0.0,
+        total_portfolio_value=_total_portfolio,
     )
     log.info(
         f"Safety state: {safety_state} | CF_raw={raw_cf:.4f} | "
@@ -333,13 +338,42 @@ def run_once(
         f"data_completeness={data_completeness:.0%}"
     )
 
-    # Step 3: Score (with correction factor from actual payouts)
-    log.info(f"Scoring {len(metrics)} markets (reward correction={correction_factor:.4f})...")
-    scored = rank_markets(metrics, hours=hours, correction_factor=correction_factor, db_path=db_path)
+    # Step 2c: Calibration layer — retrain models and produce EV estimates
+    from calibration import CalibrationManager
+    calibrator = CalibrationManager(db_path=db_path)
+    try:
+        cal_metrics = calibrator.retrain(correction_factor=correction_factor)
+        log.info(
+            f"Calibration: ready={calibrator.is_ready()} | "
+            f"fill={cal_metrics.get('fill_model', {}).get('status', '?')} | "
+            f"loss={cal_metrics.get('loss_model', {}).get('status', '?')} | "
+            f"hazard={cal_metrics.get('hazard_model', {}).get('status', '?')} | "
+            f"reward={cal_metrics.get('reward_model', {}).get('status', '?')}"
+        )
+    except Exception as e:
+        log.warning(f"Calibration retrain failed: {e}")
+        calibrator = None
 
-    # Step 4: Allocate with ACTUAL available capital
-    log.info(f"Computing allocations (${available_capital:.0f} available)...")
-    allocations = compute_allocations(scored, total_capital=available_capital)
+    # Step 3: Score (with correction factor from actual payouts + calibration)
+    log.info(f"Scoring {len(metrics)} markets (reward correction={correction_factor:.4f})...")
+    scored = rank_markets(
+        metrics, hours=hours, correction_factor=correction_factor,
+        db_path=db_path, calibrator=calibrator,
+    )
+
+    # Step 4: Allocate — profit engine when calibrator ready, else legacy
+    if calibrator is not None and calibrator.is_ready():
+        from profit import allocate_portfolio
+        log.info(f"Profit engine allocation (${available_capital:.0f} available)...")
+        allocations = allocate_portfolio(
+            scored_markets=scored,
+            total_capital=available_capital,
+            calibrator=calibrator,
+            db_path=db_path,
+        )
+    else:
+        log.info(f"Legacy allocation (${available_capital:.0f} available)...")
+        allocations = compute_allocations(scored, total_capital=available_capital)
 
     # Step 4b: SAFETY GATE — filter allocations based on system state
     allocations = safety.filter_allocations(allocations, available_capital)

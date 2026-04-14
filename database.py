@@ -342,6 +342,16 @@ CREATE INDEX IF NOT EXISTS idx_cycle_cid_ts ON cycle_snapshots(condition_id, ts)
 CREATE INDEX IF NOT EXISTS idx_daily_date ON daily_pnl(date);
 CREATE INDEX IF NOT EXISTS idx_hourly_ts ON hourly_snapshots(ts);
 CREATE INDEX IF NOT EXISTS idx_msl_ts ON market_selection_log(ts);
+
+CREATE TABLE IF NOT EXISTS calibration_model_state (
+    model_name    TEXT PRIMARY KEY,
+    weights_json  TEXT NOT NULL,
+    trained_at    REAL NOT NULL,
+    n_samples     INTEGER NOT NULL,
+    n_positive    INTEGER NOT NULL DEFAULT 0,
+    metrics_json  TEXT NOT NULL DEFAULT '{}',
+    feature_names TEXT NOT NULL DEFAULT '[]'
+);
 """
 
 
