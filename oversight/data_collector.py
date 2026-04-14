@@ -1079,11 +1079,14 @@ def _smooth_correction_factor(
     db_path: str,
     alpha: float = 0.3,
     has_new_observation: bool = True,
+    estimated_daily: float = 0.0,
+    actual_daily: float = 0.0,
+    deployed_count: int = 0,
 ) -> float:
     """EMA-smooth the correction factor using DB-persisted history.
 
-    Stores each raw observation with timestamp. On read, computes an
-    exponential moving average so a single noisy day doesn't whip the factor.
+    Stores each raw observation with timestamp and context (estimated/actual
+    daily totals, deployed market count) for post-hoc debugging.
 
     Circuit breaker: if raw_factor < 0.01 (estimates > 100x reality),
     skip smoothing and use raw directly — the model is broken and EMA
@@ -1095,12 +1098,25 @@ def _smooth_correction_factor(
         db = _connect_db(db_path)
         db.execute(
             """CREATE TABLE IF NOT EXISTS correction_factor_history (
-                id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts        REAL    NOT NULL,
-                raw       REAL    NOT NULL,
-                smoothed  REAL    NOT NULL
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts              REAL    NOT NULL,
+                raw             REAL    NOT NULL,
+                smoothed        REAL    NOT NULL,
+                estimated_daily REAL    NOT NULL DEFAULT 0,
+                actual_daily    REAL    NOT NULL DEFAULT 0,
+                deployed_count  INTEGER NOT NULL DEFAULT 0
             )"""
         )
+        # Migrate old tables missing new columns
+        for col, typedef in [
+            ("estimated_daily", "REAL NOT NULL DEFAULT 0"),
+            ("actual_daily", "REAL NOT NULL DEFAULT 0"),
+            ("deployed_count", "INTEGER NOT NULL DEFAULT 0"),
+        ]:
+            try:
+                db.execute(f"ALTER TABLE correction_factor_history ADD COLUMN {col} {typedef}")
+            except Exception:
+                pass  # column already exists
 
         # Read last smoothed value
         row = db.execute(
@@ -1135,8 +1151,11 @@ def _smooth_correction_factor(
             smoothed = max(0.001, min(10.0, smoothed))
 
             db.execute(
-                "INSERT INTO correction_factor_history (ts, raw, smoothed) VALUES (?, ?, ?)",
-                (time.time(), raw_factor, smoothed),
+                "INSERT INTO correction_factor_history "
+                "(ts, raw, smoothed, estimated_daily, actual_daily, deployed_count) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (time.time(), raw_factor, smoothed,
+                 estimated_daily, actual_daily, deployed_count),
             )
             # Keep only last 30 observations (~30 cycles ≈ 15h at 30min intervals)
             db.execute(
@@ -1166,49 +1185,65 @@ def _smooth_correction_factor(
         return raw_factor if has_new_observation else 1.0
 
 
-def _load_deployed_cids(db_path: str) -> set[str]:
-    """Load condition_ids of currently deployed markets from last allocation file.
+def persist_deployed_cids(
+    db_path: str,
+    deployed_cids: set[str],
+    probe_cids: set[str] | None = None,
+) -> None:
+    """Write the current deployed market set to DB.
 
-    GAP 1 fix: The correction factor must use ONLY deployed markets in
-    its denominator. This function reads the previous allocation output
-    to identify which markets have capital at risk.
-
-    Falls back to markets with active orders in DB if no allocation file.
-    Returns empty set on failure (safe: collect_all will use on-book fallback).
+    Called by the agent after allocation so subsequent CF calculations
+    can read from DB instead of parsing market_allocations.json.
     """
-    import os
+    try:
+        db = _connect_db(db_path)
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS deployed_markets (
+                condition_id TEXT PRIMARY KEY,
+                ts           REAL NOT NULL,
+                is_probe     INTEGER NOT NULL DEFAULT 0
+            )"""
+        )
+        db.execute("DELETE FROM deployed_markets")
+        now = time.time()
+        probe_cids = probe_cids or set()
+        db.executemany(
+            "INSERT INTO deployed_markets (condition_id, ts, is_probe) VALUES (?, ?, ?)",
+            [(cid, now, 1 if cid in probe_cids else 0) for cid in deployed_cids],
+        )
+        db.commit()
+        db.close()
+    except Exception as e:
+        log.debug(f"Failed to persist deployed CIDs: {e}")
 
-    # Primary: read allocation file — check alongside db_path first, then CWD
-    candidates = [
-        os.path.join(os.path.dirname(db_path) or ".", "market_allocations.json"),
-        "market_allocations.json",
-    ]
-    seen: set[str] = set()
-    for alloc_path in candidates:
-        real = os.path.realpath(alloc_path)
-        if real in seen:
-            continue
-        seen.add(real)
-        try:
-            if os.path.exists(alloc_path):
-                with open(alloc_path) as f:
-                    data = json.load(f)
-                deployed = {
-                    m["condition_id"]
-                    for m in data.get("markets", [])
-                    if m.get("action") == "deploy"
-                }
-                if deployed:
-                    return deployed
-        except Exception as e:
-            log.debug(f"Could not load deployed CIDs from {alloc_path}: {e}")
 
-    # Fallback: markets with active orders in DB
+def _load_deployed_cids(db_path: str) -> tuple[set[str], set[str]]:
+    """Load deployed market CIDs from DB, excluding probe markets.
+
+    Returns (deployed_cids, probe_cids).
+    deployed_cids excludes probes — use for CF denominator.
+    probe_cids are UNSAFE-state data-collection-only markets.
+
+    Falls back to active_orders table, then empty set.
+    """
+    # Primary: DB table written by persist_deployed_cids
+    rows = _query_with_retry(
+        db_path,
+        "SELECT condition_id, is_probe FROM deployed_markets WHERE ts > ?",
+        (time.time() - 7200,),  # stale after 2h
+    )
+    if rows:
+        deployed = {r[0] for r in rows if not r[1]}
+        probes = {r[0] for r in rows if r[1]}
+        if deployed or probes:
+            return deployed, probes
+
+    # Fallback: active_orders (no probe distinction)
     rows = _query_with_retry(db_path, "SELECT DISTINCT condition_id FROM active_orders")
     if rows:
-        return {r[0] for r in rows}
+        return {r[0] for r in rows}, set()
 
-    return set()
+    return set(), set()
 
 
 def collect_all(
@@ -1322,25 +1357,24 @@ def collect_all(
 
     # ── GAP 1 FIX: Portfolio-only correction factor ──
     # The correction factor must compare actual payouts against DEPLOYED
-    # markets only — not the entire tracked universe. Including all ~300+
-    # tracked markets (most with stale q_share=0.5) inflates the
-    # denominator by 100-1000x, making the ratio permanently broken and
-    # trapping the system in UNSAFE.
+    # markets only — not the entire tracked universe. Probe markets
+    # (UNSAFE state, data-collection only) are excluded because they
+    # don't earn meaningful rewards.
     #
-    # Load deployed CIDs from previous allocation file.
-    deployed_cids = _load_deployed_cids(db_path)
+    # Load deployed CIDs from DB (persisted by agent after each cycle).
+    deployed_cids, probe_cids = _load_deployed_cids(db_path)
     deployed_count = len(deployed_cids)
 
     if deployed_cids:
-        # Portfolio calibration: only deployed markets contribute
+        # Portfolio calibration: only non-probe deployed markets contribute
         estimated_daily_total = sum(
             m.daily_rate * m.q_share_pct
             for m in metrics
             if m.q_share_pct > 0 and m.condition_id in deployed_cids
         )
         log.info(
-            f"Portfolio CF denominator: {deployed_count} deployed markets, "
-            f"est=${estimated_daily_total:.2f}/d"
+            f"Portfolio CF denominator: {deployed_count} deployed markets "
+            f"({len(probe_cids)} probes excluded), est=${estimated_daily_total:.2f}/d"
         )
     else:
         # No previous allocation — use all markets with on_book > 0
@@ -1355,13 +1389,19 @@ def collect_all(
             f"on-book markets for CF, est=${estimated_daily_total:.2f}/d"
         )
 
+    # Minimum denominator guard: when estimated_daily_total is tiny
+    # (< $0.50/day), the ratio becomes noise-dominated. A single
+    # $0.10 payout swing causes 20%+ CF swings. Skip CF update.
+    MIN_EST_DAILY = 0.50
     raw_factor = 1.0
     est_actual_ratio = 0.0
-    if actual_daily_total > 0 and estimated_daily_total > 0:
+    has_new_cf = False
+    if actual_daily_total > 0 and estimated_daily_total >= MIN_EST_DAILY:
         actual_per_day = actual_daily_total / max(hours / 24, 0.1)
         raw_factor = actual_per_day / estimated_daily_total
         est_actual_ratio = estimated_daily_total / actual_per_day
         raw_factor = max(0.001, min(10.0, raw_factor))
+        has_new_cf = True
         log.info(
             f"Reward correction: actual=${actual_per_day:.2f}/d vs "
             f"estimated=${estimated_daily_total:.2f}/d → raw_factor={raw_factor:.4f} "
@@ -1373,8 +1413,12 @@ def collect_all(
                 f"MISCALIBRATION: estimates {est_actual_ratio:.0f}x higher than actual "
                 f"(deployed portfolio only)."
             )
-    elif actual_daily_total > 0 and estimated_daily_total == 0 and deployed_count < 3:
-        # Not enough deployed markets to compute ratio — don't penalize
+    elif actual_daily_total > 0 and estimated_daily_total < MIN_EST_DAILY:
+        log.info(
+            f"Reward correction: est=${estimated_daily_total:.2f}/d < "
+            f"${MIN_EST_DAILY}/d minimum — skipping CF update (noise-dominated)"
+        )
+    elif actual_daily_total > 0 and deployed_count < 3:
         log.info(
             f"Reward correction: actual=${actual_daily_total:.2f} but <3 deployed "
             f"markets — skipping ratio (insufficient signal)"
@@ -1389,7 +1433,10 @@ def collect_all(
     # This damps out single-day spikes (late payouts, double payouts).
     correction_factor = _smooth_correction_factor(
         raw_factor, db_path, alpha=0.3,
-        has_new_observation=(actual_daily_total > 0 and estimated_daily_total > 0),
+        has_new_observation=has_new_cf,
+        estimated_daily=estimated_daily_total,
+        actual_daily=actual_daily_total,
+        deployed_count=deployed_count,
     )
 
     # Issue 2+9: Compute forward-looking rate delta and data completeness

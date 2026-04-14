@@ -289,7 +289,7 @@ def run_once(
     # collect_all() already computes this internally. We replicate the
     # logic here for the safety controller's independent check.
     from oversight.data_collector import _load_deployed_cids
-    deployed_cids = _load_deployed_cids(db_path)
+    deployed_cids, _probe_cids = _load_deployed_cids(db_path)
     if deployed_cids:
         estimated_daily_total = sum(
             m.daily_rate * min(m.q_share_pct, 0.5)
@@ -343,6 +343,16 @@ def run_once(
 
     # Step 4b: SAFETY GATE — filter allocations based on system state
     allocations = safety.filter_allocations(allocations, available_capital)
+
+    # Persist deployed CIDs to DB so collect_all can read them next cycle
+    # without depending on the JSON allocation file.
+    from oversight.data_collector import persist_deployed_cids
+    _deploy_cids = {a["condition_id"] for a in allocations if a["action"] == "deploy"}
+    _probe_cids_out = {
+        a["condition_id"] for a in allocations
+        if a["action"] == "deploy" and str(a.get("reason", "")).startswith("PROBE:")
+    }
+    persist_deployed_cids(db_path, _deploy_cids, _probe_cids_out)
 
     raw_deployed = sum(
         a.get("shares_per_side", 0)
