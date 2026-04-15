@@ -10,5 +10,9 @@ These feed into: EV = (reward × time) - (P_fill × loss)
 """
 
 from .manager import CalibrationManager, CalibrationPredictions
+from .attribution import compute_attribution, get_attribution_error
 
-__all__ = ["CalibrationManager", "CalibrationPredictions"]
+__all__ = [
+    "CalibrationManager", "CalibrationPredictions",
+    "compute_attribution", "get_attribution_error",
+]

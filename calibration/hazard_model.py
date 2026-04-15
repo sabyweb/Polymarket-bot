@@ -208,6 +208,16 @@ class HazardModel:
     def is_ready(self) -> bool:
         return self.n_samples >= MIN_SAMPLES
 
+    def get_reliability_score(self) -> float:
+        """0.0 (not ready) to 1.0 (mature, high quality)."""
+        if not self.is_ready():
+            return 0.0
+        size_score = min(1.0, self.n_samples / 300)
+        segs = self.metrics.get("segments", {})
+        populated = sum(1 for s in segs.values() if s.get("n", 0) >= 10)
+        seg_bonus = 0.85 + 0.15 * min(1.0, populated / 3)
+        return min(1.0, size_score * seg_bonus)
+
     def save(self, db_path: str):
         try:
             db = _connect_db(db_path)

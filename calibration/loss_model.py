@@ -258,6 +258,18 @@ class LossModel:
     def is_ready(self) -> bool:
         return self.n_samples >= MIN_SAMPLES
 
+    def get_reliability_score(self) -> float:
+        """0.0 (not ready) to 1.0 (mature, high quality)."""
+        if not self.is_ready():
+            return 0.0
+        size_score = min(1.0, self.n_samples / 150)
+        if self.ols_weights is None:
+            ols_mult = 1.0
+        else:
+            ramp = min(1.0, (self.n_samples - MIN_SAMPLES_OLS) / 50)
+            ols_mult = 1.0 + 0.15 * ramp
+        return min(1.0, size_score * ols_mult)
+
     def save(self, db_path: str):
         try:
             db = _connect_db(db_path)

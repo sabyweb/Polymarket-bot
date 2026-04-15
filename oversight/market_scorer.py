@@ -613,7 +613,7 @@ def rank_markets(
             s = score_market_ev(m, _preds, hours)
             # Fix 5: MIN_EV_THRESHOLD — don't deploy marginal markets
             from calibration.manager import MIN_EV_THRESHOLD
-            if s < MIN_EV_THRESHOLD and s > 0 and m.on_book_hours > 2:
+            if s < MIN_EV_THRESHOLD and s > 0:
                 s = 0.0  # force to zero → classify_market will avoid
         else:
             s = score_market(m, hours, correction_factor=correction_factor)

@@ -714,6 +714,131 @@ class TestMinEVThreshold(unittest.TestCase):
         self.assertLess(ev, MIN_EV_THRESHOLD)
 
 
+class TestReliabilityScores(unittest.TestCase):
+    """Per-model get_reliability_score() methods."""
+
+    def test_fill_model_not_ready_zero(self):
+        from calibration.fill_model import FillModel
+        fm = FillModel()
+        self.assertEqual(fm.get_reliability_score(), 0.0)
+
+    def test_fill_model_increases_with_samples(self):
+        from calibration.fill_model import FillModel
+        fm_small = FillModel()
+        fm_small.n_samples = 60
+        fm_small.n_positive = 20
+        fm_small.metrics = {"epochs": 100, "base_rate": 0.33, "accuracy": 0.7}
+        fm_large = FillModel()
+        fm_large.n_samples = 300
+        fm_large.n_positive = 100
+        fm_large.metrics = {"epochs": 100, "base_rate": 0.33, "accuracy": 0.8}
+        self.assertGreater(fm_large.get_reliability_score(),
+                           fm_small.get_reliability_score())
+
+    def test_fill_model_penalizes_imbalance(self):
+        from calibration.fill_model import FillModel
+        fm_balanced = FillModel()
+        fm_balanced.n_samples = 200
+        fm_balanced.n_positive = 100
+        fm_balanced.metrics = {"epochs": 100, "base_rate": 0.50, "accuracy": 0.8}
+        fm_imbalanced = FillModel()
+        fm_imbalanced.n_samples = 200
+        fm_imbalanced.n_positive = 20
+        fm_imbalanced.metrics = {"epochs": 100, "base_rate": 0.10, "accuracy": 0.9}
+        self.assertGreater(fm_balanced.get_reliability_score(),
+                           fm_imbalanced.get_reliability_score())
+
+    def test_fill_model_convergence_bonus(self):
+        from calibration.fill_model import FillModel, MAX_EPOCHS
+        fm_fast = FillModel()
+        fm_fast.n_samples = 200
+        fm_fast.n_positive = 80
+        fm_fast.metrics = {"epochs": int(MAX_EPOCHS * 0.5), "base_rate": 0.40}
+        fm_slow = FillModel()
+        fm_slow.n_samples = 200
+        fm_slow.n_positive = 80
+        fm_slow.metrics = {"epochs": MAX_EPOCHS, "base_rate": 0.40}
+        self.assertGreater(fm_fast.get_reliability_score(),
+                           fm_slow.get_reliability_score())
+
+    def test_loss_model_not_ready_zero(self):
+        from calibration.loss_model import LossModel
+        lm = LossModel()
+        self.assertEqual(lm.get_reliability_score(), 0.0)
+
+    def test_loss_model_ols_bonus(self):
+        from calibration.loss_model import LossModel
+        lm_no_ols = LossModel()
+        lm_no_ols.n_samples = 120
+        lm_no_ols.ols_weights = None
+        lm_ols = LossModel()
+        lm_ols.n_samples = 120
+        lm_ols.ols_weights = [0.1, 0.2, 0.01, 0.005]
+        self.assertGreater(lm_ols.get_reliability_score(),
+                           lm_no_ols.get_reliability_score())
+
+    def test_hazard_model_not_ready_zero(self):
+        from calibration.hazard_model import HazardModel
+        hm = HazardModel()
+        self.assertEqual(hm.get_reliability_score(), 0.0)
+
+    def test_hazard_model_segment_coverage(self):
+        from calibration.hazard_model import HazardModel
+        hm_all = HazardModel()
+        hm_all.n_samples = 200
+        hm_all.metrics = {"segments": {
+            "front": {"n": 50}, "mid": {"n": 80}, "back": {"n": 70}
+        }}
+        hm_sparse = HazardModel()
+        hm_sparse.n_samples = 200
+        hm_sparse.metrics = {"segments": {
+            "front": {"n": 50}, "mid": {"n": 5}, "back": {"n": 3}
+        }}
+        self.assertGreater(hm_all.get_reliability_score(),
+                           hm_sparse.get_reliability_score())
+
+    def test_reward_model_phase1_partial_credit(self):
+        from calibration.reward_model import RewardModel
+        rm = RewardModel()
+        rm.phase = 1
+        rm.n_days = 3
+        score = rm.get_reliability_score()
+        self.assertGreater(score, 0.0)
+        self.assertLessEqual(score, 0.4)
+
+    def test_reward_model_phase2_higher_than_phase1(self):
+        from calibration.reward_model import RewardModel
+        rm1 = RewardModel()
+        rm1.phase = 1
+        rm1.n_days = 6
+        rm2 = RewardModel()
+        rm2.phase = 2
+        rm2.n_days = 14
+        rm2.metrics = {"relative_mae": 0.3}
+        self.assertGreater(rm2.get_reliability_score(),
+                           rm1.get_reliability_score())
+
+    def test_all_scores_in_range(self):
+        from calibration.fill_model import FillModel
+        from calibration.loss_model import LossModel
+        from calibration.hazard_model import HazardModel
+        from calibration.reward_model import RewardModel
+        for Model, setup in [
+            (FillModel, lambda m: setattr(m, 'n_samples', 300) or
+                setattr(m, 'n_positive', 100) or
+                setattr(m, 'metrics', {"epochs": 50, "base_rate": 0.33})),
+            (LossModel, lambda m: setattr(m, 'n_samples', 200)),
+            (HazardModel, lambda m: setattr(m, 'n_samples', 400) or
+                setattr(m, 'metrics', {"segments": {
+                    "front": {"n": 100}, "mid": {"n": 150}, "back": {"n": 150}}})),
+        ]:
+            model = Model()
+            setup(model)
+            s = model.get_reliability_score()
+            self.assertGreaterEqual(s, 0.0)
+            self.assertLessEqual(s, 1.0)
+
+
 class TestUncertaintyPenalty(unittest.TestCase):
     """Fix 6: EV scaled by model confidence (uncertainty discount)."""
 
@@ -724,28 +849,31 @@ class TestUncertaintyPenalty(unittest.TestCase):
         os.unlink(self.db_path)
 
     def test_ev_discounted_by_confidence(self):
-        from calibration.manager import CalibrationManager, UNCERTAINTY_FLOOR
+        from calibration.manager import (
+            CalibrationManager,
+            CONFIDENCE_FLOOR_PROFITABLE,
+            CONFIDENCE_FLOOR_UNPROFITABLE,
+        )
         mgr = CalibrationManager(db_path=self.db_path)
         mgr.retrain(correction_factor=0.5)
         preds = mgr.get_predictions(
             condition_id="cid_001", daily_rate=25.0,
             q_share_pct=0.1, on_book_hours=10.0,
         )
-        # EV should be finite and the model_versions dict should exist
         self.assertIsNotNone(preds.model_versions)
-        # With some fallbacks, EV should be discounted
-        # (not all 4 models may be ready)
-        n_model = sum(1 for v in preds.model_versions.values() if v != "fallback")
-        n_total = len(preds.model_versions)
-        expected_mult = max(UNCERTAINTY_FLOOR, n_model / max(n_total, 1))
-        # The EV has been scaled — just verify it's a real number
         self.assertFalse(math.isnan(preds.ev_per_day))
         self.assertFalse(math.isinf(preds.ev_per_day))
+        # PART 4: dynamic floor — depends on raw_ev sign.
+        expected_floor = (
+            CONFIDENCE_FLOOR_PROFITABLE if preds.raw_ev_per_day > 0
+            else CONFIDENCE_FLOOR_UNPROFITABLE
+        )
+        self.assertGreaterEqual(preds.model_confidence, expected_floor)
+        self.assertLessEqual(preds.model_confidence, 1.0)
 
     def test_all_fallback_still_produces_ev(self):
         """Even with all fallbacks, EV should be computed (at UNCERTAINTY_FLOOR)."""
         from calibration.manager import CalibrationManager, UNCERTAINTY_FLOOR
-        # Create empty DB — all models will use fallbacks
         tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         path = tmp.name
         tmp.close()
@@ -767,14 +895,23 @@ class TestUncertaintyPenalty(unittest.TestCase):
 
         mgr = CalibrationManager(db_path=path)
         mgr.retrain(correction_factor=0.5)
-        self.assertFalse(mgr.is_ready())  # all models in fallback
+        self.assertFalse(mgr.is_ready())
         preds = mgr.get_predictions(
             condition_id="test_cid", daily_rate=25.0,
             q_share_pct=0.1, on_book_hours=10.0,
         )
         self.assertEqual(preds.confidence, "fallback")
         self.assertFalse(math.isnan(preds.ev_per_day))
+        # All models fallback → all reliability 0.0 → confidence = UNCERTAINTY_FLOOR
+        self.assertAlmostEqual(preds.model_confidence, UNCERTAINTY_FLOOR, places=4)
         os.unlink(path)
+
+    def test_weighted_confidence_fill_matters_more(self):
+        """Fill model reliability should have more weight than reward model."""
+        from calibration.manager import MODEL_WEIGHTS
+        self.assertGreater(MODEL_WEIGHTS["p_fill"], MODEL_WEIGHTS["reward"])
+        self.assertGreater(MODEL_WEIGHTS["e_loss"], MODEL_WEIGHTS["reward"])
+        self.assertAlmostEqual(sum(MODEL_WEIGHTS.values()), 1.0, places=6)
 
 
 if __name__ == "__main__":

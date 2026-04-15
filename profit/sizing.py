@@ -34,10 +34,14 @@ def compute_shares(
     3. Cap: max_per_market / cost_per_share
     4. Depth-aware: reduce if shares > 2× depth_ahead (Q-score dilution)
     """
+    # FIX 11: zero (or negative) capital → zero shares, no min_size fallback.
+    # The exchange minimum is enforced only when capital was actually allocated.
+    if allocated_capital <= 0:
+        return 0, 0.0
+
     cpb = _cost_per_share_both(spread)
-    if cpb <= 0 or allocated_capital <= 0:
-        shares = int(min_size)
-        return shares, shares * _cost_per_share_both(spread)
+    if cpb <= 0:
+        return 0, 0.0
 
     # Base sizing from allocated capital
     raw_shares = int(allocated_capital / cpb)

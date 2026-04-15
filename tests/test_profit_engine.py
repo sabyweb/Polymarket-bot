@@ -110,26 +110,29 @@ def _create_profit_test_db():
 class TestRiskAdjustedScore(unittest.TestCase):
     def test_higher_ev_higher_score(self):
         from profit.allocator import _risk_adjusted_score
-        s1 = _risk_adjusted_score(ev_per_day=2.0, confidence="model", p_fill_24h=0.1)
-        s2 = _risk_adjusted_score(ev_per_day=1.0, confidence="model", p_fill_24h=0.1)
+        s1 = _risk_adjusted_score(ev_per_day=2.0, p_fill_24h=0.1, loss_per_fill=5.0)
+        s2 = _risk_adjusted_score(ev_per_day=1.0, p_fill_24h=0.1, loss_per_fill=5.0)
         self.assertGreater(s1, s2)
 
     def test_higher_fill_prob_lower_score(self):
         from profit.allocator import _risk_adjusted_score
-        s_safe = _risk_adjusted_score(ev_per_day=1.0, confidence="model", p_fill_24h=0.05)
-        s_risky = _risk_adjusted_score(ev_per_day=1.0, confidence="model", p_fill_24h=0.5)
+        s_safe = _risk_adjusted_score(ev_per_day=1.0, p_fill_24h=0.05, loss_per_fill=5.0)
+        s_risky = _risk_adjusted_score(ev_per_day=1.0, p_fill_24h=0.5, loss_per_fill=5.0)
         self.assertGreater(s_safe, s_risky)
 
-    def test_fallback_confidence_discounted(self):
+    def test_higher_loss_lower_score(self):
+        """FIX 14: loss term actually moves the score now (previous formula
+        ignored it)."""
         from profit.allocator import _risk_adjusted_score
-        s_model = _risk_adjusted_score(ev_per_day=1.0, confidence="model", p_fill_24h=0.1)
-        s_fallback = _risk_adjusted_score(ev_per_day=1.0, confidence="fallback", p_fill_24h=0.1)
-        self.assertGreater(s_model, s_fallback)
+        s_low = _risk_adjusted_score(ev_per_day=1.0, p_fill_24h=0.3, loss_per_fill=1.0)
+        s_high = _risk_adjusted_score(ev_per_day=1.0, p_fill_24h=0.3, loss_per_fill=10.0)
+        self.assertGreater(s_low, s_high)
 
-    def test_negative_ev_negative_score(self):
+    def test_negative_ev_zero_score(self):
+        """FIX 1: Negative EV collapses to exactly zero (no negative scores)."""
         from profit.allocator import _risk_adjusted_score
-        s = _risk_adjusted_score(ev_per_day=-1.0, confidence="model", p_fill_24h=0.1)
-        self.assertLess(s, 0)
+        s = _risk_adjusted_score(ev_per_day=-1.0, p_fill_24h=0.1, loss_per_fill=5.0)
+        self.assertEqual(s, 0.0)
 
 
 class TestAllocatePortfolio(unittest.TestCase):
@@ -157,11 +160,14 @@ class TestAllocatePortfolio(unittest.TestCase):
         markets = [_make_scored_market(f"m{i}", score=1.0) for i in range(10)]
         preds = {f"m{i}": _make_predictions(f"m{i}", ev=1.0) for i in range(10)}
         cal = _make_mock_calibrator(preds)
-        allocs = allocate_portfolio(markets, 500.0, cal, self.db_path)
+        # Use realistic capital so per_market_cap >= min_cost after eff scaling
+        allocs = allocate_portfolio(markets, 10000.0, cal, self.db_path)
         total_cost = sum(a.get("est_capital_cost", 0) for a in allocs
                          if a["action"] == "deploy")
-        # Total should be reasonable (may exceed capital — exchange is real gate)
         self.assertGreater(total_cost, 0)
+        # FIX 6: total must not exceed effective_capital by more than 1%
+        # (effective = deployable, no rebalance credit; eff_scale = 0.30 floor)
+        self.assertLessEqual(total_cost, 10000.0 * 1.01)
 
     def test_higher_ras_gets_more_capital(self):
         from profit.allocator import allocate_portfolio
@@ -249,10 +255,25 @@ class TestSizing(unittest.TestCase):
         shares_thin, _ = compute_shares(200.0, 0.045, min_size=50, depth_ahead=30)
         self.assertLessEqual(shares_thin, shares_no_depth)
 
-    def test_zero_capital_gives_min_size(self):
+    def test_zero_capital_gives_zero_shares(self):
+        """FIX 11: zero capital must return zero shares (no speculative min_size)."""
         from profit.sizing import compute_shares
-        shares, _ = compute_shares(0.0, 0.045, min_size=50)
-        self.assertEqual(shares, 50)
+        shares, cost = compute_shares(0.0, 0.045, min_size=50)
+        self.assertEqual(shares, 0)
+        self.assertEqual(cost, 0.0)
+
+    def test_negative_capital_gives_zero_shares(self):
+        """FIX 11: negative capital also returns zero shares."""
+        from profit.sizing import compute_shares
+        shares, cost = compute_shares(-5.0, 0.045, min_size=50)
+        self.assertEqual(shares, 0)
+        self.assertEqual(cost, 0.0)
+
+    def test_positive_capital_respects_min_size(self):
+        """Min-size floor still applies once capital IS allocated."""
+        from profit.sizing import compute_shares
+        shares, _ = compute_shares(10.0, 0.045, min_size=50)
+        self.assertGreaterEqual(shares, 50)
 
     def test_slippage_estimate(self):
         from profit.sizing import estimate_slippage
@@ -439,8 +460,9 @@ class TestCorrelationClustering(unittest.TestCase):
 
     def test_no_fills_returns_empty(self):
         from profit.correlation import build_fill_clusters
-        clusters = build_fill_clusters(self.db_path)
+        clusters, oversized = build_fill_clusters(self.db_path)
         self.assertEqual(len(clusters), 0)
+        self.assertEqual(len(oversized), 0)
 
     def test_synthetic_clusters(self):
         """3 markets co-filled 4 times in 24h → same cluster."""
@@ -467,7 +489,7 @@ class TestCorrelationClustering(unittest.TestCase):
         db.commit()
         db.close()
 
-        clusters = build_fill_clusters(self.db_path)
+        clusters, _oversized = build_fill_clusters(self.db_path)
         # A, B, C should be in same cluster
         self.assertEqual(clusters["mkt_A"], clusters["mkt_B"])
         self.assertEqual(clusters["mkt_B"], clusters["mkt_C"])
@@ -582,10 +604,11 @@ class TestEfficiencyScaling(unittest.TestCase):
         self.assertEqual(scale, MIN_EFFICIENCY_SCALE)
 
     def test_efficiency_none_scale(self):
-        """Fix 1: no data at all → scale=1.0 (no constraint)."""
-        from profit.allocator import _compute_efficiency_scale
+        """FIX 12: empty DB yields measured rpd=0.0, indistinguishable from
+        measured zero → scale = MIN (0.30). No days_with_data special-case."""
+        from profit.allocator import _compute_efficiency_scale, MIN_EFFICIENCY_SCALE
         scale = _compute_efficiency_scale(self.db_path)
-        self.assertEqual(scale, 1.0)
+        self.assertEqual(scale, MIN_EFFICIENCY_SCALE)
 
     def test_scale_floor_at_30_pct(self):
         """sqrt(ratio) < 0.30 → clamped. eff=0.0002 → ratio=0.025 → sqrt=0.158."""
@@ -703,7 +726,7 @@ class TestClusterThresholdTwo(unittest.TestCase):
                 )
         db.commit()
         db.close()
-        clusters = build_fill_clusters(self.db_path)
+        clusters, _oversized = build_fill_clusters(self.db_path)
         # With threshold=2, x and y should cluster
         self.assertIn("x", clusters)
         self.assertIn("y", clusters)
@@ -711,7 +734,7 @@ class TestClusterThresholdTwo(unittest.TestCase):
 
 
 class TestClusterSizeGuard(unittest.TestCase):
-    """Fix 4: Clusters > MAX_CLUSTER_SIZE dissolved."""
+    """FIX 9: Clusters > MAX_CLUSTER_SIZE are preserved but flagged oversized."""
 
     def setUp(self):
         self.db_path = _create_profit_test_db()
@@ -728,13 +751,14 @@ class TestClusterSizeGuard(unittest.TestCase):
     def tearDown(self):
         os.unlink(self.db_path)
 
-    def test_oversized_cluster_dissolved(self):
-        """12 markets all co-filled → cluster > MAX_CLUSTER_SIZE=10 → dissolved."""
+    def test_oversized_cluster_preserved_and_flagged(self):
+        """FIX 9: 12-market cluster is NOT dissolved (that would ignore the
+        most dangerous chain-link correlation). Instead it's retained and
+        flagged for stricter capping downstream."""
         from profit.correlation import build_fill_clusters, MAX_CLUSTER_SIZE
         db = sqlite3.connect(self.db_path)
         now = time.time()
         cids = [f"big_{i}" for i in range(12)]
-        # 3 co-fill events for all 12 markets
         for window in range(3):
             base_ts = now - 3600 * (window + 1)
             for cid in cids:
@@ -745,10 +769,14 @@ class TestClusterSizeGuard(unittest.TestCase):
                 )
         db.commit()
         db.close()
-        clusters = build_fill_clusters(self.db_path)
-        # 12-market cluster > MAX_CLUSTER_SIZE → dissolved, no markets in result
+        clusters, oversized_ids = build_fill_clusters(self.db_path)
+        # All 12 markets must remain in the cluster
         for cid in cids:
-            self.assertNotIn(cid, clusters)
+            self.assertIn(cid, clusters)
+        # Their shared cluster_id must be marked oversized
+        cluster_id = clusters[cids[0]]
+        self.assertIn(cluster_id, oversized_ids)
+        self.assertGreater(len([c for c in cids if c in clusters]), MAX_CLUSTER_SIZE)
 
 
 class TestRedistributionAfterCap(unittest.TestCase):
@@ -762,13 +790,13 @@ class TestRedistributionAfterCap(unittest.TestCase):
         allocs = [
             {"condition_id": "a", "action": "deploy", "shares_per_side": 50,
              "est_capital_cost": 45, "min_size": 50, "max_spread": 0.045,
-             "score": 1.0, "_cluster_capped": True},
+             "score": 1.0, "_final_score": 1.0, "_cluster_capped": True},
             {"condition_id": "b", "action": "deploy", "shares_per_side": 50,
              "est_capital_cost": 45, "min_size": 50, "max_spread": 0.045,
-             "score": 1.0, "_cluster_capped": True},
+             "score": 1.0, "_final_score": 1.0, "_cluster_capped": True},
             {"condition_id": "x", "action": "deploy", "shares_per_side": 50,
              "est_capital_cost": 45, "min_size": 50, "max_spread": 0.045,
-             "score": 2.0},  # not capped
+             "score": 2.0, "_final_score": 2.0},  # not capped
         ]
         # deployable=500, allocated=135, remaining=365 (>5% of 500)
         result = _redistribute_cluster_savings(allocs, clusters, 500.0, 0.30)
@@ -784,19 +812,19 @@ class TestRedistributionAfterCap(unittest.TestCase):
         allocs = [
             {"condition_id": "a", "action": "deploy", "shares_per_side": 50,
              "est_capital_cost": 45, "min_size": 50, "max_spread": 0.045,
-             "score": 1.0, "_cluster_capped": True},
+             "score": 1.0, "_final_score": 1.0, "_cluster_capped": True},
             {"condition_id": "b", "action": "deploy", "shares_per_side": 50,
              "est_capital_cost": 45, "min_size": 50, "max_spread": 0.045,
-             "score": 1.0, "_cluster_capped": True},
+             "score": 1.0, "_final_score": 1.0, "_cluster_capped": True},
             {"condition_id": "c", "action": "deploy", "shares_per_side": 50,
              "est_capital_cost": 45, "min_size": 50, "max_spread": 0.045,
-             "score": 1.0, "_cluster_capped": True},
+             "score": 1.0, "_final_score": 1.0, "_cluster_capped": True},
             {"condition_id": "x", "action": "deploy", "shares_per_side": 100,
              "est_capital_cost": 91, "min_size": 50, "max_spread": 0.045,
-             "score": 2.0},
+             "score": 2.0, "_final_score": 2.0},
             {"condition_id": "y", "action": "deploy", "shares_per_side": 100,
              "est_capital_cost": 91, "min_size": 50, "max_spread": 0.045,
-             "score": 2.0},
+             "score": 2.0, "_final_score": 2.0},
         ]
         result = _redistribute_cluster_savings(allocs, clusters, 1000.0, 0.30)
         # After redistribution, cluster 1 (x,y) should not exceed 30%
@@ -857,16 +885,20 @@ class TestScalingSqrtBehavior(unittest.TestCase):
         self.assertGreater(scale, 0.25)  # sqrt > linear for ratio < 1
 
 
-class TestScalingTiedToScores(unittest.TestCase):
-    """Fix 7: Low efficiency scale reduces individual market scores."""
+class TestNoDoubleEfficiencyScaling(unittest.TestCase):
+    """FIX 2: RAS is NOT multiplied by eff_scale. Selection pressure is
+    expressed via deployable_capital alone — applying eff_scale a second
+    time inside RAS was double-counting."""
 
-    def test_low_scale_reduces_ras(self):
-        """eff_scale < 1 should multiply into risk_adjusted_score."""
-        from profit.allocator import allocate_portfolio
+    def test_ras_matches_raw_formula(self):
+        """_ras stored on allocation must equal EV / (1 + p*loss), unscaled."""
+        import profit.allocator as alloc_mod
+        alloc_mod._cycles_without_clustering = 0  # isolate from prior tests
+        from profit.allocator import allocate_portfolio, _risk_adjusted_score
 
         db_path = _create_profit_test_db()
         db = sqlite3.connect(db_path)
-        # Very low efficiency → eff_scale ≈ 0.3
+        # Low efficiency → eff_scale < 1.0 (floors at 0.30)
         for i in range(5):
             db.execute(
                 "INSERT INTO reward_daily (date, total_combined_usd, est_daily_total) "
@@ -876,19 +908,260 @@ class TestScalingTiedToScores(unittest.TestCase):
         db.commit()
         db.close()
 
-        markets = [_make_scored_market("low_eff", score=1.0)]
-        cal = _make_mock_calibrator({"low_eff": _make_predictions("low_eff", ev=1.0)})
+        markets = [_make_scored_market("m", score=1.0)]
+        preds = _make_predictions("m", ev=1.0, p_fill=0.1, loss=5.0)
+        cal = _make_mock_calibrator({"m": preds})
 
-        allocs = allocate_portfolio(markets, 1000.0, cal, db_path)
-        # Market should still deploy but with reduced _ras
+        # $10k so per_market_cap ($200) remains > min_cost ($45) despite
+        # eff_scale=0.30 floor
+        allocs = allocate_portfolio(markets, 10000.0, cal, db_path)
         deploy = [a for a in allocs if a["action"] == "deploy"]
-        if deploy:
-            # _ras should be < raw (because eff_scale < 1 multiplied in)
-            ras = deploy[0].get("_ras", 0)
-            # raw ras ≈ 1.0 * 1.0 * 0.9 = 0.9, adjusted by eff_scale ≈ 0.3
-            self.assertLess(ras, 0.9)
+        self.assertTrue(deploy, "expected market to deploy")
+
+        expected = _risk_adjusted_score(1.0, 0.1, 5.0)  # 1/(1+0.5)=0.667
+        # _ras is the raw RAS — not multiplied by eff_scale
+        self.assertAlmostEqual(deploy[0].get("_ras", 0), expected, places=2)
 
         os.unlink(db_path)
+
+
+class TestAuditFixes(unittest.TestCase):
+    """Required post-audit regression tests (8 named invariants)."""
+
+    # ── FIX 14: risk formula uses loss ──────────────────────────
+
+    def test_risk_formula_uses_loss(self):
+        """score = EV / (1 + p_fill * loss) — loss term must move the score."""
+        from profit.allocator import _risk_adjusted_score
+        s_low = _risk_adjusted_score(ev_per_day=1.0, p_fill_24h=0.5, loss_per_fill=1.0)
+        s_high = _risk_adjusted_score(ev_per_day=1.0, p_fill_24h=0.5, loss_per_fill=10.0)
+        # Numerical: 1/(1+0.5)=0.667 vs 1/(1+5)=0.167
+        self.assertAlmostEqual(s_low, 1.0 / 1.5, places=3)
+        self.assertAlmostEqual(s_high, 1.0 / 6.0, places=3)
+        self.assertGreater(s_low, s_high)
+
+    # ── FIX 2: no double efficiency scaling ─────────────────────
+
+    def test_no_double_efficiency_scaling(self):
+        """Two portfolios with different eff_scale see the SAME _ras per
+        market (eff_scale affects deployable_capital only, not RAS)."""
+        import profit.allocator as alloc_mod
+        alloc_mod._cycles_without_clustering = 0
+        from profit.allocator import allocate_portfolio
+
+        # High-eff DB → eff_scale = 1.0
+        db_hi = _create_profit_test_db()
+        db = sqlite3.connect(db_hi)
+        for i in range(5):
+            db.execute(
+                "INSERT INTO reward_daily (date, total_combined_usd, est_daily_total) "
+                "VALUES (?, ?, ?)",
+                (f"2025-01-{10+i:02d}", 10.0, 500.0),
+            )
+        db.commit()
+        db.close()
+
+        # Low-eff DB → eff_scale ≈ 0.3 (floor)
+        db_lo = _create_profit_test_db()
+        db = sqlite3.connect(db_lo)
+        for i in range(5):
+            db.execute(
+                "INSERT INTO reward_daily (date, total_combined_usd, est_daily_total) "
+                "VALUES (?, ?, ?)",
+                (f"2025-01-{10+i:02d}", 0.1, 500.0),
+            )
+        db.commit()
+        db.close()
+
+        markets = [_make_scored_market("m", score=1.0)]
+        preds = _make_predictions("m", ev=1.0, p_fill=0.1, loss=5.0)
+        cal_hi = _make_mock_calibrator({"m": preds})
+        cal_lo = _make_mock_calibrator({"m": preds})
+
+        # $10k so both scenarios deploy despite low-eff 0.30 floor
+        allocs_hi = allocate_portfolio(markets, 10000.0, cal_hi, db_hi)
+        allocs_lo = allocate_portfolio(markets, 10000.0, cal_lo, db_lo)
+
+        hi = next(a for a in allocs_hi if a["action"] == "deploy")
+        lo = next(a for a in allocs_lo if a["action"] == "deploy")
+        # _ras identical regardless of eff_scale
+        self.assertEqual(hi["_ras"], lo["_ras"])
+
+        os.unlink(db_hi)
+        os.unlink(db_lo)
+
+    # ── FIX 6: capital conservation ─────────────────────────────
+
+    def test_capital_conservation(self):
+        """Total allocated capital must not exceed effective_capital * 1.01."""
+        import profit.allocator as alloc_mod
+        alloc_mod._cycles_without_clustering = 0
+        from profit.allocator import allocate_portfolio
+
+        db_path = _create_profit_test_db()
+
+        # Many high-EV markets → redistribution + min_cost floors try to overshoot
+        markets = [_make_scored_market(f"m{i}", score=2.0) for i in range(30)]
+        preds = {f"m{i}": _make_predictions(f"m{i}", ev=5.0, p_fill=0.05, loss=1.0)
+                 for i in range(30)}
+        cal = _make_mock_calibrator(preds)
+
+        total_capital = 500.0
+        allocs = allocate_portfolio(markets, total_capital, cal, db_path)
+
+        total = sum(a.get("est_capital_cost", 0) for a in allocs
+                    if a["action"] == "deploy")
+        # No rebalance credit (no prior positions) → effective = deployable
+        # eff_scale=1.0 (no reward_daily rows) → deployable = total_capital
+        self.assertLessEqual(total, total_capital * 1.01)
+
+        os.unlink(db_path)
+
+    # ── FIX 7: sliding-window correlation ───────────────────────
+
+    def test_sliding_window_correlation(self):
+        """Co-fill detection uses |t_i - t_j| <= 300s, NOT bucket alignment.
+        Two markets filled 100s apart across any bucket boundary must cluster."""
+        from profit.correlation import build_fill_clusters
+
+        db_path = _create_profit_test_db()
+        db = sqlite3.connect(db_path)
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS fills "
+            "(id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, condition_id TEXT, "
+            "side TEXT, fill_type TEXT, shares REAL, price REAL, "
+            "clob_cost REAL, usd_value REAL)"
+        )
+
+        # Place fills near an arbitrary 300s bucket boundary. With bucket
+        # alignment these would NOT co-occur; with sliding window they DO.
+        now = time.time()
+        boundary = int(now // 300) * 300 - 3600  # an hour ago, on a boundary
+        for k in range(3):  # 3 co-fill events (>= COFILL_MIN_COUNT=2)
+            base = boundary - 3600 * k
+            # A 250s into bucket, B 50s into next bucket → 100s apart
+            db.execute(
+                "INSERT INTO fills (ts, condition_id, side, fill_type, shares, price, clob_cost, usd_value) "
+                "VALUES (?, 'sw_A', 'yes', 'FULL', 50, 0.5, 0.5, 25)",
+                (base + 250,),
+            )
+            db.execute(
+                "INSERT INTO fills (ts, condition_id, side, fill_type, shares, price, clob_cost, usd_value) "
+                "VALUES (?, 'sw_B', 'yes', 'FULL', 50, 0.5, 0.5, 25)",
+                (base + 350,),
+            )
+        db.commit()
+        db.close()
+
+        clusters, _oversized = build_fill_clusters(db_path)
+        self.assertIn("sw_A", clusters)
+        self.assertIn("sw_B", clusters)
+        self.assertEqual(clusters["sw_A"], clusters["sw_B"])
+
+        os.unlink(db_path)
+
+    # ── FIX 8: rebalance respects caps ──────────────────────────
+
+    def test_rebalance_respects_caps(self):
+        """After compute_deltas (which can preserve a large existing position
+        on 'hold'), per-market cap must be re-enforced."""
+        import profit.allocator as alloc_mod
+        alloc_mod._cycles_without_clustering = 0
+        from profit.allocator import allocate_portfolio
+
+        db_path = _create_profit_test_db()
+        # Existing 500-share order → compute_deltas may keep shares near 500
+        # on a small-delta 'hold'. Per-market cap of $200 must still win.
+        db = sqlite3.connect(db_path)
+        db.execute(
+            "INSERT INTO active_orders VALUES "
+            "('o1', 'big', 'yes', 'buy', 0.48, 500, ?)",
+            (time.time(),),
+        )
+        db.commit()
+        db.close()
+
+        markets = [_make_scored_market("big", score=5.0, min_size=50)]
+        preds = {"big": _make_predictions("big", ev=10.0, p_fill=0.05, loss=1.0)}
+        cal = _make_mock_calibrator(preds)
+
+        allocs = allocate_portfolio(
+            markets, 10000.0, cal, db_path,
+            max_per_market=200.0,
+            max_capital_pct=0.5,
+        )
+
+        for a in allocs:
+            if a["action"] == "deploy":
+                # FIX 8 + FIX 10: est_capital_cost strictly bounded
+                self.assertLessEqual(a.get("est_capital_cost", 0), 200 + 2)
+
+        os.unlink(db_path)
+
+    # ── FIX 11: no min_size when zero capital ───────────────────
+
+    def test_no_min_size_when_zero_capital(self):
+        """compute_shares(0, ...) returns (0, 0.0) — never min_size."""
+        from profit.sizing import compute_shares
+        for cap in (0.0, -1.0, -1000.0):
+            shares, cost = compute_shares(cap, 0.045, min_size=50)
+            self.assertEqual(shares, 0, f"cap={cap}: expected 0 shares")
+            self.assertEqual(cost, 0.0, f"cap={cap}: expected 0 cost")
+
+    # ── FIX 13: no allocation when zero RAS ─────────────────────
+
+    def test_no_allocation_when_zero_ras(self):
+        """If total RAS across all markets is 0, NO market deploys
+        (no speculative min-cost deployments)."""
+        import profit.allocator as alloc_mod
+        alloc_mod._cycles_without_clustering = 0
+        from profit.allocator import allocate_portfolio
+
+        db_path = _create_profit_test_db()
+
+        # All markets have negative EV → RAS = 0 for each → total_ras = 0
+        markets = [_make_scored_market(f"loss_{i}", score=1.0) for i in range(3)]
+        preds = {f"loss_{i}": _make_predictions(f"loss_{i}", ev=-1.0)
+                 for i in range(3)}
+        cal = _make_mock_calibrator(preds)
+
+        allocs = allocate_portfolio(markets, 1000.0, cal, db_path)
+        deploys = [a for a in allocs if a["action"] == "deploy"]
+        self.assertEqual(len(deploys), 0)
+
+        os.unlink(db_path)
+
+    # ── FIX 9: oversized cluster handling ───────────────────────
+
+    def test_oversized_cluster_handling(self):
+        """Oversized clusters use OVERSIZED_CLUSTER_PCT (0.15), not the
+        default DEFAULT_MAX_CLUSTER_PCT (0.30) — tighter cap, NOT dissolve."""
+        from profit.correlation import (
+            apply_cluster_caps,
+            OVERSIZED_CLUSTER_PCT,
+            DEFAULT_MAX_CLUSTER_PCT,
+        )
+
+        clusters = {"a": 0, "b": 0}  # both in cluster 0, marked oversized
+        allocs = [
+            {"condition_id": "a", "action": "deploy", "shares_per_side": 300,
+             "est_capital_cost": 250, "min_size": 50, "max_spread": 0.045},
+            {"condition_id": "b", "action": "deploy", "shares_per_side": 300,
+             "est_capital_cost": 250, "min_size": 50, "max_spread": 0.045},
+        ]
+        total = 1000.0
+        result = apply_cluster_caps(
+            allocs, clusters, DEFAULT_MAX_CLUSTER_PCT, total,
+            oversized_cluster_ids={0},
+        )
+        cluster_cost = sum(a["est_capital_cost"] for a in result)
+        # Stricter cap: 15% * $1000 = $150 (plus min-size floor slack)
+        # Must be STRICTLY under default 30% ($300)
+        self.assertLess(cluster_cost, total * DEFAULT_MAX_CLUSTER_PCT)
+        # And target is the stricter OVERSIZED_CLUSTER_PCT
+        self.assertLessEqual(
+            cluster_cost, total * OVERSIZED_CLUSTER_PCT + 100  # floor slack
+        )
 
 
 if __name__ == "__main__":

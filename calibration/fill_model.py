@@ -224,6 +224,18 @@ class FillModel:
     def is_ready(self) -> bool:
         return self.n_samples >= MIN_SAMPLES and self.n_positive >= MIN_POSITIVES
 
+    def get_reliability_score(self) -> float:
+        """0.0 (not ready) to 1.0 (mature, high quality)."""
+        if not self.is_ready():
+            return 0.0
+        size_score = min(1.0, self.n_samples / 250)
+        epoch_frac = self.metrics.get("epochs", MAX_EPOCHS) / MAX_EPOCHS
+        convergence = 1.0 if epoch_frac < 0.8 else 0.85
+        br = self.metrics.get("base_rate", 0.5)
+        balance = min(br, 1 - br) / 0.5
+        balance_factor = 0.7 + 0.3 * balance
+        return min(1.0, size_score * convergence * balance_factor)
+
     def save(self, db_path: str):
         """Persist model weights to calibration_model_state."""
         try:

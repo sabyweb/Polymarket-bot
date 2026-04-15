@@ -361,6 +361,25 @@ def run_once(
         db_path=db_path, calibrator=calibrator,
     )
 
+    # Step 3b: Learning loop — real-time behavior correction.
+    # Runs ALWAYS (safe by design: OFF/SHADOW publish neutral state). The
+    # applied_state is the ONLY thing that can influence downstream
+    # decisions — OFF/SHADOW modes are guaranteed to produce all-1.0
+    # scalars so behavior is identical to the prior system until the
+    # gate promotes to ACTIVE.
+    from profit.learning import LearningController
+    try:
+        learn_ctrl = LearningController(db_path=db_path)
+        learn_step = learn_ctrl.step()
+        learning_state = learn_step.applied_state
+        if calibrator is not None:
+            # Propagate reward_trust into the calibrator's PART 6 reward
+            # pipeline. 1.0 in OFF/SHADOW → no effect.
+            calibrator.reward_trust = learning_state.reward_trust
+    except Exception as e:
+        log.warning(f"Learning loop failed (proceeding neutral): {e}")
+        learning_state = None
+
     # Step 4: Allocate — profit engine when calibrator ready, else legacy
     if calibrator is not None and calibrator.is_ready():
         from profit import allocate_portfolio
@@ -370,6 +389,7 @@ def run_once(
             total_capital=available_capital,
             calibrator=calibrator,
             db_path=db_path,
+            learning_state=learning_state,
         )
     else:
         log.info(f"Legacy allocation (${available_capital:.0f} available)...")
@@ -426,6 +446,23 @@ def run_once(
     # Step 6: Phase 0 — daily reward attribution + pruning
     _phase0_daily_attribution(db_path, metrics, correction_factor)
     _phase0_prune(db_path)
+
+    # Step 6b: Phase 4 — daily bandit posterior update + per-market
+    # reward attribution. Both consume the last 24h of PnL + payout data
+    # that was just written by step 6 / the bot's live DB writes.
+    # Failures here must not crash the cycle (fail-closed: no bandit
+    # update simply means posteriors stay where they were).
+    try:
+        from profit.bandit import Bandit
+        Bandit(db_path).update()
+    except Exception as e:
+        log.warning(f"Bandit update failed: {e}")
+
+    try:
+        from calibration.attribution import compute_attribution
+        compute_attribution(db_path)
+    except Exception as e:
+        log.warning(f"Reward attribution failed: {e}")
 
     # Step 7: Summary
     summary = generate_summary(allocations)

@@ -15,7 +15,7 @@ from oversight.data_collector import _connect_db
 log = logging.getLogger("profit.correlation")
 
 # Co-fill detection parameters
-COFILL_WINDOW_SECS = 300      # 5-minute window
+COFILL_WINDOW_SECS = 300      # 5-minute window (sliding, not bucket-aligned)
 COFILL_MIN_COUNT = 2          # Fix 2: lowered from 3 to catch real correlations
 COFILL_LOOKBACK_SECS = 86400  # 24h lookback
 
@@ -25,18 +25,26 @@ MAX_CLUSTER_SIZE = 10
 # Default cluster cap
 DEFAULT_MAX_CLUSTER_PCT = 0.30
 
+# FIX 9: Stricter cap applied to oversized clusters instead of dissolving them
+OVERSIZED_CLUSTER_PCT = 0.15
 
-def build_fill_clusters(db_path: str) -> dict[str, int]:
+
+def build_fill_clusters(db_path: str) -> tuple[dict[str, int], set[int]]:
     """Build clusters of correlated markets from co-fill patterns.
 
-    Two markets are in the same cluster if they received fills within
-    the same 5-minute window ≥ COFILL_MIN_COUNT times in the last 24h.
+    Two markets are in the same cluster if a pair of their fills landed within
+    COFILL_WINDOW_SECS of each other at least COFILL_MIN_COUNT times in the
+    last COFILL_LOOKBACK_SECS. The window is a true sliding window measured
+    with |t1 - t2| <= COFILL_WINDOW_SECS — NOT bucket-aligned.
 
-    Clusters exceeding MAX_CLUSTER_SIZE are dissolved (markets treated
-    as unclustered) to prevent chain-link explosion.
+    Oversized clusters (> MAX_CLUSTER_SIZE) are preserved but flagged in the
+    returned oversized_cluster_ids set so callers can apply a stricter cap.
+    They are NEVER dropped (doing so would treat the most dangerous chain-link
+    clusters as uncorrelated).
 
-    Returns: {market_id: cluster_id}. Only markets in multi-market
-    clusters are included. Singleton markets are omitted.
+    Returns: (clusters, oversized_cluster_ids)
+      - clusters: {market_id: cluster_id}, only multi-market clusters.
+      - oversized_cluster_ids: set of cluster_ids with size > MAX_CLUSTER_SIZE.
     """
     cutoff = time.time() - COFILL_LOOKBACK_SECS
 
@@ -51,40 +59,37 @@ def build_fill_clusters(db_path: str) -> dict[str, int]:
         db.close()
     except Exception as e:
         log.warning(f"Cluster build failed (DB): {e}")
-        return {}
+        return {}, set()
 
     if not rows:
-        return {}
+        return {}, set()
 
-    # Step 1: Bucket fills into 5-min windows
-    buckets: dict[int, set[str]] = {}
-    all_cids: set[str] = set()
-    for cid, ts in rows:
-        bucket_key = int(ts // COFILL_WINDOW_SECS)
-        buckets.setdefault(bucket_key, set()).add(cid)
-        all_cids.add(cid)
+    all_cids: set[str] = {cid for cid, _ in rows}
 
-    # Step 2: Count co-fill occurrences between pairs
+    # FIX 7: Sliding-window co-fill detection.
+    # Rows are ORDER BY ts. For each fill i, scan forward while
+    # |ts_j - ts_i| <= window and count distinct pair interactions.
     pair_counts: dict[tuple[str, str], int] = {}
-    for bucket_cids in buckets.values():
-        if len(bucket_cids) < 2:
-            continue
-        cids_sorted = sorted(bucket_cids)
-        for i in range(len(cids_sorted)):
-            for j in range(i + 1, len(cids_sorted)):
-                pair = (cids_sorted[i], cids_sorted[j])
-                pair_counts[pair] = pair_counts.get(pair, 0) + 1
+    n = len(rows)
+    for i in range(n):
+        cid_i, ts_i = rows[i]
+        for j in range(i + 1, n):
+            cid_j, ts_j = rows[j]
+            if ts_j - ts_i > COFILL_WINDOW_SECS:
+                break
+            if cid_i == cid_j:
+                continue
+            pair = (cid_i, cid_j) if cid_i < cid_j else (cid_j, cid_i)
+            pair_counts[pair] = pair_counts.get(pair, 0) + 1
 
-    # Step 3: Build edges for pairs with ≥ COFILL_MIN_COUNT co-fills
-    edges: list[tuple[str, str]] = []
-    for (a, b), count in pair_counts.items():
-        if count >= COFILL_MIN_COUNT:
-            edges.append((a, b))
-
+    edges: list[tuple[str, str]] = [
+        (a, b) for (a, b), count in pair_counts.items()
+        if count >= COFILL_MIN_COUNT
+    ]
     if not edges:
-        return {}
+        return {}, set()
 
-    # Step 4: Union-Find
+    # Union-Find
     parent: dict[str, str] = {cid: cid for cid in all_cids}
 
     def find(x: str) -> str:
@@ -103,45 +108,41 @@ def build_fill_clusters(db_path: str) -> dict[str, int]:
     for a, b in edges:
         union(a, b)
 
-    # Step 5: Collect clusters
     clusters_by_root: dict[str, list[str]] = {}
     for cid in sorted(all_cids):
         root = find(cid)
         clusters_by_root.setdefault(root, []).append(cid)
 
-    # Step 6: Assign cluster IDs, enforcing size guard (Fix 4)
+    # FIX 9: Oversized clusters are NOT dissolved. They get a stricter cap
+    # applied downstream so the most dangerous chain-link correlations are
+    # restrained, not ignored.
     result: dict[str, int] = {}
+    oversized_ids: set[int] = set()
     next_id = 0
-    oversized_count = 0
-
     for root, members in sorted(clusters_by_root.items()):
         if len(members) < 2:
-            continue  # skip singletons — not correlated
-        if len(members) > MAX_CLUSTER_SIZE:
-            # Fix 4: dissolve oversized clusters
-            oversized_count += 1
-            log.warning(
-                f"Cluster dissolved: {len(members)} markets > MAX_CLUSTER_SIZE={MAX_CLUSTER_SIZE} "
-                f"(root={root[:12]})"
-            )
             continue
         for cid in members:
             result[cid] = next_id
+        if len(members) > MAX_CLUSTER_SIZE:
+            oversized_ids.add(next_id)
+            log.warning(
+                f"Cluster {next_id}: {len(members)} markets > "
+                f"MAX_CLUSTER_SIZE={MAX_CLUSTER_SIZE} — applying stricter cap"
+            )
         next_id += 1
 
-    # Log stats
     cluster_sizes: dict[int, int] = {}
     for cluster_id in result.values():
         cluster_sizes[cluster_id] = cluster_sizes.get(cluster_id, 0) + 1
-    multi_clusters = {k: v for k, v in cluster_sizes.items() if v > 1}
-    if multi_clusters or oversized_count:
+    if cluster_sizes:
         log.info(
-            f"Fill clusters: {len(multi_clusters)} groups, "
-            f"largest={max(multi_clusters.values()) if multi_clusters else 0}, "
-            f"{len(edges)} pairs, {oversized_count} dissolved"
+            f"Fill clusters: {len(cluster_sizes)} groups, "
+            f"largest={max(cluster_sizes.values())}, "
+            f"{len(edges)} pairs, {len(oversized_ids)} oversized"
         )
 
-    return result
+    return result, oversized_ids
 
 
 def compute_cluster_exposure(
@@ -167,20 +168,30 @@ def apply_cluster_caps(
     clusters: dict[str, int],
     max_cluster_pct: float,
     total_capital: float,
+    oversized_cluster_ids: set[int] | None = None,
 ) -> list[dict]:
     """Scale down allocations in over-allocated clusters.
 
     Marks capped markets with _cluster_capped=True for redistribution.
+
+    FIX 9: Clusters in `oversized_cluster_ids` use OVERSIZED_CLUSTER_PCT
+    (tighter) instead of max_cluster_pct.
     """
     if not clusters:
         return allocations
 
-    max_cluster_capital = total_capital * max_cluster_pct
+    oversized = oversized_cluster_ids or set()
+
+    # Per-cluster cap ($) — looked up by cluster_id
+    def cluster_cap(cid_int: int) -> float:
+        pct = OVERSIZED_CLUSTER_PCT if cid_int in oversized else max_cluster_pct
+        return total_capital * pct
+
     exposure = compute_cluster_exposure(allocations, clusters)
 
     over_clusters: dict[int, float] = {}
     for cluster_id, total in exposure.items():
-        if total > max_cluster_capital:
+        if total > cluster_cap(cluster_id):
             over_clusters[cluster_id] = total
 
     if not over_clusters:
@@ -195,7 +206,7 @@ def apply_cluster_caps(
             continue
 
         current_total = over_clusters[cluster_id]
-        scale = max_cluster_capital / current_total
+        scale = cluster_cap(cluster_id) / current_total
 
         old_shares = a["shares_per_side"]
         new_shares = max(int(a.get("min_size", 50)), int(old_shares * scale))
@@ -208,12 +219,14 @@ def apply_cluster_caps(
         a["est_capital_cost"] = round(new_shares * cpb, 2)
 
     for cluster_id, total in over_clusters.items():
+        cap_dollars = cluster_cap(cluster_id)
+        tag = " (oversized)" if cluster_id in oversized else ""
         members = [a["condition_id"] for a in allocations
                     if clusters.get(a["condition_id"]) == cluster_id
                     and a.get("action") == "deploy"]
         log.info(
-            f"Cluster {cluster_id} capped: ${total:.0f} → "
-            f"${max_cluster_capital:.0f} ({len(members)} markets)"
+            f"Cluster {cluster_id}{tag} capped: ${total:.0f} → "
+            f"${cap_dollars:.0f} ({len(members)} markets)"
         )
 
     return allocations

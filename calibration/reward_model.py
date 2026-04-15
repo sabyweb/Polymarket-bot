@@ -173,6 +173,15 @@ class RewardModel:
         """True if phase 2 model is active and validated."""
         return self.phase == 2
 
+    def get_reliability_score(self) -> float:
+        """0.0 (no data) to 1.0 (mature phase 2)."""
+        if self.phase == 1:
+            return min(0.4, self.n_days / 7 * 0.4)
+        day_score = 0.5 + 0.5 * min(1.0, (self.n_days - 7) / 21)
+        rel_mae = self.metrics.get("relative_mae", 0.5)
+        quality = max(0.5, 1.0 - rel_mae)
+        return min(1.0, max(0.4, day_score * quality))
+
     def save(self, db_path: str):
         try:
             db = _connect_db(db_path)

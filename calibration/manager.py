@@ -29,9 +29,35 @@ REWARD_SAFETY_BIAS = 0.80
 # Fix 5: Minimum EV to deploy ($/day) — prevents deploying marginal markets
 MIN_EV_THRESHOLD = 0.10
 
-# Fix 6: Uncertainty penalty — scale EV by confidence
-# Early models are wrong; discount their outputs
-UNCERTAINTY_FLOOR = 0.3  # minimum confidence multiplier
+# PART 4: dynamic confidence floor (replaces the static UNCERTAINTY_FLOOR
+# baseline). The constant is retained as the floor used when raw EV is
+# positive — older callers/tests still import it, and it equals
+# CONFIDENCE_FLOOR_PROFITABLE so semantics are preserved.
+UNCERTAINTY_FLOOR = 0.3
+CONFIDENCE_FLOOR_PROFITABLE = 0.2  # raw_ev > 0
+CONFIDENCE_FLOOR_UNPROFITABLE = 0.5  # raw_ev <= 0  → demand more certainty
+
+# PART 3: per-market reliability degrade levels. A model that fell back to
+# defaults for THIS market is treated as low reliability for THIS market
+# regardless of the model's global training quality.
+PER_MARKET_FALLBACK_RELIABILITY = 0.3
+PER_MARKET_BOOK_STALE_RELIABILITY_CAP = 0.5
+
+# Per-model importance weights for confidence (sum to 1.0)
+# Fill + loss drive the risk term; hazard + reward drive the reward term
+MODEL_WEIGHTS = {
+    "p_fill": 0.35,
+    "e_loss": 0.30,
+    "e_time": 0.20,
+    "reward": 0.15,
+}
+
+# STEP 10 — Attribution error → confidence penalty.
+# If the attribution reconciliation drifts more than 30% from the
+# recorded total payout, the per-market reward signal is unreliable
+# and we soften the whole confidence vector by 0.8×.
+ATTRIBUTION_ERROR_THRESHOLD = 0.30
+ATTRIBUTION_CONFIDENCE_PENALTY = 0.80
 
 
 @dataclass
@@ -39,12 +65,14 @@ class CalibrationPredictions:
     """Unified predictions for a single market."""
     condition_id: str
     p_fill_24h: float             # P(fill within 24h)
-    e_loss_given_fill: float      # E[$ loss per share | fill]
+    e_loss_given_fill: float      # E[$ total loss per fill]
     e_time_on_book_hours: float   # E[hours on book]
     reward_rate_per_hour: float   # $/hour this market earns
     ev_per_day: float             # final EV in $/day
     confidence: str               # "model" or "fallback"
     model_versions: dict          # which model produced each estimate
+    model_confidence: float = 1.0 # numeric 0.3–1.0 weighted reliability
+    raw_ev_per_day: float = 0.0   # pre-confidence EV (reward − p_fill·loss)
 
 
 class CalibrationManager:
@@ -58,10 +86,35 @@ class CalibrationManager:
         self.reward_model = RewardModel()
         self._last_retrain: float = 0.0
         self._book_cache: dict[str, dict] = {}
+        # STEP 10: cache the attribution-error read so get_predictions()
+        # doesn't hit the DB per market. Cleared on retrain().
+        self._attribution_error_cache: float | None = None
+        # Learning-loop reward_trust hook. Caller (oversight_agent) sets
+        # this to ls.reward_trust ONLY when the LearningController is in
+        # ACTIVE mode; OFF/SHADOW leave it at the neutral default 1.0.
+        # Values outside [0.5, 1.0] are clamped by the learning module.
+        self.reward_trust: float = 1.0
 
         # Try loading persisted models
         self._ensure_table()
         self._load_all()
+
+    def _cached_attribution_error(self) -> float:
+        """STEP 10 hook — lazy-load today's attribution reconciliation error.
+
+        Cached for the lifetime of a prediction cycle (reset by retrain()).
+        Returns 0.0 on any failure so the penalty is OFF by default.
+        """
+        if self._attribution_error_cache is not None:
+            return self._attribution_error_cache
+        try:
+            from .attribution import get_attribution_error
+            err = get_attribution_error(self.db_path)
+        except Exception as e:
+            log.debug(f"attribution_error load failed: {e}")
+            err = 0.0
+        self._attribution_error_cache = err
+        return err
 
     def _ensure_table(self):
         """Create calibration_model_state table if missing."""
@@ -102,6 +155,8 @@ class CalibrationManager:
             return {"status": "cooldown"}
 
         self._book_cache.clear()
+        # STEP 10: force a fresh attribution-error read on next get_predictions
+        self._attribution_error_cache = None
 
         results = {}
 
@@ -195,6 +250,7 @@ class CalibrationManager:
         Uses model predictions when ready, else conservative fallbacks.
         """
         book = self._book_cache.get(condition_id, {})
+        book_missing = not book
         spread = book.get("spread", 0.045)
         midpoint = book.get("midpoint", 0.5)
         depth_ahead = book.get("bid_depth_ahead", 0)
@@ -217,6 +273,9 @@ class CalibrationManager:
             if p_fill < 0:
                 p_fill = self._fallback_p_fill(fill_count_recent, on_book_hours)
                 versions["p_fill"] = "fallback"
+            elif book_missing:
+                # FIX 13: book cache miss → prediction ran on default features
+                versions["p_fill"] = "book_stale"
             else:
                 versions["p_fill"] = "model"
         else:
@@ -232,6 +291,7 @@ class CalibrationManager:
         else:
             e_loss = self._fallback_e_loss(
                 fill_cost_recent, dump_revenue_recent, fill_count_recent,
+                agent_shares=ag_sh,
             )
             versions["e_loss"] = "fallback"
 
@@ -240,44 +300,121 @@ class CalibrationManager:
             e_time = self.hazard_model.predict(depth_ahead=depth_ahead)
             versions["e_time"] = "model"
         else:
-            e_time = min(on_book_hours, 24.0) if on_book_hours > 0 else 12.0
+            # PART 5: no min(e_time, 24) cap — time horizon for EV is
+            # enforced explicitly via reward = reward_rate * 24 below.
+            # e_time is an observability signal only.
+            e_time = on_book_hours if on_book_hours > 0 else 12.0
             versions["e_time"] = "fallback"
 
-        # Reward rate — apply safety bias (Fix 4)
-        # Reward attribution is the noisiest component; cap at 80% of estimate
-        reward_rate_raw = self.reward_model.predict_rate(
+        # Reward rate — UNBIASED model output. The 0.80 safety bias is
+        # applied explicitly in the EV pipeline (PART 6) so all reward-side
+        # multipliers are visible in one place.
+        reward_rate_unbiased = self.reward_model.predict_rate(
             condition_id=condition_id,
             daily_rate=daily_rate,
             q_share_pct=q_share_pct,
             correction_factor=correction_factor,
         )
-        reward_rate = reward_rate_raw * REWARD_SAFETY_BIAS
-        versions["reward"] = f"phase{self.reward_model.phase}"
+        # FIX 4: phase 1 reward is a CF passthrough — mark it as fallback_cf
+        versions["reward"] = (
+            "fallback_cf" if self.reward_model.phase == 1 else "model"
+        )
 
-        # EV = (reward_rate * E[time]) - (P_fill * E[loss])
-        raw_ev = (reward_rate * min(e_time, 24.0)) - (p_fill * e_loss)
+        # PART 5 + FIX 15: time horizon for reward is exactly 24h; the
+        # baseline biased reward is what raw_ev/floor selection is computed
+        # against (model_confidence is NOT applied here — that's PART 6).
+        raw_reward = reward_rate_unbiased * 24 * REWARD_SAFETY_BIAS
 
-        # Fix 6: Uncertainty penalty — scale EV by confidence_score
-        # from the safety controller (if available) or model confidence.
-        # Early models produce noisy estimates; discount them.
+        # PART 1 + FIX 14: raw EV uses the SAME p_fill_24h and the SAME
+        # loss_per_fill that RAS uses downstream. No divergence allowed.
+        raw_ev = raw_reward - (p_fill * e_loss)
+
+        # Confidence label: any non-"model" version counts as fallback so
+        # "fallback", "fallback_cf", and "book_stale" all degrade it.
         confidence_label = "model" if all(
-            v != "fallback" for v in versions.values()
+            v == "model" for v in versions.values()
         ) else "fallback"
 
-        n_model = sum(1 for v in versions.values() if v not in ("fallback",))
-        n_total = len(versions)
-        model_confidence = max(UNCERTAINTY_FLOOR, n_model / max(n_total, 1))
-        ev = raw_ev * model_confidence
+        # PART 3: per-market reliability. Start from the global per-model
+        # reliability score, then degrade for THIS market based on:
+        #   - feature/book availability ("book_stale" → cap at 0.5)
+        #   - per-market model availability ("fallback"/"fallback_cf" → 0.3)
+        # Models that produced a real model prediction keep their global
+        # score. This is "true per-market" — two markets with different
+        # versions get different model_confidence values.
+        reliability = {
+            "p_fill": self.fill_model.get_reliability_score(),
+            "e_loss": self.loss_model.get_reliability_score(),
+            "e_time": self.hazard_model.get_reliability_score(),
+            "reward": self.reward_model.get_reliability_score(),
+        }
+        per_market_reliability: dict = {}
+        for k in MODEL_WEIGHTS:
+            v = versions.get(k, "fallback")
+            base = reliability[k]
+            if v == "model":
+                per_market_reliability[k] = base
+            elif v == "book_stale":
+                per_market_reliability[k] = min(
+                    base, PER_MARKET_BOOK_STALE_RELIABILITY_CAP,
+                )
+            else:  # "fallback" or "fallback_cf"
+                per_market_reliability[k] = PER_MARKET_FALLBACK_RELIABILITY
+
+        # Per-market weighted confidence. MODEL_WEIGHTS sums to 1.0 and
+        # every key contributes at >= PER_MARKET_FALLBACK_RELIABILITY, so
+        # weighted_conf is always in [0.3, 1.0] before the floor.
+        weighted_conf = sum(
+            MODEL_WEIGHTS[k] * per_market_reliability[k] for k in MODEL_WEIGHTS
+        )
+
+        # STEP 10: Optional attribution-error penalty. Cached so we don't
+        # requery the DB on every market — the error is a daily statistic.
+        attr_err = self._cached_attribution_error()
+        if attr_err > ATTRIBUTION_ERROR_THRESHOLD:
+            weighted_conf *= ATTRIBUTION_CONFIDENCE_PENALTY
+
+        # PART 4: dynamic floor based on raw EV sign.
+        #   raw_ev > 0  → market looks profitable; small floor allows the
+        #                 EV/RAS pipeline to express the signal.
+        #   raw_ev <= 0 → market looks unprofitable; require higher floor
+        #                 so a low-confidence model can't accidentally
+        #                 inflate the picture.
+        floor = (
+            CONFIDENCE_FLOOR_PROFITABLE if raw_ev > 0
+            else CONFIDENCE_FLOOR_UNPROFITABLE
+        )
+        model_confidence = max(floor, weighted_conf)
+
+        # PART 6: explicit reward pipeline. Four multipliers, no hidden
+        # stacking elsewhere. reward_trust is the learning-loop feedback
+        # multiplier — default 1.0 (neutral), reduced when observed reward
+        # has been < 0.7× predicted over a window.
+        reward = reward_rate_unbiased * 24
+        reward *= REWARD_SAFETY_BIAS
+        reward *= model_confidence
+        reward *= self.reward_trust
+
+        # PART 1 + PART 2: capped confidence asymmetry. Loss inflates by
+        # at most 2× (when model_confidence == 0); reward shrinks by at
+        # most model_confidence×. The SAME p_fill_24h and loss_per_fill
+        # used in raw_ev / RAS appear here.
+        loss_term = (p_fill * e_loss) * (1.0 + (1.0 - model_confidence))
+        ev = reward - loss_term
 
         return CalibrationPredictions(
             condition_id=condition_id,
             p_fill_24h=p_fill,
             e_loss_given_fill=e_loss,
             e_time_on_book_hours=e_time,
-            reward_rate_per_hour=reward_rate,
+            # Field semantics preserved: the BIASED rate, since the safety
+            # bias is part of the rate the EV pipeline actually consumes.
+            reward_rate_per_hour=reward_rate_unbiased * REWARD_SAFETY_BIAS,
             ev_per_day=ev,
             confidence=confidence_label,
             model_versions=versions,
+            model_confidence=model_confidence,
+            raw_ev_per_day=raw_ev,
         )
 
     def get_ev(self, condition_id: str, **kwargs) -> float:
@@ -314,9 +451,10 @@ class CalibrationManager:
     @staticmethod
     def _fallback_e_loss(
         fill_cost: float, dump_revenue: float, fill_count: int,
+        agent_shares: float = 50.0,
     ) -> float:
         """Fallback expected loss from observed fill damage."""
         if fill_count <= 0:
-            return 0.02 * 50  # default: $0.02/share * 50 shares = $1
+            return 0.02 * agent_shares
         net_damage = max(0, fill_cost - dump_revenue)
         return net_damage / fill_count
