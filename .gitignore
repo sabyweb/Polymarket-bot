@@ -17,3 +17,18 @@ __pycache__/
 *.pyo
 .DS_Store
 .claude/
+
+# Runtime databases
+*.db
+
+# Runtime state files
+market_allocations.json
+positions.json.migrated
+reward_history.json.migrated
+
+# Safety alerts
+SAFETY_ALERT.txt
+
+# Ad-hoc diagnostic scripts
+analyze_distributions.py
+diagnose_*.py
