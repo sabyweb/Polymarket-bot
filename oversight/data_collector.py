@@ -11,6 +11,8 @@ import sqlite3
 import time
 from dataclasses import dataclass
 
+from config import RF_NEW_MARKET_Q_SHARE_PRIOR
+
 log = logging.getLogger("oversight.collector")
 
 
@@ -219,27 +221,35 @@ def _load_reward_markets_cache(db_path: str, min_rate: float) -> dict[str, dict]
 
 
 def _fetch_reward_market_expiries(condition_ids: list[str] | None = None,
-                                   db_path: str = "bot_history.db") -> dict[str, str]:
-    """Fetch end_date_iso for markets. Uses DB cache + Gamma + CLOB fallback.
+                                   db_path: str = "bot_history.db") -> dict[str, dict[str, str]]:
+    """Fetch end_date_iso and game_start_time for markets.
+
+    Returns {condition_id: {"end_date_iso": str, "game_start_time": str}}.
+    game_start_time is the actual event/kickoff time (ISO 8601); it is only
+    populated for markets fetched via CLOB (Gamma API does not expose this
+    field). Gamma-routed markets will have game_start_time="".
 
     Cache-first: loads from market_expiry_cache table, only fetches
     for CIDs not in cache or with stale entries (>24h old).
     Reduces ~671 CLOB calls to ~10-20 per cycle (only new markets).
     """
     import requests
-    result = {}
+    result: dict[str, dict[str, str]] = {}
     cache_ttl = 24 * 3600  # 24h cache validity
 
     # Step 0: Load from DB cache
     cutoff = time.time() - cache_ttl
     rows = _query_with_retry(
         db_path,
-        "SELECT condition_id, end_date_iso FROM market_expiry_cache WHERE fetched_at > ?",
+        "SELECT condition_id, end_date_iso, game_start_time FROM market_expiry_cache WHERE fetched_at > ?",
         (cutoff,),
     )
     if rows:
         for r in rows:
-            result[r["condition_id"]] = r["end_date_iso"]
+            result[r["condition_id"]] = {
+                "end_date_iso": r["end_date_iso"] or "",
+                "game_start_time": r["game_start_time"] or "",
+            }
         log.debug(f"Expiry cache: {len(result)} markets loaded from DB")
 
     # Determine which CIDs still need fetching
@@ -251,7 +261,7 @@ def _fetch_reward_market_expiries(condition_ids: list[str] | None = None,
         return result
 
     # Step 1: Bulk fetch from Gamma (fast, covers most markets)
-    gamma_fetched = {}
+    gamma_fetched: dict[str, str] = {}
     try:
         for offset in range(0, 10000, 100):
             resp = requests.get(
@@ -272,12 +282,13 @@ def _fetch_reward_market_expiries(condition_ids: list[str] | None = None,
     except Exception as e:
         log.debug(f"Gamma expiry fetch failed: {e}")
 
-    # Apply Gamma results
+    # Apply Gamma results (no game_start_time available from Gamma)
     for cid in need_fetch:
         if cid in gamma_fetched:
-            result[cid] = gamma_fetched[cid]
+            result[cid] = {"end_date_iso": gamma_fetched[cid], "game_start_time": ""}
 
-    # Step 2: CLOB fallback for markets still missing
+    # Step 2: CLOB fallback for markets still missing — CLOB exposes
+    # game_start_time for sports markets (~73% of CLOB markets).
     still_missing = [cid for cid in need_fetch if cid not in result]
     if still_missing:
         log.info(f"Fetching expiry for {len(still_missing)} CLOB-only markets")
@@ -288,9 +299,10 @@ def _fetch_reward_market_expiries(condition_ids: list[str] | None = None,
                 )
                 if resp.status_code == 200:
                     mkt = resp.json()
-                    end_date = mkt.get("end_date_iso", "")
-                    if end_date:
-                        result[cid] = end_date
+                    end_date = mkt.get("end_date_iso", "") or ""
+                    game_start = mkt.get("game_start_time", "") or ""
+                    if end_date or game_start:
+                        result[cid] = {"end_date_iso": end_date, "game_start_time": game_start}
             except Exception:
                 pass
 
@@ -301,8 +313,10 @@ def _fetch_reward_market_expiries(condition_ids: list[str] | None = None,
             db = _connect_db(db_path)
             now = time.time()
             db.executemany(
-                "INSERT OR REPLACE INTO market_expiry_cache (condition_id, end_date_iso, fetched_at) VALUES (?, ?, ?)",
-                [(cid, end_date, now) for cid, end_date in new_entries.items()],
+                "INSERT OR REPLACE INTO market_expiry_cache "
+                "(condition_id, end_date_iso, game_start_time, fetched_at) VALUES (?, ?, ?, ?)",
+                [(cid, v["end_date_iso"], v["game_start_time"], now)
+                 for cid, v in new_entries.items()],
             )
             db.commit()
             db.close()
@@ -419,7 +433,8 @@ class MarketMetrics:
     current_position_usd: float    # open position value (from DB)
     on_book_hours: float           # time with orders on book (from reward_tracker)
     q_share_pct: float             # our share of Q-score pool
-    end_date_iso: str = ""         # market expiry (from CLOB rewards data)
+    end_date_iso: str = ""         # market expiry / resolution deadline (from CLOB/Gamma)
+    game_start_time: str = ""      # actual event start time (ISO 8601); sports only, CLOB-fetched
     min_size: float = 50.0         # minimum order size for rewards
     max_spread: float = 0.045      # maximum spread for rewards
     question_group: str = ""       # grouping key for portfolio concentration limits
@@ -872,6 +887,7 @@ def query_reward_stats(db_path: str) -> dict[str, dict]:
         cumulative_capped = 0
         stale_decayed = 0
         stale_excluded = 0
+        prior_used = 0
         for r in rows:
             d = json.loads(r["data"])
             cid = d["condition_id"]
@@ -917,14 +933,24 @@ def query_reward_stats(db_path: str) -> dict[str, dict]:
                 if ws and ws["samples"] >= 3:
                     q_share = min(ws["scoring_ratio"] * 0.5, 0.5)
                     windowed_used += 1
-                else:
+                elif total_market_q > 0 and d.get("q_score_samples", 0) > 0:
                     # Priority 2: cumulative from reward_tracker
-                    q_share = 0.0
-                    if total_market_q > 0 and d.get("q_score_samples", 0) > 0:
-                        q_share = d["total_q_score"] / total_market_q
-                        if on_book > 4.0 and q_share > 0.5:
-                            q_share = 0.5
-                            cumulative_capped += 1
+                    q_share = d["total_q_score"] / total_market_q
+                    if on_book > 4.0 and q_share > 0.5:
+                        q_share = 0.5
+                        cumulative_capped += 1
+                elif on_book < 2.0 and d.get("q_score_samples", 0) == 0:
+                    # Priority 3: cold-start prior.
+                    # Markets with no posting history (< 2h on book, zero scoring
+                    # samples) get a conservative prior instead of 0.0. This
+                    # escapes the cold-start trap where score=0 would classify
+                    # every unknown market as a "trial" and cap discovery at
+                    # RF_MAX_TRIAL_MARKETS. Discovery churn is still limited via
+                    # the confidence-based trial cap in market_scorer.rank_markets().
+                    q_share = RF_NEW_MARKET_Q_SHARE_PRIOR
+                    prior_used += 1
+                else:
+                    q_share = 0.0  # stale/broken — explicit fallthrough
 
             result[cid] = {
                 "rate": d.get("daily_rate", 0),
@@ -943,9 +969,10 @@ def query_reward_stats(db_path: str) -> dict[str, dict]:
                 "cycles_both_in_window": d.get("cycles_both_in_window", 0),
                 "total_market_q": total_market_q,
             }
-        if windowed_used or stale_decayed or stale_excluded:
+        if windowed_used or stale_decayed or stale_excluded or prior_used:
             log.info(
                 f"Q-share: {windowed_used} windowed, {cumulative_capped} cumulative capped, "
+                f"{prior_used} cold-start prior, "
                 f"{stale_decayed} decayed (>6h), {stale_excluded} excluded (>24h)"
             )
         return result
@@ -1288,9 +1315,13 @@ def collect_all(
         if cid not in all_cids:
             all_cids.add(cid)
             new_discovered += 1
+            # Cold-start prior: CLOB-discovered markets we've never posted on
+            # get a conservative q_share prior instead of 0.0, so they produce
+            # score > 0 at discovery. The trial cap in market_scorer still
+            # throttles how many of these deploy per cycle.
             stats[cid] = {
                 "rate": mkt_data["daily_rate"],
-                "q_share": 0,
+                "q_share": RF_NEW_MARKET_Q_SHARE_PRIOR,
                 "on_book_hrs": 0,
                 "question": "",
             }
@@ -1341,7 +1372,8 @@ def collect_all(
             current_position_usd=pos_data.get("total", 0),
             on_book_hours=stat_data.get("on_book_hrs", 0),
             q_share_pct=stat_data.get("q_share", 0),
-            end_date_iso=expiry_map.get(cid, ""),
+            end_date_iso=expiry_map.get(cid, {}).get("end_date_iso", ""),
+            game_start_time=expiry_map.get(cid, {}).get("game_start_time", ""),
             min_size=clob_reward_markets.get(cid, {}).get("min_size", 50.0),
             max_spread=clob_reward_markets.get(cid, {}).get("max_spread", 0.045),
             question_group=_question_group_key(question) if question else "",

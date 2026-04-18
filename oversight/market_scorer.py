@@ -9,6 +9,7 @@ matching, no heuristics. If a market earns and doesn't lose, it's in.
 
 import logging
 from dataclasses import dataclass
+from config import RF_MAX_TRIAL_MARKETS
 from .data_collector import MarketMetrics, _connect_db
 
 log = logging.getLogger("oversight.scorer")
@@ -34,7 +35,8 @@ class ScoredMarket:
     locked_position_usd: float = 0.0  # $ currently locked in open positions
     question_group: str = ""       # topic group for concentration limits
     q_share_pct: float = 0.0       # our share of Q-score pool (competition signal)
-    end_date_iso: str = ""         # market expiry date (ISO format)
+    end_date_iso: str = ""         # market expiry / resolution deadline (ISO format)
+    game_start_time: str = ""      # actual event start time (ISO 8601); sports only
 
 
 def score_market(m: MarketMetrics, hours: float = 24, correction_factor: float = 1.0) -> float:
@@ -146,6 +148,7 @@ def classify_market(
             est_capital_cost=0.0, locked_position_usd=m.current_position_usd,
             question_group=getattr(m, "question_group", ""),
             q_share_pct=m.q_share_pct, end_date_iso=getattr(m, "end_date_iso", ""),
+            game_start_time=getattr(m, "game_start_time", ""),
         )
 
     # ── Capital-aware continuous sizing ──
@@ -368,6 +371,7 @@ def classify_market(
         question_group=getattr(m, "question_group", ""),
         q_share_pct=m.q_share_pct,
         end_date_iso=getattr(m, "end_date_iso", ""),
+        game_start_time=getattr(m, "game_start_time", ""),
     )
 
 
@@ -768,13 +772,20 @@ def rank_markets(
     scored.sort(key=lambda x: x.score, reverse=True)
 
     # ── Cap trial deployments ──
-    # Trial markets (score <= 0, deployed for discovery) are valuable but
+    # Trial markets (unconfirmed, still gathering signal) are valuable but
     # must be limited. Without a cap, all ~1000 CLOB reward markets with
     # no history get deployed, flooding the bot with unknown markets and
     # consuming all capital on min_size orders.
+    #
+    # Trial = "confidence == low AND zero fills" — same criterion as the
+    # trial-sizing branches in classify_market() (lines 232, 243). This
+    # captures cold-start markets directly, independent of score. Required
+    # because RF_NEW_MARKET_Q_SHARE_PRIOR makes new markets score > 0, so
+    # the old "score <= 0" criterion no longer matches them.
     # Sort trials by daily_rate desc so the richest pools get trialed first.
-    max_trials = 10
-    trials = [(i, sm) for i, sm in enumerate(scored) if sm.action == "deploy" and sm.score <= 0]
+    max_trials = RF_MAX_TRIAL_MARKETS
+    trials = [(i, sm) for i, sm in enumerate(scored)
+              if sm.action == "deploy" and sm.confidence == "low" and sm.fill_count == 0]
     trials.sort(key=lambda x: x[1].daily_rate, reverse=True)
     for rank, (idx, sm) in enumerate(trials):
         if rank >= max_trials:

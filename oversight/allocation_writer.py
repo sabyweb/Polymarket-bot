@@ -243,6 +243,7 @@ def _to_dict(
         "question_group": getattr(sm, "question_group", ""),
         "q_share_pct": round(getattr(sm, "q_share_pct", 0.0), 6),
         "end_date_iso": getattr(sm, "end_date_iso", ""),
+        "game_start_time": getattr(sm, "game_start_time", ""),
     }
 
 

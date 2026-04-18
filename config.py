@@ -226,6 +226,8 @@ RF_MIN_DAILY_RATE: float = 10.0             # Minimum reward rate ($/day) to con
 RF_MAX_LIQUIDITY: int = 5000                # Skip markets with on-book depth above this
 RF_MAX_COST_PER_MARKET: float = 50.0        # Max initial position cost per market
 RF_MAX_MARKETS: int = 60                    # Maximum markets in portfolio (exchange is the capital gate)
+RF_MAX_TRIAL_MARKETS: int = 50              # Max trial (confidence=low, zero fills) markets per cycle, sorted by daily_rate
+RF_NEW_MARKET_Q_SHARE_PRIOR: float = 0.10   # Prior q_share for cold-start markets (0 on_book, 0 samples); escapes cold-start trap
 RF_MAX_TOTAL_EXPOSURE: float = 1500.0       # Total USD at risk limit
 RF_CYCLE_SECS: int = 30                     # Main loop cycle frequency
 RF_BATCH_SIZE: int = 10                     # Markets processed per cycle (was 5, increased for faster coverage)

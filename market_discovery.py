@@ -163,6 +163,8 @@ def fetch_all_reward_markets() -> list[dict]:
             question = g.get("question", "")
             tick = float(g.get("orderPriceMinTickSize") or 0.01)
             end_date_iso = g.get("endDateIso") or g.get("end_date_iso")
+            # Gamma API does not expose game_start_time; only CLOB does.
+            game_start_time = ""
         else:
             if rate < MIN_DAILY_RATE():
                 continue
@@ -182,6 +184,10 @@ def fetch_all_reward_markets() -> list[dict]:
                 question = mkt.get("question", "")
                 tick = float(mkt.get("minimum_tick_size") or 0.01)
                 end_date_iso = mkt.get("end_date_iso")
+                # CLOB exposes game_start_time on ~73% of markets (all sports).
+                # This is the actual event/kickoff time, distinct from
+                # end_date_iso (market resolution deadline).
+                game_start_time = mkt.get("game_start_time", "") or ""
                 liq = 999999.0
                 vol = 0.0
             except Exception as e:
@@ -200,6 +206,7 @@ def fetch_all_reward_markets() -> list[dict]:
             "liquidity": liq,
             "volume_24h": vol,
             "end_date_iso": end_date_iso,
+            "game_start_time": game_start_time,
         })
 
     log.info(f"  Merged: {len(merged)} candidates with rate >= ${MIN_DAILY_RATE()}/day")

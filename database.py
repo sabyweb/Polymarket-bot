@@ -417,6 +417,8 @@ class BotDatabase:
             ("orders_cancelled", "side", "TEXT NOT NULL DEFAULT ''"),
             ("orders_cancelled", "price", "REAL NOT NULL DEFAULT 0"),
             ("orders_cancelled", "age_secs", "REAL NOT NULL DEFAULT 0"),
+            # market_expiry_cache: game start time for sports markets (CLOB only)
+            ("market_expiry_cache", "game_start_time", "TEXT NOT NULL DEFAULT ''"),
         ]
         for table, col, typedef in migrations:
             try:

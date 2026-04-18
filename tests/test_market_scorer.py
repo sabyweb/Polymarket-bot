@@ -169,6 +169,28 @@ class TestClassifyMarket(unittest.TestCase):
         self.assertEqual(sm.action, "avoid")
         self.assertEqual(sm.recommended_shares, 0)
 
+    def test_classify_market_propagates_game_start_time(self):
+        """ScoredMarket carries game_start_time from MarketMetrics for both
+        the deploy path and the MIN_EFFECTIVE_DAILY avoid path."""
+        # Deploy path: positive-score market with a game_start_time.
+        m_deploy = _make_metric(
+            daily_rate=50, q_share_pct=1.0, on_book_hours=24,
+            end_date_iso="2026-05-01T00:00:00Z",
+            game_start_time="2026-04-28T18:30:00Z",
+        )
+        sm_deploy = classify_market(m_deploy, score=25.0)
+        self.assertEqual(sm_deploy.action, "deploy")
+        self.assertEqual(sm_deploy.game_start_time, "2026-04-28T18:30:00Z")
+
+        # MIN_EFFECTIVE_DAILY avoid path: q_share > 0 but effective_daily < 0.10.
+        m_avoid = _make_metric(
+            daily_rate=1.0, q_share_pct=0.05, on_book_hours=5,
+            end_date_iso="2026-05-01T00:00:00Z",
+            game_start_time="2026-04-29T20:00:00Z",
+        )
+        sm_avoid = classify_market(m_avoid, score=0.05, correction_factor=1.0)
+        self.assertEqual(sm_avoid.game_start_time, "2026-04-29T20:00:00Z")
+
 
 class TestRankMarkets(unittest.TestCase):
     """Test ranking and cap logic."""
@@ -194,6 +216,139 @@ class TestRankMarkets(unittest.TestCase):
         deploy_count = sum(1 for s in scored if s.action == "deploy")
         # All 10 are score-positive → all deploy. Bot stops on exchange error.
         self.assertEqual(deploy_count, 10)
+
+    def test_trial_cap_is_configurable_and_keeps_top_by_daily_rate(self):
+        """Trial cap reads from RF_MAX_TRIAL_MARKETS config and keeps the
+        highest-daily_rate trials.
+
+        Creates more trial candidates than the configured cap (all score=0 via
+        q_share_pct=0, low confidence via on_book_hours=1, varying daily_rate).
+        Asserts:
+        1. Exactly RF_MAX_TRIAL_MARKETS trials deploy (rest are trial-capped).
+        2. The kept trials are the top-N by daily_rate (not random).
+        3. Capped markets have reason containing "Trial cap reached".
+        """
+        from config import RF_MAX_TRIAL_MARKETS
+        n_trials = RF_MAX_TRIAL_MARKETS + 10  # overflow the cap by 10
+        # daily_rate=100.0 for m0 down to daily_rate=41.0 for m59.
+        # All above the trial-path threshold of $5/day, no sports keywords,
+        # no end_date_iso (so no short-duration filter fires), q_share=0 (score=0).
+        metrics = [
+            _make_metric(
+                condition_id=f"trial{i}",
+                question=f"Trial market {i}?",
+                daily_rate=100.0 - i,
+                q_share_pct=0.0,
+                on_book_hours=1.0,
+                fill_count_recent=0,
+            )
+            for i in range(n_trials)
+        ]
+        # Use a bogus db_path so rank_markets doesn't touch real DB state.
+        scored = rank_markets(metrics, max_markets=100, db_path="/nonexistent.db")
+
+        deployed = [s for s in scored if s.action == "deploy"]
+        capped = [s for s in scored if s.action == "avoid" and "Trial cap reached" in s.reason]
+
+        # (1) Exactly RF_MAX_TRIAL_MARKETS deploy.
+        self.assertEqual(len(deployed), RF_MAX_TRIAL_MARKETS,
+                         f"Expected {RF_MAX_TRIAL_MARKETS} deploys, got {len(deployed)}")
+
+        # (2) Overflow count = n_trials - cap, and all are trial-capped.
+        self.assertEqual(len(capped), n_trials - RF_MAX_TRIAL_MARKETS)
+
+        # (3) The kept trials are the top-N by daily_rate (descending).
+        # Highest daily_rate is trial0 (100.0), trial1 (99.0), ... so the first
+        # RF_MAX_TRIAL_MARKETS cids (trial0..trial{N-1}) should deploy; the rest avoid.
+        deployed_cids = {s.condition_id for s in deployed}
+        expected_deployed = {f"trial{i}" for i in range(RF_MAX_TRIAL_MARKETS)}
+        self.assertEqual(deployed_cids, expected_deployed,
+                         "Trial cap did not keep the top-N by daily_rate")
+
+    def test_trial_cap_uses_confidence_and_fills_not_score(self):
+        """Trial cap catches cold-start markets even when they score positive.
+
+        After RF_NEW_MARKET_Q_SHARE_PRIOR was introduced, new markets can
+        score > 0 due to the prior. The trial cap must still throttle them
+        based on confidence (low = on_book_hours < 2) + zero fills, not score.
+        """
+        from config import RF_MAX_TRIAL_MARKETS
+        n_trials = RF_MAX_TRIAL_MARKETS + 5
+        # All markets have LOW confidence (on_book_hours=1) and ZERO fills.
+        # q_share_pct=0.2 (simulating the prior post-propagation) so score > 0.
+        metrics = [
+            _make_metric(
+                condition_id=f"coldstart{i}",
+                question=f"Cold-start market {i}?",
+                daily_rate=100.0 - i,
+                q_share_pct=0.2,           # positive score despite cold-start
+                on_book_hours=1.0,          # low confidence
+                fill_count_recent=0,        # zero fills
+            )
+            for i in range(n_trials)
+        ]
+        scored = rank_markets(metrics, max_markets=200, db_path="/nonexistent.db")
+
+        deployed = [s for s in scored if s.action == "deploy"]
+        capped = [s for s in scored if s.action == "avoid" and "Trial cap reached" in s.reason]
+
+        # Cap should still enforce RF_MAX_TRIAL_MARKETS, even though every
+        # market has positive score (due to the prior-like q_share=0.2).
+        self.assertEqual(len(deployed), RF_MAX_TRIAL_MARKETS,
+                         f"Trial cap leaked: expected {RF_MAX_TRIAL_MARKETS} deploys, got {len(deployed)}")
+        self.assertEqual(len(capped), n_trials - RF_MAX_TRIAL_MARKETS)
+
+    def test_trial_cap_ignores_high_confidence_markets(self):
+        """Markets with confidence >= "medium" (on_book_hours >= 2) are NOT
+        trial-capped regardless of score. Only cold-start markets count.
+
+        Verifies that the new trial cap criterion (confidence == "low" AND
+        fill_count == 0) correctly excludes markets that have accumulated
+        sufficient on-book observation time.
+        """
+        from config import RF_MAX_TRIAL_MARKETS
+        # 5 high-confidence markets — should always deploy, not counted toward cap.
+        high_conf = [
+            _make_metric(
+                condition_id=f"hc{i}",
+                question=f"High-confidence market {i}?",
+                daily_rate=50.0,
+                q_share_pct=1.0,         # score > 0
+                on_book_hours=10.0,       # HIGH confidence (>= 8h)
+                fill_count_recent=0,
+            )
+            for i in range(5)
+        ]
+        # 60 cold-start markets — subject to trial cap.
+        n_trials = RF_MAX_TRIAL_MARKETS + 10
+        cold_start = [
+            _make_metric(
+                condition_id=f"cs{i}",
+                question=f"Cold-start market {i}?",
+                daily_rate=25.0,          # lower, so hc markets rank above
+                q_share_pct=0.0,
+                on_book_hours=1.0,        # low confidence
+                fill_count_recent=0,
+            )
+            for i in range(n_trials)
+        ]
+        metrics = high_conf + cold_start
+        scored = rank_markets(metrics, max_markets=200, db_path="/nonexistent.db")
+
+        deployed_cids = {s.condition_id for s in scored if s.action == "deploy"}
+
+        # All 5 high-confidence markets deploy (never counted as trials).
+        for i in range(5):
+            self.assertIn(f"hc{i}", deployed_cids,
+                          f"High-confidence market hc{i} was incorrectly capped")
+
+        # Exactly RF_MAX_TRIAL_MARKETS cold-start markets deploy.
+        cs_deployed = [c for c in deployed_cids if c.startswith("cs")]
+        self.assertEqual(len(cs_deployed), RF_MAX_TRIAL_MARKETS,
+                         f"Expected {RF_MAX_TRIAL_MARKETS} cold-start deploys, got {len(cs_deployed)}")
+
+        # Total deployed = 5 (high-conf) + RF_MAX_TRIAL_MARKETS (cold-start cap).
+        self.assertEqual(len(deployed_cids), 5 + RF_MAX_TRIAL_MARKETS)
 
 
 class TestHistoricalAdjustments(unittest.TestCase):

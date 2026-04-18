@@ -170,5 +170,46 @@ class TestMarketPerformance(unittest.TestCase):
         self.assertEqual(len(history), 0)
 
 
+class TestMarketExpiryCacheMigration(unittest.TestCase):
+    """Test that the game_start_time column migration runs on old schemas."""
+
+    def setUp(self):
+        self.db_fd, self.db_path = tempfile.mkstemp(suffix=".db")
+
+    def tearDown(self):
+        os.close(self.db_fd)
+        os.unlink(self.db_path)
+
+    def test_migration_adds_game_start_time_column(self):
+        """Simulate an older DB missing the game_start_time column, then
+        run BotDatabase init (which invokes _migrate_enrichment_columns)
+        and verify the column has been added."""
+        # Create the old schema manually (without game_start_time).
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("""
+            CREATE TABLE market_expiry_cache (
+                condition_id TEXT PRIMARY KEY,
+                end_date_iso TEXT NOT NULL,
+                fetched_at   REAL NOT NULL
+            )
+        """)
+        conn.commit()
+        # Confirm the column is NOT present pre-migration.
+        cols_before = {row[1] for row in conn.execute("PRAGMA table_info(market_expiry_cache)")}
+        conn.close()
+        self.assertNotIn("game_start_time", cols_before)
+
+        # Instantiate BotDatabase — this triggers _migrate_enrichment_columns.
+        db = BotDatabase(self.db_path)
+        try:
+            # Verify the column is now present.
+            conn = sqlite3.connect(self.db_path)
+            cols_after = {row[1] for row in conn.execute("PRAGMA table_info(market_expiry_cache)")}
+            conn.close()
+            self.assertIn("game_start_time", cols_after)
+        finally:
+            db.close()
+
+
 if __name__ == "__main__":
     unittest.main()
