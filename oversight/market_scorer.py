@@ -260,10 +260,13 @@ def classify_market(
     est_capital = shares * cost_per_share_both if shares > 0 else 0.0
 
     # ── Sports / short-duration protection ──
-    # Sports markets near expiry have extreme adverse selection risk.
-    # Layer 1 (agent): HARD AVOID if sports + (< 4h to expiry OR missing end_date).
-    # Non-sports short-duration markets (< 72h) get capped to min_size.
-    from config import SPORTS_KEYWORDS, RF_SPORTS_BLOCK_HOURS
+    # Sports markets near the event have extreme adverse selection risk from
+    # informed bettors. Two independent signals:
+    #   Phase 1 (game_start_time): true kickoff time; CLOB-routed markets only.
+    #   Phase 2-4 (end_date_iso):  market resolution deadline; universal.
+    # Either signal can trigger avoid. Phase 2-4 also caps 4-72h deploys to
+    # min_size for reduced exposure.
+    from config import SPORTS_KEYWORDS, RF_SPORTS_BLOCK_HOURS, RF_GAME_BLOCK_HOURS
 
     _is_sports = False
     if m.question and action == "deploy":
@@ -272,34 +275,57 @@ def classify_market(
             _is_sports = True
 
     if _is_sports and action == "deploy":
-        if not m.end_date_iso:
-            # No end_date = no proof it's safe. Default-deny for sports.
-            action = "avoid"
-            shares = 0
-            est_capital = 0.0
-            reason = f"Sports market with no expiry date — cannot verify safety"
-        else:
-            from datetime import datetime, timezone
+        from datetime import datetime, timezone
+
+        # Phase 1 (new): game_start_time check.
+        # Fires only when the field is populated (CLOB-routed sports). Negative
+        # hours_to_game means the game has already started — also triggers
+        # avoid because any value <= RF_GAME_BLOCK_HOURS qualifies.
+        # Unparseable strings silently fall through to Phase 2-4.
+        if m.game_start_time and RF_GAME_BLOCK_HOURS > 0:
             try:
-                dt = datetime.fromisoformat(m.end_date_iso.replace("Z", "+00:00"))
-                hours_to_expiry = (dt - datetime.now(timezone.utc)).total_seconds() / 3600
-                if hours_to_expiry <= RF_SPORTS_BLOCK_HOURS:
+                gst = datetime.fromisoformat(m.game_start_time.replace("Z", "+00:00"))
+                hours_to_game = (gst - datetime.now(timezone.utc)).total_seconds() / 3600
+                if hours_to_game <= RF_GAME_BLOCK_HOURS:
                     action = "avoid"
                     shares = 0
                     est_capital = 0.0
-                    reason = f"Sports market expiring in {hours_to_expiry:.1f}h (< {RF_SPORTS_BLOCK_HOURS}h block)"
-                elif hours_to_expiry <= 72:
-                    # Sports > 4h but < 72h: cap to min_size (reduced exposure)
-                    if shares > int(m.min_size):
-                        shares = int(m.min_size)
-                        est_capital = shares * cost_per_share_both
-                        size_reason = f"sports cap → min_size={shares}sh (${est_capital:.0f})"
+                    reason = (
+                        f"Sports market {hours_to_game:+.1f}h from kickoff "
+                        f"(< {RF_GAME_BLOCK_HOURS}h block; game_start={m.game_start_time})"
+                    )
             except Exception:
-                # Can't parse date — treat as no date for sports
+                pass  # fall through to end_date_iso gates below
+
+        # Phases 2-4 (existing, unchanged): only run if Phase 1 didn't avoid.
+        if action == "deploy":
+            if not m.end_date_iso:
+                # No end_date = no proof it's safe. Default-deny for sports.
                 action = "avoid"
                 shares = 0
                 est_capital = 0.0
-                reason = f"Sports market with unparseable expiry date"
+                reason = f"Sports market with no expiry date — cannot verify safety"
+            else:
+                try:
+                    dt = datetime.fromisoformat(m.end_date_iso.replace("Z", "+00:00"))
+                    hours_to_expiry = (dt - datetime.now(timezone.utc)).total_seconds() / 3600
+                    if hours_to_expiry <= RF_SPORTS_BLOCK_HOURS:
+                        action = "avoid"
+                        shares = 0
+                        est_capital = 0.0
+                        reason = f"Sports market expiring in {hours_to_expiry:.1f}h (< {RF_SPORTS_BLOCK_HOURS}h block)"
+                    elif hours_to_expiry <= 72:
+                        # Sports > 4h but < 72h: cap to min_size (reduced exposure)
+                        if shares > int(m.min_size):
+                            shares = int(m.min_size)
+                            est_capital = shares * cost_per_share_both
+                            size_reason = f"sports cap → min_size={shares}sh (${est_capital:.0f})"
+                except Exception:
+                    # Can't parse date — treat as no date for sports
+                    action = "avoid"
+                    shares = 0
+                    est_capital = 0.0
+                    reason = f"Sports market with unparseable expiry date"
 
     # Non-sports short-duration cap (< 72h → min_size)
     _is_short_duration = False

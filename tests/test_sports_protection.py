@@ -199,6 +199,126 @@ class TestLayer1AgentSportsAvoid(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Layer 1 (addendum): game_start_time Phase 1 block
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestGameStartTimeBlock(unittest.TestCase):
+    """Phase 1 of sports protection: block within RF_GAME_BLOCK_HOURS of kickoff.
+
+    The game_start_time check runs BEFORE the end_date_iso gates and is
+    additive — it can only make protection stricter, never looser. When
+    game_start_time is absent (Gamma-routed markets), behavior is identical
+    to the pre-Phase-1 world.
+    """
+
+    def test_inplay_market_avoided(self):
+        """Game already started (game_start_time in the past) → AVOID via Phase 1."""
+        from oversight.market_scorer import classify_market, score_market
+        m = _make_market_metrics(
+            question="Lakers vs Celtics — will Lakers win?",
+            game_start_time=_hours_from_now(-0.5),   # kicked off 30min ago
+            end_date_iso=_hours_from_now(4.0),        # resolves in 4h — end_date gate won't fire
+        )
+        sm = classify_market(m, score_market(m, hours=24))
+        self.assertEqual(sm.action, "avoid")
+        self.assertIn("from kickoff", sm.reason.lower())
+
+    def test_pre_kickoff_within_block_avoided(self):
+        """Kickoff in 30min → AVOID via Phase 1 (within RF_GAME_BLOCK_HOURS=1h)."""
+        from oversight.market_scorer import classify_market, score_market
+        m = _make_market_metrics(
+            question="Man City vs Arsenal — Premier League winner?",
+            game_start_time=_hours_from_now(0.5),
+            end_date_iso=_hours_from_now(5.0),        # safe by end_date_iso alone
+        )
+        sm = classify_market(m, score_market(m, hours=24))
+        self.assertEqual(sm.action, "avoid")
+        self.assertIn("from kickoff", sm.reason.lower())
+
+    def test_pre_kickoff_beyond_block_deployed(self):
+        """Kickoff in 5h, resolves in 10h → both signals safe → DEPLOY."""
+        from oversight.market_scorer import classify_market, score_market
+        m = _make_market_metrics(
+            question="Lakers vs Celtics — will Lakers win?",
+            daily_rate=50.0,
+            game_start_time=_hours_from_now(5.0),
+            end_date_iso=_hours_from_now(10.0),
+        )
+        sm = classify_market(m, score_market(m, hours=24))
+        self.assertEqual(sm.action, "deploy")
+
+    def test_end_date_still_blocks_when_game_start_safe(self):
+        """Kickoff in 20h (safe) but end_date in 2h (within 4h block) → AVOID
+        via existing end_date_iso gate, NOT Phase 1. Confirms Phase 2-4
+        still runs when Phase 1 doesn't trigger."""
+        from oversight.market_scorer import classify_market, score_market
+        m = _make_market_metrics(
+            question="NFL Sunday: Patriots vs Bills",
+            game_start_time=_hours_from_now(20.0),    # far in future
+            end_date_iso=_hours_from_now(2.0),         # within 4h block
+        )
+        sm = classify_market(m, score_market(m, hours=24))
+        self.assertEqual(sm.action, "avoid")
+        # Must be the end_date reason, not the kickoff reason.
+        self.assertIn("expiring", sm.reason.lower())
+        self.assertNotIn("from kickoff", sm.reason.lower())
+
+    def test_missing_game_start_time_preserves_today_behavior(self):
+        """Gamma-routed market (game_start_time="") with safe end_date → DEPLOY.
+        Regression guard: the new Phase 1 gate MUST NOT fire on empty strings."""
+        from oversight.market_scorer import classify_market, score_market
+        m = _make_market_metrics(
+            question="UFC 300: Main Event",
+            daily_rate=50.0,
+            game_start_time="",                        # empty — Gamma-routed case
+            end_date_iso=_hours_from_now(10.0),         # safe
+            on_book_hours=24.0,                         # high confidence
+        )
+        sm = classify_market(m, score_market(m, hours=24))
+        self.assertEqual(sm.action, "deploy")
+
+    def test_unparseable_game_start_time_falls_through(self):
+        """Garbage in game_start_time → Phase 1 silently falls through, then
+        Phase 3 (end_date_iso ≤ 4h) fires. We do NOT avoid on parse error
+        because end_date_iso is still a valid signal."""
+        from oversight.market_scorer import classify_market, score_market
+        m = _make_market_metrics(
+            question="NBA: Lakers vs Warriors",
+            game_start_time="not-a-valid-date",
+            end_date_iso=_hours_from_now(2.0),          # ≤ 4h block
+        )
+        sm = classify_market(m, score_market(m, hours=24))
+        self.assertEqual(sm.action, "avoid")
+        # Reason must come from Phase 3 (end_date), not Phase 1.
+        self.assertIn("expiring", sm.reason.lower())
+        self.assertNotIn("kickoff", sm.reason.lower())
+
+    def test_rf_game_block_hours_zero_disables_phase1(self):
+        """Setting RF_GAME_BLOCK_HOURS=0 must disable Phase 1 entirely,
+        even for a market that would otherwise be blocked (kickoff imminent)."""
+        from oversight.market_scorer import classify_market, score_market
+        m = _make_market_metrics(
+            question="Lakers vs Celtics",
+            daily_rate=50.0,
+            game_start_time=_hours_from_now(0.25),     # 15min from kickoff
+            end_date_iso=_hours_from_now(10.0),         # safe
+            on_book_hours=24.0,
+        )
+        # Monkeypatch the constant; classify_market re-imports it each call.
+        import config
+        original = config.RF_GAME_BLOCK_HOURS
+        config.RF_GAME_BLOCK_HOURS = 0.0
+        try:
+            sm = classify_market(m, score_market(m, hours=24))
+            # With Phase 1 disabled, the market deploys (end_date_iso=10h > 4h,
+            # and > 72h cap doesn't apply either since 10h < 72h → min_size cap).
+            self.assertEqual(sm.action, "deploy")
+            self.assertNotIn("kickoff", sm.reason.lower())
+        finally:
+            config.RF_GAME_BLOCK_HOURS = original
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Layer 2: Bot (order_lifecycle)
 # ═══════════════════════════════════════════════════════════════════════
 
