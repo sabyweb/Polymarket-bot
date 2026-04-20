@@ -245,6 +245,7 @@ RF_FILL_BREAKER_THRESHOLD: int = 3           # Total fills (both sides) to trigg
 RF_FILL_BREAKER_SIDE_THRESHOLD: int = 2      # Same-side fills to trigger block
 RF_SPORTS_BLOCK_HOURS: float = 4.0           # Block sports markets expiring within this many hours
 RF_GAME_BLOCK_HOURS: float = 1.0             # Block sports markets within N hours of game_start_time (pre-kickoff + in-play); 0 disables
+RF_BOOK_CACHE_TTL: int = 180                 # Max age (seconds) for MarketState.cached_book used by Q-score sampling in record_cycle; 0 disables
 RF_ORDER_STALE_CHECK_SECS: int = 300         # Force-check orders still in open_ids after this many seconds
 
 # ── Sports Keywords ──────────────────────────────────────────────────────────

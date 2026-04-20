@@ -326,9 +326,13 @@ class RewardTracker:
                     order_book, stats.max_spread, midpoint
                 )
 
-            if our_q > 0:
+            # Require BOTH signals. Skipping when market_q is 0 is correct;
+            # the old `max(market_q, our_q)` fallback produced q_share=1.0
+            # saturation on every cycle where the order book was unavailable
+            # (see memory file: project_market_q_fallback_bug.md).
+            if our_q > 0 and market_q > 0:
                 stats.total_q_score += our_q
-                stats.total_market_q += max(market_q, our_q)
+                stats.total_market_q += market_q
                 stats.q_score_samples += 1
 
     def record_order_placed(self, condition_id: str) -> None:

@@ -30,6 +30,7 @@ class MarketState:
     dump_failures: int = 0
     unknown_count: dict = field(default_factory=lambda: {"yes": 0, "no": 0})
     last_book_fetch: float = 0.0
+    cached_book: dict | None = None   # Last successful merged book; consumed by record_cycle via RF_BOOK_CACHE_TTL
     midpoint: float = 0.0
     last_fill_price: dict = field(default_factory=dict)
     agent_shares: float = 0

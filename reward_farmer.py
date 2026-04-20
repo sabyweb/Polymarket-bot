@@ -1015,6 +1015,7 @@ class RewardFarmer:
             del self.markets[cid]
 
         # Step 5: Record rewards
+        from config import RF_BOOK_CACHE_TTL
         for ms in market_list:
             has_yes = ms.orders["yes"].order_id is not None
             has_no = ms.orders["no"].order_id is not None
@@ -1028,6 +1029,13 @@ class RewardFarmer:
                 (ms.orders["yes"].price + ms.orders["no"].price) / 2
                 if ms.orders["yes"].price > 0 and ms.orders["no"].price > 0 else 0
             )
+            # Reuse the book cached by place_orders_for_market within TTL.
+            # None means record_cycle will skip the Q-score sample for this
+            # market this cycle — correct behavior when no fresh book exists.
+            book_for_scoring = None
+            if ms.cached_book and RF_BOOK_CACHE_TTL > 0:
+                if time.time() - ms.last_book_fetch <= RF_BOOK_CACHE_TTL:
+                    book_for_scoring = ms.cached_book
             self.rewards.record_cycle(
                 condition_id=ms.cid,
                 has_yes_order=has_yes, has_no_order=has_no,
@@ -1038,6 +1046,7 @@ class RewardFarmer:
                 midpoint=mid,
                 bid_size=ms.orders["yes"].shares if has_yes else 0,
                 ask_size=ms.orders["no"].shares if has_no else 0,
+                order_book=book_for_scoring,
             )
 
         if self.cycle_count % 5 == 0:

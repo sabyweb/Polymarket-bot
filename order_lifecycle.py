@@ -209,6 +209,10 @@ class OrderLifecycle:
         best_ask = float(merged["asks"][0]["price"])
         midpoint = (best_bid + best_ask) / 2
         ms.midpoint = midpoint
+        # Cache the book so record_cycle (reward_farmer.py) can feed it to
+        # estimate_market_q without refetching. TTL enforced at read site
+        # via RF_BOOK_CACHE_TTL.
+        ms.cached_book = merged
         ms.last_book_fetch = time.time()
 
         # ── Phase 0: Log book snapshot (zero extra API calls) ──
