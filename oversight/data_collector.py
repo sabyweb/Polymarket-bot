@@ -11,7 +11,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 
-from config import RF_NEW_MARKET_Q_SHARE_PRIOR
+from config import RF_NEW_MARKET_Q_SHARE_PRIOR, RF_POISONED_Q_SHARE_THRESHOLD
 
 log = logging.getLogger("oversight.collector")
 
@@ -888,6 +888,7 @@ def query_reward_stats(db_path: str) -> dict[str, dict]:
         stale_decayed = 0
         stale_excluded = 0
         prior_used = 0
+        poisoned_skipped = 0
         for r in rows:
             d = json.loads(r["data"])
             cid = d["condition_id"]
@@ -934,11 +935,24 @@ def query_reward_stats(db_path: str) -> dict[str, dict]:
                     q_share = min(ws["scoring_ratio"] * 0.5, 0.5)
                     windowed_used += 1
                 elif total_market_q > 0 and d.get("q_score_samples", 0) > 0:
-                    # Priority 2: cumulative from reward_tracker
-                    q_share = d["total_q_score"] / total_market_q
-                    if on_book > 4.0 and q_share > 0.5:
-                        q_share = 0.5
-                        cumulative_capped += 1
+                    # Priority 2: cumulative from reward_tracker, with
+                    # poisoned-row guard.
+                    raw_cumulative = d["total_q_score"] / total_market_q
+                    if raw_cumulative > RF_POISONED_Q_SHARE_THRESHOLD:
+                        # Legacy poisoned row (see memory file:
+                        # project_market_q_fallback_bug.md). Cumulative totals
+                        # are contaminated by q_share=1.0 saturation from the
+                        # pre-Option-B max(market_q, our_q) fallback. Treat as
+                        # cold-start so Priority 1 (windowed) can take over
+                        # once samples accumulate; self-heals when dilution
+                        # drops the ratio under the threshold.
+                        q_share = RF_NEW_MARKET_Q_SHARE_PRIOR
+                        poisoned_skipped += 1
+                    else:
+                        q_share = raw_cumulative
+                        if on_book > 4.0 and q_share > 0.5:
+                            q_share = 0.5
+                            cumulative_capped += 1
                 elif on_book < 2.0 and d.get("q_score_samples", 0) == 0:
                     # Priority 3: cold-start prior.
                     # Markets with no posting history (< 2h on book, zero scoring
@@ -969,10 +983,10 @@ def query_reward_stats(db_path: str) -> dict[str, dict]:
                 "cycles_both_in_window": d.get("cycles_both_in_window", 0),
                 "total_market_q": total_market_q,
             }
-        if windowed_used or stale_decayed or stale_excluded or prior_used:
+        if windowed_used or stale_decayed or stale_excluded or prior_used or poisoned_skipped:
             log.info(
                 f"Q-share: {windowed_used} windowed, {cumulative_capped} cumulative capped, "
-                f"{prior_used} cold-start prior, "
+                f"{prior_used} cold-start prior, {poisoned_skipped} poisoned skipped, "
                 f"{stale_decayed} decayed (>6h), {stale_excluded} excluded (>24h)"
             )
         return result
@@ -1173,9 +1187,12 @@ def _smooth_correction_factor(
                 # Normal EMA: new_smoothed = alpha * raw + (1 - alpha) * prev_smoothed
                 smoothed = alpha * raw_factor + (1 - alpha) * prev_smoothed
 
-            # Clamp to [0.001, 10.0] — lower bound prevents division-by-zero
-            # downstream but no longer masks catastrophic errors (old: 0.10)
-            smoothed = max(0.001, min(10.0, smoothed))
+            # Clamp to [1e-6, 10.0]. No consumer divides by CF (audited
+            # 2026-04-20); lower bound preserves "effectively nonzero"
+            # semantics for downstream multiplicands without masking
+            # catastrophic calibration errors. Legacy floors: 0.10
+            # pre-d792156, 0.001 post-d792156.
+            smoothed = max(1e-6, min(10.0, smoothed))
 
             db.execute(
                 "INSERT INTO correction_factor_history "
