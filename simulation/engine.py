@@ -38,8 +38,9 @@ from profit.learning import (
 )
 
 from .invariants import (
-    InvariantViolation, check_per_cycle, check_post_run,
+    InvariantViolation, check_per_cycle, check_post_run, check_sim_sanity,
 )
+from .v3_metrics import compute_v3_cycle
 from .market_env import MarketEnvironment, MarketSignals
 from .metrics import CycleMetric, MetricsTracker
 from .runner import (
@@ -122,6 +123,37 @@ class SimulationResult:
     cumulative_reward: float
     cumulative_loss: float
     final_learning_state: dict
+    # SIM PATCH PART 8 — harness sanity diagnostics
+    sim_sanity_violations: list[InvariantViolation] = field(default_factory=list)
+    # V3 — per-cycle expected-capital / overcommit / tail-risk snapshots
+    v3_per_cycle: list[dict] = field(default_factory=list)
+
+
+# SIM PATCH PART 2 — fixed simulated-time epoch. Chosen to be "now-ish"
+# so that datetime.fromtimestamp(sim_now) renders a real-looking date,
+# but far enough in the past that no real-world calendar boundaries
+# interact with the sim's 1 hr/cycle advance across a 200-cycle run.
+_SIM_EPOCH = 2000000000.0  # 2033-05-18 UTC
+
+
+class _SimClock:
+    """Mutable holder used to advance the simulated wall-clock per cycle.
+
+    The engine patches `time.time` globally to call `_SimClock.now()`, so
+    every module that does `import time; time.time()` — including
+    production learning/calibration/allocator — sees the same simulated
+    time. `advance_to_cycle(k)` pins the clock to SIM_EPOCH + k * 3600
+    seconds, giving "one simulated hour per cycle" semantics.
+    """
+
+    def __init__(self):
+        self._cycle = 0
+
+    def advance_to_cycle(self, cycle: int) -> None:
+        self._cycle = int(cycle)
+
+    def now(self) -> float:
+        return _SIM_EPOCH + self._cycle * 3600.0
 
 
 @contextmanager
@@ -130,24 +162,51 @@ def _deterministic_environment(seed: int):
     pull from at runtime, so a (seed, scenario) repro is bit-exact:
 
       - Python global `random` (used by Patch 5's regime spike)
+      - numpy.random global (seeded if numpy is importable; some
+        calibration models use it for feature scaling / shuffles)
+      - `time.time()` — patched globally to return simulated seconds
+        so 24h-windowed SQL in LearningMetrics captures only the last
+        24 cycles' worth of inserts (see _SimClock)
       - profit.learning.REGIME_SPIKE_PROBABILITY: forced to 0 unless
         a test explicitly enables it
       - profit.bandit's wall-clock seed: re-seeded per call deterministically
 
-    This DOES NOT change production behavior — only its environment.
+    SIM PATCH PART 7 — numpy seeding + time-clock patching are new.
+    Without the time patch, the sim's 200 cycles execute in a few real
+    seconds and production's `ts > time.time() - 86400` window includes
+    everything — forcing loss_per_capital to read against cumulative
+    loss but per-cycle capital (the bug Patch 6 couldn't beat).
+
+    Production behaviour is unchanged — only the wall-clock the tests
+    feed it.
     """
     saved = random.getstate()
     random.seed(seed)
+    # numpy seeding (best-effort — numpy is optional for some paths).
+    np_saved_state = None
+    try:
+        import numpy as _np
+        np_saved_state = _np.random.get_state()
+        _np.random.seed(seed & 0xFFFFFFFF)
+    except Exception:
+        _np = None
     # Force-disable the stochastic spike for the audit run so the report
     # is reproducible. The spike's correctness is tested separately in
     # tests/test_regime_learning.py.
     p_patcher = patch("profit.learning.REGIME_SPIKE_PROBABILITY", 0.0)
     p_patcher.start()
+    # SIM PATCH PART 2 — install the simulated clock.
+    sim_clock = _SimClock()
+    time_patcher = patch("time.time", side_effect=sim_clock.now)
+    time_patcher.start()
     try:
-        yield
+        yield sim_clock
     finally:
+        time_patcher.stop()
         p_patcher.stop()
         random.setstate(saved)
+        if np_saved_state is not None and _np is not None:
+            _np.random.set_state(np_saved_state)
 
 
 class SimulationEngine:
@@ -177,8 +236,10 @@ class SimulationEngine:
         alloc_path = self._create_alloc_path()
 
         try:
-            with _deterministic_environment(self.seed):
-                return self._run_inner(scenario, cycles, db_path, alloc_path)
+            with _deterministic_environment(self.seed) as sim_clock:
+                return self._run_inner(
+                    scenario, cycles, db_path, alloc_path, sim_clock,
+                )
         finally:
             for p in (db_path, alloc_path):
                 if p and os.path.exists(p):
@@ -193,6 +254,7 @@ class SimulationEngine:
         cycles: int,
         db_path: str,
         alloc_path: str,
+        sim_clock: _SimClock,
     ) -> SimulationResult:
         # Each concern gets its own RNG seeded off the master seed so
         # ordering of consumption doesn't leak between concerns.
@@ -216,11 +278,21 @@ class SimulationEngine:
         metrics = MetricsTracker()
         learning_history: list[dict] = []
         per_cycle_violations: list[InvariantViolation] = []
+        # SIM PATCH PART 8 — collected per-cycle sanity inputs
+        sanity_fill_rates: list = []
+        sanity_loss_per_capital: list = []
+        sanity_cycle_losses: list = []
+        # V3 per-cycle snapshots (expected capital, overcommit, tail risk…)
+        v3_per_cycle: list[dict] = []
 
         cumulative_reward = 0.0
         cumulative_loss = 0.0
 
         for cycle in range(cycles):
+            # SIM PATCH PART 2 — advance the simulated wall-clock BEFORE
+            # the cycle runs, so every `time.time()` call inside step()
+            # and allocate_portfolio sees the post-advance value.
+            sim_clock.advance_to_cycle(cycle)
             signals = env.signals_for(cycle)
             outcome: CycleOutcome = execute_cycle(
                 cycle=cycle,
@@ -290,7 +362,30 @@ class SimulationEngine:
                 exploration_pct=outcome.exploration_pct,
             ))
 
+            # SIM PATCH PART 8 — collect inputs for post-run sanity
+            sanity_fill_rates.append(fill_rate)
+            lpc = (
+                outcome.loss / outcome.capital_deployed
+                if outcome.capital_deployed > 0 else None
+            )
+            sanity_loss_per_capital.append(lpc)
+            sanity_cycle_losses.append(outcome.loss)
+
+            # V3 per-cycle metrics
+            v3_snap = compute_v3_cycle(
+                outcome=outcome,
+                total_capital=outcome.total_capital,
+                applied_state=applied,
+            )
+            v3_per_cycle.append(v3_snap)
+
         post_run_violations = check_post_run(metrics, learning_history)
+        sim_sanity_violations = check_sim_sanity(
+            metrics_tracker=metrics,
+            per_cycle_fill_rates=sanity_fill_rates,
+            per_cycle_loss_per_capital=sanity_loss_per_capital,
+            per_cycle_losses=sanity_cycle_losses,
+        )
 
         final_state = (
             learning_history[-1] if learning_history else {}
@@ -306,4 +401,6 @@ class SimulationEngine:
             cumulative_reward=cumulative_reward,
             cumulative_loss=cumulative_loss,
             final_learning_state=final_state,
+            sim_sanity_violations=sim_sanity_violations,
+            v3_per_cycle=v3_per_cycle,
         )

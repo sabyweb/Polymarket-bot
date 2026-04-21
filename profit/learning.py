@@ -145,6 +145,32 @@ COLD_START_FRONTIER_MULT = 1.10
 REGIME_SPIKE_PROBABILITY = 0.05
 REGIME_SPIKE_CAP_UP = 1.20
 
+# ── PATCH 6 (SAFE EXPANSION) CONSTANTS ─────────────────────────
+# Fill + loss thresholds that characterise a "too passive" or "too
+# aggressive" regime independent of reward baseline. When both the
+# fill rate and the capital-normalised loss are below SAFE_*, the
+# system has headroom to expand. When both exceed the upper band
+# (fill > 2× SAFE_FILL_RATE AND loss > SAFE_LOSS_PER_CAPITAL) the
+# system should tighten. EMA + clamp + min_floor still apply.
+SAFE_FILL_RATE = 0.15
+SAFE_LOSS_PER_CAPITAL = 0.01
+EXPANSION_SCALE_UP = 1.05
+EXPANSION_SCALE_DOWN = 0.97
+# Aggressiveness nudge paired with the SAFE expansion path.
+SAFE_EXPANSION_AGGR_UP = 1.02
+
+# ── PATCH 11 (OSCILLATION DAMPING) CONSTANTS ───────────────────
+# When the capital_scale trace shows ≥ OSCILLATION_THRESHOLD direction
+# flips in the last OSCILLATION_WINDOW valid updates, dampen the raw
+# u_cap by OSCILLATION_DAMPEN_FACTOR BEFORE EMA smoothing. Targets
+# the V3.1 audit INV7 finding: learning loop oscillates under
+# overcommit in adversarial regimes.
+OSCILLATION_WINDOW = 20
+OSCILLATION_THRESHOLD = 6
+OSCILLATION_DAMPEN_FACTOR = 0.85
+# Cap stored per state; beyond this, oldest samples drop off.
+CAPITAL_HISTORY_MAX = 100
+
 # ── STEP 5 EMA SMOOTHING ───────────────────────────────────────
 EMA_ALPHA = 0.20
 
@@ -163,6 +189,41 @@ PREDICTED_LOSS_PER_FILL_BASELINE = 1.25
 
 def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
+
+
+# ═══════════════════════════════════════════════════════════════
+# PATCH 11 — Oscillation detection + in-memory history cache
+# ═══════════════════════════════════════════════════════════════
+#
+# The LearningController is instantiated per-cycle by oversight_agent
+# (see oversight_agent.py:372), so an instance attribute would not
+# survive across cycles. A module-level cache DOES survive the
+# long-running agent process — matching the user's "in-memory only,
+# 20-cycle rebuild on restart" intent. The cache is populated from the
+# LearningState returned by update_state() during persist_state, and
+# injected back during load_state. No DB migration, no state bloat.
+_CAPITAL_HISTORY_CACHE: list[float] = []
+
+
+def _reset_capital_history_cache() -> None:
+    """Test helper — clears the module-level capital_history cache so
+    tests that exercise oscillation damping start from a known state.
+    No production caller touches this."""
+    global _CAPITAL_HISTORY_CACHE
+    _CAPITAL_HISTORY_CACHE = []
+
+
+def _detect_oscillation(history: list) -> bool:
+    """Return True when `history` shows ≥ OSCILLATION_THRESHOLD direction
+    flips. A flip is a sign change in the first difference between
+    consecutive samples. With `range(2, len(history))` we safely index
+    `i-2` without Python's negative-index wrap. Equal consecutive values
+    produce a zero-difference and contribute no flip."""
+    flips = 0
+    for i in range(2, len(history)):
+        if (history[i] - history[i - 1]) * (history[i - 1] - history[i - 2]) < 0:
+            flips += 1
+    return flips >= OSCILLATION_THRESHOLD
 
 
 def _safe_div(num: Optional[float], den: Optional[float]) -> Optional[float]:
@@ -288,6 +349,11 @@ class LearningState:
     # Persisted as a JSON string in the DB. Pruned to
     # FRONTIER_MEMORY_MAX_SIZE entries on write.
     frontier_memory: dict = field(default_factory=dict)
+    # PATCH 11 — rolling trace of post-clamp capital_scale values used by
+    # _detect_oscillation. NOT DB-persisted; the LearningController
+    # injects this from a module-level cache during load_state and
+    # writes back during persist_state. Bounded at CAPITAL_HISTORY_MAX.
+    capital_history: list = field(default_factory=list)
 
 
 @dataclass
@@ -836,6 +902,10 @@ class LearningController:
                 float(row[8]) if row[8] is not None else None
             ),
             frontier_memory=frontier_memory,
+            # PATCH 11 — inject the module-level history cache so
+            # _detect_oscillation sees past capital_scale values across
+            # cycles within the same process.
+            capital_history=list(_CAPITAL_HISTORY_CACHE),
         )
 
     def persist_state(self, state: LearningState, mode: str) -> None:
@@ -883,6 +953,13 @@ class LearningController:
             db.close()
         except Exception as e:
             log.warning(f"[LEARNING] persist_state failed: {e}")
+
+        # PATCH 11 — refresh the module-level history cache so the next
+        # load_state() in this process picks up the new sample. Kept
+        # outside the try/except above so a DB-write failure doesn't
+        # silently drop the in-memory trace.
+        global _CAPITAL_HISTORY_CACHE
+        _CAPITAL_HISTORY_CACHE = list(state.capital_history)[-CAPITAL_HISTORY_MAX:]
 
     # ── Pure decision function (no I/O) ────────────────────────
 
@@ -994,6 +1071,22 @@ class LearningController:
             elif re_ > target_eff:
                 u_cap *= CAP_UP
 
+        # ── PATCH 6 PART 1: SAFE EXPANSION TRIGGER ────────────
+        # Fill+loss regime rule (independent of reward baseline). When
+        # both signals say "idle with no damage", expand. When both say
+        # "active and bleeding", tighten. Neutral otherwise. Both inputs
+        # must be present (None → skip, fail-closed).
+        fill_rate_raw = metrics.get("fill_rate")
+        loss_per_capital_raw = metrics.get("loss_per_capital")
+        if fill_rate_raw is not None and loss_per_capital_raw is not None:
+            if (fill_rate_raw < SAFE_FILL_RATE
+                    and loss_per_capital_raw < SAFE_LOSS_PER_CAPITAL):
+                u_cap *= EXPANSION_SCALE_UP
+                u_aggr *= SAFE_EXPANSION_AGGR_UP
+            elif (fill_rate_raw > SAFE_FILL_RATE * 2
+                    and loss_per_capital_raw > SAFE_LOSS_PER_CAPITAL):
+                u_cap *= EXPANSION_SCALE_DOWN
+
         # ── PART 2: REWARD-GROWTH EXPANSION ───────────────────
         # Reward-maximization pressure: when rewards are growing AND
         # efficiency is at least EXPANSION_EFFICIENCY_FLOOR_FRAC of the
@@ -1099,6 +1192,20 @@ class LearningController:
             min_floor = CLAMP_CAP[0]
         u_cap = max(u_cap, min_floor)
 
+        # ── PATCH 11: OSCILLATION DAMPING ─────────────────────
+        # Applied AFTER the min_floor guard and BEFORE EMA smoothing —
+        # this way the damping nudges the raw u_cap the same way other
+        # rules do, and the EMA + clamp pass still applies on top.
+        # Fires only when prev has accumulated ≥ OSCILLATION_WINDOW
+        # samples AND the last window shows ≥ OSCILLATION_THRESHOLD
+        # direction flips. In-memory window — on a fresh process it
+        # takes 20 cycles (≈ 10h at 30-min cadence) before damping can
+        # engage.
+        if len(prev.capital_history) >= OSCILLATION_WINDOW:
+            recent = prev.capital_history[-OSCILLATION_WINDOW:]
+            if _detect_oscillation(recent):
+                u_cap *= OSCILLATION_DAMPEN_FACTOR
+
         # ── FIX 5: reward_trust mean reversion (after rules, before EMA) ─
         # Each cycle pull trust 2% of the distance toward the neutral 1.0.
         # When trust < 1.0 this is a small upward pressure that prevents
@@ -1113,9 +1220,10 @@ class LearningController:
         new_trust = a * u_trust + (1 - a) * prev.reward_trust
 
         # ── Clamp (STEP 3 hard constraints) ───────────────────
+        new_cap_clamped = _clamp(new_cap, *CLAMP_CAP)
         return LearningState(
             aggressiveness=_clamp(new_aggr, *CLAMP_AGGR),
-            capital_scale=_clamp(new_cap, *CLAMP_CAP),
+            capital_scale=new_cap_clamped,
             risk_multiplier=_clamp(new_risk, *CLAMP_RISK),
             reward_trust=_clamp(new_trust, *CLAMP_TRUST),
             # FIX 6 — increments only when called (i.e. only on valid cycles)
@@ -1134,6 +1242,11 @@ class LearningController:
             # PATCH 5 PART 2/8 — carry the (possibly updated, possibly
             # pruned) regime memory forward.
             frontier_memory=_prune_memory(memory),
+            # PATCH 11 — append the post-clamp value; bounded at
+            # CAPITAL_HISTORY_MAX so memory never unboundedly grows.
+            capital_history=(
+                list(prev.capital_history) + [new_cap_clamped]
+            )[-CAPITAL_HISTORY_MAX:],
         )
 
     # ── Full cycle ─────────────────────────────────────────────
@@ -1199,6 +1312,9 @@ class LearningController:
             # FIX 6: only increment the valid counter when metrics were
             # complete. Broken/incomplete cycles don't count toward the
             # 50-cycle ACTIVE promotion threshold.
+            # PATCH 11: preserve prev.capital_history so persist_state's
+            # cache refresh writes the baseline trace (and a later
+            # update_state success further advances the cache explicitly).
             counter_only = LearningState(
                 aggressiveness=prev.aggressiveness,
                 capital_scale=prev.capital_scale,
@@ -1210,11 +1326,24 @@ class LearningController:
                 updated_at=time.time(),
                 mode=mode,
                 market_efficiency_map={},
+                capital_history=list(prev.capital_history),
             )
+            # Persist FIRST (matches pre-Patch-11 ordering) — if
+            # update_state below raises, the counter + scalars still land.
             self.persist_state(counter_only, mode)
 
             if metrics_ok:
                 computed = self.update_state(metrics, prev)
+                # PATCH 11: explicitly advance the module cache so the
+                # damping window warms up during SHADOW and is ready the
+                # moment the gate promotes to ACTIVE. persist_state
+                # above already refreshed the cache from
+                # counter_only.capital_history (= prev); this overwrites
+                # with the post-update trace.
+                global _CAPITAL_HISTORY_CACHE
+                _CAPITAL_HISTORY_CACHE = list(
+                    computed.capital_history,
+                )[-CAPITAL_HISTORY_MAX:]
                 log.info(
                     f"[LEARNING_SHADOW] would_apply "
                     f"aggr {prev.aggressiveness:.3f}→{computed.aggressiveness:.3f} "
@@ -1244,6 +1373,9 @@ class LearningController:
             # FIX 6: do NOT increment counter here; prev is reused as-is.
             # Carry the current mode through so allocator sees ACTIVE and
             # can still enable exploration on the prev scalars.
+            # PATCH 11: preserve prev.capital_history so the module-level
+            # damping cache isn't wiped by a single incomplete-metrics
+            # cycle.
             held = LearningState(
                 aggressiveness=prev.aggressiveness,
                 capital_scale=prev.capital_scale,
@@ -1253,6 +1385,7 @@ class LearningController:
                 updated_at=prev.updated_at,
                 mode=mode,
                 market_efficiency_map={},
+                capital_history=list(prev.capital_history),
             )
             self._log_cycle(metrics, held, mode)
             return LearningStep(
@@ -1307,6 +1440,8 @@ class LearningController:
         self._log_cycle(metrics, computed, mode)
         # PART 7 — expansion-specific log line.
         self._log_expansion(metrics, cap_scale_before, computed, is_probe)
+        # PATCH 6 PART 5 — safe-expansion observability line.
+        self._log_patch6(metrics, computed)
         return LearningStep(
             mode=mode,
             applied_state=computed,
@@ -1364,4 +1499,20 @@ class LearningController:
             f"regime_id={regime_id} "
             f"regime_best_reward={regime_best_reward:.2f} "
             f"regime_best_capital_scale={regime_best_cap:.3f}"
+        )
+
+    def _log_patch6(self, m: dict, s: LearningState) -> None:
+        """PATCH 6 PART 5 — safe-expansion observability. Emits the raw
+        (None-safe) fill_rate and loss_per_capital that drive Rule E, plus
+        the post-clamp capital_scale."""
+        def _f(x, fmt=".4f"):
+            if x is None:
+                return "nan"
+            return format(x, fmt)
+
+        log.info(
+            f"[LEARNING_P6] "
+            f"fill_rate={_f(m.get('fill_rate'))} "
+            f"loss_per_capital={_f(m.get('loss_per_capital'))} "
+            f"capital_scale={s.capital_scale:.3f}"
         )

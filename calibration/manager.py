@@ -22,6 +22,36 @@ log = logging.getLogger("calibration.manager")
 # Retrain cooldown: don't retrain if last train was < 30 min ago
 RETRAIN_COOLDOWN_SECS = 1800
 
+
+# ── PATCH 7 PART 2: COLD-START P_FILL FALLBACK ─────────────────
+# Book-aware heuristic used when the trained FillModel is unavailable
+# OR returns a too-small prediction (< 0.005). Keeps p_fill strictly
+# non-zero so expected_capital and V3 audit metrics remain defined in
+# the early run before the model has enough training data.
+#
+# Heuristic:
+#   base = 0.02
+#   + 0.05 if spread <  0.02 (very tight → fills fast)
+#   + 0.02 if spread <  0.05 (moderately tight)
+#   + 0.02 if depth  <  500  (shallow book → fewer shares ahead of us)
+#   × max(0.5, 1.0 - queue_position)   (worse queue position → slower)
+# Clamped to [0.01, 0.15].
+def _fallback_p_fill_cold_start(
+    spread: float, depth: float, position: float,
+) -> float:
+    spread = float(spread if spread is not None else 0.05)
+    depth = float(depth if depth is not None else 0.0)
+    position = float(position if position is not None else 0.0)
+    base = 0.02
+    if spread < 0.02:
+        base += 0.05
+    elif spread < 0.05:
+        base += 0.02
+    if depth < 500:
+        base += 0.02
+    base *= max(0.5, 1.0 - position)
+    return min(0.15, max(0.01, base))
+
 # Fix 4: Safety bias — cap reward term at 80% of naive estimate
 # Reward attribution is the noisiest model; never trust it fully
 REWARD_SAFETY_BIAS = 0.80
@@ -261,25 +291,49 @@ class CalibrationManager:
 
         versions: dict = {}
 
-        # P(fill)
+        # P(fill) — PATCH 7 scope: book-aware fallback applies ONLY when
+        # the FillModel has been trained (is_ready) but the prediction is
+        # suspiciously low (< 0.005). When the model has no training data
+        # yet, keep the legacy observation-based fallback so EV doesn't
+        # collapse during bootstrap: a non-zero cold-start p_fill against
+        # a non-zero cold-start e_loss yields negative raw_ev for almost
+        # every market, the hard profit guard fires "NO DEPLOYMENT", and
+        # the learning gate never leaves OFF.
+        queue_pos = 0.0
+        if total_same and total_same > 0:
+            queue_pos = min(1.0, depth_ahead / max(1.0, total_same))
+
         if self.fill_model.is_ready():
             order_price = midpoint - spread / 2  # typical bid placement
-            p_fill = self.fill_model.predict_from_book(
+            p_fill_model = self.fill_model.predict_from_book(
                 spread=spread, midpoint=midpoint,
                 depth_ahead=depth_ahead, total_same_depth=total_same,
                 opposite_depth_5c=opp_depth, daily_rate=dr,
                 agent_shares=ag_sh, order_price=order_price,
             )
-            if p_fill < 0:
-                p_fill = self._fallback_p_fill(fill_count_recent, on_book_hours)
-                versions["p_fill"] = "fallback"
+            if p_fill_model is None or p_fill_model < 0.005:
+                # PATCH 7 — trained model produced an unreliably-low value.
+                # Use book-aware heuristic instead.
+                p_fill = _fallback_p_fill_cold_start(
+                    spread, total_same, queue_pos,
+                )
+                versions["p_fill"] = "fallback_fill"
             elif book_missing:
                 # FIX 13: book cache miss → prediction ran on default features
+                p_fill = p_fill_model
                 versions["p_fill"] = "book_stale"
             else:
+                p_fill = p_fill_model
                 versions["p_fill"] = "model"
         else:
-            p_fill = self._fallback_p_fill(fill_count_recent, on_book_hours)
+            # Model not trained yet — observation-based fallback keeps
+            # bootstrap behavior. Returns 0 with no observations, which
+            # intentionally lets EV stay positive so the system can deploy
+            # and collect data. Non-zero observability floor is enforced
+            # downstream by the allocator's PATCH 7 `_p_fill` stamp.
+            p_fill = self._fallback_p_fill(
+                fill_count_recent, on_book_hours,
+            )
             versions["p_fill"] = "fallback"
 
         # E[loss | fill]

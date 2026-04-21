@@ -86,11 +86,27 @@ class TestInvariants(unittest.TestCase):
         return LearningState(**defaults)
 
     def test_capital_overrun_caught(self):
-        """An allocation that exceeds budget * tolerance must trigger
-        the capital_overrun violation."""
+        """PATCH 7 — expected_capital exceeding the tolerance must trigger
+        `expected_capital_overrun`. Notional alone no longer triggers it;
+        under Polymarket mechanics notional can legitimately overcommit."""
         allocs = [{
             "action": "deploy", "condition_id": "X",
-            "est_capital_cost": 2000.0,
+            "est_capital_cost": 3000.0, "_p_fill": 0.8,  # exp = $2400
+        }]
+        viols = check_per_cycle(
+            cycle=0, allocations=allocs, applied_state=self._state(),
+            total_capital=1000.0, total_ev=10.0, exploration_pct=0.05,
+        )
+        names = {v.name for v in viols}
+        self.assertIn("expected_capital_overrun", names)
+
+    def test_legacy_capital_overrun_triggers_without_p_fill(self):
+        """When no `_p_fill` is stamped (legacy allocation dicts), the
+        invariant falls back to the naive notional check. Required for
+        backward compat with older test fixtures."""
+        allocs = [{
+            "action": "deploy", "condition_id": "X",
+            "est_capital_cost": 2000.0,  # no _p_fill key
         }]
         viols = check_per_cycle(
             cycle=0, allocations=allocs, applied_state=self._state(),
@@ -100,9 +116,11 @@ class TestInvariants(unittest.TestCase):
         self.assertIn("capital_overrun", names)
 
     def test_capital_under_tolerance_passes(self):
+        """Notional may exceed budget under Patch 7, but expected_capital
+        staying within tolerance must NOT trigger the overrun check."""
         allocs = [{
             "action": "deploy", "condition_id": "X",
-            "est_capital_cost": 1050.0,  # within 5%
+            "est_capital_cost": 5000.0, "_p_fill": 0.10,  # exp = $500
         }]
         viols = check_per_cycle(
             cycle=0, allocations=allocs, applied_state=self._state(),
@@ -110,6 +128,7 @@ class TestInvariants(unittest.TestCase):
         )
         names = {v.name for v in viols}
         self.assertNotIn("capital_overrun", names)
+        self.assertNotIn("expected_capital_overrun", names)
 
     def test_ev_negative_with_deployment_caught(self):
         allocs = [{

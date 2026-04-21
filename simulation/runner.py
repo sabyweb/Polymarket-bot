@@ -46,24 +46,19 @@ class CycleOutcome:
     order_count: int
 
 
-# Number of synthetic markets per cycle. Kept moderate so the per-cycle
-# DB writes are bounded and the allocator's cluster/group caps still
-# have meaningful market counts to operate on.
-N_SYNTHETIC_MARKETS = 8
+# Number of synthetic markets per cycle. Raised from 8 → 30 so the
+# allocator has room to deploy past the 8×$200 = $1600 ceiling that
+# was binding the v2 audit's deploy_ratio (SIM PATCH PART 4).
+N_SYNTHETIC_MARKETS = 30
 
-# Per-side share count for synthetic deploy markets. This drives the
-# fill cost (shares * clob_cost) and the unwind revenue (shares *
-# sell_price) numbers we insert. Picked small enough that the per-
-# market cap (15% of effective capital) easily covers the min_size
-# cost even when the cold-start eff_scale is at its 0.30 floor.
+# Per-side share count for synthetic deploy markets. Drives fill cost
+# (shares × clob_cost) and unwind revenue (shares × sell_price).
 SHARES_PER_SIDE = 30
 
-# Total deployable capital used by every cycle of the audit. Picked so
-# that 8 markets * ~30 shares * ~$0.50 per share * 2 sides ≈ $240 fits
-# comfortably under the budget AND so per_market_cap > min_size cost
-# even at the 0.30 cold-start eff_scale floor:
-#   per_market_cap >= TOTAL_CAPITAL * 0.30 * 0.15 = $90
-#   min_size cost  ≈ 30 * 0.91 ≈ $27
+# Total deployable capital used by every cycle of the audit. Kept at
+# $2000 so per_market_cap = min($200, budget × 0.15) = $200 remains
+# the binding per-market limit. 30 markets × $200 = $6000 possible,
+# so the 75%/85% utilisation targets become physically reachable.
 TOTAL_CAPITAL = 2000.0
 
 
@@ -72,19 +67,28 @@ def _build_scored_markets(
     rng,
 ) -> list[ScoredMarket]:
     """Generate `N_SYNTHETIC_MARKETS` ScoredMarkets with signals
-    consistent with the scenario. Question groups are spread across
-    a few buckets so the allocator's per-group cap is exercised."""
+    consistent with the scenario. Question groups spread across a few
+    buckets so the allocator's per-group cap is exercised.
+
+    SIM PATCH PART 4 — per-market diversity. Each market index gets a
+    STABLE deterministic offset on q_share, spread, and daily_rate so
+    markets are not identical clones. Offsets are index-derived (no
+    RNG dependency) so the sequence is reproducible across runs."""
     out: list[ScoredMarket] = []
-    n_groups = 3
+    n_groups = 5
+    n = max(1, N_SYNTHETIC_MARKETS)
     for i in range(N_SYNTHETIC_MARKETS):
         cid = f"SIM_{signals.regime_tag}_{i}"
-        # advertised_daily_rate flows into reward predictions inside the
-        # calibrator — for high_reward_fake this is much greater than the
-        # actual paid reward we attribute later.
+        # Per-market stable jitter in [-1, +1] space, evenly spaced.
+        j = (i / max(1, n - 1)) * 2.0 - 1.0  # -1 .. +1
+        q_share_i = max(0.5, 10.0 * (1.0 + 0.30 * j))          # 7–13%
+        spread_i = max(0.005, 0.045 * (1.0 + 0.20 * j))        # 3.6–5.4%
+        rate_i = max(0.0, signals.advertised_daily_rate
+                     * (1.0 + 0.15 * j))                       # ±15%
         sm = ScoredMarket(
             condition_id=cid,
             question=f"Synthetic {signals.regime_tag} {i}",
-            score=1.0 + rng.uniform(-0.1, 0.1),
+            score=1.0 + rng.uniform(-0.05, 0.05),
             action="deploy",
             recommended_shares=SHARES_PER_SIDE,
             reason="simulator",
@@ -92,13 +96,13 @@ def _build_scored_markets(
             actual_reward_total=0.0,
             fill_damage=0.0,
             fill_count=0,
-            daily_rate=signals.advertised_daily_rate,
+            daily_rate=rate_i,
             min_size=float(SHARES_PER_SIDE),
-            max_spread=0.045,
+            max_spread=spread_i,
             est_capital_cost=0.0,
             locked_position_usd=0.0,
             question_group=f"grp_{i % n_groups}",
-            q_share_pct=10.0,
+            q_share_pct=q_share_i,
             end_date_iso="",
         )
         out.append(sm)
@@ -106,10 +110,21 @@ def _build_scored_markets(
 
 
 def _now_ts(cycle: int) -> float:
-    """Per-cycle timestamp. Uses real wall-clock so the LearningMetrics
-    24h cutoff (`now - 86400`) sees our inserts. Cycle index added as a
-    sub-second offset so ts values are monotone across cycles in a run."""
-    return time.time() + cycle * 1e-3
+    """Per-cycle timestamp. Returns current (patched) `time.time()`
+    plus a 1-second offset.
+
+    The engine patches `time.time()` to `SIM_EPOCH + cycle * 3600`
+    (one simulated hour per cycle). Without the +1 offset, the next
+    cycle's 1h cutoff = `SIM_EPOCH + k*3600 - 3600` equals exactly
+    the prior cycle's ts, and production's `ts > cutoff` strict-greater
+    excludes it — `global_fill_rate_1h` would then come back None and
+    block `_metrics_complete`.
+
+    With +1s, the prior cycle's ts = SIM_EPOCH + (k-1)*3600 + 1 is
+    strictly greater than the next cycle's 1h cutoff, so it's captured;
+    the 24h window similarly retains the expected ~24 cycles of fills.
+    """
+    return time.time() + 1.0
 
 
 # 1 cycle == 1 simulated hour. Cycles 0..23 fall on day 0; 24..47 on
@@ -142,9 +157,33 @@ def _insert_outcomes(
     rng,
 ) -> tuple[float, float, int, int]:
     """Insert orders_placed / fills / unwinds / reward_attribution for
-    the cycle. Returns (reward, loss, fill_count, order_count)."""
+    the cycle. Returns (reward, loss, fill_count, order_count).
+
+    SIM PATCH PART 1 — at start of cycle, DELETE the per-cycle tables
+    so metrics computed from them reflect ONLY this cycle's behaviour.
+    Without this, fills/unwinds/orders accumulate over 200 cycles and
+    loss_per_capital / fill_rate are read against cumulative totals
+    vs. a per-cycle capital_deployed — a time-scale mismatch that
+    masked Rule E's SAFE expansion gate.
+
+    PRESERVED (not deleted): reward_daily (historical, feeds gate's
+    reward_days counter) and learning_state (controller persistence).
+    """
     db = sqlite3.connect(db_path)
     db.execute("PRAGMA journal_mode=WAL")
+    # ── SIM PATCH PART 1: 24h WINDOWING (see engine._time_simulator) ──
+    # We do NOT delete fills/unwinds/orders_placed here. Instead, the
+    # engine patches `time.time()` to advance 1 simulated hour per cycle
+    # (SIM PATCH PART 2's CYCLE_DURATION_HOURS). Rows are inserted with
+    # ts == that simulated wall-clock, so production's 24h-window query
+    # `ts > time.time() - 86400` naturally captures only the last 24
+    # cycles. Lifetime `COUNT(*) FROM fills` still sees every row, so
+    # LearningGate's `fills_total >= 100` trigger progresses as before.
+    #
+    # reward_attribution is date-keyed (today/yesterday) and the UPSERT
+    # already overwrites today's per-market row each cycle — no DELETE
+    # needed; the per-cycle per-market value is what actual_reward_24h
+    # reads on the next step() call.
     now = _now_ts(cycle)
     today = _today_str()
     # Simulated calendar date for reward_daily — drives the gate's

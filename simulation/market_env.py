@@ -6,10 +6,27 @@ five adversarial scenarios. Each cycle returns:
     {
         "p_fill": float,
         "loss_per_fill": float,
-        "reward_rate": float,        # actual paid reward per market per cycle
-        "advertised_daily_rate": float,  # what calibrator sees pre-attribution
+        "reward_rate": float,            # per-cycle reward per market
+        "advertised_daily_rate": float,  # per-day reward per market
         "volatility": float,
     }
+
+SIM PATCH PART 2 — time-scale semantics (made explicit):
+
+    CYCLE_DURATION_HOURS = 1 (1 cycle = 1 simulated step)
+
+  • p_fill               : probability of fill within the cycle window
+  • fill_rate measured   : this cycle's fills / this cycle's orders
+  • loss_per_capital     : this cycle's net loss / this cycle's capital
+  • reward_rate          : paid reward per market THIS CYCLE
+  • advertised_daily_rate: predicted reward per market over 24h
+
+The runner DELETEs fills, unwinds, orders_placed, reward_attribution at
+the start of each cycle (PART 1), so every metric reads cleanly against
+per-cycle inputs. predicted_reward_24h (= daily_rate × q_share / 100)
+remains the 24h aggregate — it is matched against actual_reward_24h
+which also collapses to one cycle's worth, so reward_error becomes a
+real ratio instead of a cumulative/per-cycle mixture.
 
 The "high_reward_fake" scenario produces advertised >> actual to drive
 reward_error < 0.7 in the learning loop. The "regime_shift" scenario
@@ -32,6 +49,11 @@ SCENARIOS = (
     "regime_shift",
     "stable_optimal",
 )
+
+# SIM PATCH PART 2 — time model constant. 1 cycle == 1 simulated step.
+# Consumers (runner, invariants, report_v2) key off this so any change
+# here is the single source of truth for the sim's time semantics.
+CYCLE_DURATION_HOURS = 1
 
 
 @dataclass
