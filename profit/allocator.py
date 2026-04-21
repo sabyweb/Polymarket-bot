@@ -741,6 +741,25 @@ def allocate_portfolio(
             "_low_ev_override": low_ev_override,
         })
 
+    # ── PATCH 13 PART 4: EFFICIENCY-AWARE EXPANSION CONTROL ────
+    # When current reward_efficiency is below its adaptive baseline in
+    # ACTIVE mode, the learning loop has over-expanded past the
+    # efficient frontier. Penalise final_score uniformly by 10% so
+    # every downstream consumer sees a tighter allocation profile.
+    # Ranking is preserved (uniform multiplier). Gated on ACTIVE and
+    # on both inputs being present so learning_state=None / OFF /
+    # SHADOW / baseline-unknown callers see unchanged behaviour
+    # (Hard Guarantee #4).
+    if learning_state is not None and ls_mode == "ACTIVE":
+        eff_now = getattr(learning_state, "reward_efficiency", None)
+        baseline_now = getattr(
+            learning_state, "reward_efficiency_baseline", None,
+        )
+        if (eff_now is not None and baseline_now is not None
+                and float(eff_now) < float(baseline_now)):
+            for m in market_data:
+                m["final_score"] = float(m.get("final_score", 0.0)) * 0.9
+
     # ── PART 11: Hard profit guard ─────────────────────────────
     # If the SUM of expected per-market EVs (across to-deploy markets) is
     # negative, the portfolio is unprofitable in expectation — return
@@ -884,6 +903,70 @@ def allocate_portfolio(
         alloc = max(min_cost, alloc * per_market_scale)
         md["allocated_capital"] = alloc
 
+    # ── PATCH 13 PART 1: TARGET-DRIVEN ALLOCATION ──────────────
+    # After Phase B market selection and before Phase C allocation
+    # sizing, greedy-fill the overcommit target with top-RAS markets.
+    # Each target allocation is bounded at effective_per_market_cap
+    # (Patch 9 compatibility). A marginal-efficiency gate skips
+    # markets where ev / (p_fill × size) falls below 0.7 × baseline.
+    # Part 2's merge step applies these decisions to the Phase C
+    # allocations list, preferring the larger of the two per market.
+    target_allocations: list[dict] = []
+    if learning_state is not None and ls_mode == "ACTIVE":
+        target_notional_p13 = float(total_capital) * overcommit_factor
+        baseline_eff_p13 = getattr(
+            learning_state, "reward_efficiency_baseline", None,
+        )
+        # Rank by RAS descending. Markets with ras=0 / non-deploy action
+        # / missing predictions are filtered out by the loop body.
+        ranked_p13 = sorted(
+            market_data,
+            key=lambda m: float(m.get("ras") or 0.0),
+            reverse=True,
+        )
+        remaining_p13 = target_notional_p13
+        for m in ranked_p13:
+            if remaining_p13 <= 0:
+                break
+            if m.get("action") != "deploy":
+                continue
+            sm_p13 = m.get("sm")
+            preds_p13 = m.get("predictions")
+            if sm_p13 is None or preds_p13 is None:
+                continue
+            # Per-market base size — min(soft-cap, remaining).
+            size_p13 = min(
+                float(effective_per_market_cap), float(remaining_p13),
+            )
+            if size_p13 <= 0:
+                continue
+            # Marginal efficiency gate — ev / (p_fill × size) must
+            # clear 70% of the efficiency baseline. Skipped when
+            # baseline is not yet available (fail-open early cycle).
+            p_fill_p13 = max(float(preds_p13.p_fill_24h or 0.0), 1e-4)
+            ev_p13 = float(preds_p13.ev_per_day or 0.0)
+            marginal_eff_p13 = ev_p13 / max(p_fill_p13 * size_p13, 1e-9)
+            if (baseline_eff_p13 is not None
+                    and marginal_eff_p13 < 0.7 * float(baseline_eff_p13)):
+                continue
+            # Convert size → shares using spread-derived cpb with the
+            # usual min_size floor. Avoids the phantom "cost_per_share"
+            # lookup in the spec pseudocode.
+            spread_p13 = getattr(sm_p13, "max_spread", 0.045)
+            s_p13 = spread_p13 if spread_p13 > 0 else 0.045
+            cpb_p13 = 2 * max(0.05, (1.0 - 2 * s_p13) / 2)
+            if cpb_p13 <= 0:
+                continue
+            min_shares_p13 = int(sm_p13.min_size or 50)
+            shares_p13 = max(min_shares_p13, int(size_p13 / cpb_p13))
+            realised_cost_p13 = round(shares_p13 * cpb_p13, 2)
+            target_allocations.append({
+                "condition_id": sm_p13.condition_id,
+                "est_capital_cost": realised_cost_p13,
+                "shares_per_side": shares_p13,
+            })
+            remaining_p13 -= realised_cost_p13
+
     # ── Phase C: Depth-aware sizing ────────────────────────────
 
     allocations: list[dict] = []
@@ -959,6 +1042,34 @@ def allocate_portfolio(
         d["_exploration_pct"] = round(exploration_pct, 4)
 
         allocations.append(d)
+
+    # ── PATCH 13 PART 2: MERGE TARGET-DRIVEN INTO PHASE C ──────
+    # For each market in target_allocations, upsize the Phase C
+    # allocation when the target size is larger. Preserves action
+    # semantics (never downgrades a Phase C deploy; promotes an
+    # avoid to deploy if target picked it). Stamps _forced_target_alloc
+    # for observability.
+    if target_allocations:
+        by_cid = {
+            a.get("condition_id"): a for a in allocations
+            if a.get("condition_id")
+        }
+        for ta in target_allocations:
+            a = by_cid.get(ta["condition_id"])
+            if a is None:
+                continue
+            current_cost = float(a.get("est_capital_cost") or 0.0)
+            if float(ta["est_capital_cost"]) > current_cost:
+                a["shares_per_side"] = int(ta["shares_per_side"])
+                a["est_capital_cost"] = float(ta["est_capital_cost"])
+                a["action"] = "deploy"
+                a["_forced_target_alloc"] = True
+                # Keep _expected_capital consistent with the new cost
+                # so downstream _enforce_expected_capital uses fresh data.
+                p_fill = float(a.get("_p_fill") or 0.0)
+                a["_expected_capital"] = round(
+                    p_fill * a["est_capital_cost"], 4,
+                )
 
     # ── Phase B2: Correlation cluster caps ─────────────────────
 
@@ -1306,135 +1417,100 @@ def allocate_portfolio(
         # unknown p_fill contribute 0 to expected_capital.
         allocations = _enforce_expected_capital(allocations, total_capital)
 
-    # ── PATCH 11: EXPOSURE SATURATION ─────────────────────────────
-    # Upsize EXISTING deploys toward the Patch 7 overcommit target.
-    # Patch 10 promotes avoids; when there are no avoids (all markets
-    # marked _low_ev_override), Patch 11 is what closes the gap.
-    #
-    # Target is the LIVE Patch-7 overcommit_factor × total_capital —
-    # not a hardcoded ratio — so saturation tracks the learning-loop-
-    # and regime-aware commit level.
-    #
-    # Cumulative scaling: each iter multiplies by UPSCALE_STEP (1.25),
-    # clamped at EXPOSURE_SATURATION_MAX_SCALE (3.0). Loop exits early
-    # when the target is reached.
-    #
-    # Safety sequence after the loop:
-    #   1. Re-apply cluster caps (Hard Guarantee #2).
-    #   2. Re-enforce expected_capital ≤ 0.95 × total (Hard Guarantee #1).
-    #
-    # ACTIVE-only: OFF/SHADOW/None keep pre-Patch-11 behaviour (HG #4).
+    # ── PATCH 13 PART 6: FINAL SAFETY RE-ENFORCEMENT ──────────────
+    # Parts 1 + 2 (target-driven greedy allocation + merge) and the
+    # Patch 10 forced-exposure block above may have grown notional
+    # past cluster/group/expected-capital bounds. This final pass
+    # restores the three safety invariants in ACTIVE mode:
+    #   1. Fill-cluster caps ≤ 30% of effective_capital (HG #2)
+    #   2. Question-group caps ≤ 30% of effective_capital (HG #2)
+    #   3. Σ p_fill × size ≤ 0.95 × total_capital (HG #1)
+    # Also stamps Patch 11 observability fields so existing consumers
+    # continue to read _saturation_applied / _target_notional /
+    # _saturation_scale unchanged. OFF/SHADOW/None skip entirely
+    # (Hard Guarantee #4).
     if learning_state is not None and ls_mode == "ACTIVE":
         target_notional = float(total_capital) * overcommit_factor
-        current_notional = sum(
-            float(a.get("est_capital_cost") or 0.0)
-            for a in allocations if a.get("action") == "deploy"
-        )
-        cumulative_scale = 1.0
-        if current_notional < target_notional and current_notional > 0:
-            for _ in range(UPSCALE_MAX_ITERS):
-                next_scale = min(
-                    EXPOSURE_SATURATION_MAX_SCALE,
-                    cumulative_scale * UPSCALE_STEP,
-                )
-                if next_scale <= cumulative_scale:
-                    break  # hit MAX ceiling — further iters would no-op
-                step_ratio = next_scale / cumulative_scale
-                for a in allocations:
-                    if a.get("action") != "deploy":
-                        continue
-                    spread = a.get("max_spread", 0.045)
-                    s = spread if spread > 0 else 0.045
-                    cpb = 2 * max(0.05, (1.0 - 2 * s) / 2)
-                    if cpb <= 0:
-                        continue
-                    old_cost = float(a.get("est_capital_cost") or 0.0)
-                    # Per-market cap: respect Patch-9's soft ceiling so
-                    # an individual market never grows past
-                    # effective_per_market_cap, even if that means
-                    # saturation falls short of the overcommit target.
-                    new_cost_target = min(
-                        old_cost * step_ratio,
-                        float(effective_per_market_cap),
-                    )
-                    min_shares = int(a.get("min_size", 50) or 50)
-                    new_shares = max(
-                        min_shares, int(new_cost_target / cpb),
-                    )
-                    a["shares_per_side"] = new_shares
-                    a["est_capital_cost"] = round(new_shares * cpb, 2)
-                cumulative_scale = next_scale
-                current_notional = sum(
-                    float(a.get("est_capital_cost") or 0.0)
-                    for a in allocations if a.get("action") == "deploy"
-                )
-                if current_notional >= target_notional:
-                    break
 
-            # Re-apply fill-cluster caps (Hard Guarantee #2) — upsizing
-            # may have pushed a clustered market past the 30% cap.
-            if clusters:
-                allocations = apply_cluster_caps(
-                    allocations, clusters, max_cluster_pct,
-                    effective_capital,
-                    oversized_cluster_ids=oversized_ids,
-                )
+        # Re-apply fill-cluster caps.
+        if clusters:
+            allocations = apply_cluster_caps(
+                allocations, clusters, max_cluster_pct,
+                effective_capital,
+                oversized_cluster_ids=oversized_ids,
+            )
 
-            # Re-enforce question_group cap (max_group_pct) — distinct
-            # from fill-cluster caps above. The inline enforcement in
-            # Phase B doesn't re-run after saturation, so a single group
-            # can otherwise balloon past its 30% ceiling.
-            group_totals: dict[str, float] = {}
+        # Re-enforce question_group cap.
+        group_totals: dict[str, float] = {}
+        for a in allocations:
+            if a.get("action") != "deploy":
+                continue
+            g = a.get("question_group", "") or ""
+            if not g:
+                continue
+            group_totals[g] = group_totals.get(g, 0.0) + float(
+                a.get("est_capital_cost") or 0.0,
+            )
+        for g, total in group_totals.items():
+            if total <= per_group_cap:
+                continue
+            scale_down = per_group_cap / total
             for a in allocations:
                 if a.get("action") != "deploy":
                     continue
-                g = a.get("question_group", "") or ""
-                if not g:
+                if (a.get("question_group") or "") != g:
                     continue
-                group_totals[g] = group_totals.get(g, 0.0) + float(
-                    a.get("est_capital_cost") or 0.0,
+                spread = a.get("max_spread", 0.045)
+                s = spread if spread > 0 else 0.045
+                cpb = 2 * max(0.05, (1.0 - 2 * s) / 2)
+                if cpb <= 0:
+                    continue
+                old_cost = float(a.get("est_capital_cost") or 0.0)
+                new_cost_target = old_cost * scale_down
+                min_shares = int(a.get("min_size", 50) or 50)
+                new_shares = max(
+                    min_shares, int(new_cost_target / cpb),
                 )
-            for g, total in group_totals.items():
-                if total <= per_group_cap:
-                    continue
-                scale_down = per_group_cap / total
-                for a in allocations:
-                    if a.get("action") != "deploy":
-                        continue
-                    if (a.get("question_group") or "") != g:
-                        continue
-                    spread = a.get("max_spread", 0.045)
-                    s = spread if spread > 0 else 0.045
-                    cpb = 2 * max(0.05, (1.0 - 2 * s) / 2)
-                    if cpb <= 0:
-                        continue
-                    old_cost = float(a.get("est_capital_cost") or 0.0)
-                    new_cost_target = old_cost * scale_down
-                    min_shares = int(a.get("min_size", 50) or 50)
-                    new_shares = max(
-                        min_shares, int(new_cost_target / cpb),
-                    )
-                    a["shares_per_side"] = new_shares
-                    a["est_capital_cost"] = round(new_shares * cpb, 2)
+                a["shares_per_side"] = new_shares
+                a["est_capital_cost"] = round(new_shares * cpb, 2)
 
-            # Final safety net: re-enforce Σ p_fill × size ≤ 0.95 × total.
-            allocations = _enforce_expected_capital(
-                allocations, total_capital,
+        # Final expected-capital safety net.
+        allocations = _enforce_expected_capital(
+            allocations, total_capital,
+        )
+
+        # ── Patch 11 observability stamps (compat contract) ────
+        # _saturation_applied = True if any deploy was upsized by
+        # Part 2's target-driven merge OR if total deployed notional
+        # meaningfully exceeds 1x capital.
+        post_notional = sum(
+            float(a.get("est_capital_cost") or 0.0)
+            for a in allocations if a.get("action") == "deploy"
+        )
+        any_forced = any(
+            bool(a.get("_forced_target_alloc"))
+            for a in allocations if a.get("action") == "deploy"
+        )
+        reported_scale = 1.0
+        if post_notional > float(total_capital) and float(total_capital) > 0:
+            reported_scale = min(
+                EXPOSURE_SATURATION_MAX_SCALE,
+                post_notional / float(total_capital),
             )
+        applied = any_forced or post_notional > float(total_capital) * 1.05
 
-            log.info(
-                f"[PATCH11] saturation: target=${target_notional:.0f} "
-                f"final=${sum(float(a.get('est_capital_cost') or 0.0) for a in allocations if a.get('action') == 'deploy'):.0f} "
-                f"scale={cumulative_scale:.2f}× "
-                f"(overcommit_factor={overcommit_factor:.2f})"
-            )
-
-        # Observability stamps — on every deploy row regardless of fire.
         for a in allocations:
             if a.get("action") == "deploy":
-                a["_saturation_applied"] = cumulative_scale > 1.0
+                a["_saturation_applied"] = bool(applied)
                 a["_target_notional"] = round(target_notional, 2)
-                a["_saturation_scale"] = round(cumulative_scale, 4)
+                a["_saturation_scale"] = round(reported_scale, 4)
+
+        log.info(
+            f"[PATCH13] target-driven: target=${target_notional:.0f} "
+            f"final=${post_notional:.0f} forced={any_forced} "
+            f"reported_scale={reported_scale:.2f}× "
+            f"(overcommit_factor={overcommit_factor:.2f})"
+        )
 
     # Log summary
     n_deploy = sum(1 for a in allocations if a["action"] == "deploy")

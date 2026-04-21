@@ -171,6 +171,17 @@ OSCILLATION_DAMPEN_FACTOR = 0.85
 # Cap stored per state; beyond this, oldest samples drop off.
 CAPITAL_HISTORY_MAX = 100
 
+# ── PATCH 13 (OSCILLATION HYSTERESIS) CONSTANTS ────────────────
+# Replaces the earlier Patch-13 hard-lock with a hysteresis approach
+# applied AFTER EMA + clamp. CAPITAL_CHANGE_MIN_STEP is a dead-band
+# filter: post-EMA capital_scale deltas smaller than this revert to
+# prev (prevents micro-oscillation). CAPITAL_DIRECTION_LOCK arms a
+# direction lock after every legitimate direction flip — the next N
+# cycles cannot flip direction again. Both mechanisms ACTIVE-gated
+# for backward compatibility (Hard Guarantee #4).
+CAPITAL_CHANGE_MIN_STEP = 0.05
+CAPITAL_DIRECTION_LOCK = 5
+
 # ── STEP 5 EMA SMOOTHING ───────────────────────────────────────
 EMA_ALPHA = 0.20
 
@@ -354,6 +365,14 @@ class LearningState:
     # injects this from a module-level cache during load_state and
     # writes back during persist_state. Bounded at CAPITAL_HISTORY_MAX.
     capital_history: list = field(default_factory=list)
+    # PATCH 13 — hysteresis fields. `last_direction` is the sign of
+    # the most recent accepted capital_scale delta (∈ {-1, 0, +1}).
+    # `direction_lock` counts down each cycle; while > 0 any attempted
+    # reversal is blocked (capital_scale reverts to prev). Set to
+    # CAPITAL_DIRECTION_LOCK on every legitimate direction flip.
+    # DB-persisted via new columns on learning_state (migration below).
+    last_direction: int = 0
+    direction_lock: int = 0
 
 
 @dataclass
@@ -811,7 +830,9 @@ class LearningController:
                     prev_reward_efficiency REAL,
                     best_reward            REAL NOT NULL DEFAULT 0.0,
                     best_capital_scale     REAL NOT NULL DEFAULT 1.0,
-                    frontier_memory        TEXT
+                    frontier_memory        TEXT,
+                    last_direction         INTEGER NOT NULL DEFAULT 0,
+                    direction_lock         INTEGER NOT NULL DEFAULT 0
                 )"""
             )
             # FIX 6 + PATCH 3 + PATCH 4 migrations — ALTER TABLE for any
@@ -857,6 +878,24 @@ class LearningController:
                         f"ALTER TABLE {self.TABLE_NAME} "
                         f"ADD COLUMN frontier_memory TEXT"
                     )
+                # PATCH 13 — hysteresis columns. The earlier
+                # oscillation_lock column (from a prior Patch 13 draft)
+                # is intentionally left in place if present on a legacy
+                # DB — it's unused by this version but dropping it
+                # would require a rewrite (SQLite pre-3.35 lacks DROP
+                # COLUMN). Readers ignore it; writers don't touch it.
+                if "last_direction" not in col_names:
+                    db.execute(
+                        f"ALTER TABLE {self.TABLE_NAME} "
+                        f"ADD COLUMN last_direction "
+                        f"INTEGER NOT NULL DEFAULT 0"
+                    )
+                if "direction_lock" not in col_names:
+                    db.execute(
+                        f"ALTER TABLE {self.TABLE_NAME} "
+                        f"ADD COLUMN direction_lock "
+                        f"INTEGER NOT NULL DEFAULT 0"
+                    )
             except Exception as mig_e:
                 log.warning(f"[LEARNING] column migration skipped: {mig_e}")
             db.commit()
@@ -871,7 +910,7 @@ class LearningController:
                 f"SELECT aggressiveness, capital_scale, risk_multiplier, "
                 f"reward_trust, valid_cycles_observed, updated_at, mode, "
                 f"last_probe_cycle, prev_reward_efficiency, "
-                f"frontier_memory "
+                f"frontier_memory, last_direction, direction_lock "
                 f"FROM {self.TABLE_NAME} WHERE id = 1",
             ).fetchone()
             db.close()
@@ -906,6 +945,9 @@ class LearningController:
             # _detect_oscillation sees past capital_scale values across
             # cycles within the same process.
             capital_history=list(_CAPITAL_HISTORY_CACHE),
+            # PATCH 13 — hysteresis bookkeeping persists via DB.
+            last_direction=int(row[10] or 0) if len(row) > 10 else 0,
+            direction_lock=int(row[11] or 0) if len(row) > 11 else 0,
         )
 
     def persist_state(self, state: LearningState, mode: str) -> None:
@@ -920,8 +962,8 @@ class LearningController:
                 f"(id, mode, aggressiveness, capital_scale, risk_multiplier, "
                 f"reward_trust, valid_cycles_observed, updated_at, "
                 f"last_probe_cycle, prev_reward_efficiency, "
-                f"frontier_memory) "
-                f"VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                f"frontier_memory, last_direction, direction_lock) "
+                f"VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 f"ON CONFLICT(id) DO UPDATE SET "
                 f"mode=excluded.mode, "
                 f"aggressiveness=excluded.aggressiveness, "
@@ -932,7 +974,9 @@ class LearningController:
                 f"updated_at=excluded.updated_at, "
                 f"last_probe_cycle=excluded.last_probe_cycle, "
                 f"prev_reward_efficiency=excluded.prev_reward_efficiency, "
-                f"frontier_memory=excluded.frontier_memory",
+                f"frontier_memory=excluded.frontier_memory, "
+                f"last_direction=excluded.last_direction, "
+                f"direction_lock=excluded.direction_lock",
                 (
                     mode,
                     float(state.aggressiveness),
@@ -947,6 +991,8 @@ class LearningController:
                         if state.prev_reward_efficiency is not None else None
                     ),
                     memory_json,
+                    int(getattr(state, "last_direction", 0) or 0),
+                    int(getattr(state, "direction_lock", 0) or 0),
                 ),
             )
             db.commit()
@@ -1193,14 +1239,11 @@ class LearningController:
         u_cap = max(u_cap, min_floor)
 
         # ── PATCH 11: OSCILLATION DAMPING ─────────────────────
-        # Applied AFTER the min_floor guard and BEFORE EMA smoothing —
-        # this way the damping nudges the raw u_cap the same way other
-        # rules do, and the EMA + clamp pass still applies on top.
-        # Fires only when prev has accumulated ≥ OSCILLATION_WINDOW
-        # samples AND the last window shows ≥ OSCILLATION_THRESHOLD
-        # direction flips. In-memory window — on a fresh process it
-        # takes 20 cycles (≈ 10h at 30-min cadence) before damping can
-        # engage.
+        # Applied AFTER the min_floor guard and BEFORE EMA smoothing.
+        # Oscillation stabilisation has two complementary layers:
+        #   (1) this pre-EMA dampen, which nudges u_cap,
+        #   (2) Patch 13 hysteresis applied post-EMA (below), which
+        #       blocks rapid direction flips and small-delta churn.
         if len(prev.capital_history) >= OSCILLATION_WINDOW:
             recent = prev.capital_history[-OSCILLATION_WINDOW:]
             if _detect_oscillation(recent):
@@ -1221,9 +1264,50 @@ class LearningController:
 
         # ── Clamp (STEP 3 hard constraints) ───────────────────
         new_cap_clamped = _clamp(new_cap, *CLAMP_CAP)
+
+        # ── PATCH 13: HYSTERESIS (ACTIVE-gated) ──────────────
+        # Apply direction-lock + dead-band filter AFTER EMA and clamp,
+        # but only in ACTIVE mode so OFF/SHADOW behaviour is
+        # unchanged (Hard Guarantee #4; this also preserves Patch 11
+        # test contracts which operate with default mode=OFF).
+        delta = new_cap_clamped - prev.capital_scale
+        direction = 1 if delta > 0 else (-1 if delta < 0 else 0)
+        prev_dir = int(getattr(prev, "last_direction", 0) or 0)
+        prev_dir_lock = int(getattr(prev, "direction_lock", 0) or 0)
+        new_last_direction = prev_dir
+        new_direction_lock = prev_dir_lock
+        new_cap_final = new_cap_clamped
+        if prev.mode == MODE_ACTIVE:
+            if direction != 0 and direction != prev_dir and prev_dir_lock > 0:
+                # Direction flip blocked while lock is armed — revert
+                # capital_scale, preserve direction, decrement lock.
+                new_cap_final = prev.capital_scale
+                new_last_direction = prev_dir
+                new_direction_lock = max(0, prev_dir_lock - 1)
+            elif direction != 0 and direction != prev_dir:
+                # Direction change accepted (either a fresh direction
+                # from 0 or a flip after the lock expired). Arm the
+                # lock for the next N cycles so the next flip is
+                # blocked. The scalar passes through unchanged — a
+                # legitimate direction change is not micro-churn.
+                new_last_direction = direction
+                new_direction_lock = CAPITAL_DIRECTION_LOCK
+            else:
+                # Same direction — preserve direction, decrement lock,
+                # and apply the dead-band filter: |delta| < MIN_STEP
+                # reverts to prev to prevent continued-direction
+                # micro-churn (the oscillation-noise case the filter
+                # is designed for). Direction changes above never hit
+                # this branch, so rule-driven first moves pass through.
+                if direction != 0:
+                    new_last_direction = direction
+                new_direction_lock = max(0, prev_dir_lock - 1)
+                if abs(delta) < CAPITAL_CHANGE_MIN_STEP:
+                    new_cap_final = prev.capital_scale
+
         return LearningState(
             aggressiveness=_clamp(new_aggr, *CLAMP_AGGR),
-            capital_scale=new_cap_clamped,
+            capital_scale=new_cap_final,
             risk_multiplier=_clamp(new_risk, *CLAMP_RISK),
             reward_trust=_clamp(new_trust, *CLAMP_TRUST),
             # FIX 6 — increments only when called (i.e. only on valid cycles)
@@ -1242,11 +1326,15 @@ class LearningController:
             # PATCH 5 PART 2/8 — carry the (possibly updated, possibly
             # pruned) regime memory forward.
             frontier_memory=_prune_memory(memory),
-            # PATCH 11 — append the post-clamp value; bounded at
-            # CAPITAL_HISTORY_MAX so memory never unboundedly grows.
+            # PATCH 11 — append the ACTUAL applied post-hysteresis
+            # value so the oscillation detector reflects real
+            # behaviour; bounded at CAPITAL_HISTORY_MAX.
             capital_history=(
-                list(prev.capital_history) + [new_cap_clamped]
+                list(prev.capital_history) + [new_cap_final]
             )[-CAPITAL_HISTORY_MAX:],
+            # PATCH 13 — hysteresis bookkeeping carried forward.
+            last_direction=int(new_last_direction),
+            direction_lock=int(new_direction_lock),
         )
 
     # ── Full cycle ─────────────────────────────────────────────
@@ -1327,6 +1415,12 @@ class LearningController:
                 mode=mode,
                 market_efficiency_map={},
                 capital_history=list(prev.capital_history),
+                last_direction=int(
+                    getattr(prev, "last_direction", 0) or 0,
+                ),
+                direction_lock=int(
+                    getattr(prev, "direction_lock", 0) or 0,
+                ),
             )
             # Persist FIRST (matches pre-Patch-11 ordering) — if
             # update_state below raises, the counter + scalars still land.
@@ -1344,6 +1438,17 @@ class LearningController:
                 _CAPITAL_HISTORY_CACHE = list(
                     computed.capital_history,
                 )[-CAPITAL_HISTORY_MAX:]
+                # PATCH 13: mirror the computed hysteresis fields onto
+                # counter_only so persisted SHADOW state carries the
+                # direction + lock forward once update_state touches them.
+                counter_only.last_direction = int(
+                    getattr(computed, "last_direction", 0) or 0,
+                )
+                counter_only.direction_lock = int(
+                    getattr(computed, "direction_lock", 0) or 0,
+                )
+                # Re-persist so the mirrored state actually lands.
+                self.persist_state(counter_only, mode)
                 log.info(
                     f"[LEARNING_SHADOW] would_apply "
                     f"aggr {prev.aggressiveness:.3f}→{computed.aggressiveness:.3f} "
@@ -1386,6 +1491,12 @@ class LearningController:
                 mode=mode,
                 market_efficiency_map={},
                 capital_history=list(prev.capital_history),
+                last_direction=int(
+                    getattr(prev, "last_direction", 0) or 0,
+                ),
+                direction_lock=int(
+                    getattr(prev, "direction_lock", 0) or 0,
+                ),
             )
             self._log_cycle(metrics, held, mode)
             return LearningStep(
