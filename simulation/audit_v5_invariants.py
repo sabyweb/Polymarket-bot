@@ -48,9 +48,15 @@ from .audit_v4_metrics import V4CycleSnapshot
 # Thresholds (spec section 2)
 # ═══════════════════════════════════════════════════════════════
 
-# INV3_new — expected capital utilisation band.
-INV3_NEW_UTIL_MIN = 0.50
-INV3_NEW_UTIL_MAX = 0.95
+# INV3_new — cap-normalised capital utilisation.
+# capital_util = Σ(C_i) / total_capital    (pure capital coverage,
+# unweighted by p_fill — measures control-loop deployment, not the
+# fill model).
+# feasible_capital_fraction = min(CAPITAL_BUFFER,
+#                                 Σ cluster_cap_pct + unclustered_fraction)
+# normalized_util = capital_util / feasible_capital_fraction
+# PASS when post-warmup mean normalized_util ≥ INV3_NEW_NORMALIZED_MIN.
+INV3_NEW_NORMALIZED_MIN = 0.70
 
 # INV5_new — minimum allocation coverage (active markets / total).
 INV5_NEW_COVERAGE_MIN = 0.50
@@ -176,59 +182,115 @@ def compute_coverage_ratio(snap: V4CycleSnapshot) -> Optional[float]:
 # INV3_new — Expected Capital Utilisation
 # ═══════════════════════════════════════════════════════════════
 
+def compute_capital_util(snap: V4CycleSnapshot) -> Optional[float]:
+    """Σ(C_i) / total_capital — pure capital coverage across deploys.
+    Returns None when total_capital ≤ 0 (cycle excluded from aggregate).
+    Reads the already-stamped `total_notional` (= Σ est_capital_cost)."""
+    tc = float(snap.total_capital or 0.0)
+    if tc <= 0:
+        return None
+    return float(snap.total_notional or 0.0) / tc
+
+
+def _normalized_capital_util(snap: V4CycleSnapshot) -> Optional[float]:
+    """Cap-normalised capital utilisation:
+        normalized_util = capital_util / feasible_capital_fraction
+    Returns None when either side is missing or the denominator is
+    non-positive (cycle is excluded from the aggregate)."""
+    c = compute_capital_util(snap)
+    if c is None:
+        return None
+    f = snap.feasible_capital_fraction
+    if f is None or f <= 0.0:
+        return None
+    return c / f
+
+
 def evaluate_inv3_expected_utilisation(
     snapshots: list[V4CycleSnapshot],
 ) -> V5InvariantResult:
-    """INV3_new — post-warmup average expected_util must fall in
-    [INV3_NEW_UTIL_MIN, INV3_NEW_UTIL_MAX]."""
+    """INV3_new — post-warmup avg normalized_util ≥ INV3_NEW_NORMALIZED_MIN.
+
+        capital_util = Σ(C_i) / total_capital
+        feasible_capital_fraction =
+            min(CAPITAL_BUFFER,
+                Σ cluster_cap_pct + unclustered_fraction)
+        normalized_util = capital_util / feasible_capital_fraction
+
+    The numerator is pure capital coverage (unweighted by p_fill), so
+    the invariant measures control-loop deployment quality — not the
+    fill model. The denominator divides out the cap-stack's physical
+    ceiling, so the metric is scenario-independent.
+    """
     post_warm = [s for s in snapshots if s.cycle > WARMUP_CUTOFF]
     if not post_warm:
         return V5InvariantResult(
             invariant="INV3_new", passed=False,
             metric_values={
-                "avg_expected_util": None,
+                "normalized_util": None,
                 "post_warmup_cycles": 0,
-                "util_min": INV3_NEW_UTIL_MIN,
-                "util_max": INV3_NEW_UTIL_MAX,
+                "normalized_util_min": INV3_NEW_NORMALIZED_MIN,
             },
             reason="no post-warmup cycles (run too short)",
         )
 
-    # Per-cycle util (None excluded from aggregate; kept aligned for
-    # failing-cycle scanning below).
-    per_cycle: list[tuple[V4CycleSnapshot, Optional[float]]] = [
-        (s, compute_expected_util(s)) for s in post_warm
+    per_cycle_norm: list[tuple[V4CycleSnapshot, Optional[float]]] = [
+        (s, _normalized_capital_util(s)) for s in post_warm
     ]
-    util_vals = [u for _, u in per_cycle if u is not None]
+    norm_vals = [v for _, v in per_cycle_norm if v is not None]
 
-    if not util_vals:
-        # Every cycle had total_capital=0 — degenerate scenario.
+    # Auxiliary aggregates for the failure block.
+    cap_vals = [
+        compute_capital_util(s) for s in post_warm
+        if compute_capital_util(s) is not None
+    ]
+    avg_capital_util = (
+        sum(cap_vals) / len(cap_vals) if cap_vals else None
+    )
+    feasible_vals = [
+        float(s.feasible_capital_fraction) for s in post_warm
+        if s.feasible_capital_fraction is not None
+    ]
+    avg_feasible = (
+        sum(feasible_vals) / len(feasible_vals) if feasible_vals else None
+    )
+    total_notional = sum(float(s.total_notional or 0.0) for s in post_warm)
+    total_total_capital = sum(
+        float(s.total_capital or 0.0) for s in post_warm
+    )
+
+    if not norm_vals:
+        # No feasible_capital_fraction anywhere → invariant can't be
+        # evaluated. Fail closed (don't silently pass on missing data).
         return V5InvariantResult(
             invariant="INV3_new", passed=False,
             metric_values={
-                "avg_expected_util": None,
+                "normalized_util": None,
+                "avg_capital_util": (
+                    round(avg_capital_util, 6)
+                    if avg_capital_util is not None else None
+                ),
+                "avg_feasible_capital_fraction": None,
                 "post_warmup_cycles": len(post_warm),
                 "util_samples": 0,
-                "util_min": INV3_NEW_UTIL_MIN,
-                "util_max": INV3_NEW_UTIL_MAX,
+                "normalized_util_min": INV3_NEW_NORMALIZED_MIN,
             },
             reason=(
-                "no valid expected_util samples "
-                "(total_capital ≤ 0 on every post-warmup cycle)"
+                "feasible_capital_fraction unavailable on every "
+                "post-warmup cycle (V4Tracker db_path not set?)"
             ),
         )
 
-    avg_util = sum(util_vals) / len(util_vals)
-    passed = INV3_NEW_UTIL_MIN <= avg_util <= INV3_NEW_UTIL_MAX
+    avg_norm_util = sum(norm_vals) / len(norm_vals)
+    passed = avg_norm_util >= INV3_NEW_NORMALIZED_MIN
 
-    # Per-cycle failures (out-of-band) for the diagnostics block.
+    # Per-cycle failing runs (normalized_util below threshold). Missing-
+    # denominator cycles don't count against the invariant — they're
+    # reported separately via util_samples < post_warmup_cycles.
     failing_cycles: list[tuple[int, int]] = []
     run_start: Optional[int] = None
-    for s, u in per_cycle:
-        in_band = (
-            u is not None
-            and INV3_NEW_UTIL_MIN <= u <= INV3_NEW_UTIL_MAX
-        )
+    for s, v in per_cycle_norm:
+        in_band = v is None or v >= INV3_NEW_NORMALIZED_MIN
         if in_band:
             if run_start is not None:
                 failing_cycles.append((run_start, s.cycle - 1))
@@ -239,36 +301,31 @@ def evaluate_inv3_expected_utilisation(
     if run_start is not None:
         failing_cycles.append((run_start, post_warm[-1].cycle))
 
-    # Headline aggregates for the failure block (spec §3.5).
-    total_expected = sum(float(s.expected_capital or 0.0) for s in post_warm)
-    total_total_capital = sum(
-        float(s.total_capital or 0.0) for s in post_warm
-    )
-
     reason: Optional[str] = None
     if not passed:
-        if avg_util < INV3_NEW_UTIL_MIN:
-            reason = (
-                f"avg expected_util={avg_util:.4f} < "
-                f"{INV3_NEW_UTIL_MIN} (under-deployed)"
-            )
-        else:
-            reason = (
-                f"avg expected_util={avg_util:.4f} > "
-                f"{INV3_NEW_UTIL_MAX} (safety ceiling breached)"
-            )
+        reason = (
+            f"avg normalized_util={avg_norm_util:.4f} < "
+            f"{INV3_NEW_NORMALIZED_MIN} "
+            f"(capital_util={avg_capital_util:.4f}, "
+            f"feasible={avg_feasible:.4f})"
+        )
 
     return V5InvariantResult(
         invariant="INV3_new",
         passed=passed,
         metric_values={
-            "expected_util": round(avg_util, 6),
-            "total_expected_capital": round(total_expected, 4),
+            # Primary field keeps the `expected_util` key for report
+            # schema back-compat; its value is now the cap-normalised
+            # capital utilisation.
+            "expected_util": round(avg_norm_util, 6),
+            "normalized_util": round(avg_norm_util, 6),
+            "avg_capital_util": round(avg_capital_util, 6),
+            "avg_feasible_capital_fraction": round(avg_feasible, 6),
+            "total_notional": round(total_notional, 4),
             "total_capital": round(total_total_capital, 4),
-            "util_samples": len(util_vals),
+            "util_samples": len(norm_vals),
             "post_warmup_cycles": len(post_warm),
-            "util_min": INV3_NEW_UTIL_MIN,
-            "util_max": INV3_NEW_UTIL_MAX,
+            "normalized_util_min": INV3_NEW_NORMALIZED_MIN,
         },
         failing_cycles=failing_cycles,
         reason=reason,

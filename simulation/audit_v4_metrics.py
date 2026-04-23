@@ -102,6 +102,11 @@ class V4CycleSnapshot:
     reward: float
     loss: float
 
+    # V5 INV3 normalisation input — fraction of total_capital the cap
+    # stack physically allows to be deployed on this cycle. None when
+    # db_path unavailable or no deploys (INV3 skips those cycles).
+    feasible_capital_fraction: Optional[float] = None
+
     def to_row(self) -> dict:
         return asdict(self)
 
@@ -120,12 +125,16 @@ class V4Tracker:
         record Optional[None] and move on.
     """
 
-    def __init__(self):
+    def __init__(self, db_path: Optional[str] = None):
         self._prev_capital_scale: Optional[float] = None
         # Ring-buffer of recent deltas (signed) for rolling flip rate.
         self._delta_window: list[float] = []
         # Total flips observed since cycle 0.
         self._flip_count_cumulative: int = 0
+        # When set, per-cycle feasible_capital_fraction is computed for
+        # V5 INV3 cap-normalised utilisation. V4 runners leave it None;
+        # INV3 then receives None and falls back to the legacy band.
+        self._db_path: Optional[str] = db_path
 
     # ── Delta + flip accounting ──────────────────────────────
 
@@ -257,6 +266,52 @@ class V4Tracker:
             and float(reward_efficiency) < float(reward_efficiency_baseline)
         )
 
+        # V5 INV3 cap-normalised utilisation input. The cap-stack upper
+        # bound on `expected_capital / total_capital` is:
+        #     feasible_capital_fraction =
+        #         min(CAPITAL_BUFFER,
+        #             Σ cluster_cap_pct + unclustered_fraction)
+        # where cluster_cap_pct comes from the cap policy (oversized vs
+        # default) summed over clusters with ≥1 deploy on this cycle,
+        # and unclustered_fraction is the count-share of deploy rows
+        # not in any fill cluster. Fully derived from cap-stack state;
+        # no static thresholds. Only computed when db_path was provided
+        # (V5 path); V4 runs leave this as None.
+        feasible_capital_fraction: Optional[float] = None
+        if self._db_path is not None and deploy_count > 0:
+            try:
+                from profit.correlation import (
+                    build_fill_clusters,
+                    DEFAULT_MAX_CLUSTER_PCT,
+                    OVERSIZED_CLUSTER_PCT,
+                )
+                from profit.allocator import CAPITAL_BUFFER
+                clusters_map, oversized_ids = build_fill_clusters(
+                    self._db_path,
+                )
+                cluster_ids_in_deploy: set[int] = set()
+                num_unclustered = 0
+                for a in deploys:
+                    cid = a.get("condition_id")
+                    cl = clusters_map.get(cid) if cid else None
+                    if cl is None:
+                        num_unclustered += 1
+                    else:
+                        cluster_ids_in_deploy.add(cl)
+                sum_cluster_cap_pct = 0.0
+                for cl in cluster_ids_in_deploy:
+                    sum_cluster_cap_pct += (
+                        OVERSIZED_CLUSTER_PCT if cl in oversized_ids
+                        else DEFAULT_MAX_CLUSTER_PCT
+                    )
+                unclustered_fraction = num_unclustered / deploy_count
+                feasible_capital_fraction = min(
+                    CAPITAL_BUFFER,
+                    sum_cluster_cap_pct + unclustered_fraction,
+                )
+            except Exception:
+                feasible_capital_fraction = None
+
         return V4CycleSnapshot(
             cycle=int(cycle),
             deploy_ratio=round(deploy_ratio, 6),
@@ -293,6 +348,10 @@ class V4Tracker:
             total_capital=round(total_capital, 2),
             reward=round(float(outcome.reward), 4),
             loss=round(float(outcome.loss), 4),
+            feasible_capital_fraction=(
+                round(float(feasible_capital_fraction), 6)
+                if feasible_capital_fraction is not None else None
+            ),
         )
 
 

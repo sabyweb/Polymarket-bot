@@ -128,7 +128,7 @@ def _run_loop(
     calibrator = make_sim_calibrator(db_path=db_path)
     learn_ctrl = LearningController(db_path=db_path, alloc_path=alloc_path)
 
-    tracker = V4Tracker()
+    tracker = V4Tracker(db_path=db_path)
     snapshots: list[V4CycleSnapshot] = []
 
     for cycle in range(cycles):
