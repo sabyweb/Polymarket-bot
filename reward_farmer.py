@@ -44,6 +44,21 @@ def MAX_COST_PER_MARKET(): return cfg("RF_MAX_COST_PER_MARKET")
 def MAX_TOTAL_EXPOSURE(): return cfg("RF_MAX_TOTAL_EXPOSURE")
 
 
+# ── Runtime safety guardrails (applied after allocation, before placement) ──
+# All thresholds are live-capital bounds; the allocator/learning loop is
+# unaware of them (correct layering: allocation decides intent, farmer
+# enforces execution-time safety). Fail-open on missing data so a DB hiccup
+# can never halt trading — only the explicit kill-switch triggers halt.
+MAX_NOTIONAL_RATIO = 2.0                 # Σ live notional / total_capital cap
+CLUSTER_NOTIONAL_LIMIT_FRAC = 0.5        # fraction of total_capital per fill cluster
+MAX_DAILY_LOSS_FRAC = 0.1                # kill-switch: realized loss / total_capital
+CRITICAL_CF_THRESHOLD = 0.01             # kill-switch: CF floor
+FILL_RATE_SPIKE_FACTOR = 3.0             # kill-switch: short-window / rolling-avg
+GUARDRAIL_FILLRATE_SHORT_SECS = 3600     # 1h fill-count window
+GUARDRAIL_FILLRATE_BASELINE_SECS = 21600 # 6h baseline window
+GUARDRAIL_FILLRATE_MIN_BASELINE = 5      # require ≥ N baseline fills before ratio fires
+
+
 class RewardFarmer:
     """Production reward farming bot — orchestrator."""
 
@@ -115,6 +130,15 @@ class RewardFarmer:
         # Issue 3: Cross-market fill storm detector
         self._global_fill_times: list[float] = []  # timestamps of all fills across all markets
         self._fill_storm_until: float = 0.0  # if > time.time(), halt new placements
+
+        # Runtime safety guardrails state (see module-level constants).
+        # Once the kill switch trips, it stays on until the operator
+        # restarts the process — deliberate: the trigger conditions
+        # (CF collapse, fill storm, daily-loss breach) all benefit from
+        # human eyes-on before re-entry.
+        self._kill_switch_active: bool = False
+        self._kill_switch_reason: str = ""
+        self._kill_switch_triggered_at: float = 0.0
 
     # ── Startup ─────────────────────────────────────────────────────
 
@@ -920,6 +944,289 @@ class RewardFarmer:
         if swept:
             log.info(f"Expiry sweep: cleared {swept} market(s) approaching resolution")
 
+    # ── Runtime Safety Guardrails ───────────────────────────────────
+    # All helpers are read-only and fail-open: any missing data returns
+    # None (or an empty result) and the caller skips the corresponding
+    # check. The only control-flow changes are (a) blocking placements
+    # and (b) activating the kill switch — both gated inside run_cycle.
+
+    def _guardrail_total_capital_from_alloc(self) -> float | None:
+        """Read `_total_capital` stamp from the first deploy row of the
+        current allocation JSON. None when file is missing / stale /
+        unstamped — farmer falls open (skips capital-fraction checks)."""
+        alloc_path = os.path.join(
+            os.path.dirname(__file__) or ".", "market_allocations.json",
+        )
+        try:
+            if not os.path.exists(alloc_path):
+                return None
+            with open(alloc_path) as f:
+                data = json.load(f)
+            for m in data.get("markets", []):
+                if m.get("action") != "deploy":
+                    continue
+                tc = m.get("_total_capital")
+                if tc is not None:
+                    return float(tc)
+        except Exception as e:
+            log.debug(f"[GUARDRAIL] total_capital read failed: {e}")
+        return None
+
+    def _guardrail_live_notional_per_market(self) -> dict[str, float]:
+        """Per-market sum of (price × shares) over both sides for every
+        slot that currently holds an order_id. Dump orders are included
+        so the kill switch sees the full live exposure."""
+        out: dict[str, float] = {}
+        for cid, ms in self.markets.items():
+            notional = 0.0
+            for side in ("yes", "no"):
+                slot = ms.orders.get(side)
+                if slot and slot.order_id:
+                    notional += float(slot.price or 0.0) * float(slot.shares or 0.0)
+                # Dump sell orders also carry live exposure (we owe shares).
+                dump_oid = ms.dump_orders.get(side) if isinstance(ms.dump_orders, dict) else None
+                dump_state = ms.dump_state.get(side) if isinstance(ms.dump_state, dict) else None
+                if dump_oid and isinstance(dump_state, dict):
+                    dp = float(dump_state.get("price") or 0.0)
+                    ds = float(dump_state.get("shares") or 0.0)
+                    notional += dp * ds
+            if notional > 0:
+                out[cid] = notional
+        return out
+
+    def _guardrail_cluster_notional(
+        self, live_notional: dict[str, float],
+    ) -> tuple[dict[int, float], dict[str, int | None]]:
+        """Group live notional by fill-cluster. Returns (cluster_id →
+        notional, cid → cluster_id). Fail-open: returns empty dicts if
+        the cluster DB read fails."""
+        cluster_by_cid: dict[str, int | None] = {}
+        cluster_notional: dict[int, float] = {}
+        try:
+            from profit.correlation import build_fill_clusters
+            clusters, _oversized = build_fill_clusters(self.db._db_path)
+        except Exception as e:
+            log.debug(f"[GUARDRAIL] cluster build skipped: {e}")
+            return {}, {}
+        for cid, n in live_notional.items():
+            cl = clusters.get(cid)
+            cluster_by_cid[cid] = cl
+            if cl is None:
+                continue
+            cluster_notional[cl] = cluster_notional.get(cl, 0.0) + n
+        return cluster_notional, cluster_by_cid
+
+    def _guardrail_current_cf(self) -> float | None:
+        """Latest smoothed correction_factor. None on missing / error."""
+        try:
+            conn = self.db._get_conn()
+            row = conn.execute(
+                "SELECT correction_factor FROM reward_daily "
+                "ORDER BY date DESC LIMIT 1"
+            ).fetchone()
+            if row is None:
+                return None
+            return float(row[0])
+        except Exception as e:
+            log.debug(f"[GUARDRAIL] CF read failed: {e}")
+            return None
+
+    def _guardrail_daily_realized_loss(self) -> float | None:
+        """Realized loss over last 24h (positive number = how much we
+        lost). Sum of negative PnL on unwinds. None on DB error — the
+        kill-switch test is skipped in that case (fail-open)."""
+        try:
+            conn = self.db._get_conn()
+            cutoff = time.time() - 86400
+            row = conn.execute(
+                "SELECT COALESCE(SUM(pnl), 0) FROM unwinds "
+                "WHERE ts > ? AND pnl < 0",
+                (cutoff,),
+            ).fetchone()
+            if row is None:
+                return 0.0
+            # Sum of negative PnL → convert to positive loss.
+            return -float(row[0] or 0.0)
+        except Exception as e:
+            log.debug(f"[GUARDRAIL] daily realized loss read failed: {e}")
+            return None
+
+    def _guardrail_fill_rate_ratio(self) -> tuple[float | None, int, int]:
+        """Return (ratio, short_count, baseline_count).
+
+        short_count := fills across all markets in the last
+            GUARDRAIL_FILLRATE_SHORT_SECS.
+        baseline := fills in the last GUARDRAIL_FILLRATE_BASELINE_SECS
+            (includes the short window).
+
+        ratio is `short_count / (baseline_per_short_window_equivalent)`
+        — i.e. `short_count / (baseline_count * short/baseline)`.
+        None when the baseline is below GUARDRAIL_FILLRATE_MIN_BASELINE
+        (not enough history for a meaningful ratio — fail-open)."""
+        now = time.time()
+        short_cutoff = now - GUARDRAIL_FILLRATE_SHORT_SECS
+        base_cutoff = now - GUARDRAIL_FILLRATE_BASELINE_SECS
+        short_count = 0
+        base_count = 0
+        for ms in self.markets.values():
+            ft = ms.fill_times if isinstance(ms.fill_times, dict) else {}
+            for side in ("yes", "no"):
+                times = ft.get(side) or []
+                for t in times:
+                    if t >= base_cutoff:
+                        base_count += 1
+                        if t >= short_cutoff:
+                            short_count += 1
+        if base_count < GUARDRAIL_FILLRATE_MIN_BASELINE:
+            return None, short_count, base_count
+        # Scale baseline to the short-window duration for a like-for-like
+        # comparison. ratio = observed-short / expected-short-from-baseline.
+        window_ratio = (
+            GUARDRAIL_FILLRATE_SHORT_SECS / GUARDRAIL_FILLRATE_BASELINE_SECS
+        )
+        expected_short = base_count * window_ratio
+        if expected_short <= 0:
+            return None, short_count, base_count
+        return short_count / expected_short, short_count, base_count
+
+    def _guardrail_check_and_log(self) -> dict:
+        """Compute all guardrail signals, emit a structured telemetry
+        line, and return a decision struct for run_cycle to act on.
+
+        Schema of the returned dict (all keys always present):
+            kill_switch        : bool
+            kill_reason        : str ("" when False)
+            notional_block     : bool
+            blocked_clusters   : set[int]
+            cluster_by_cid     : dict[str, int | None]
+            total_capital      : float | None
+        """
+        total_capital = self._guardrail_total_capital_from_alloc()
+        live_by_cid = self._guardrail_live_notional_per_market()
+        total_live_notional = sum(live_by_cid.values())
+        active_markets = len(live_by_cid)
+        cluster_notional, cluster_by_cid = self._guardrail_cluster_notional(
+            live_by_cid,
+        )
+        cf = self._guardrail_current_cf()
+        daily_loss = self._guardrail_daily_realized_loss()
+        fill_ratio, short_fills, base_fills = self._guardrail_fill_rate_ratio()
+
+        notional_ratio: float | None = None
+        if total_capital is not None and total_capital > 0:
+            notional_ratio = total_live_notional / total_capital
+
+        # ── Decisions ─────────────────────────────────────────────
+        kill_reasons: list[str] = []
+        if total_capital is not None and daily_loss is not None:
+            loss_limit = MAX_DAILY_LOSS_FRAC * total_capital
+            if daily_loss > loss_limit:
+                kill_reasons.append(
+                    f"daily_realized_loss={daily_loss:.2f} > "
+                    f"{loss_limit:.2f} (= {MAX_DAILY_LOSS_FRAC:.0%}·T)"
+                )
+        if cf is not None and cf < CRITICAL_CF_THRESHOLD:
+            kill_reasons.append(
+                f"correction_factor={cf:.4f} < {CRITICAL_CF_THRESHOLD}"
+            )
+        if fill_ratio is not None and fill_ratio > FILL_RATE_SPIKE_FACTOR:
+            kill_reasons.append(
+                f"fill_rate_ratio={fill_ratio:.2f} > {FILL_RATE_SPIKE_FACTOR}× "
+                f"(short={short_fills}, baseline={base_fills})"
+            )
+
+        notional_block = (
+            notional_ratio is not None
+            and notional_ratio > MAX_NOTIONAL_RATIO
+        )
+        blocked_clusters: set[int] = set()
+        if total_capital is not None and total_capital > 0:
+            cluster_limit_usd = CLUSTER_NOTIONAL_LIMIT_FRAC * total_capital
+            for cl_id, cl_notional in cluster_notional.items():
+                if cl_notional > cluster_limit_usd:
+                    blocked_clusters.add(cl_id)
+
+        # ── Structured telemetry (single machine-readable line) ──
+        tele = {
+            "event": "guardrail",
+            "cycle": self.cycle_count,
+            "ts": round(time.time(), 3),
+            "total_capital": (
+                round(total_capital, 2) if total_capital is not None else None
+            ),
+            "total_live_notional": round(total_live_notional, 2),
+            "notional_ratio": (
+                round(notional_ratio, 4) if notional_ratio is not None else None
+            ),
+            "active_markets": active_markets,
+            "cluster_count": len(cluster_notional),
+            "max_cluster_notional": (
+                round(max(cluster_notional.values()), 2)
+                if cluster_notional else 0.0
+            ),
+            "blocked_cluster_count": len(blocked_clusters),
+            "fill_rate_short_1h": short_fills,
+            "fill_rate_baseline_6h": base_fills,
+            "fill_rate_ratio": (
+                round(fill_ratio, 3) if fill_ratio is not None else None
+            ),
+            "realized_loss_24h": (
+                round(daily_loss, 2) if daily_loss is not None else None
+            ),
+            "cf": round(cf, 6) if cf is not None else None,
+            "notional_block": notional_block,
+            "kill_switch": bool(kill_reasons),
+        }
+        log.info(f"[GUARDRAIL] {json.dumps(tele, sort_keys=True)}")
+
+        return {
+            "kill_switch": bool(kill_reasons),
+            "kill_reason": "; ".join(kill_reasons),
+            "notional_block": notional_block,
+            "blocked_clusters": blocked_clusters,
+            "cluster_by_cid": cluster_by_cid,
+            "total_capital": total_capital,
+        }
+
+    def _activate_kill_switch(self, reason: str) -> None:
+        """One-shot: flip the flag, log prominently, cancel every live
+        BUY slot + dump sell. Subsequent cycles short-circuit out of
+        run_cycle. Operator must restart the process to clear."""
+        self._kill_switch_active = True
+        self._kill_switch_reason = reason
+        self._kill_switch_triggered_at = time.time()
+        log.error(f"[GUARDRAIL] KILL SWITCH ACTIVATED: {reason}")
+        log.error("[GUARDRAIL] cancelling all live + dump orders")
+        cancelled = 0
+        for ms in list(self.markets.values()):
+            for side in ("yes", "no"):
+                slot = ms.orders.get(side)
+                if slot and slot.order_id:
+                    try:
+                        if self.order_lifecycle.cancel_order(
+                            slot.order_id, reason="kill_switch",
+                        ):
+                            cancelled += 1
+                    except Exception as e:
+                        log.debug(f"[GUARDRAIL] cancel failed {slot.order_id}: {e}")
+                dump_oid = (
+                    ms.dump_orders.get(side)
+                    if isinstance(ms.dump_orders, dict) else None
+                )
+                if dump_oid:
+                    try:
+                        if self.order_lifecycle.cancel_order(
+                            dump_oid, reason="kill_switch_dump",
+                        ):
+                            cancelled += 1
+                    except Exception as e:
+                        log.debug(f"[GUARDRAIL] dump-cancel failed {dump_oid}: {e}")
+        log.error(f"[GUARDRAIL] kill switch cancelled {cancelled} orders")
+        log.info(
+            f"[GUARDRAIL] "
+            f"{json.dumps({'event': 'kill_switch_activated', 'cycle': self.cycle_count, 'reason': reason, 'cancelled_orders': cancelled, 'ts': round(time.time(), 3)}, sort_keys=True)}"
+        )
+
     # ── Core Cycle ──────────────────────────────────────────────────
 
     def run_cycle(self):
@@ -927,6 +1234,17 @@ class RewardFarmer:
         self.cycle_count += 1
         self.order_lifecycle.cycle_count = self.cycle_count
         self.order_lifecycle.capital_ceiling = None
+
+        # Kill-switch short-circuit: if a prior cycle tripped the halt,
+        # bail out immediately (no fills polled, no placements, no
+        # reward recording). Reset requires a process restart.
+        if self._kill_switch_active:
+            if self.cycle_count % 10 == 0:
+                log.warning(
+                    f"[GUARDRAIL] kill switch ACTIVE: "
+                    f"{self._kill_switch_reason} — skipping cycle"
+                )
+            return
 
         # Step 1: Fetch exchange orders
         if self.dry_run:
@@ -988,15 +1306,42 @@ class RewardFarmer:
         if not market_list:
             return
 
+        # Step 4pre: runtime safety guardrails. Runs AFTER allocation
+        # (already consumed by market filtering upstream) and BEFORE
+        # new placements. Emits structured telemetry every cycle.
+        guard = self._guardrail_check_and_log()
+        if guard["kill_switch"]:
+            self._activate_kill_switch(guard["kill_reason"])
+            return
+
         # If fill storm active, skip all new placements
         if time.time() < self._fill_storm_until:
             remaining = self._fill_storm_until - time.time()
             if self.cycle_count % 10 == 0:  # log every ~5min
                 log.warning(f"Fill storm halt active — {remaining:.0f}s remaining, skipping placements")
+        elif guard["notional_block"]:
+            if self.cycle_count % 10 == 0:
+                log.warning(
+                    f"[GUARDRAIL] notional_ratio > {MAX_NOTIONAL_RATIO} — "
+                    f"blocking ALL new placements this cycle"
+                )
         else:
             batch = self.order_lifecycle.get_priority_batch(market_list)
+            blocked_clusters = guard["blocked_clusters"]
+            cluster_by_cid = guard["cluster_by_cid"]
+            skipped_cluster = 0
             for ms in batch:
+                cl = cluster_by_cid.get(ms.cid)
+                if cl is not None and cl in blocked_clusters:
+                    skipped_cluster += 1
+                    continue
                 self.order_lifecycle.place_orders_for_market(ms)
+            if skipped_cluster and self.cycle_count % 10 == 0:
+                log.warning(
+                    f"[GUARDRAIL] skipped {skipped_cluster} placement(s) in "
+                    f"{len(blocked_clusters)} over-exposed cluster(s) "
+                    f"(> {CLUSTER_NOTIONAL_LIMIT_FRAC:.0%}·T)"
+                )
 
         # Step 4b: Remove dead markets (3+ consecutive book failures = resolved/delisted)
         BOOK_FAILURE_LIMIT = 3
