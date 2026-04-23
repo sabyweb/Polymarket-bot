@@ -1,8 +1,13 @@
-"""simulation/run_audit_v4.py — CLI entrypoint for Audit V4.
+"""simulation/run_audit_v5.py — CLI entrypoint for Audit V5.
+
+V5 evaluates the continuous allocator against invariants aligned to its
+design (expected capital utilisation + allocation coverage), keeping V7
+oscillation stability unchanged. V4 files are untouched; this module
+reuses the V4 scenarios, engine wrapper, and cycle tracker wholesale.
 
 Usage:
 
-    python3 -m simulation.run_audit_v4 \\
+    python3 -m simulation.run_audit_v5 \\
         --cycles 500 \\
         --seeds 1 42 1337 \\
         --log-detailed \\
@@ -10,21 +15,16 @@ Usage:
         --dump-timeseries
 
 Produces:
-    stdout  — summary table + (optional) per-cycle detail + failure trace
-    <out-dir>/audit_v4_report.json     — machine-readable verdict
-    <out-dir>/<scenario>/seed_<N>/     — per-run CSVs (timeseries) +
-                                          full_snapshots.jsonl
+
+    stdout                             summary table + (optional) per-cycle
+                                       detail + failure trace.
+    <out-dir>/audit_v5_report.json     machine-readable verdict.
+    <out-dir>/<scenario>/seed_<N>/     per-run CSVs (capital_scale,
+                                       flip_rate, expected_util,
+                                       coverage_ratio) + full_snapshots.jsonl.
 
 Exit code: 0 when every scenario × seed passes all three invariants;
 1 otherwise.
-
-The audit does NOT stub allocator or learning-loop logic. It drives the
-real production modules through a deterministic wrapper identical to
-the V3 audit (same `_deterministic_environment` context, same
-`_SimClock`, same DB schema) — V4 only differs in:
-  - scenario set (6 instead of 5, D extended to 3 phases, E + F new)
-  - per-cycle metric capture (Patch 11/13 stamps in addition to V3 set)
-  - invariant definitions (V4 thresholds per spec section 5)
 """
 
 from __future__ import annotations
@@ -36,26 +36,28 @@ import sys
 
 from profit.learning import LearningController
 
-# Sim-only calibrator wrapper — non-zero deterministic p_fill during
-# the bootstrap phase. See simulation/bootstrap_calibrator.py for the
-# scope-limited fix rationale.
+# Sim-only calibrator wrapper — fixes the bootstrap p_fill=0 collapse
+# that would otherwise drive expected_capital ≈ 0 before FillModel
+# trains. Production calibration code is unaffected.
 from .bootstrap_calibrator import make_sim_calibrator
 
-# Reuse engine internals — DO NOT duplicate production logic.
+# Reuse the V4 engine scaffolding verbatim — DO NOT duplicate the loop.
 from .engine import (
     SimulationEngine, _deterministic_environment, _SimClock,
 )
 from .runner import execute_cycle, TOTAL_CAPITAL
 from .audit_v4_scenarios import AuditV4Environment, AUDIT_V4_SCENARIOS
 from .audit_v4_metrics import V4Tracker, V4CycleSnapshot
-from .audit_v4_invariants import evaluate_all
-from .audit_v4_report import (
-    V4SeedResult, build_scenario_verdicts, build_json_report,
-    dump_timeseries, emit_failure_diagnostics, emit_summary_table,
+from .audit_v5_invariants import (
+    evaluate_all_v5, validate_v5_fields, V5FieldMissingError,
+)
+from .audit_v5_report import (
+    V5SeedResult, build_scenario_verdicts_v5, build_json_report_v5,
+    dump_timeseries_v5, emit_failure_diagnostics_v5, emit_summary_table_v5,
 )
 
 
-log = logging.getLogger("audit_v4")
+log = logging.getLogger("audit_v5")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -67,16 +69,15 @@ def run_one(
     seed: int,
     cycles: int,
     log_detailed: bool = False,
-) -> V4SeedResult:
-    """Run one (scenario, seed) combination and return V4SeedResult.
+) -> V5SeedResult:
+    """Run one (scenario, seed) combination and return a V5SeedResult.
 
-    Mirrors SimulationEngine._run_inner's structure but swaps in the
-    V4 environment and V4 metrics tracker. Invariant evaluation runs
-    after the loop.
+    Uses V4's scenario definitions + V4Tracker (the per-cycle data the
+    tracker captures is a superset of what V5 invariants read). After
+    each cycle we validate the continuous allocator's per-market
+    stamps (spec §3.2) so a missing field surfaces as a deterministic
+    V5FieldMissingError instead of silent NaN propagation downstream.
     """
-    # The engine owns DB creation + clock patching. We instantiate it
-    # only to reuse its private _create_db helper. The actual run loop
-    # lives here so we can inject V4 metrics capture.
     engine = SimulationEngine(seed=seed)
     db_path = engine._create_db()
     alloc_path = engine._create_alloc_path()
@@ -109,11 +110,10 @@ def _run_loop(
     alloc_path: str,
     sim_clock: _SimClock,
     log_detailed: bool,
-) -> V4SeedResult:
+) -> V5SeedResult:
     import random
-    # Same RNG layering as SimulationEngine._run_inner so the V4 audit
-    # consumes the same seed → sequence mapping as V3 does (for the
-    # wrapped scenarios A / B / C).
+    # Same RNG layering V4 uses so (scenario, seed) is bit-identical
+    # across V4 and V5 runs — only the invariant evaluators differ.
     master = random.Random(seed)
     market_seed = master.randint(0, 2**31 - 1)
     fill_seed = master.randint(0, 2**31 - 1)
@@ -145,24 +145,42 @@ def _run_loop(
             fill_rng=fill_rng,
             total_capital=TOTAL_CAPITAL,
         )
+
+        # Spec §3.2: raise on missing per-market fields. Unlike V4 which
+        # required Patch 7/11/13 stamps, V5 requires only the fields the
+        # continuous allocator emits on every deploy row.
+        validate_v5_fields(
+            outcome.allocations,
+            cycle=cycle,
+            scenario=scenario,
+            seed=seed,
+            total_capital=outcome.total_capital,
+        )
+
         snap = tracker.snapshot(cycle, outcome)
         snapshots.append(snap)
+
         if log_detailed:
+            # Derived V5 metrics for the detailed log — no mutation.
+            from .audit_v5_invariants import (
+                compute_expected_util, compute_coverage_ratio,
+            )
+            eu = compute_expected_util(snap)
+            cov = compute_coverage_ratio(snap)
             log.info(
-                "[V4 %s seed=%d cy=%04d] mode=%s deploy_ratio=%.3f "
-                "total=$%.0f target=%s oc=%s cap=%.3f dir=%d lock=%d "
-                "flip_rate=%.1f forced=%.1f%%",
-                scenario, seed, cycle, snap.mode, snap.deploy_ratio,
-                snap.total_notional,
-                f"${snap.target_notional:.0f}" if snap.target_notional is not None else "—",
-                f"{snap.overcommit_factor:.2f}" if snap.overcommit_factor is not None else "—",
+                "[V5 %s seed=%d cy=%04d] mode=%s deploy=%d "
+                "expected_util=%s coverage=%s cap=%.3f dir=%d lock=%d "
+                "flip_rate=%.1f",
+                scenario, seed, cycle, snap.mode,
+                snap.number_of_deployed_markets,
+                f"{eu:.4f}" if eu is not None else "—",
+                f"{cov:.3f}" if cov is not None else "—",
                 snap.capital_scale, snap.last_direction,
                 snap.direction_lock, snap.rolling_flip_rate_100,
-                snap.percent_forced_target_alloc * 100.0,
             )
 
-    invariants = evaluate_all(snapshots)
-    return V4SeedResult(
+    invariants = evaluate_all_v5(snapshots)
+    return V5SeedResult(
         scenario=scenario,
         seed=seed,
         cycles=cycles,
@@ -177,13 +195,10 @@ def _run_loop(
 
 def _setup_logging(detailed: bool) -> None:
     level = logging.INFO if detailed else logging.WARNING
-    # Route ours to INFO, suppress production modules (they'd flood output).
     logging.basicConfig(
         level=level,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
-    # Production modules log a LOT. Quiet them below WARNING by default,
-    # but let them through at detail level so --log-detailed shows them.
     if not detailed:
         for name in ("profit.allocator", "profit.learning",
                      "oversight.data_collector", "calibration.manager"):
@@ -192,10 +207,10 @@ def _setup_logging(detailed: bool) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="python3 -m simulation.run_audit_v4",
+        prog="python3 -m simulation.run_audit_v5",
         description=(
-            "Audit V4: system-level simulation verifying INV3 / INV5 / "
-            "INV7 under six deterministic scenarios."
+            "Audit V5: system-level simulation verifying INV3_new / "
+            "INV5_new / INV7 against the continuous allocator."
         ),
     )
     parser.add_argument(
@@ -210,7 +225,7 @@ def main(argv: list[str] | None = None) -> int:
         "--scenarios", nargs="+", default=list(AUDIT_V4_SCENARIOS),
         help=(
             f"subset of scenarios to run "
-            f"(default all 6 = {list(AUDIT_V4_SCENARIOS)})"
+            f"(default all = {list(AUDIT_V4_SCENARIOS)})"
         ),
     )
     parser.add_argument(
@@ -219,26 +234,26 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--trace-invariants", action="store_true",
-        help="emit structured failure diagnostics to stdout",
+        help="emit structured failure diagnostics to stdout "
+             "(force-enabled on any FAIL verdict)",
     )
     parser.add_argument(
         "--dump-timeseries", action="store_true",
         help="write per-run CSV + JSONL timeseries under --out-dir",
     )
     parser.add_argument(
-        "--out-dir", default="audit_v4_out",
+        "--out-dir", default="audit_v5_out",
         help="output directory for JSON report + timeseries dumps",
     )
     parser.add_argument(
         "--json", default=None,
         help="path for the machine-readable JSON report "
-             "(default: <out-dir>/audit_v4_report.json)",
+             "(default: <out-dir>/audit_v5_report.json)",
     )
     args = parser.parse_args(argv)
 
     _setup_logging(args.log_detailed)
 
-    # Validate scenario list.
     for s in args.scenarios:
         if s not in AUDIT_V4_SCENARIOS:
             print(
@@ -247,59 +262,66 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 2
 
-    # Run every (scenario, seed) combination. Preserve the argument
-    # order so the summary table row order mirrors CLI intent.
-    results: list[V4SeedResult] = []
+    # Run every (scenario, seed). Preserve argument order.
+    results: list[V5SeedResult] = []
     for scenario in args.scenarios:
         for seed in args.seeds:
             print(
-                f"[V4] running scenario={scenario} seed={seed} "
+                f"[V5] running scenario={scenario} seed={seed} "
                 f"cycles={args.cycles} ...",
                 flush=True,
             )
-            result = run_one(
-                scenario=scenario,
-                seed=seed,
-                cycles=args.cycles,
-                log_detailed=args.log_detailed,
-            )
-            # Per-run headline for the operator.
+            try:
+                result = run_one(
+                    scenario=scenario,
+                    seed=seed,
+                    cycles=args.cycles,
+                    log_detailed=args.log_detailed,
+                )
+            except V5FieldMissingError as e:
+                # Strict contract — bubble up with a clean summary.
+                print(f"    → FIELD-MISSING: {e}", flush=True)
+                print(
+                    "\n=== AUDIT V5 OVERALL: FAIL "
+                    "(allocator contract violation) ===",
+                    flush=True,
+                )
+                return 1
             inv = result.invariants
             print(
-                f"    → INV3={'PASS' if inv['INV3'].passed else 'FAIL'} "
-                f"INV5={'PASS' if inv['INV5'].passed else 'FAIL'} "
+                f"    → INV3_new={'PASS' if inv['INV3_new'].passed else 'FAIL'} "
+                f"INV5_new={'PASS' if inv['INV5_new'].passed else 'FAIL'} "
                 f"INV7={'PASS' if inv['INV7'].passed else 'FAIL'}",
                 flush=True,
             )
             results.append(result)
 
-    verdicts = build_scenario_verdicts(results)
+    verdicts = build_scenario_verdicts_v5(results)
     print()
-    print(emit_summary_table(verdicts))
+    print(emit_summary_table_v5(verdicts))
     print()
 
-    # Failure diagnostics — only when requested OR when any scenario fails.
     any_fail = any(v.verdict == "FAIL" for v in verdicts)
     if args.trace_invariants or any_fail:
-        print(emit_failure_diagnostics(verdicts))
+        print(emit_failure_diagnostics_v5(verdicts))
 
-    # JSON report.
     os.makedirs(args.out_dir, exist_ok=True)
-    json_path = args.json or os.path.join(args.out_dir, "audit_v4_report.json")
+    json_path = args.json or os.path.join(
+        args.out_dir, "audit_v5_report.json",
+    )
     with open(json_path, "w") as f:
         json.dump(
-            build_json_report(verdicts, args.cycles),
+            build_json_report_v5(verdicts, args.cycles),
             f, indent=2, default=str,
         )
     print(f"JSON report: {json_path}")
 
-    # Timeseries dumps.
     if args.dump_timeseries:
-        written = dump_timeseries(args.out_dir, results)
+        written = dump_timeseries_v5(args.out_dir, results)
         print(f"Wrote {len(written)} timeseries files under {args.out_dir}/")
 
     overall = "PASS" if not any_fail else "FAIL"
-    print(f"\n=== AUDIT V4 OVERALL: {overall} ===")
+    print(f"\n=== AUDIT V5 OVERALL: {overall} ===")
     return 0 if not any_fail else 1
 
 

@@ -383,10 +383,21 @@ def run_once(
     # Step 4: Allocate — profit engine when calibrator ready, else legacy
     if calibrator is not None and calibrator.is_ready():
         from profit import allocate_portfolio
-        log.info(f"Profit engine allocation (${available_capital:.0f} available)...")
+        # capital_scale is applied HERE (outside the continuous allocator)
+        # so the allocator sees a single total_capital input. Neutral when
+        # learning_state is None or in OFF/SHADOW.
+        cap_scale = 1.0
+        if learning_state is not None:
+            cap_scale = float(getattr(learning_state, "capital_scale", 1.0))
+        alloc_capital = available_capital * cap_scale
+        log.info(
+            f"Profit engine allocation "
+            f"(${available_capital:.0f} × cap_scale {cap_scale:.2f} = "
+            f"${alloc_capital:.0f})..."
+        )
         allocations = allocate_portfolio(
             scored_markets=scored,
-            total_capital=available_capital,
+            total_capital=alloc_capital,
             calibrator=calibrator,
             db_path=db_path,
             learning_state=learning_state,

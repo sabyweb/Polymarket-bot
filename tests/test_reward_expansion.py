@@ -21,7 +21,7 @@ from profit.learning import (
     MODE_OFF, MODE_SHADOW, MODE_ACTIVE,
     LearningState, LearningController, LearningMetrics, LearningGate,
     LearningStep,
-    CLAMP_CAP, CLAMP_AGGR, CLAMP_RISK, CLAMP_TRUST,
+    CLAMP_CAP, CLAMP_TRUST,
     PROBE_INTERVAL, PROBE_SCALE,
     EXPANSION_CAP_UP, EXPANSION_CAP_DOWN, EXPANSION_AGGR_UP,
     EXPANSION_EFFICIENCY_FLOOR_FRAC,
@@ -29,7 +29,9 @@ from profit.learning import (
     RECENCY_WEIGHT,
     EMA_ALPHA,
 )
-from profit.allocator import _compute_exploration_pct
+# _compute_exploration_pct was a helper in the deleted legacy allocator.
+# Its tests (class TestExplorationPct) are skipped below — the continuous
+# allocator does not consume a dynamic exploration budget.
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -133,7 +135,7 @@ class TestRewardGrowthExpansion(unittest.TestCase):
     def test_positive_growth_at_or_above_floor_expands_capital(self):
         """At exactly baseline efficiency, Rule B is inactive, so the
         only mover is Part 2's expansion rule: positive growth + eff >=
-        0.7*baseline → CAP_UP * EXPANSION_CAP_UP and aggressiveness UP."""
+        0.7*baseline → CAP_UP * EXPANSION_CAP_UP."""
         prev = LearningState()
         m = _healthy_metrics(
             reward_growth=5.0,                 # positive
@@ -142,7 +144,6 @@ class TestRewardGrowthExpansion(unittest.TestCase):
         )
         new = LearningController.update_state(m, prev)
         self.assertGreater(new.capital_scale, prev.capital_scale)
-        self.assertGreater(new.aggressiveness, prev.aggressiveness)
 
     def test_positive_growth_below_floor_does_not_expand(self):
         """Efficiency must be at least 70% of baseline to permit
@@ -329,41 +330,8 @@ class TestFrontierProbe(unittest.TestCase):
                 os.unlink(alloc_path)
 
 
-# ═══════════════════════════════════════════════════════════════
-# PART 4 — Dynamic exploration budget
-# ═══════════════════════════════════════════════════════════════
-
-class TestExplorationPct(unittest.TestCase):
-
-    # Test 4: exploration_pct increases when efficiency drops
-    def test_exploration_pct_monotone_in_efficiency_gap(self):
-        baseline = 0.001
-        self.assertAlmostEqual(
-            _compute_exploration_pct(baseline, baseline), 0.05, places=6,
-        )
-        # Half-baseline efficiency: gap = 0.5 → pct = 0.55 capped at 0.15
-        self.assertAlmostEqual(
-            _compute_exploration_pct(baseline * 0.5, baseline), 0.15, places=6,
-        )
-        # 92% efficiency: gap = 0.08 → pct = 0.13 (below cap)
-        self.assertAlmostEqual(
-            _compute_exploration_pct(baseline * 0.92, baseline), 0.13, places=6,
-        )
-        # Above baseline: gap = 0 → pct = 0.05
-        self.assertAlmostEqual(
-            _compute_exploration_pct(baseline * 1.5, baseline), 0.05, places=6,
-        )
-
-    def test_exploration_pct_neutral_on_missing_data(self):
-        self.assertEqual(_compute_exploration_pct(None, None), 0.05)
-        self.assertEqual(_compute_exploration_pct(0.001, None), 0.05)
-        self.assertEqual(_compute_exploration_pct(None, 0.001), 0.05)
-        self.assertEqual(_compute_exploration_pct(0.001, 0.0), 0.05)
-
-    def test_exploration_pct_hard_cap_at_15pct(self):
-        """Invariant: the budget never exceeds 15%, even at zero efficiency."""
-        self.assertLessEqual(_compute_exploration_pct(0.0, 0.001), 0.15)
-        self.assertLessEqual(_compute_exploration_pct(-10, 0.001), 0.15)
+# PART 4 (Dynamic exploration budget) — removed with the legacy
+# allocator; continuous allocator does not reserve an exploration budget.
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -416,8 +384,8 @@ class TestInvariants(unittest.TestCase):
     def test_no_data_no_change(self):
         """When reward_growth, baseline, efficiency, and delta are all
         None, no expansion/contraction rule fires. Trust reversion still
-        produces tiny drift, but capital/aggressiveness stay at EMA of
-        their prev values (i.e. unchanged)."""
+        produces tiny drift, but capital_scale stays at EMA of its
+        prev value (i.e. unchanged)."""
         prev = LearningState()
         m = _healthy_metrics(
             reward_growth=None,
@@ -427,7 +395,6 @@ class TestInvariants(unittest.TestCase):
         )
         new = LearningController.update_state(m, prev)
         self.assertAlmostEqual(new.capital_scale, prev.capital_scale, places=6)
-        self.assertAlmostEqual(new.aggressiveness, prev.aggressiveness, places=6)
 
     # Test 7: capital remains within clamps (under both good and hostile data)
     def test_capital_clamped_under_sustained_expansion(self):
@@ -445,8 +412,6 @@ class TestInvariants(unittest.TestCase):
             s = LearningController.update_state(m, s, is_probe=True)
             self.assertGreaterEqual(s.capital_scale, CLAMP_CAP[0])
             self.assertLessEqual(s.capital_scale, CLAMP_CAP[1])
-            self.assertGreaterEqual(s.aggressiveness, CLAMP_AGGR[0])
-            self.assertLessEqual(s.aggressiveness, CLAMP_AGGR[1])
 
     def test_capital_clamped_under_sustained_contraction(self):
         s = LearningState()
@@ -497,8 +462,6 @@ class TestInvariants(unittest.TestCase):
             for a, b in zip(allocs_none, allocs_neutral):
                 self.assertEqual(a["action"], b["action"])
                 self.assertEqual(a["shares_per_side"], b["shares_per_side"])
-                self.assertFalse(a.get("_exploration"))
-                self.assertFalse(b.get("_exploration"))
         finally:
             os.unlink(f.name)
 

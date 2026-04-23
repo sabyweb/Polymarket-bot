@@ -22,7 +22,7 @@ from unittest.mock import patch
 from profit.learning import (
     MODE_OFF, MODE_SHADOW, MODE_ACTIVE,
     LearningState, LearningController, LearningMetrics,
-    CLAMP_CAP, CLAMP_AGGR, EMA_ALPHA,
+    CLAMP_CAP, EMA_ALPHA,
     FRONTIER_EXPANSION_CAP_UP, FRONTIER_LIMIT_MULT,
     FRONTIER_MIN_FLOOR_FRAC,
     COLD_START_FRONTIER_MULT,

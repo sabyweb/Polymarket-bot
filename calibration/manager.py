@@ -103,6 +103,13 @@ class CalibrationPredictions:
     model_versions: dict          # which model produced each estimate
     model_confidence: float = 1.0 # numeric 0.3–1.0 weighted reliability
     raw_ev_per_day: float = 0.0   # pre-confidence EV (reward − p_fill·loss)
+    # Clean reward term in $/day — the same value that appears on the
+    # reward side of the EV equation, with safety bias, per-market model
+    # confidence, and learning-loop reward_trust baked in. Kept separate
+    # so the continuous allocator consumes reward directly rather than
+    # reconstructing it from EV (which would couple reward and loss via
+    # the asymmetric (1 + (1 - model_confidence)) loss inflator).
+    raw_reward_per_day: float = 0.0
 
 
 class CalibrationManager:
@@ -469,6 +476,7 @@ class CalibrationManager:
             model_versions=versions,
             model_confidence=model_confidence,
             raw_ev_per_day=raw_ev,
+            raw_reward_per_day=reward,
         )
 
     def get_ev(self, condition_id: str, **kwargs) -> float:

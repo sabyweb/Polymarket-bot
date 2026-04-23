@@ -17,7 +17,7 @@ from __future__ import annotations
 from typing import Optional
 
 from profit.learning import (
-    CLAMP_AGGR, CLAMP_CAP, CLAMP_RISK, CLAMP_TRUST,
+    CLAMP_CAP, CLAMP_TRUST, CLAMP_LAMBDA_1, CLAMP_LAMBDA_2,
 )
 
 
@@ -115,10 +115,10 @@ def check_per_cycle(
     s = applied_state
     if s is not None:
         for name, val, (lo, hi) in (
-            ("aggressiveness", s.aggressiveness, CLAMP_AGGR),
             ("capital_scale", s.capital_scale, CLAMP_CAP),
-            ("risk_multiplier", s.risk_multiplier, CLAMP_RISK),
             ("reward_trust", s.reward_trust, CLAMP_TRUST),
+            ("lambda_1", s.lambda_1, CLAMP_LAMBDA_1),
+            ("lambda_2", s.lambda_2, CLAMP_LAMBDA_2),
         ):
             if not (lo - 1e-9 <= float(val) <= hi + 1e-9):
                 out.append(InvariantViolation(

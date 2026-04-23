@@ -2,12 +2,15 @@
 
 This is NOT model retraining. It is a decoupled, observable feedback loop
 that measures divergence between predictions and reality and emits four
-scalar adjustments that the profit engine already knows how to consume:
+scalar adjustments that the continuous allocator / calibrator consume:
 
-    aggressiveness   scales final allocation score
-    capital_scale    scales deployable capital
-    risk_multiplier  inflates the loss term in RAS
-    reward_trust     discounts the reward term in EV
+    beta             utilisation target for allocator Step 3 scale
+                     (scale = β · total_capital / Σ p·raw)
+    eta              concentration exponent: raw_i = w_i^(1+η)
+    capital_scale    scales deployable capital (applied by oversight_agent
+                     BEFORE passing total_capital into the allocator)
+    reward_trust     discounts the reward term in the calibrator's EV
+                     pipeline (applied upstream in CalibrationManager)
 
 Gate (STEP 0):
     OFF    — insufficient data; do nothing.
@@ -15,10 +18,10 @@ Gate (STEP 0):
     ACTIVE — fully armed; compute, persist, apply.
 
 Invariants:
-  1. OFF and SHADOW applied_state is ALWAYS neutral (all 1.0).
-     Only ACTIVE can influence decisions.
-  2. Clamped scalars: aggressiveness ∈ [0.3,1.5], capital_scale ∈ [0.3,1.2],
-     risk_multiplier ∈ [1.0,2.0], reward_trust ∈ [0.5,1.0].
+  1. OFF and SHADOW applied_state is ALWAYS neutral (all scalars at
+     their default). Only ACTIVE can influence decisions.
+  2. Clamped scalars: capital_scale ∈ [0.3,1.2], reward_trust ∈ [0.5,1.0],
+     beta ∈ [0.10,0.95], eta ∈ [0.00,4.00].
   3. EMA-smoothed with alpha=0.2 — never overreact to one noisy cycle.
   4. Deterministic — no randomness, no wall-clock dependencies in the
      decision function (update_state is pure).
@@ -26,6 +29,14 @@ Invariants:
   6. No new raw data collection — reads only fills, unwinds,
      reward_attribution, reward_daily, orders_placed, book_snapshots,
      and market_allocations.json.
+
+β / η control law (current patch): β is nudged toward TARGET_UTIL using
+expected_util feedback; η is nudged toward TARGET_COVERAGE using
+coverage_ratio feedback. Both updates are EMA-smoothed with small α and
+halved when the capital_scale trace is oscillating. The legacy λ1 / λ2
+columns and class-level references are retained only for DB / external
+import compatibility (sim modules import CLAMP_LAMBDA_{1,2}); no
+allocator or learning rule reads them.
 """
 
 import json
@@ -186,10 +197,34 @@ CAPITAL_DIRECTION_LOCK = 5
 EMA_ALPHA = 0.20
 
 # ── STEP 3 CLAMPS ──────────────────────────────────────────────
-CLAMP_AGGR = (0.30, 1.50)
 CLAMP_CAP = (0.30, 1.20)
-CLAMP_RISK = (1.00, 2.00)
 CLAMP_TRUST = (0.50, 1.00)
+# Continuous-allocator control bounds.
+CLAMP_BETA = (0.10, 0.95)
+CLAMP_ETA  = (0.00, 4.00)
+# Defaults must match profit.allocator.DEFAULT_{BETA,ETA}.
+DEFAULT_BETA = 0.75
+DEFAULT_ETA  = 0.0
+
+# ── β / η CONTROL LAW CONSTANTS (spec §6.1) ────────────────────
+# β nudges expected capital utilisation toward this target.
+TARGET_UTIL = 0.75
+# η nudges allocation coverage (active markets / total markets) toward
+# this target; rising η concentrates onto top markets so some can
+# escape the min-capital floor after the cap stack.
+TARGET_COVERAGE = 0.5
+# EMA step sizes — small per spec so updates are slow.
+ALPHA_BETA = 0.03
+ALPHA_ETA  = 0.03
+# Proportional gains on the target values.
+K_BETA = 0.5
+K_ETA  = 1.0
+
+# Legacy λ clamp constants — retained as module-level exports so the
+# simulation invariants module (which imports them) does not fail at
+# import time. No longer referenced by any learning or allocator rule.
+CLAMP_LAMBDA_1 = (0.50, 5.00)
+CLAMP_LAMBDA_2 = (0.01, 2.00)
 
 # ── BASELINES ──────────────────────────────────────────────────
 # Predicted loss per fill when no historical model signal exists.
@@ -314,28 +349,44 @@ def _prune_memory(memory: dict, max_size: int = FRONTIER_MEMORY_MAX_SIZE) -> dic
 
 @dataclass
 class LearningState:
-    """Four behavioral scalars broadcast to the profit engine each cycle.
+    """Behavioural scalars broadcast to the allocator / calibrator each cycle.
 
     Defaults are neutral (no influence on decisions). OFF/SHADOW modes
-    always publish the neutral state — scalars all 1.0, market_efficiency_map
-    empty, mode reflecting the gate's decision.
+    always publish the neutral state — scalars at their defaults,
+    market_efficiency_map empty, mode reflecting the gate's decision.
+
+    Scalars:
+      capital_scale — scales deployable capital (consumed by
+        oversight_agent BEFORE passing total_capital into the allocator).
+      reward_trust  — discounts the reward term in CalibrationManager.
+      beta          — utilisation target: allocator's Step 3 scale
+        becomes β·total_capital / Σ(p·raw). Bounds [0.10, 0.95].
+      eta           — concentration exponent: allocator's raw_i
+        becomes w_i^(1+η). Bounds [0.00, 4.00].
 
     FIX 4 — market_efficiency_map: per-market reward/capital ratio. The
-    allocator applies ±10% / −20% score multipliers based on quintile
-    position. Empty in OFF/SHADOW so it has no effect there.
+    legacy allocator used this for quintile multipliers. The continuous
+    allocator does not consume it; the field is kept so existing
+    persistence / simulation paths don't regress.
 
-    FIX 6 — valid_cycles_observed replaces cycles_observed. Increments
-    ONLY on cycles where _metrics_complete returned True, so the gate
-    can't be tricked into promoting on cycles that failed to produce
-    usable signal.
+    FIX 6 — valid_cycles_observed increments ONLY on cycles where
+    _metrics_complete returned True, so the gate can't be tricked into
+    promoting on cycles that failed to produce usable signal.
 
-    FIX 7 — mode: the allocator reads this to decide whether to reserve
-    5% of deployable capital for exploration (only in ACTIVE).
+    FIX 7 — mode: drives OFF/SHADOW/ACTIVE gating for scalar application.
     """
-    aggressiveness: float = 1.0
     capital_scale: float = 1.0
-    risk_multiplier: float = 1.0
     reward_trust: float = 1.0
+    beta: float = DEFAULT_BETA
+    eta:  float = DEFAULT_ETA
+    # Deprecated compatibility fields — the control role of λ1 / λ2 was
+    # replaced by β / η (spec §4.2). Retained as class attributes so
+    # external modules that still reference them (simulation/engine.py,
+    # simulation/invariants.py) do not raise AttributeError. No rule
+    # updates these; the allocator does not read them; they are frozen
+    # at the defaults below for the lifetime of any LearningState.
+    lambda_1: float = 1.0
+    lambda_2: float = 0.5
     valid_cycles_observed: int = 0
     updated_at: float = 0.0
     mode: str = MODE_OFF
@@ -543,9 +594,23 @@ class LearningMetrics:
             return {**out, "status": "error", "error": str(e)}
 
         # ── Allocation-file metrics ────────────────────────────
-        predicted_reward_24h, capital_deployed, market_capital_map = (
-            self._read_alloc_file()
-        )
+        (
+            predicted_reward_24h,
+            capital_deployed,
+            market_capital_map,
+            expected_capital_sum,
+            total_capital_input,
+        ) = self._read_alloc_file()
+
+        # expected_util = Σ(p × C) / total_capital (spec §4). None when
+        # we can't read total_capital from the alloc file — the λ2
+        # control rule treats None as "skip this cycle".
+        expected_util: Optional[float] = None
+        if (
+            total_capital_input is not None
+            and total_capital_input > 0
+        ):
+            expected_util = expected_capital_sum / total_capital_input
 
         # ── Derived ────────────────────────────────────────────
         fill_rate = _safe_div(fill_count_24h, orders_24h)
@@ -649,6 +714,10 @@ class LearningMetrics:
             "profit_efficiency": profit_efficiency,
             "reward_efficiency_baseline": reward_efficiency_baseline,  # FIX 2
             "reward_efficiency_raw": raw_reward_efficiency,            # PART 5
+            # Continuous-allocator control input (spec §4).
+            "expected_util": expected_util,
+            "expected_capital_sum": expected_capital_sum,
+            "total_capital_input": total_capital_input,
             "reward_growth": reward_growth,                            # PART 1
             # Fill behavior
             "fill_count": fill_count_24h,
@@ -742,8 +811,11 @@ class LearningMetrics:
             return vals[n // 2]
         return (vals[n // 2 - 1] + vals[n // 2]) / 2.0
 
-    def _read_alloc_file(self) -> tuple[Optional[float], float, dict]:
-        """Returns (predicted_reward_24h, capital_deployed, per_market_capital).
+    def _read_alloc_file(
+        self,
+    ) -> tuple[Optional[float], float, dict, float, Optional[float]]:
+        """Returns (predicted_reward_24h, capital_deployed,
+        per_market_capital, expected_capital_sum, total_capital).
 
         predicted_reward is None when file missing, unparseable, or has
         zero deploy entries — caller treats this as "cannot compute
@@ -751,15 +823,25 @@ class LearningMetrics:
 
         per_market_capital: {condition_id: est_capital_cost} for deploy
         entries only. Used by FIX 4 to compute per-market efficiency.
+
+        expected_capital_sum: Σ(_p_fill × est_capital_cost) over deploy
+        rows. Zero when no deploy rows or when rows lack the `_p_fill`
+        stamp. Consumed by the λ2 control rule via `expected_util`.
+
+        total_capital: the allocator's budget input, read from the
+        `_total_capital` observability stamp on any deploy row (every
+        row has the same value). None when no deploy rows or when the
+        stamp is missing — caller treats this as "cannot compute
+        expected_util" (λ2 rule skips).
         """
         try:
             with open(self.alloc_path, "r") as f:
                 alloc = json.load(f)
         except FileNotFoundError:
-            return None, 0.0, {}
+            return None, 0.0, {}, 0.0, None
         except Exception as e:
             log.warning(f"[LEARNING] alloc file parse failed: {e}")
-            return None, 0.0, {}
+            return None, 0.0, {}, 0.0, None
 
         if isinstance(alloc, dict):
             items = alloc.get("allocations", [])
@@ -770,7 +852,9 @@ class LearningMetrics:
 
         pred_reward = 0.0
         cap_deployed = 0.0
+        expected_cap_sum = 0.0
         per_market_capital: dict = {}
+        total_capital: Optional[float] = None
         n_deploy = 0
         for a in items:
             if not isinstance(a, dict):
@@ -784,12 +868,30 @@ class LearningMetrics:
             cid = a.get("condition_id")
             pred_reward += dr * (qp / 100.0)
             cap_deployed += cap
+            p_fill = a.get("_p_fill")
+            if p_fill is not None:
+                try:
+                    expected_cap_sum += float(p_fill) * cap
+                except (TypeError, ValueError):
+                    pass
+            # _total_capital is stamped uniformly across deploy rows by
+            # the allocator; first valid value wins.
+            if total_capital is None:
+                tc = a.get("_total_capital")
+                if tc is not None:
+                    try:
+                        total_capital = float(tc)
+                    except (TypeError, ValueError):
+                        pass
             if cid:
                 per_market_capital[cid] = per_market_capital.get(cid, 0.0) + cap
 
         if n_deploy == 0:
-            return None, 0.0, {}
-        return pred_reward, cap_deployed, per_market_capital
+            return None, 0.0, {}, 0.0, None
+        return (
+            pred_reward, cap_deployed, per_market_capital,
+            expected_cap_sum, total_capital,
+        )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -816,13 +918,18 @@ class LearningController:
     def _ensure_table(self) -> None:
         try:
             db = _connect_db(self.db_path)
+            # Schema note: aggressiveness and risk_multiplier were deleted
+            # as control levers but kept as NOT NULL DEFAULT 1.0 columns
+            # so existing deployments don't need a destructive migration
+            # (SQLite DROP COLUMN is constrained). INSERTs silently write
+            # the default; no code reads them.
             db.execute(
                 f"""CREATE TABLE IF NOT EXISTS {self.TABLE_NAME} (
                     id                     INTEGER PRIMARY KEY,
                     mode                   TEXT NOT NULL,
-                    aggressiveness         REAL NOT NULL,
+                    aggressiveness         REAL NOT NULL DEFAULT 1.0,
                     capital_scale          REAL NOT NULL,
-                    risk_multiplier        REAL NOT NULL,
+                    risk_multiplier        REAL NOT NULL DEFAULT 1.0,
                     reward_trust           REAL NOT NULL,
                     valid_cycles_observed  INTEGER NOT NULL,
                     updated_at             REAL NOT NULL,
@@ -832,7 +939,11 @@ class LearningController:
                     best_capital_scale     REAL NOT NULL DEFAULT 1.0,
                     frontier_memory        TEXT,
                     last_direction         INTEGER NOT NULL DEFAULT 0,
-                    direction_lock         INTEGER NOT NULL DEFAULT 0
+                    direction_lock         INTEGER NOT NULL DEFAULT 0,
+                    lambda_1               REAL NOT NULL DEFAULT 1.0,
+                    lambda_2               REAL NOT NULL DEFAULT 0.5,
+                    beta                   REAL NOT NULL DEFAULT 0.75,
+                    eta                    REAL NOT NULL DEFAULT 0.0
                 )"""
             )
             # FIX 6 + PATCH 3 + PATCH 4 migrations — ALTER TABLE for any
@@ -896,6 +1007,29 @@ class LearningController:
                         f"ADD COLUMN direction_lock "
                         f"INTEGER NOT NULL DEFAULT 0"
                     )
+                # Legacy λ columns — retained for NOT NULL compatibility
+                # with pre-existing DBs; no code reads them post-β/η.
+                if "lambda_1" not in col_names:
+                    db.execute(
+                        f"ALTER TABLE {self.TABLE_NAME} "
+                        f"ADD COLUMN lambda_1 REAL NOT NULL DEFAULT 1.0"
+                    )
+                if "lambda_2" not in col_names:
+                    db.execute(
+                        f"ALTER TABLE {self.TABLE_NAME} "
+                        f"ADD COLUMN lambda_2 REAL NOT NULL DEFAULT 0.5"
+                    )
+                # β / η control columns (replace λ1 / λ2 control role).
+                if "beta" not in col_names:
+                    db.execute(
+                        f"ALTER TABLE {self.TABLE_NAME} "
+                        f"ADD COLUMN beta REAL NOT NULL DEFAULT 0.75"
+                    )
+                if "eta" not in col_names:
+                    db.execute(
+                        f"ALTER TABLE {self.TABLE_NAME} "
+                        f"ADD COLUMN eta REAL NOT NULL DEFAULT 0.0"
+                    )
             except Exception as mig_e:
                 log.warning(f"[LEARNING] column migration skipped: {mig_e}")
             db.commit()
@@ -907,10 +1041,10 @@ class LearningController:
         try:
             db = _connect_db(self.db_path)
             row = db.execute(
-                f"SELECT aggressiveness, capital_scale, risk_multiplier, "
-                f"reward_trust, valid_cycles_observed, updated_at, mode, "
-                f"last_probe_cycle, prev_reward_efficiency, "
-                f"frontier_memory, last_direction, direction_lock "
+                f"SELECT capital_scale, reward_trust, valid_cycles_observed, "
+                f"updated_at, mode, last_probe_cycle, prev_reward_efficiency, "
+                f"frontier_memory, last_direction, direction_lock, "
+                f"beta, eta "
                 f"FROM {self.TABLE_NAME} WHERE id = 1",
             ).fetchone()
             db.close()
@@ -923,22 +1057,20 @@ class LearningController:
         # to empty dict on any parse error so the controller can recover
         # gracefully.
         frontier_memory = _deserialize_memory(
-            row[9] if row[9] is not None else ""
+            row[7] if row[7] is not None else ""
         )
         return LearningState(
-            aggressiveness=float(row[0]),
-            capital_scale=float(row[1]),
-            risk_multiplier=float(row[2]),
-            reward_trust=float(row[3]),
-            valid_cycles_observed=int(row[4]),
-            updated_at=float(row[5]),
-            mode=str(row[6] or MODE_OFF),
+            capital_scale=float(row[0]),
+            reward_trust=float(row[1]),
+            valid_cycles_observed=int(row[2]),
+            updated_at=float(row[3]),
+            mode=str(row[4] or MODE_OFF),
             # market_efficiency_map is not persisted — it's recomputed
             # each cycle from fresh metrics. Load returns it empty.
             market_efficiency_map={},
-            last_probe_cycle=int(row[7] or 0),
+            last_probe_cycle=int(row[5] or 0),
             prev_reward_efficiency=(
-                float(row[8]) if row[8] is not None else None
+                float(row[6]) if row[6] is not None else None
             ),
             frontier_memory=frontier_memory,
             # PATCH 11 — inject the module-level history cache so
@@ -946,8 +1078,17 @@ class LearningController:
             # cycles within the same process.
             capital_history=list(_CAPITAL_HISTORY_CACHE),
             # PATCH 13 — hysteresis bookkeeping persists via DB.
-            last_direction=int(row[10] or 0) if len(row) > 10 else 0,
-            direction_lock=int(row[11] or 0) if len(row) > 11 else 0,
+            last_direction=int(row[8] or 0) if len(row) > 8 else 0,
+            direction_lock=int(row[9] or 0) if len(row) > 9 else 0,
+            # Continuous-allocator β / η controls.
+            beta=(
+                float(row[10]) if len(row) > 10 and row[10] is not None
+                else DEFAULT_BETA
+            ),
+            eta=(
+                float(row[11]) if len(row) > 11 and row[11] is not None
+                else DEFAULT_ETA
+            ),
         )
 
     def persist_state(self, state: LearningState, mode: str) -> None:
@@ -957,18 +1098,21 @@ class LearningController:
             # state is always bounded at FRONTIER_MEMORY_MAX_SIZE.
             pruned = _prune_memory(state.frontier_memory)
             memory_json = _serialize_memory(pruned)
+            # Legacy NOT NULL columns (aggressiveness / risk_multiplier /
+            # lambda_1 / lambda_2) are written with hard-coded defaults.
+            # The allocator does not read them, but the schema still
+            # requires a value on INSERT.
             db.execute(
                 f"INSERT INTO {self.TABLE_NAME} "
                 f"(id, mode, aggressiveness, capital_scale, risk_multiplier, "
                 f"reward_trust, valid_cycles_observed, updated_at, "
                 f"last_probe_cycle, prev_reward_efficiency, "
-                f"frontier_memory, last_direction, direction_lock) "
-                f"VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                f"frontier_memory, last_direction, direction_lock, "
+                f"lambda_1, lambda_2, beta, eta) "
+                f"VALUES (1, ?, 1.0, ?, 1.0, ?, ?, ?, ?, ?, ?, ?, ?, 1.0, 0.5, ?, ?) "
                 f"ON CONFLICT(id) DO UPDATE SET "
                 f"mode=excluded.mode, "
-                f"aggressiveness=excluded.aggressiveness, "
                 f"capital_scale=excluded.capital_scale, "
-                f"risk_multiplier=excluded.risk_multiplier, "
                 f"reward_trust=excluded.reward_trust, "
                 f"valid_cycles_observed=excluded.valid_cycles_observed, "
                 f"updated_at=excluded.updated_at, "
@@ -976,12 +1120,12 @@ class LearningController:
                 f"prev_reward_efficiency=excluded.prev_reward_efficiency, "
                 f"frontier_memory=excluded.frontier_memory, "
                 f"last_direction=excluded.last_direction, "
-                f"direction_lock=excluded.direction_lock",
+                f"direction_lock=excluded.direction_lock, "
+                f"beta=excluded.beta, "
+                f"eta=excluded.eta",
                 (
                     mode,
-                    float(state.aggressiveness),
                     float(state.capital_scale),
-                    float(state.risk_multiplier),
                     float(state.reward_trust),
                     int(state.valid_cycles_observed),
                     float(state.updated_at),
@@ -993,6 +1137,8 @@ class LearningController:
                     memory_json,
                     int(getattr(state, "last_direction", 0) or 0),
                     int(getattr(state, "direction_lock", 0) or 0),
+                    float(getattr(state, "beta", DEFAULT_BETA)),
+                    float(getattr(state, "eta",  DEFAULT_ETA)),
                 ),
             )
             db.commit()
@@ -1044,10 +1190,14 @@ class LearningController:
           PART 6 — efficiency_delta = cur - prev_reward_efficiency; when
             < EFFICIENCY_DELTA_COLLAPSE, pull capital down.
         """
-        u_aggr = prev.aggressiveness
         u_cap = prev.capital_scale
-        u_risk = prev.risk_multiplier
         u_trust = prev.reward_trust
+        # β / η carried through from prev; overwritten by the control
+        # law below when the corresponding input signal is present.
+        prev_beta = float(getattr(prev, "beta", DEFAULT_BETA))
+        prev_eta  = float(getattr(prev, "eta",  DEFAULT_ETA))
+        u_beta = prev_beta
+        u_eta  = prev_eta
 
         fr = metrics.get("fill_rate") or 0.0
         apf = metrics.get("avg_loss_per_fill") or 0.0
@@ -1094,19 +1244,15 @@ class LearningController:
             memory.get(regime_id) if regime_id is not None else None
         )
 
-        # ── Rule Group A: AGGRESSION ───────────────────────────
-        # FIX 1: loss condition is (loss_per_capital high) OR (per-fill high)
+        # Rule Group A removed: aggressiveness + risk_multiplier deleted
+        # as control levers (spec §2 + §12 of the continuous-allocator
+        # replacement). The loss-high / efficiency-high signals now only
+        # drive capital_scale and downstream scalars; ranking shape is
+        # handled entirely by the allocator's w_i = R / (λ1·p·L + λ2).
         loss_high = (
             (lpc is not None and lpc > LOSS_PER_CAPITAL_HIGH)
             or apf > LOSS_PER_FILL_HIGH
         )
-        if fr > FILL_RATE_HIGH and loss_high and np_ <= 0:
-            u_aggr *= AGGR_DOWN
-            u_risk *= RISK_UP
-        # FIX 3: reward-first positive scaling — efficiency drives aggression
-        # up, regardless of profit sign. When baseline missing, skip.
-        elif target_eff is not None and cur_eff_raw is not None and re_ > target_eff:
-            u_aggr *= AGGR_UP
 
         # ── Rule Group B: CAPITAL EFFICIENCY ──────────────────
         # FIX 2+3: binary decision against adaptive baseline. Skip
@@ -1128,7 +1274,6 @@ class LearningController:
             if (fill_rate_raw < SAFE_FILL_RATE
                     and loss_per_capital_raw < SAFE_LOSS_PER_CAPITAL):
                 u_cap *= EXPANSION_SCALE_UP
-                u_aggr *= SAFE_EXPANSION_AGGR_UP
             elif (fill_rate_raw > SAFE_FILL_RATE * 2
                     and loss_per_capital_raw > SAFE_LOSS_PER_CAPITAL):
                 u_cap *= EXPANSION_SCALE_DOWN
@@ -1161,7 +1306,6 @@ class LearningController:
                     and re_ >= EXPANSION_EFFICIENCY_FLOOR_FRAC * target_eff):
                 if prev.capital_scale < frontier_limit:
                     u_cap *= FRONTIER_EXPANSION_CAP_UP
-                u_aggr *= EXPANSION_AGGR_UP
             if reward_growth < 0 and re_ < target_eff:
                 u_cap *= EXPANSION_CAP_DOWN
 
@@ -1181,21 +1325,17 @@ class LearningController:
             u_cap *= EFFICIENCY_DELTA_SHARP_CAP
 
         # ── Rule Group C: MODEL CORRECTION ─────────────────────
+        # reward_trust reacts to reward-model error; loss-model error no
+        # longer has a destination scalar (risk_multiplier deleted), so
+        # lerr is observed-only.
         if rerr is not None:
             if rerr < REWARD_ERROR_OVERESTIMATE:
                 u_trust *= TRUST_DOWN
             elif REWARD_ERROR_HEALTHY_LO <= rerr <= REWARD_ERROR_HEALTHY_HI:
                 u_trust *= TRUST_UP
 
-        if lerr is not None:
-            if lerr > LOSS_ERROR_UNDERESTIMATE:
-                u_risk *= RISK_UP
-            elif LOSS_ERROR_HEALTHY_LO <= lerr <= LOSS_ERROR_HEALTHY_HI:
-                u_risk *= RISK_DOWN
-
         # ── Rule Group D: GLOBAL REGIME ───────────────────────
         if gfr > GLOBAL_FILL_RATE_HIGH:
-            u_aggr *= AGGR_DOWN
             u_cap *= CAP_DOWN
 
         # ── PART 3: FRONTIER PROBE ────────────────────────────
@@ -1255,12 +1395,57 @@ class LearningController:
         # the system from staying pessimistic forever.
         u_trust += TRUST_REVERSION_RATE * (1.0 - u_trust)
 
+        # ── CONTINUOUS-ALLOCATOR β / η CONTROL LAW (spec §6) ──────
+        # Signals come from the metrics engine. β update needs
+        # expected_util; η update needs coverage_ratio. Each rule is
+        # skipped (carry-through) when its signal is missing — the EMA
+        # step on a carried-through target is a no-op.
+        expected_util = metrics.get("expected_util")
+        coverage_ratio = metrics.get("coverage_ratio")
+
+        # β update — utilisation-target feedback.
+        if expected_util is not None:
+            try:
+                eu = float(expected_util)
+            except (TypeError, ValueError):
+                eu = None
+            if eu is not None:
+                err_beta = TARGET_UTIL - eu
+                beta_raw = prev_beta * (1.0 + K_BETA * err_beta)
+                u_beta = _clamp(beta_raw, *CLAMP_BETA)
+
+        # η update — coverage-feedback control.
+        if coverage_ratio is not None:
+            try:
+                cov = float(coverage_ratio)
+            except (TypeError, ValueError):
+                cov = None
+            if cov is not None:
+                err_eta = TARGET_COVERAGE - cov
+                eta_raw = prev_eta + K_ETA * err_eta
+                u_eta = _clamp(eta_raw, *CLAMP_ETA)
+
+        # Stability guard (§6.4) — halve the β / η EMA step when the
+        # capital_scale trace is oscillating. Reuses the existing
+        # Patch-11 _detect_oscillation signal so we do not introduce a
+        # new metric.
+        alpha_beta = ALPHA_BETA
+        alpha_eta  = ALPHA_ETA
+        if len(prev.capital_history) >= OSCILLATION_WINDOW:
+            recent_for_ctrl = prev.capital_history[-OSCILLATION_WINDOW:]
+            if _detect_oscillation(recent_for_ctrl):
+                alpha_beta = ALPHA_BETA / 2.0
+                alpha_eta  = ALPHA_ETA  / 2.0
+
         # ── EMA smoothing (STEP 5) ────────────────────────────
         a = EMA_ALPHA
-        new_aggr = a * u_aggr + (1 - a) * prev.aggressiveness
         new_cap = a * u_cap + (1 - a) * prev.capital_scale
-        new_risk = a * u_risk + (1 - a) * prev.risk_multiplier
         new_trust = a * u_trust + (1 - a) * prev.reward_trust
+        # β / η use their own (slower) EMA step so the capital_scale /
+        # reward_trust loops stay responsive while the allocator's
+        # control parameters move gradually.
+        new_beta = (1.0 - alpha_beta) * prev_beta + alpha_beta * u_beta
+        new_eta  = (1.0 - alpha_eta)  * prev_eta  + alpha_eta  * u_eta
 
         # ── Clamp (STEP 3 hard constraints) ───────────────────
         new_cap_clamped = _clamp(new_cap, *CLAMP_CAP)
@@ -1306,10 +1491,10 @@ class LearningController:
                     new_cap_final = prev.capital_scale
 
         return LearningState(
-            aggressiveness=_clamp(new_aggr, *CLAMP_AGGR),
             capital_scale=new_cap_final,
-            risk_multiplier=_clamp(new_risk, *CLAMP_RISK),
             reward_trust=_clamp(new_trust, *CLAMP_TRUST),
+            beta=_clamp(new_beta, *CLAMP_BETA),
+            eta=_clamp(new_eta,  *CLAMP_ETA),
             # FIX 6 — increments only when called (i.e. only on valid cycles)
             valid_cycles_observed=prev.valid_cycles_observed + 1,
             updated_at=time.time(),
@@ -1404,10 +1589,10 @@ class LearningController:
             # cache refresh writes the baseline trace (and a later
             # update_state success further advances the cache explicitly).
             counter_only = LearningState(
-                aggressiveness=prev.aggressiveness,
                 capital_scale=prev.capital_scale,
-                risk_multiplier=prev.risk_multiplier,
                 reward_trust=prev.reward_trust,
+                beta=float(getattr(prev, "beta", DEFAULT_BETA)),
+                eta=float(getattr(prev, "eta",  DEFAULT_ETA)),
                 valid_cycles_observed=(
                     prev.valid_cycles_observed + (1 if metrics_ok else 0)
                 ),
@@ -1451,10 +1636,10 @@ class LearningController:
                 self.persist_state(counter_only, mode)
                 log.info(
                     f"[LEARNING_SHADOW] would_apply "
-                    f"aggr {prev.aggressiveness:.3f}→{computed.aggressiveness:.3f} "
                     f"cap {prev.capital_scale:.3f}→{computed.capital_scale:.3f} "
-                    f"risk {prev.risk_multiplier:.3f}→{computed.risk_multiplier:.3f} "
-                    f"trust {prev.reward_trust:.3f}→{computed.reward_trust:.3f}"
+                    f"trust {prev.reward_trust:.3f}→{computed.reward_trust:.3f} "
+                    f"β {prev.beta:.3f}→{computed.beta:.3f} "
+                    f"η {prev.eta:.3f}→{computed.eta:.3f}"
                 )
             else:
                 log.warning(
@@ -1482,10 +1667,10 @@ class LearningController:
             # damping cache isn't wiped by a single incomplete-metrics
             # cycle.
             held = LearningState(
-                aggressiveness=prev.aggressiveness,
                 capital_scale=prev.capital_scale,
-                risk_multiplier=prev.risk_multiplier,
                 reward_trust=prev.reward_trust,
+                beta=float(getattr(prev, "beta", DEFAULT_BETA)),
+                eta=float(getattr(prev, "eta",  DEFAULT_ETA)),
                 valid_cycles_observed=prev.valid_cycles_observed,
                 updated_at=prev.updated_at,
                 mode=mode,
@@ -1573,10 +1758,10 @@ class LearningController:
             f"profit=${_f(m.get('net_profit'), fmt='.2f')} "
             f"reward=${_f(m.get('total_rewards'), fmt='.2f')} "
             f"efficiency={_f(m.get('reward_efficiency'))} "
-            f"aggr={s.aggressiveness:.3f} "
             f"capital={s.capital_scale:.3f} "
-            f"risk={s.risk_multiplier:.3f} "
-            f"trust={s.reward_trust:.3f}"
+            f"trust={s.reward_trust:.3f} "
+            f"β={s.beta:.3f} "
+            f"η={s.eta:.3f}"
         )
 
     def _log_expansion(

@@ -79,8 +79,8 @@ class TestInvariants(unittest.TestCase):
 
     def _state(self, **kw):
         defaults = dict(
-            aggressiveness=1.0, capital_scale=1.0,
-            risk_multiplier=1.0, reward_trust=1.0,
+            capital_scale=1.0, reward_trust=1.0,
+            beta=0.75, eta=0.0,
         )
         defaults.update(kw)
         return LearningState(**defaults)
@@ -151,17 +151,20 @@ class TestInvariants(unittest.TestCase):
         self.assertNotIn("ev_negative_with_deployment", names)
 
     def test_clamp_violation_caught(self):
-        """Out-of-clamp scalar must trigger {name}_out_of_clamp."""
+        """Out-of-clamp scalar must trigger {name}_out_of_clamp. With
+        aggressiveness/risk_multiplier deleted, this exercises lambda_1
+        instead — its clamp is [0.5, 5.0]."""
         bad_state = LearningState(
-            aggressiveness=2.0,  # > 1.5
-            capital_scale=1.0, risk_multiplier=1.0, reward_trust=1.0,
+            capital_scale=1.0, reward_trust=1.0,
+            lambda_1=10.0,  # > 5.0
+            lambda_2=0.5,
         )
         viols = check_per_cycle(
             cycle=0, allocations=[], applied_state=bad_state,
             total_capital=1000.0, total_ev=0.0, exploration_pct=0.05,
         )
         names = {v.name for v in viols}
-        self.assertIn("aggressiveness_out_of_clamp", names)
+        self.assertIn("lambda_1_out_of_clamp", names)
 
     def test_exploration_pct_overrun_caught(self):
         viols = check_per_cycle(

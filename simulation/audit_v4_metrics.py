@@ -196,28 +196,26 @@ class V4Tracker:
             for a in deploys
         )
 
-        # Patch 7 / 11 stamps — required in ACTIVE per allocator contract.
-        overcommit_factor = _first_stamp(deploys, "_overcommit_factor")
-        target_notional = _first_stamp(deploys, "_target_notional")
-        if mode == MODE_ACTIVE and deploy_count > 0:
-            if overcommit_factor is None:
-                raise RuntimeError(
-                    f"V4Tracker cycle={cycle}: ACTIVE deploy row is "
-                    "missing `_overcommit_factor` stamp — Patch 7 broken?"
-                )
-            if target_notional is None:
-                raise RuntimeError(
-                    f"V4Tracker cycle={cycle}: ACTIVE deploy row is "
-                    "missing `_target_notional` stamp — Patch 11/13 broken?"
-                )
+        # Continuous-allocator reinterpretation: the allocator no longer
+        # emits Patch 7 `_overcommit_factor` / Patch 11 `_target_notional`
+        # stamps — those concepts don't exist. We derive equivalent
+        # observables from the allocation data itself so V4 invariants
+        # still produce comparable metrics.
+        #   overcommit_factor := realized total_notional / total_capital
+        #                        (≤ ~1 under continuous; no explicit factor)
+        #   target_notional   := total_capital × CAPITAL_BUFFER (0.95×)
+        from profit.allocator import CAPITAL_BUFFER
+        if total_capital > 0:
+            overcommit_factor = total_notional / total_capital
+            target_notional = total_capital * CAPITAL_BUFFER
+        else:
+            overcommit_factor = None
+            target_notional = None
 
-        # Structure metrics.
-        forced_count = sum(
-            1 for a in deploys if bool(a.get("_forced_target_alloc"))
-        )
-        percent_forced = (
-            forced_count / deploy_count if deploy_count > 0 else 0.0
-        )
+        # Forced-target-alloc disappeared with Patch 13 — the continuous
+        # allocator has no concept of forced promotion, so this metric
+        # is always 0.
+        percent_forced = 0.0
         # Top-5 concentration: sum of 5 largest costs ÷ total.
         if deploy_count > 0 and total_notional > 0:
             sorted_costs = sorted(

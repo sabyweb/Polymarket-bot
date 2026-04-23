@@ -269,8 +269,14 @@ class SimulationEngine:
         fill_rng = random.Random(fill_seed)
         market_rng = random.Random(master.randint(0, 2**31 - 1))
 
-        # Real production modules — never mocked.
-        calibrator = CalibrationManager(db_path=db_path)
+        # Real production modules — never mocked. The calibrator is
+        # wrapped by the sim-only bootstrap shim so p_fill is non-zero
+        # while FillModel is still training (prevents expected_capital
+        # from collapsing to ~0). Production calibration is untouched;
+        # the wrapper is a transparent pass-through once the model
+        # trains. See simulation/bootstrap_calibrator.py.
+        from .bootstrap_calibrator import make_sim_calibrator
+        calibrator = make_sim_calibrator(db_path=db_path)
         learn_ctrl = LearningController(
             db_path=db_path, alloc_path=alloc_path,
         )
@@ -328,10 +334,10 @@ class SimulationEngine:
                 reward_efficiency=reward_eff,
                 fill_rate=fill_rate,
                 learning_state={
-                    "aggressiveness": applied.aggressiveness,
                     "capital_scale": applied.capital_scale,
-                    "risk_multiplier": applied.risk_multiplier,
                     "reward_trust": applied.reward_trust,
+                    "lambda_1": applied.lambda_1,
+                    "lambda_2": applied.lambda_2,
                     "valid_cycles_observed": applied.valid_cycles_observed,
                     "mode": applied.mode,
                     "frontier_memory_size": len(applied.frontier_memory or {}),
@@ -347,9 +353,9 @@ class SimulationEngine:
                 "valid_cycles_observed": applied.valid_cycles_observed,
                 "mode": applied.mode,
                 "capital_scale": applied.capital_scale,
-                "aggressiveness": applied.aggressiveness,
-                "risk_multiplier": applied.risk_multiplier,
                 "reward_trust": applied.reward_trust,
+                "lambda_1": applied.lambda_1,
+                "lambda_2": applied.lambda_2,
                 "frontier_memory_size": len(applied.frontier_memory or {}),
             })
 

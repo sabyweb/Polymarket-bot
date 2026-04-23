@@ -26,7 +26,7 @@ from unittest.mock import patch
 from profit.learning import (
     MODE_OFF, MODE_SHADOW, MODE_ACTIVE,
     LearningState, LearningController, LearningMetrics,
-    CLAMP_CAP, CLAMP_AGGR,
+    CLAMP_CAP,
     EMA_ALPHA,
     FRONTIER_EXPANSION_CAP_UP, FRONTIER_LIMIT_MULT,
     FRONTIER_MIN_FLOOR_FRAC,
@@ -521,6 +521,8 @@ class TestSharpCollapseCorrection(unittest.TestCase):
 class TestBackwardCompat(unittest.TestCase):
 
     def test_allocator_unchanged_with_none_learning_state(self):
+        """learning_state=None must produce identical output to a default
+        LearningState() under the continuous allocator."""
         from profit.allocator import allocate_portfolio
         from calibration.manager import CalibrationManager
         from oversight.market_scorer import ScoredMarket
@@ -551,8 +553,6 @@ class TestBackwardCompat(unittest.TestCase):
             for x, y in zip(a_none, a_default):
                 self.assertEqual(x["action"], y["action"])
                 self.assertEqual(x["shares_per_side"], y["shares_per_side"])
-                self.assertFalse(x.get("_exploration"))
-                self.assertFalse(y.get("_exploration"))
         finally:
             os.unlink(f.name)
 
