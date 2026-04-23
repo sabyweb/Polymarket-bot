@@ -192,6 +192,11 @@ CAPITAL_HISTORY_MAX = 100
 # for backward compatibility (Hard Guarantee #4).
 CAPITAL_CHANGE_MIN_STEP = 0.05
 CAPITAL_DIRECTION_LOCK = 5
+# Bounded-rate step: maximum per-cycle |Δcapital_scale|. Applied after
+# all rules (A/B/D/E + damping + EMA + clamp + hysteresis) — a final
+# rate limiter to reduce INV7 oscillation amplitude without touching
+# the upstream rule surface.
+MAX_CAPITAL_SCALE_STEP = 0.07
 
 # ── STEP 5 EMA SMOOTHING ───────────────────────────────────────
 EMA_ALPHA = 0.20
@@ -1489,6 +1494,41 @@ class LearningController:
                 new_direction_lock = max(0, prev_dir_lock - 1)
                 if abs(delta) < CAPITAL_CHANGE_MIN_STEP:
                     new_cap_final = prev.capital_scale
+
+        # ── BOUNDED-RATE STEP (final stability limiter) ────────
+        # Clip |new_cap_final − prev.capital_scale| to
+        # MAX_CAPITAL_SCALE_STEP. Runs after every prior rule / filter,
+        # so upstream behaviour is unchanged — only the per-cycle
+        # amplitude is bounded. prev.capital_scale and new_cap_final
+        # are both already within CLAMP_CAP, so the bounded step
+        # remains within CLAMP_CAP by construction (no re-clamp).
+        step_delta = new_cap_final - prev.capital_scale
+        if step_delta > MAX_CAPITAL_SCALE_STEP:
+            step_delta = MAX_CAPITAL_SCALE_STEP
+        elif step_delta < -MAX_CAPITAL_SCALE_STEP:
+            step_delta = -MAX_CAPITAL_SCALE_STEP
+        new_cap_final = prev.capital_scale + step_delta
+
+        # ── SMALL-AMPLITUDE FLIP SUPPRESSION ───────────────────
+        # Revert when the current delta flips direction against the
+        # last accepted nonzero delta AND both magnitudes are below
+        # CAPITAL_CHANGE_MIN_STEP. Targets the ~0.01–0.025 amplitude
+        # direction churn that slips past Patch-13's dead-band (which
+        # is gated to same-direction deltas). Large reversals (either
+        # side ≥ MIN_STEP) and same-direction moves pass through.
+        delta = new_cap_final - prev.capital_scale
+        prev_delta = None
+        hist = prev.capital_history
+        for i in range(len(hist) - 1, 0, -1):
+            d = hist[i] - hist[i - 1]
+            if d != 0.0:
+                prev_delta = d
+                break
+        if (prev_delta is not None
+                and (delta * prev_delta) < 0
+                and abs(delta) < CAPITAL_CHANGE_MIN_STEP
+                and abs(prev_delta) < CAPITAL_CHANGE_MIN_STEP):
+            new_cap_final = prev.capital_scale
 
         return LearningState(
             capital_scale=new_cap_final,
