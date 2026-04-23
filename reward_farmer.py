@@ -49,14 +49,31 @@ def MAX_TOTAL_EXPOSURE(): return cfg("RF_MAX_TOTAL_EXPOSURE")
 # unaware of them (correct layering: allocation decides intent, farmer
 # enforces execution-time safety). Fail-open on missing data so a DB hiccup
 # can never halt trading — only the explicit kill-switch triggers halt.
-MAX_NOTIONAL_RATIO = 2.0                 # Σ live notional / total_capital cap
-CLUSTER_NOTIONAL_LIMIT_FRAC = 0.5        # fraction of total_capital per fill cluster
+MAX_NOTIONAL_RATIO = 2.0                 # soft: block new placements above this
+HARD_NOTIONAL_RATIO = 2.5                # hard: actively cancel lowest-priority
+                                         # orders until ratio ≤ MAX_NOTIONAL_RATIO
+CLUSTER_NOTIONAL_LIMIT_FRAC = 0.5        # soft+hard: block new placements AND
+                                         # actively cancel once a cluster exceeds
+                                         # 0.5·total_capital (§4.1 of spec — the
+                                         # soft and hard cluster thresholds are
+                                         # intentionally the same fraction).
 MAX_DAILY_LOSS_FRAC = 0.1                # kill-switch: realized loss / total_capital
 CRITICAL_CF_THRESHOLD = 0.01             # kill-switch: CF floor
 FILL_RATE_SPIKE_FACTOR = 3.0             # kill-switch: short-window / rolling-avg
 GUARDRAIL_FILLRATE_SHORT_SECS = 3600     # 1h fill-count window
 GUARDRAIL_FILLRATE_BASELINE_SECS = 21600 # 6h baseline window
-GUARDRAIL_FILLRATE_MIN_BASELINE = 5      # require ≥ N baseline fills before ratio fires
+MIN_FILL_BASELINE = 5                    # require ≥ N baseline fills before the
+                                         # fill-rate spike trigger can fire
+                                         # (stabilises cold-start behaviour)
+MAX_CANCELS_PER_CYCLE = 5                # hard-enforcement cap per helper per
+                                         # cycle. Reduces exposure faster than
+                                         # one-at-a-time without burst-cancelling
+                                         # the whole book during a large breach.
+MAX_BREACH_CYCLES = 3                    # after N consecutive cycles of
+                                         # notional_ratio > HARD_NOTIONAL_RATIO,
+                                         # emit [CRITICAL] persistent_overexposure.
+                                         # Observational only — does NOT auto-trip
+                                         # the kill switch (§5.3).
 
 
 class RewardFarmer:
@@ -139,6 +156,12 @@ class RewardFarmer:
         self._kill_switch_active: bool = False
         self._kill_switch_reason: str = ""
         self._kill_switch_triggered_at: float = 0.0
+        # Persistent-breach tracker (spec §5.1): consecutive cycles
+        # where notional_ratio > HARD_NOTIONAL_RATIO. Incremented in
+        # _guardrail_check_and_log; reset when ratio drops back under
+        # the hard threshold. Unknown (signal missing) leaves the
+        # counter unchanged so a DB hiccup doesn't mask a real breach.
+        self._consecutive_hard_notional_breach_cycles: int = 0
 
     # ── Startup ─────────────────────────────────────────────────────
 
@@ -953,12 +976,17 @@ class RewardFarmer:
     def _guardrail_total_capital_from_alloc(self) -> float | None:
         """Read `_total_capital` stamp from the first deploy row of the
         current allocation JSON. None when file is missing / stale /
-        unstamped — farmer falls open (skips capital-fraction checks)."""
+        unstamped — farmer falls open (skips capital-fraction checks)
+        and emits a [GUARDRAIL_WARNING] so the gap is visible."""
         alloc_path = os.path.join(
             os.path.dirname(__file__) or ".", "market_allocations.json",
         )
         try:
             if not os.path.exists(alloc_path):
+                log.warning(
+                    "[GUARDRAIL_WARNING] missing_signal=total_capital "
+                    "(alloc file not found)"
+                )
                 return None
             with open(alloc_path) as f:
                 data = json.load(f)
@@ -968,8 +996,14 @@ class RewardFarmer:
                 tc = m.get("_total_capital")
                 if tc is not None:
                     return float(tc)
+            log.warning(
+                "[GUARDRAIL_WARNING] missing_signal=total_capital "
+                "(no deploy row with _total_capital stamp)"
+            )
         except Exception as e:
-            log.debug(f"[GUARDRAIL] total_capital read failed: {e}")
+            log.warning(
+                f"[GUARDRAIL_WARNING] missing_signal=total_capital (error: {e})"
+            )
         return None
 
     def _guardrail_live_notional_per_market(self) -> dict[str, float]:
@@ -1006,7 +1040,9 @@ class RewardFarmer:
             from profit.correlation import build_fill_clusters
             clusters, _oversized = build_fill_clusters(self.db._db_path)
         except Exception as e:
-            log.debug(f"[GUARDRAIL] cluster build skipped: {e}")
+            log.warning(
+                f"[GUARDRAIL_WARNING] missing_signal=cluster_data (error: {e})"
+            )
             return {}, {}
         for cid, n in live_notional.items():
             cl = clusters.get(cid)
@@ -1017,7 +1053,8 @@ class RewardFarmer:
         return cluster_notional, cluster_by_cid
 
     def _guardrail_current_cf(self) -> float | None:
-        """Latest smoothed correction_factor. None on missing / error."""
+        """Latest smoothed correction_factor. None on missing / error;
+        emits [GUARDRAIL_WARNING] so the CF-kill gap is visible."""
         try:
             conn = self.db._get_conn()
             row = conn.execute(
@@ -1025,10 +1062,16 @@ class RewardFarmer:
                 "ORDER BY date DESC LIMIT 1"
             ).fetchone()
             if row is None:
+                log.warning(
+                    "[GUARDRAIL_WARNING] missing_signal=cf "
+                    "(no reward_daily row yet)"
+                )
                 return None
             return float(row[0])
         except Exception as e:
-            log.debug(f"[GUARDRAIL] CF read failed: {e}")
+            log.warning(
+                f"[GUARDRAIL_WARNING] missing_signal=cf (error: {e})"
+            )
             return None
 
     def _guardrail_daily_realized_loss(self) -> float | None:
@@ -1077,7 +1120,11 @@ class RewardFarmer:
                         base_count += 1
                         if t >= short_cutoff:
                             short_count += 1
-        if base_count < GUARDRAIL_FILLRATE_MIN_BASELINE:
+        if base_count < MIN_FILL_BASELINE:
+            log.warning(
+                f"[GUARDRAIL_WARNING] missing_signal=fill_rate "
+                f"(baseline={base_count} < MIN_FILL_BASELINE={MIN_FILL_BASELINE})"
+            )
             return None, short_count, base_count
         # Scale baseline to the short-window duration for a like-for-like
         # comparison. ratio = observed-short / expected-short-from-baseline.
@@ -1115,6 +1162,24 @@ class RewardFarmer:
         notional_ratio: float | None = None
         if total_capital is not None and total_capital > 0:
             notional_ratio = total_live_notional / total_capital
+
+        # Persistent-breach tracking (spec §5.1–§5.3). Count only when
+        # we have a signal; missing signal leaves the counter unchanged
+        # so a DB hiccup can't mask nor reset a real breach.
+        if notional_ratio is None:
+            pass  # no signal — leave counter as-is
+        elif notional_ratio > HARD_NOTIONAL_RATIO:
+            self._consecutive_hard_notional_breach_cycles += 1
+        else:
+            self._consecutive_hard_notional_breach_cycles = 0
+        if (
+            self._consecutive_hard_notional_breach_cycles >= MAX_BREACH_CYCLES
+            and notional_ratio is not None
+        ):
+            log.error(
+                f"[CRITICAL] persistent_overexposure "
+                f"{json.dumps({'notional_ratio': round(notional_ratio, 4), 'cycles': self._consecutive_hard_notional_breach_cycles}, sort_keys=True)}"
+            )
 
         # ── Decisions ─────────────────────────────────────────────
         kill_reasons: list[str] = []
@@ -1185,18 +1250,25 @@ class RewardFarmer:
             "notional_block": notional_block,
             "blocked_clusters": blocked_clusters,
             "cluster_by_cid": cluster_by_cid,
+            "cluster_notional": cluster_notional,
+            "live_by_cid": live_by_cid,
+            "total_live_notional": total_live_notional,
+            "notional_ratio": notional_ratio,
             "total_capital": total_capital,
         }
 
     def _activate_kill_switch(self, reason: str) -> None:
-        """One-shot: flip the flag, log prominently, cancel every live
-        BUY slot + dump sell. Subsequent cycles short-circuit out of
-        run_cycle. Operator must restart the process to clear."""
+        """Atomic halt (spec §5.1): set flag → cancel every live order
+        → log event → caller returns immediately. No further logic
+        runs in this cycle. Operator must restart the process to
+        resume — deliberate: the trigger conditions all benefit from
+        human eyes-on before re-entry."""
+        # 1. Flag FIRST so any concurrent re-entry short-circuits.
         self._kill_switch_active = True
         self._kill_switch_reason = reason
         self._kill_switch_triggered_at = time.time()
-        log.error(f"[GUARDRAIL] KILL SWITCH ACTIVATED: {reason}")
-        log.error("[GUARDRAIL] cancelling all live + dump orders")
+
+        # 2. Cancel ALL live orders immediately (BUY slots + dump SELLs).
         cancelled = 0
         for ms in list(self.markets.values()):
             for side in ("yes", "no"):
@@ -1221,11 +1293,188 @@ class RewardFarmer:
                             cancelled += 1
                     except Exception as e:
                         log.debug(f"[GUARDRAIL] dump-cancel failed {dump_oid}: {e}")
-        log.error(f"[GUARDRAIL] kill switch cancelled {cancelled} orders")
+
+        # 3. Log event (one loud line + one structured record).
+        log.error(
+            f"[GUARDRAIL] KILL SWITCH ACTIVATED: {reason} "
+            f"— cancelled {cancelled} live orders"
+        )
         log.info(
             f"[GUARDRAIL] "
             f"{json.dumps({'event': 'kill_switch_activated', 'cycle': self.cycle_count, 'reason': reason, 'cancelled_orders': cancelled, 'ts': round(time.time(), 3)}, sort_keys=True)}"
         )
+        # 4. Caller returns from run_cycle — see integration in run_cycle.
+
+    # ── Hard enforcement helpers ────────────────────────────────────
+    # Soft guardrails (§3.1 notional_block, §4 cluster block) prevent
+    # growth. Hard enforcement actively reduces exposure that's already
+    # past the hard thresholds (can happen if fills land between cycles
+    # or if allocation/cap policy drift puts existing orders over). All
+    # cancellations are incremental: sort by priority, cancel one at a
+    # time, stop as soon as the threshold is cleared.
+
+    def _guardrail_cancellation_order(
+        self, filter_cids: set[str] | None = None,
+    ) -> list[tuple]:
+        """Return live BUY orders in LOWEST-priority-first order.
+
+        Priority key (ascending sort, spec §4.1):
+            (daily_rate, -notional, -max_spread, cid, side)
+        → lowest reward first; within equal reward, largest notional
+        first (remove biggest exposure); within equal notional, highest
+        spread first (risk proxy); then deterministic string tiebreak.
+        Intent (§4.2): remove lowest value first, and within that,
+        remove largest risk first. Dump sell orders are intentionally
+        excluded — they exist to flatten a filled position and cancelling
+        them would leave the position stranded. The kill-switch path
+        still cancels dumps because it's terminal.
+        """
+        cands: list[tuple] = []
+        for cid, ms in self.markets.items():
+            if filter_cids is not None and cid not in filter_cids:
+                continue
+            for side in ("yes", "no"):
+                slot = ms.orders.get(side)
+                if not slot or not slot.order_id:
+                    continue
+                notional = float(slot.price or 0.0) * float(slot.shares or 0.0)
+                if notional <= 0:
+                    continue
+                key = (
+                    float(ms.daily_rate or 0.0),
+                    -notional,
+                    -float(ms.max_spread or 0.0),
+                    str(cid), side,
+                )
+                cands.append((key, ms, side, slot, notional))
+        cands.sort(key=lambda c: c[0])
+        return cands
+
+    def _guardrail_cancel_slot(
+        self, ms: "MarketState", side: str, slot: "OrderSlot", reason: str,
+    ) -> bool:
+        """Cancel + clear slot + delete DB entry. Matches the existing
+        expiry_sweep pattern. Returns True on successful cancel."""
+        oid = slot.order_id
+        if not oid:
+            return False
+        try:
+            ok = self.order_lifecycle.cancel_order(oid, reason=reason)
+        except Exception as e:
+            log.debug(f"[GUARDRAIL] cancel error {oid}: {e}")
+            return False
+        if ok:
+            try:
+                self.db.delete_active_order(oid)
+            except Exception:
+                pass
+            ms.orders[side] = OrderSlot()
+        return ok
+
+    def _guardrail_hard_enforce_notional(
+        self, total_capital: float | None, total_live_notional: float,
+    ) -> int:
+        """Cancel lowest-priority orders until
+        notional_ratio ≤ MAX_NOTIONAL_RATIO once ratio has exceeded
+        HARD_NOTIONAL_RATIO. Incremental: one cancel per iteration,
+        stops as soon as the running total drops under the soft cap."""
+        if total_capital is None or total_capital <= 0:
+            return 0
+        hard_usd = HARD_NOTIONAL_RATIO * total_capital
+        soft_usd = MAX_NOTIONAL_RATIO * total_capital
+        if total_live_notional <= hard_usd:
+            return 0
+        log.error(
+            f"[GUARDRAIL] HARD notional breach: "
+            f"${total_live_notional:.2f} > {HARD_NOTIONAL_RATIO}·T=${hard_usd:.2f} "
+            f"— cancelling to ≤ {MAX_NOTIONAL_RATIO}·T=${soft_usd:.2f}"
+        )
+        cancelled = 0
+        running = total_live_notional
+        for key, ms, side, slot, notional in self._guardrail_cancellation_order():
+            if running <= soft_usd:
+                break
+            if cancelled >= MAX_CANCELS_PER_CYCLE:
+                log.warning(
+                    f"[GUARDRAIL] hard-notional cancel cap reached "
+                    f"({MAX_CANCELS_PER_CYCLE}/cycle); residual breach "
+                    f"${running - soft_usd:.2f} carries into next cycle"
+                )
+                break
+            oid = slot.order_id
+            if self._guardrail_cancel_slot(ms, side, slot, "notional_hard_enforce"):
+                running -= notional
+                cancelled += 1
+                log.warning(
+                    f"[GUARDRAIL] hard-notional cancel {oid} "
+                    f"({ms.question[:40]}/{side}, notional=${notional:.2f}, "
+                    f"daily_rate=${float(ms.daily_rate or 0.0):.2f}) "
+                    f"→ running ${running:.2f}"
+                )
+        log.error(
+            f"[GUARDRAIL] hard-notional enforcement cancelled {cancelled} orders "
+            f"→ notional=${running:.2f}/${total_capital:.2f} "
+            f"(ratio={running / max(total_capital, 1e-9):.3f})"
+        )
+        return cancelled
+
+    def _guardrail_hard_enforce_clusters(
+        self,
+        total_capital: float | None,
+        cluster_notional: dict[int, float],
+        cluster_by_cid: dict[str, int | None],
+    ) -> int:
+        """For each cluster whose notional > 0.5·T, cancel lowest-
+        priority members until the cluster drops back under the limit.
+        Incremental per cluster; other clusters untouched."""
+        if total_capital is None or total_capital <= 0:
+            return 0
+        limit = CLUSTER_NOTIONAL_LIMIT_FRAC * total_capital
+        cancelled_total = 0
+        for cl_id, cl_notional in cluster_notional.items():
+            if cl_notional <= limit:
+                continue
+            member_cids = {
+                cid for cid, cl in cluster_by_cid.items() if cl == cl_id
+            }
+            if not member_cids:
+                continue
+            log.error(
+                f"[GUARDRAIL] HARD cluster breach: cluster={cl_id} "
+                f"notional=${cl_notional:.2f} > "
+                f"{CLUSTER_NOTIONAL_LIMIT_FRAC}·T=${limit:.2f} "
+                f"— cancelling lowest-priority in cluster"
+            )
+            running = cl_notional
+            cnt = 0
+            for key, ms, side, slot, notional in self._guardrail_cancellation_order(
+                filter_cids=member_cids,
+            ):
+                if running <= limit:
+                    break
+                if cnt >= MAX_CANCELS_PER_CYCLE:
+                    log.warning(
+                        f"[GUARDRAIL] cluster={cl_id} cancel cap reached "
+                        f"({MAX_CANCELS_PER_CYCLE}/cycle); residual breach "
+                        f"${running - limit:.2f} carries into next cycle"
+                    )
+                    break
+                oid = slot.order_id
+                if self._guardrail_cancel_slot(
+                    ms, side, slot, "cluster_hard_enforce",
+                ):
+                    running -= notional
+                    cnt += 1
+                    log.warning(
+                        f"[GUARDRAIL] cluster={cl_id} cancel {oid} "
+                        f"(notional=${notional:.2f}) → running ${running:.2f}"
+                    )
+            log.error(
+                f"[GUARDRAIL] cluster={cl_id} enforcement cancelled {cnt} orders "
+                f"→ ${running:.2f} (limit ${limit:.2f})"
+            )
+            cancelled_total += cnt
+        return cancelled_total
 
     # ── Core Cycle ──────────────────────────────────────────────────
 
@@ -1311,8 +1560,26 @@ class RewardFarmer:
         # new placements. Emits structured telemetry every cycle.
         guard = self._guardrail_check_and_log()
         if guard["kill_switch"]:
+            # Atomic halt: activate (flag → cancel → log) → return.
+            # Nothing after this executes in the killed cycle.
             self._activate_kill_switch(guard["kill_reason"])
             return
+
+        # Hard enforcement: cancel lowest-priority orders to bring
+        # notional + cluster exposure back under their soft caps when
+        # they've drifted past the hard thresholds. No-ops when within
+        # bounds. Runs BEFORE the soft-block / fill-storm gate so a
+        # breach is actively reduced even on cycles where new
+        # placements are already blocked for other reasons.
+        self._guardrail_hard_enforce_notional(
+            total_capital=guard["total_capital"],
+            total_live_notional=guard["total_live_notional"],
+        )
+        self._guardrail_hard_enforce_clusters(
+            total_capital=guard["total_capital"],
+            cluster_notional=guard["cluster_notional"],
+            cluster_by_cid=guard["cluster_by_cid"],
+        )
 
         # If fill storm active, skip all new placements
         if time.time() < self._fill_storm_until:
