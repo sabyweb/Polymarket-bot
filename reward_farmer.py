@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import collections
 import json
 import logging
 import os
@@ -75,12 +76,37 @@ MAX_BREACH_CYCLES = 3                    # after N consecutive cycles of
                                          # Observational only — does NOT auto-trip
                                          # the kill switch (§5.3).
 
+# Execution modes (§3.1). Staged deployment: DRY_RUN → SHADOW → LIVE.
+#   DRY_RUN : no API calls at all; every intent is logged only.
+#   SHADOW  : API reads permitted (get_orders, book fetches); no writes
+#             (no place, no cancel) — intent-logged instead.
+#   LIVE    : full execution, guardrails active.
+# Default is DRY_RUN so instantiating RewardFarmer() without an explicit
+# mode runs in log-only mode. Upgrade via --mode shadow / --mode live.
+MODE_DRY_RUN = "DRY_RUN"
+MODE_SHADOW  = "SHADOW"
+MODE_LIVE    = "LIVE"
+VALID_MODES  = (MODE_DRY_RUN, MODE_SHADOW, MODE_LIVE)
+DEFAULT_MODE = MODE_DRY_RUN
+ROLLING_STATS_WINDOW = 100               # cycles retained for rolling averages
+ROLLING_STATS_EMIT_EVERY = 10            # emit [ROLLING_STATS] every N cycles
+
 
 class RewardFarmer:
     """Production reward farming bot — orchestrator."""
 
-    def __init__(self, dry_run: bool = False):
-        self.dry_run = dry_run
+    def __init__(self, mode: str = DEFAULT_MODE):
+        if mode not in VALID_MODES:
+            raise ValueError(
+                f"mode must be one of {VALID_MODES}, got {mode!r}"
+            )
+        self.mode = mode
+        # Back-compat read-gate: self.dry_run stays True only in DRY_RUN,
+        # which preserves the existing startup/get_orders skips for
+        # reads. SHADOW allows reads, so dry_run=False there. All
+        # order-writing sites now go through _gated_place_orders_for_market
+        # / _gated_cancel_order which enforce the full mode semantics.
+        self.dry_run = (mode == MODE_DRY_RUN)
 
         # Create CLOB client
         from config import (
@@ -123,14 +149,20 @@ class RewardFarmer:
         self.all_market_data: list[dict] = []
         self._market_lock = threading.Lock()
 
-        # Extracted modules — share the markets dict reference
+        # Extracted modules — share the markets dict reference.
+        # Pass dry_run=True to OL + DumpManager in any non-LIVE mode
+        # (belt-and-suspenders: the farmer's _gated_* wrappers already
+        # prevent write calls, and OL's internal dry_run handling adds a
+        # second layer so any code path that bypasses the wrapper still
+        # can't fire a real API write).
+        _module_dry = (self.mode != MODE_LIVE)
         self.order_lifecycle = OrderLifecycle(
             client=self.client, db=self.db, positions=self.positions,
-            rewards=self.rewards, markets=self.markets, dry_run=dry_run,
+            rewards=self.rewards, markets=self.markets, dry_run=_module_dry,
         )
         self.dump_mgr = DumpManager(
             client=self.client, db=self.db, positions=self.positions,
-            cancel_fn=self.order_lifecycle.cancel_order, dry_run=dry_run,
+            cancel_fn=self._gated_cancel_order, dry_run=_module_dry,
         )
         self.order_lifecycle.set_dump_manager(self.dump_mgr)
 
@@ -162,6 +194,24 @@ class RewardFarmer:
         # the hard threshold. Unknown (signal missing) leaves the
         # counter unchanged so a DB hiccup doesn't mask a real breach.
         self._consecutive_hard_notional_breach_cycles: int = 0
+
+        # Cycle-scope observability counters. Reset at the top of each
+        # run_cycle; emitted in [CYCLE_SUMMARY] at every run_cycle exit.
+        # Counter coverage: farmer-side cancels inside run_cycle
+        # (kill-switch, hard enforcement, expiry sweep, dead-market
+        # cleanup) and batch placements. Startup/shutdown cancels and
+        # between-cycle refreshes aren't counted — they run outside
+        # run_cycle.
+        self._cycle_orders_placed: int = 0
+        self._cycle_orders_cancelled: int = 0
+        self._rolling_stats: collections.deque = collections.deque(
+            maxlen=ROLLING_STATS_WINDOW,
+        )
+        # Most recent _guardrail_check_and_log return dict; consumed by
+        # _emit_cycle_telemetry so the summary doesn't re-query the DB.
+        # None when the guardrail check hasn't run this cycle yet
+        # (early returns on kill-switch-active / no-market).
+        self._last_guard: dict | None = None
 
     # ── Startup ─────────────────────────────────────────────────────
 
@@ -268,11 +318,23 @@ class RewardFarmer:
                 f"{unwinds_recovered} unwind(s) recovered from offline orders"
             )
 
-        # Step 4: Cancel all remaining exchange orders
+        # Step 4: Cancel all remaining exchange orders. In non-LIVE
+        # modes, log intent instead of executing — SHADOW mode
+        # specifically must not cancel real orders even during
+        # startup reconciliation (spec §3.2). Stub-safe: getattr
+        # defaults to LIVE so unit-test fixtures (which call this
+        # method on a minimal Stub) still see the real cancel path.
+        mode = getattr(self, "mode", MODE_LIVE)
         if existing:
             cancelled = 0
             for order in existing:
                 oid = order.get("id", "")
+                if mode != MODE_LIVE:
+                    self._log_dry_run_intent(
+                        "cancel_order", order_id=oid,
+                        reason="startup_reconcile",
+                    )
+                    continue
                 try:
                     self.client.cancel(oid)
                     cancelled += 1
@@ -821,7 +883,7 @@ class RewardFarmer:
                     for side in ("yes", "no"):
                         slot = ms.orders[side]
                         if slot.order_id:
-                            self.order_lifecycle.cancel_order(slot.order_id, reason="not_in_allocation")
+                            self._gated_cancel_order(slot.order_id, reason="not_in_allocation")
                             self.db.delete_active_order(slot.order_id)
                             ms.orders[side] = OrderSlot()
             return
@@ -862,7 +924,7 @@ class RewardFarmer:
             for side in ["yes", "no"]:
                 oid = ms.orders[side].order_id
                 if oid:
-                    self.order_lifecycle.cancel_order(oid, reason="market_removed")
+                    self._gated_cancel_order(oid, reason="market_removed")
                     self.db.delete_active_order(oid)
                     ms.orders[side].order_id = None
             for side in ["yes", "no"]:
@@ -885,7 +947,7 @@ class RewardFarmer:
                     for side in ("yes", "no"):
                         slot = self.markets[cid].orders[side]
                         if slot.order_id:
-                            self.order_lifecycle.cancel_order(slot.order_id, reason="resize")
+                            self._gated_cancel_order(slot.order_id, reason="resize")
                             self.db.delete_active_order(slot.order_id)
                             self.markets[cid].orders[side] = OrderSlot()
             else:
@@ -939,18 +1001,28 @@ class RewardFarmer:
             if hours_to_expiry > 1.0:
                 continue
 
-            # Market expiring within 1 hour — cancel all orders
+            # Market expiring within 1 hour — cancel all orders.
+            # Use _gated_cancel_order so non-LIVE modes log intent
+            # instead of cancelling real orders (§3.2). Stub-safe:
+            # unit-test fixtures call _sweep_expiring_markets on a
+            # minimal FarmerStub that doesn't define _gated_cancel_order;
+            # the getattr fallback drops to the raw (mocked) cancel so
+            # those tests continue to pass.
+            _cancel = getattr(
+                self, "_gated_cancel_order",
+                self.order_lifecycle.cancel_order,
+            )
             for side in ("yes", "no"):
                 slot = ms.orders[side]
                 if slot.order_id:
-                    self.order_lifecycle.cancel_order(slot.order_id, reason="expiry_sweep")
+                    _cancel(slot.order_id, reason="expiry_sweep")
                     self.db.delete_active_order(slot.order_id)
                     ms.orders[side] = OrderSlot()
 
                 # Cancel dump orders too — no point selling into a resolving market
                 dump_oid = ms.dump_orders[side]
                 if dump_oid:
-                    self.order_lifecycle.cancel_order(dump_oid, reason="expiry_sweep")
+                    _cancel(dump_oid, reason="expiry_sweep")
                     self.db.delete_active_order(dump_oid)
                     ms.dump_orders[side] = None
                     ms.dump_state[side] = None
@@ -1244,7 +1316,7 @@ class RewardFarmer:
         }
         log.info(f"[GUARDRAIL] {json.dumps(tele, sort_keys=True)}")
 
-        return {
+        result = {
             "kill_switch": bool(kill_reasons),
             "kill_reason": "; ".join(kill_reasons),
             "notional_block": notional_block,
@@ -1255,7 +1327,12 @@ class RewardFarmer:
             "total_live_notional": total_live_notional,
             "notional_ratio": notional_ratio,
             "total_capital": total_capital,
+            "cf": cf,
+            "daily_loss": daily_loss,
         }
+        # Cached for the cycle-summary emitter so it doesn't re-query.
+        self._last_guard = result
+        return result
 
     def _activate_kill_switch(self, reason: str) -> None:
         """Atomic halt (spec §5.1): set flag → cancel every live order
@@ -1269,30 +1346,30 @@ class RewardFarmer:
         self._kill_switch_triggered_at = time.time()
 
         # 2. Cancel ALL live orders immediately (BUY slots + dump SELLs).
+        # All cancels go through _gated_cancel_order. Because
+        # _kill_switch_active is True (set in step 1 above), its
+        # force_execute path is taken and real cancels fire regardless
+        # of self.mode — spec §5.1 "kill switch ALWAYS executes real
+        # cancellations, IGNORE mode". The wrapper also increments
+        # _cycle_orders_cancelled internally.
         cancelled = 0
         for ms in list(self.markets.values()):
             for side in ("yes", "no"):
                 slot = ms.orders.get(side)
                 if slot and slot.order_id:
-                    try:
-                        if self.order_lifecycle.cancel_order(
-                            slot.order_id, reason="kill_switch",
-                        ):
-                            cancelled += 1
-                    except Exception as e:
-                        log.debug(f"[GUARDRAIL] cancel failed {slot.order_id}: {e}")
+                    if self._gated_cancel_order(
+                        slot.order_id, reason="kill_switch",
+                    ):
+                        cancelled += 1
                 dump_oid = (
                     ms.dump_orders.get(side)
                     if isinstance(ms.dump_orders, dict) else None
                 )
                 if dump_oid:
-                    try:
-                        if self.order_lifecycle.cancel_order(
-                            dump_oid, reason="kill_switch_dump",
-                        ):
-                            cancelled += 1
-                    except Exception as e:
-                        log.debug(f"[GUARDRAIL] dump-cancel failed {dump_oid}: {e}")
+                    if self._gated_cancel_order(
+                        dump_oid, reason="kill_switch_dump",
+                    ):
+                        cancelled += 1
 
         # 3. Log event (one loud line + one structured record).
         log.error(
@@ -1354,15 +1431,13 @@ class RewardFarmer:
         self, ms: "MarketState", side: str, slot: "OrderSlot", reason: str,
     ) -> bool:
         """Cancel + clear slot + delete DB entry. Matches the existing
-        expiry_sweep pattern. Returns True on successful cancel."""
+        expiry_sweep pattern. Returns True on successful cancel.
+        Intent logging + counter increment live inside
+        _gated_cancel_order."""
         oid = slot.order_id
         if not oid:
             return False
-        try:
-            ok = self.order_lifecycle.cancel_order(oid, reason=reason)
-        except Exception as e:
-            log.debug(f"[GUARDRAIL] cancel error {oid}: {e}")
-            return False
+        ok = self._gated_cancel_order(oid, reason=reason)
         if ok:
             try:
                 self.db.delete_active_order(oid)
@@ -1476,6 +1551,150 @@ class RewardFarmer:
             cancelled_total += cnt
         return cancelled_total
 
+    # ── Dry-run + cycle telemetry helpers ───────────────────────────
+    # Both are pure observability — they never change trading decisions.
+    # Fail-open: any logging exception is swallowed at DEBUG level.
+
+    def _log_dry_run_intent(self, action: str, **kv) -> None:
+        """Emit a `[DRY_RUN|SHADOW] <action> {…json…}` line when the
+        current mode is non-LIVE. Prefix is dynamic so DRY_RUN and
+        SHADOW are visually separable in logs. No-op in LIVE mode and
+        when self.mode is missing (stub fixtures default to LIVE)."""
+        mode = getattr(self, "mode", MODE_LIVE)
+        if mode == MODE_LIVE:
+            return
+        try:
+            log.info(f"[{mode}] {action} {json.dumps(kv, sort_keys=True)}")
+        except Exception as e:
+            log.debug(f"[{mode}] log emit failed ({action}): {e}")
+
+    def _gated_place_orders_for_market(self, ms) -> None:
+        """Mode-gated wrapper around OrderLifecycle.place_orders_for_market
+        (§4.2). In non-LIVE modes: emit structured intent log and return.
+        In LIVE: delegate + increment the cycle counter. Stub-safe: when
+        self.mode is missing (test fixtures), defaults to LIVE so the
+        delegated call still fires."""
+        mode = getattr(self, "mode", MODE_LIVE)
+        if mode != MODE_LIVE:
+            self._log_dry_run_intent(
+                "place_order", cid=ms.cid,
+                question=str(ms.question)[:40],
+            )
+            return
+        self.order_lifecycle.place_orders_for_market(ms)
+        try:
+            self._cycle_orders_placed += 1
+        except AttributeError:
+            pass
+
+    def _gated_cancel_order(self, order_id: str, reason: str = "") -> bool:
+        """Mode-gated wrapper around OrderLifecycle.cancel_order (§4.2)
+        with kill-switch override (§5.1). Returns True on successful
+        cancel, False when skipped or failed. Logic:
+
+            force_execute = self._kill_switch_active
+            if mode != LIVE and not force_execute:
+                log intent; return False
+            else:
+                execute cancel; increment counter
+
+        Kill-switch override: §5.1 requires real cancels whenever the
+        kill switch has been activated this cycle, even if the current
+        mode is DRY_RUN / SHADOW — capital protection trumps mode
+        safety. _activate_kill_switch sets the flag BEFORE looping
+        through cancels, so every cancel it issues hits the LIVE path.
+        Stub-safe defaults as in _gated_place_orders_for_market."""
+        if not order_id:
+            return False
+        mode = getattr(self, "mode", MODE_LIVE)
+        force_execute = bool(getattr(self, "_kill_switch_active", False))
+        if mode != MODE_LIVE and not force_execute:
+            self._log_dry_run_intent(
+                "cancel_order", order_id=order_id, reason=reason,
+            )
+            return False
+        try:
+            ok = bool(
+                self.order_lifecycle.cancel_order(order_id, reason=reason)
+            )
+        except Exception as e:
+            log.debug(f"[GATED] cancel error {order_id}: {e}")
+            return False
+        if ok:
+            try:
+                self._cycle_orders_cancelled += 1
+            except AttributeError:
+                pass
+        return ok
+
+    def _emit_cycle_telemetry(self) -> None:
+        """Emit one [CYCLE_SUMMARY] per run_cycle exit. Every
+        ROLLING_STATS_EMIT_EVERY cycles, also emit [ROLLING_STATS]
+        over the last ROLLING_STATS_WINDOW cycles. All arithmetic is
+        deterministic; fail-open on any logging error."""
+        try:
+            g = self._last_guard or {}
+            notional_ratio = g.get("notional_ratio")
+            cluster_notional_vals = g.get("cluster_notional") or {}
+            max_cluster = (
+                max(cluster_notional_vals.values())
+                if cluster_notional_vals else 0.0
+            )
+            summary = {
+                "cycle": self.cycle_count,
+                "ts": round(time.time(), 3),
+                "active_markets": len(g.get("live_by_cid") or {}),
+                "total_live_notional": round(
+                    float(g.get("total_live_notional") or 0.0), 2,
+                ),
+                "notional_ratio": (
+                    round(notional_ratio, 4)
+                    if notional_ratio is not None else None
+                ),
+                "max_cluster_notional": round(max_cluster, 2),
+                "cluster_count": len(cluster_notional_vals),
+                "blocked_clusters": len(g.get("blocked_clusters") or ()),
+                "orders_placed": self._cycle_orders_placed,
+                "orders_cancelled": self._cycle_orders_cancelled,
+                "kill_switch": bool(self._kill_switch_active),
+                "realized_loss_24h": g.get("daily_loss"),
+                "cf": g.get("cf"),
+            }
+            log.info(
+                f"[CYCLE_SUMMARY] {json.dumps(summary, sort_keys=True)}"
+            )
+
+            # Push this cycle's sample into the rolling window.
+            self._rolling_stats.append({
+                "notional_ratio": (
+                    float(notional_ratio) if notional_ratio is not None else 0.0
+                ),
+                "orders": self._cycle_orders_placed,
+                "cancels": self._cycle_orders_cancelled,
+            })
+
+            if (
+                self.cycle_count % ROLLING_STATS_EMIT_EVERY == 0
+                and self._rolling_stats
+            ):
+                n = len(self._rolling_stats)
+                ratios = [s["notional_ratio"] for s in self._rolling_stats]
+                stats = {
+                    "avg_notional_ratio": round(sum(ratios) / n, 4),
+                    "max_notional_ratio": round(max(ratios), 4),
+                    "avg_orders": round(
+                        sum(s["orders"] for s in self._rolling_stats) / n, 3,
+                    ),
+                    "avg_cancels": round(
+                        sum(s["cancels"] for s in self._rolling_stats) / n, 3,
+                    ),
+                }
+                log.info(
+                    f"[ROLLING_STATS] {json.dumps(stats, sort_keys=True)}"
+                )
+        except Exception as e:
+            log.debug(f"[CYCLE_SUMMARY] emit failed: {e}")
+
     # ── Core Cycle ──────────────────────────────────────────────────
 
     def run_cycle(self):
@@ -1483,6 +1702,12 @@ class RewardFarmer:
         self.cycle_count += 1
         self.order_lifecycle.cycle_count = self.cycle_count
         self.order_lifecycle.capital_ceiling = None
+
+        # Reset per-cycle observability counters + guard cache. These
+        # populate the [CYCLE_SUMMARY] emit at every run_cycle exit.
+        self._cycle_orders_placed = 0
+        self._cycle_orders_cancelled = 0
+        self._last_guard = None
 
         # Kill-switch short-circuit: if a prior cycle tripped the halt,
         # bail out immediately (no fills polled, no placements, no
@@ -1493,6 +1718,7 @@ class RewardFarmer:
                     f"[GUARDRAIL] kill switch ACTIVE: "
                     f"{self._kill_switch_reason} — skipping cycle"
                 )
+            self._emit_cycle_telemetry()
             return
 
         # Step 1: Fetch exchange orders
@@ -1503,6 +1729,7 @@ class RewardFarmer:
                 exchange_orders = self.client.get_orders() or []
             except Exception as e:
                 log.error(f"get_orders failed: {e}")
+                self._emit_cycle_telemetry()
                 return
             open_ids = {o["id"] for o in exchange_orders}
 
@@ -1553,6 +1780,7 @@ class RewardFarmer:
         # Step 4: Place orders on priority batch
         market_list = list(self.markets.values())
         if not market_list:
+            self._emit_cycle_telemetry()
             return
 
         # Step 4pre: runtime safety guardrails. Runs AFTER allocation
@@ -1563,6 +1791,7 @@ class RewardFarmer:
             # Atomic halt: activate (flag → cancel → log) → return.
             # Nothing after this executes in the killed cycle.
             self._activate_kill_switch(guard["kill_reason"])
+            self._emit_cycle_telemetry()
             return
 
         # Hard enforcement: cancel lowest-priority orders to bring
@@ -1602,7 +1831,10 @@ class RewardFarmer:
                 if cl is not None and cl in blocked_clusters:
                     skipped_cluster += 1
                     continue
-                self.order_lifecycle.place_orders_for_market(ms)
+                # _gated_place_orders_for_market logs [DRY_RUN|SHADOW]
+                # intent and skips real execution in non-LIVE modes;
+                # counter lives inside the wrapper.
+                self._gated_place_orders_for_market(ms)
             if skipped_cluster and self.cycle_count % 10 == 0:
                 log.warning(
                     f"[GUARDRAIL] skipped {skipped_cluster} placement(s) in "
@@ -1622,7 +1854,7 @@ class RewardFarmer:
             for side in ["yes", "no"]:
                 oid = ms.orders[side].order_id
                 if oid:
-                    self.order_lifecycle.cancel_order(oid, reason="dead_market")
+                    self._gated_cancel_order(oid, reason="dead_market")
                     self.db.delete_active_order(oid)
             del self.markets[cid]
 
@@ -1687,6 +1919,10 @@ class RewardFarmer:
                     self.db.log_scoring_snapshot(scoring_data)
             except Exception as e:
                 log.debug(f"Phase0 scoring snapshot failed: {e}")
+
+        # Natural end of run_cycle → emit cycle telemetry + (every 10th
+        # cycle) rolling stats. Every early-return path above emits too.
+        self._emit_cycle_telemetry()
 
     # ── Main Loop ───────────────────────────────────────────────────
 
@@ -1811,10 +2047,10 @@ class RewardFarmer:
             for side in ["yes", "no"]:
                 oid = ms.orders[side].order_id
                 if oid and oid != "dry_yes" and oid != "dry_no":
-                    self.order_lifecycle.cancel_order(oid, reason="shutdown")
+                    self._gated_cancel_order(oid, reason="shutdown")
                 dump_oid = ms.dump_orders[side]
                 if dump_oid:
-                    self.order_lifecycle.cancel_order(dump_oid, reason="shutdown_dump")
+                    self._gated_cancel_order(dump_oid, reason="shutdown_dump")
         self.rewards._save()
         log.info("All orders cancelled. Shutdown complete.")
 
@@ -1834,19 +2070,28 @@ def parse_duration(s: str) -> int:
 
 def main():
     parser = argparse.ArgumentParser(description="Reward Farmer — Polymarket LP reward farming bot")
-    parser.add_argument("--dry-run", action="store_true", help="Log only, no real orders")
+    # Execution mode: staged deployment DRY_RUN → SHADOW → LIVE. Default
+    # is `dry` so running with no flags never sends real orders.
+    parser.add_argument(
+        "--mode", choices=("dry", "shadow", "live"), default="dry",
+        help="dry: no API calls (default); shadow: reads only, no writes; "
+             "live: full execution",
+    )
     parser.add_argument("--duration", default="0", help="Run duration (e.g. 10m, 1h, 6h). 0 = indefinite")
     args = parser.parse_args()
 
     duration = parse_duration(args.duration) if args.duration != "0" else 0
 
+    mode_map = {"dry": MODE_DRY_RUN, "shadow": MODE_SHADOW, "live": MODE_LIVE}
+    mode = mode_map[args.mode]
+
     log.info("Reward Farmer starting")
-    log.info(f"  Dry run: {args.dry_run}")
+    log.info(f"  Mode: {mode}")
     log.info(f"  Duration: {'indefinite' if duration == 0 else f'{duration}s'}")
     log.info(f"  Strategy: {SHARES_PER_SIDE()}sh/side, {PLACEMENT_TICKS_INSIDE()} tick inside edge")
     log.info(f"  Markets: max {MAX_MARKETS()}, rate >= ${MIN_DAILY_RATE()}/d, liq < ${MAX_LIQUIDITY()}")
 
-    bot = RewardFarmer(dry_run=args.dry_run)
+    bot = RewardFarmer(mode=mode)
     bot.run(duration_secs=duration)
 
 
