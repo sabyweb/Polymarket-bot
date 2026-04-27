@@ -31,6 +31,13 @@ from models import OrderSlot, MarketState
 from market_discovery import fetch_all_reward_markets, get_merged_book
 from order_lifecycle import OrderLifecycle
 from dump_manager import DumpManager
+# Oversight integration (final safety layer): the farmer calls
+# `oversight_agent.evaluate(guard)` once per cycle, after the guardrail
+# computation and before the placement decision. The contract is
+# `{"action": "continue"|"pause"|"kill", "reason": str}`. The evaluator
+# is optional — if `oversight_agent.evaluate` is absent or raises, the
+# farmer fails open ("continue") via the try/except in run_cycle.
+import oversight_agent
 
 # Config accessors (hot-reloadable)
 def SHARES_PER_SIDE(): return cfg("RF_SHARES_PER_SIDE")
@@ -1787,6 +1794,39 @@ class RewardFarmer:
         # (already consumed by market filtering upstream) and BEFORE
         # new placements. Emits structured telemetry every cycle.
         guard = self._guardrail_check_and_log()
+
+        # Oversight evaluation (final safety layer, §3 of spec). Runs
+        # after guardrail computation and before any placement decision.
+        # Decision contract: {"action": "continue"|"pause"|"kill",
+        # "reason": str}. Failure-safety (§9): any exception or
+        # malformed return collapses to "continue". `decision` is
+        # cycle-local — never persisted on self.
+        try:
+            decision = oversight_agent.evaluate(guard)
+        except Exception as e:
+            log.warning("[OVERSIGHT_WARNING] evaluation failed: %s", e)
+            decision = {"action": "continue", "reason": "error"}
+        if not isinstance(decision, dict):
+            decision = {"action": "continue", "reason": "invalid"}
+
+        # Oversight kill (§6) — fires BEFORE the existing guard kill so
+        # an oversight-driven halt isn't masked by a coincident guard
+        # signal. Same atomic ordering as _activate_kill_switch (flag →
+        # cancel → log) plus telemetry-once invariant: emit then return.
+        if decision.get("action") == "kill":
+            self._activate_kill_switch(reason="oversight")
+            self._emit_cycle_telemetry()
+            return
+
+        # Periodic oversight log (§8) — every 10th cycle, after
+        # evaluation and before the placement block. No new telemetry
+        # event; log.info only.
+        if self.cycle_count % 10 == 0:
+            log.info(
+                "[OVERSIGHT] action=%s reason=%s",
+                decision.get("action"), decision.get("reason"),
+            )
+
         if guard["kill_switch"]:
             # Atomic halt: activate (flag → cancel → log) → return.
             # Nothing after this executes in the killed cycle.
@@ -1815,6 +1855,16 @@ class RewardFarmer:
             remaining = self._fill_storm_until - time.time()
             if self.cycle_count % 10 == 0:  # log every ~5min
                 log.warning(f"Fill storm halt active — {remaining:.0f}s remaining, skipping placements")
+        elif decision.get("action") == "pause":
+            # Oversight pause (§7) — skip placements only. Existing
+            # cycle work (fills, dumps, hard enforcement, telemetry)
+            # already ran above; the natural-end emit at the bottom of
+            # run_cycle covers [CYCLE_SUMMARY] for this cycle.
+            if self.cycle_count % 10 == 0:
+                log.warning(
+                    "[OVERSIGHT] placements skipped: %s",
+                    decision.get("reason"),
+                )
         elif guard["notional_block"]:
             if self.cycle_count % 10 == 0:
                 log.warning(
