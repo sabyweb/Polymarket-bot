@@ -97,6 +97,11 @@ VALID_MODES  = (MODE_DRY_RUN, MODE_SHADOW, MODE_LIVE)
 DEFAULT_MODE = MODE_DRY_RUN
 ROLLING_STATS_WINDOW = 100               # cycles retained for rolling averages
 ROLLING_STATS_EMIT_EVERY = 10            # emit [ROLLING_STATS] every N cycles
+OVERSIGHT_LATENCY_WARN_MS = 50           # warn when oversight_agent.evaluate
+                                         # exceeds this wall-time per cycle.
+                                         # Synchronous integration — slow
+                                         # evaluators block the 30 s farmer
+                                         # cycle, so this surfaces it loudly.
 
 
 class RewardFarmer:
@@ -1795,37 +1800,66 @@ class RewardFarmer:
         # new placements. Emits structured telemetry every cycle.
         guard = self._guardrail_check_and_log()
 
-        # Oversight evaluation (final safety layer, §3 of spec). Runs
-        # after guardrail computation and before any placement decision.
-        # Decision contract: {"action": "continue"|"pause"|"kill",
-        # "reason": str}. Failure-safety (§9): any exception or
-        # malformed return collapses to "continue". `decision` is
+        # Oversight evaluation (final safety layer). Single deterministic
+        # call per cycle. hasattr() distinguishes "function not yet
+        # implemented" (silent fallback to continue) from "function
+        # exists but raised" (loud log.error). Decision contract:
+        # {"action": "continue"|"pause"|"kill", "reason": str}.
+        # `decision` / `action` / `reason` / `latency_ms` are all
         # cycle-local — never persisted on self.
-        try:
-            decision = oversight_agent.evaluate(guard)
-        except Exception as e:
-            log.warning("[OVERSIGHT_WARNING] evaluation failed: %s", e)
-            decision = {"action": "continue", "reason": "error"}
-        if not isinstance(decision, dict):
-            decision = {"action": "continue", "reason": "invalid"}
+        start = time.time()
+        missing_evaluate = not hasattr(oversight_agent, "evaluate")
+        if missing_evaluate:
+            decision = {"action": "continue", "reason": "not_implemented"}
+        else:
+            try:
+                decision = oversight_agent.evaluate(guard)
+            except Exception as e:
+                log.error("[OVERSIGHT_ERROR] evaluation failed: %s", e)
+                decision = {"action": "continue", "reason": "error"}
+        latency_ms = (time.time() - start) * 1000.0
 
-        # Oversight kill (§6) — fires BEFORE the existing guard kill so
-        # an oversight-driven halt isn't masked by a coincident guard
+        # Strict decision validation. action restricted to the contract's
+        # three values; reason normalised to str and truncated to 200
+        # chars to bound log volume from a misbehaving evaluator.
+        if not isinstance(decision, dict):
+            log.error(
+                "[OVERSIGHT_ERROR] invalid decision type: %s", type(decision),
+            )
+            action = "continue"
+            reason = "invalid"
+        else:
+            action = decision.get("action")
+            reason = decision.get("reason", "")
+            if action not in ("continue", "pause", "kill"):
+                log.error("[OVERSIGHT_ERROR] invalid action: %s", action)
+                action = "continue"
+                reason = "invalid"
+        reason = str(reason)[:200]
+
+        if latency_ms > OVERSIGHT_LATENCY_WARN_MS:
+            log.warning(
+                "[OVERSIGHT_WARNING] slow evaluation: %.2fms > %dms",
+                latency_ms,
+                OVERSIGHT_LATENCY_WARN_MS,
+            )
+
+        # Decision log every cycle (full auditability — no throttle).
+        log.info(
+            "[OVERSIGHT] action=%s reason=%s latency_ms=%.2f",
+            action,
+            reason,
+            latency_ms,
+        )
+
+        # Oversight kill — fires BEFORE the existing guard kill so an
+        # oversight-driven halt isn't masked by a coincident guard
         # signal. Same atomic ordering as _activate_kill_switch (flag →
         # cancel → log) plus telemetry-once invariant: emit then return.
-        if decision.get("action") == "kill":
-            self._activate_kill_switch(reason="oversight")
+        if action == "kill":
+            self._activate_kill_switch(reason="oversight:" + reason)
             self._emit_cycle_telemetry()
             return
-
-        # Periodic oversight log (§8) — every 10th cycle, after
-        # evaluation and before the placement block. No new telemetry
-        # event; log.info only.
-        if self.cycle_count % 10 == 0:
-            log.info(
-                "[OVERSIGHT] action=%s reason=%s",
-                decision.get("action"), decision.get("reason"),
-            )
 
         if guard["kill_switch"]:
             # Atomic halt: activate (flag → cancel → log) → return.
@@ -1855,22 +1889,18 @@ class RewardFarmer:
             remaining = self._fill_storm_until - time.time()
             if self.cycle_count % 10 == 0:  # log every ~5min
                 log.warning(f"Fill storm halt active — {remaining:.0f}s remaining, skipping placements")
-        elif decision.get("action") == "pause":
-            # Oversight pause (§7) — skip placements only. Existing
-            # cycle work (fills, dumps, hard enforcement, telemetry)
-            # already ran above; the natural-end emit at the bottom of
-            # run_cycle covers [CYCLE_SUMMARY] for this cycle.
-            if self.cycle_count % 10 == 0:
-                log.warning(
-                    "[OVERSIGHT] placements skipped: %s",
-                    decision.get("reason"),
-                )
         elif guard["notional_block"]:
             if self.cycle_count % 10 == 0:
                 log.warning(
                     f"[GUARDRAIL] notional_ratio > {MAX_NOTIONAL_RATIO} — "
                     f"blocking ALL new placements this cycle"
                 )
+        elif action == "pause":
+            # Oversight pause — skip placements only. Existing cycle
+            # work (fills, dumps, hard enforcement, telemetry) already
+            # ran above; the natural-end emit at the bottom of
+            # run_cycle covers [CYCLE_SUMMARY] for this cycle.
+            log.warning("[OVERSIGHT] placements skipped: %s", reason)
         else:
             batch = self.order_lifecycle.get_priority_batch(market_list)
             blocked_clusters = guard["blocked_clusters"]
