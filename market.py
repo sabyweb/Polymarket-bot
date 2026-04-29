@@ -52,6 +52,113 @@ def get_client() -> ClobClient:
     )
 
 
+# ── V2 endpoint compatibility helpers ────────────────────────────────────────
+# Background:
+#   1. /rewards/markets/current is currently HTTP 500 with PG statement timeout
+#      (since CLOB V2 cutover on 2026-04-28). Endpoint URL is canonical per V2
+#      docs but the backend is unhealthy. Fallback: /sampling-markets returns
+#      reward params nested differently — see _v2_sampling_to_v1_flat below.
+#   2. Gamma /markets `offset` pagination was deprecated 2026-04-10 in favour
+#      of /markets/keyset cursor pagination. Offset still works but will be
+#      rejected at some future date — see _gamma_paginated_keyset below.
+
+def _v2_sampling_to_v1_flat(m: dict) -> dict | None:
+    """Translate a /sampling-markets V2 item into the V1
+    /rewards/markets/current flat shape that downstream code expects.
+
+    Returns None for markets without rewards (caller should skip).
+
+    V2 nested shape:
+        {"rewards": {"rates": [{"rewards_daily_rate": N, ...}],
+                     "min_size": M, "max_spread": S},
+         "condition_id": ..., "tokens": [...], "end_date_iso": ...,
+         "game_start_time": ..., "question": ..., "minimum_tick_size": ...,
+         "active": ..., "accepting_orders": ..., "neg_risk": ...}
+
+    V1 flat shape (what downstream reads):
+        {"condition_id": ..., "total_daily_rate": N,
+         "rewards_min_size": M, "rewards_max_spread": S, ...}
+
+    `total_daily_rate` aggregates across all `rates[]` entries to capture
+    sponsored + native rewards in a single number, matching V1 semantics.
+    """
+    rewards = m.get("rewards")
+    if not isinstance(rewards, dict):
+        return None
+    rates = rewards.get("rates") or []
+    total_daily_rate = sum(
+        float(r.get("rewards_daily_rate") or 0)
+        for r in rates if isinstance(r, dict)
+    )
+    return {
+        "condition_id": m.get("condition_id", ""),
+        "total_daily_rate": total_daily_rate,
+        "rewards_min_size": float(rewards.get("min_size") or 0),
+        "rewards_max_spread": float(rewards.get("max_spread") or 0),
+        # V2 passthrough fields — not on V1 /rewards/markets/current but
+        # available on /sampling-markets, useful when Gamma cross-ref misses:
+        "tokens": m.get("tokens", []),
+        "end_date_iso": m.get("end_date_iso"),
+        "game_start_time": m.get("game_start_time", "") or "",
+        "minimum_tick_size": m.get("minimum_tick_size"),
+        "minimum_order_size": m.get("minimum_order_size"),
+        "question": m.get("question", ""),
+        "active": m.get("active", True),
+        "accepting_orders": m.get("accepting_orders", True),
+        "neg_risk": m.get("neg_risk", False),
+    }
+
+
+def _gamma_paginated_keyset(
+    extra_params: dict | None = None,
+    max_pages: int = 100,
+    page_size: int = 100,
+) -> list[dict]:
+    """Paginate Gamma's /markets/keyset endpoint. Returns concatenated
+    'markets' lists across pages.
+
+    Replaces offset-based pagination (deprecated 2026-04-10).
+
+    Response shape from /markets/keyset:
+        {"markets": [...], "next_cursor": "<base64>"}
+
+    Pagination terminates when either (a) the response has no markets,
+    (b) next_cursor is empty/missing, or (c) max_pages is reached.
+    """
+    url = f"{GAMMA_API}/markets/keyset"
+    all_markets: list[dict] = []
+    cursor = ""
+    base_params = dict(extra_params) if extra_params else {}
+    base_params.setdefault("limit", page_size)
+    for _ in range(max_pages):
+        params = dict(base_params)
+        if cursor:
+            params["next_cursor"] = cursor
+        try:
+            response = requests.get(url, params=params, timeout=20)
+            response.raise_for_status()
+            data = response.json()
+        except Exception as e:
+            log.debug(f"Gamma keyset fetch error (cursor={cursor[:20]}): {e}")
+            break
+        if not isinstance(data, dict):
+            break
+        markets = data.get("markets") or []
+        if not markets:
+            break
+        next_cursor = data.get("next_cursor") or ""
+        # Stuck-cursor detection: a misbehaving server returning the same
+        # cursor we just used would loop forever — break BEFORE appending
+        # the duplicate page so the result stays consistent.
+        if next_cursor and next_cursor == cursor:
+            break
+        all_markets.extend(markets)
+        if not next_cursor:
+            break
+        cursor = next_cursor
+    return all_markets
+
+
 # ── Fetching ─────────────────────────────────────────────────────────────────
 def fetch_all_rewards_markets() -> list[dict]:
     """Paginate through Gamma API and return all markets with active rewards.
@@ -59,59 +166,108 @@ def fetch_all_rewards_markets() -> list[dict]:
     Returns:
         List of raw market dicts that have a positive daily reward rate.
     """
-    url = f"{GAMMA_API}/markets"
+    # Pagination: Gamma `offset` was deprecated 2026-04-10 in favour of
+    # /markets/keyset cursor pagination. Top-50-by-volume sample is enough
+    # to find a representative rewards-bearing slice; bound max_pages.
     page_size = 100
-    offset = 0
-    max_offset = 50  # Only scan top 50 markets by volume
+    max_pages = 1   # 1 page × 100 = top 100 by volume — was max_offset=50
     all_rewards: list[dict] = []
 
-    log.info("Paginating through all Gamma API markets...")
+    log.info("Paginating through Gamma /markets/keyset (top by volume24hr)...")
 
-    while True:
-        params = {
+    pages = _gamma_paginated_keyset(
+        extra_params={
             "active": "true",
             "closed": "false",
             "archived": "false",
             "enableOrderBook": "true",
-            "limit": page_size,
-            "offset": offset,
             "order": "volume24hr",
             "ascending": "false",
-        }
-        try:
-            response = requests.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            page = response.json()
-        except Exception as e:
-            log.error(f"Error fetching page at offset {offset}: {e}")
-            break
-
-        if not page:
-            break
-
-        for market in page:
-            clob_rewards = market.get("clobRewards", [])
-            if isinstance(clob_rewards, list) and len(clob_rewards) > 0:
-                daily_rate = float(clob_rewards[0].get("rewardsDailyRate") or 0)
-                if daily_rate > 0:
-                    all_rewards.append(market)
-
-        log.info(
-            f"  Offset {offset}: fetched {len(page)} markets | "
-            f"cumulative rewards markets: {len(all_rewards)}"
-        )
-
-        if len(page) < page_size:
-            break
-
-        offset += page_size
-
-        if offset >= max_offset:
-            log.info(f"Reached max offset {max_offset} — stopping pagination")
-            break
+            "limit": page_size,
+        },
+        max_pages=max_pages,
+        page_size=page_size,
+    )
+    if not pages:
+        log.warning("Gamma /markets/keyset returned 0 markets")
+    for market in pages:
+        clob_rewards = market.get("clobRewards", [])
+        if isinstance(clob_rewards, list) and len(clob_rewards) > 0:
+            daily_rate = float(clob_rewards[0].get("rewardsDailyRate") or 0)
+            if daily_rate > 0:
+                all_rewards.append(market)
+    log.info(
+        f"  Fetched {len(pages)} markets | "
+        f"cumulative rewards markets: {len(all_rewards)}"
+    )
 
     log.info(f"Total rewards markets found: {len(all_rewards)}")
     return all_rewards
+
+
+def _fetch_v2_sampling_rewards_params() -> dict[str, dict]:
+    """V2 fallback for fetch_clob_rewards_params: pulls /sampling-markets via
+    the authenticated SDK and translates the nested rewards object into the
+    flat {min_size, max_spread} shape callers expect.
+
+    Used when /rewards/markets/current returns 5xx or empty (currently the
+    case post-2026-04-28 cutover due to PG statement timeout backend issue).
+
+    Documented limitation: /sampling-markets does NOT include all the
+    high-reward "championship-winner"-style markets visible in the rewards
+    UI. Coverage is ~5,000 markets — sufficient for normal operation but
+    misses some top-tier opportunities while the primary endpoint is broken.
+    """
+    try:
+        from py_clob_client_v2.client import ClobClient
+        from py_clob_client_v2.clob_types import ApiCreds, BuilderConfig
+    except Exception as e:
+        log.warning(f"V2 SDK import failed: {e}")
+        return {}
+
+    try:
+        creds = ApiCreds(
+            api_key=CLOB_API_KEY,
+            api_secret=CLOB_SECRET,
+            api_passphrase=CLOB_PASS_PHRASE,
+        )
+        client = ClobClient(
+            host=HOST, key=PRIVATE_KEY, chain_id=CHAIN_ID,
+            creds=creds, signature_type=SIGNATURE_TYPE, funder=FUNDER,
+            builder_config=BuilderConfig(builder_code=BUILDER_CODE)
+            if BUILDER_CODE else None,
+        )
+        all_items: list[dict] = []
+        cursor = "MA=="
+        for _ in range(20):
+            resp = client.get_sampling_markets(next_cursor=cursor)
+            items = resp.get("data", []) if isinstance(resp, dict) else []
+            all_items.extend(items)
+            cursor = resp.get("next_cursor", "") if isinstance(resp, dict) else ""
+            if not cursor or cursor == "LTE=":
+                break
+    except Exception as e:
+        log.warning(f"V2 /sampling-markets fallback failed: {e}")
+        return {}
+
+    result: dict[str, dict] = {}
+    for m in all_items:
+        flat = _v2_sampling_to_v1_flat(m)
+        if flat is None:
+            continue
+        cid = flat["condition_id"]
+        if not cid:
+            continue
+        # max_spread comes as cents (4.5 = 4.5c) — convert to price units
+        result[cid] = {
+            "min_size": flat["rewards_min_size"] or 5,
+            "max_spread": (flat["rewards_max_spread"] or 3.0) / 100.0,
+        }
+    log.warning(
+        f"[V2_FALLBACK] /rewards/markets/current unavailable; using "
+        f"/sampling-markets — {len(result)} reward params loaded"
+    )
+    return result
 
 
 def fetch_clob_rewards_params() -> dict[str, dict]:
@@ -125,11 +281,17 @@ def fetch_clob_rewards_params() -> dict[str, dict]:
         Dict keyed by condition_id (hex string) with values:
             {"min_size": float, "max_spread": float}
         max_spread is converted from cents to price units (4.5 → 0.045).
+
+    V2 fallback: when the primary endpoint is unhealthy (HTTP 5xx or empty
+    data — see PG-timeout outage starting 2026-04-28), falls back to
+    /sampling-markets via the V2 SDK. Resumes primary on next call once
+    the endpoint recovers.
     """
     global _clob_rewards_cache
     url = f"{HOST}/rewards/markets/current"
     result: dict[str, dict] = {}
     cursor = None
+    primary_failed = False
 
     try:
         while True:
@@ -154,18 +316,32 @@ def fetch_clob_rewards_params() -> dict[str, dict]:
                 result[cid] = {"min_size": min_size, "max_spread": max_spread}
 
             cursor = data.get("next_cursor") if isinstance(data, dict) else None
-            if not cursor or len(items) == 0:
+            # "LTE=" is Polymarket's terminal cursor sentinel — must break
+            # explicitly or we loop forever against the same end-of-stream page.
+            if not cursor or cursor == "LTE=" or len(items) == 0:
                 break
 
         log.info(f"Fetched CLOB rewards params for {len(result)} markets")
-        _clob_rewards_cache = result
-        return result
 
     except Exception as e:
         log.warning(f"Could not fetch CLOB rewards params: {e}")
-        if result:
-            _clob_rewards_cache = result
-        return _clob_rewards_cache
+        primary_failed = True
+
+    # V2 fallback: trigger when primary errored OR returned no data.
+    if primary_failed or not result:
+        fallback = _fetch_v2_sampling_rewards_params()
+        if fallback:
+            result = fallback
+        elif _clob_rewards_cache:
+            log.info(
+                "Both primary and V2 fallback empty — using last cached "
+                f"result ({len(_clob_rewards_cache)} markets)"
+            )
+            return _clob_rewards_cache
+
+    if result:
+        _clob_rewards_cache = result
+    return result
 
 
 # ── Parsers ──────────────────────────────────────────────────────────────────

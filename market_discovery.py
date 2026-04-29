@@ -90,7 +90,16 @@ def verify_order_books(markets: list[dict]) -> list[dict]:
 
 
 def fetch_all_reward_markets() -> list[dict]:
-    """Fetch ALL reward markets from CLOB endpoint + Gamma details."""
+    """Fetch ALL reward markets from CLOB endpoint + Gamma details.
+
+    Has two V2-compat fallbacks:
+      1. CLOB rewards: if /rewards/markets/current returns 5xx or empty
+         (post-2026-04-28 PG-timeout outage), fall back to /sampling-markets
+         via authenticated V2 SDK. Translated into V1-flat shape via
+         market._v2_sampling_to_v1_flat.
+      2. Gamma pagination: uses /markets/keyset (post-2026-04-10
+         deprecation of `offset` parameter) via market._gamma_paginated_keyset.
+    """
     log.info("  Fetching CLOB rewards (authoritative source)...")
     clob_markets = []
     cursor = ""
@@ -115,22 +124,46 @@ def fetch_all_reward_markets() -> list[dict]:
             break
     log.info(f"  CLOB: {len(clob_markets)} reward markets")
 
-    log.info("  Fetching Gamma market details...")
-    gamma_all = []
-    for offset in range(0, 10000, 100):
+    # V2 fallback: when /rewards/markets/current is unhealthy or empty,
+    # fetch /sampling-markets via the V2 SDK and translate to V1 shape.
+    if not clob_markets:
         try:
-            resp = requests.get(
-                "https://gamma-api.polymarket.com/markets",
-                params={"limit": 100, "offset": offset, "closed": "false"},
-                timeout=15,
+            from market import _v2_sampling_to_v1_flat, get_client
+            client = get_client()
+            sampling_items: list[dict] = []
+            sm_cursor = "MA=="
+            for _ in range(20):
+                resp = client.get_sampling_markets(next_cursor=sm_cursor)
+                items = resp.get("data", []) if isinstance(resp, dict) else []
+                sampling_items.extend(items)
+                sm_cursor = (
+                    resp.get("next_cursor", "")
+                    if isinstance(resp, dict) else ""
+                )
+                if not sm_cursor or sm_cursor == "LTE=":
+                    break
+            for raw in sampling_items:
+                flat = _v2_sampling_to_v1_flat(raw)
+                if flat is None:
+                    continue
+                if not flat.get("accepting_orders", True):
+                    continue
+                clob_markets.append(flat)
+            log.warning(
+                f"  [V2_FALLBACK] /rewards/markets/current empty/5xx — "
+                f"used /sampling-markets, got {len(clob_markets)} markets "
+                f"(may miss championship-style top-tier reward markets)"
             )
-            batch = resp.json()
         except Exception as e:
-            log.debug(f"  Gamma fetch failed at offset {offset}: {e}")
-            break
-        if not batch:
-            break
-        gamma_all.extend(batch)
+            log.warning(f"  V2 /sampling-markets fallback failed: {e}")
+
+    log.info("  Fetching Gamma market details (keyset pagination)...")
+    from market import _gamma_paginated_keyset
+    gamma_all = _gamma_paginated_keyset(
+        extra_params={"closed": "false", "limit": 100},
+        max_pages=100,
+        page_size=100,
+    )
     log.info(f"  Gamma: {len(gamma_all)} markets")
 
     gamma_by_cid = {m.get("conditionId", ""): m for m in gamma_all}

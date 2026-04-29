@@ -260,18 +260,25 @@ def _fetch_reward_market_expiries(condition_ids: list[str] | None = None,
         log.info(f"Expiry: {len(result)} from cache, 0 to fetch")
         return result
 
-    # Step 1: Bulk fetch from Gamma (fast, covers most markets)
+    # Step 1: Bulk fetch from Gamma (fast, covers most markets).
+    # Uses keyset pagination — `offset` was deprecated 2026-04-10.
     gamma_fetched: dict[str, str] = {}
     try:
-        for offset in range(0, 10000, 100):
+        cursor = ""
+        for _ in range(100):
+            params = {"limit": 100, "closed": "false"}
+            if cursor:
+                params["next_cursor"] = cursor
             resp = requests.get(
-                "https://gamma-api.polymarket.com/markets",
-                params={"limit": 100, "offset": offset, "closed": "false"},
-                timeout=15,
+                "https://gamma-api.polymarket.com/markets/keyset",
+                params=params, timeout=15,
             )
             if resp.status_code != 200:
                 break
-            batch = resp.json()
+            data = resp.json()
+            if not isinstance(data, dict):
+                break
+            batch = data.get("markets") or []
             if not batch:
                 break
             for m in batch:
@@ -279,6 +286,10 @@ def _fetch_reward_market_expiries(condition_ids: list[str] | None = None,
                 end_date = m.get("endDateIso") or m.get("end_date_iso", "")
                 if cid and end_date:
                     gamma_fetched[cid] = end_date
+            next_cursor = data.get("next_cursor") or ""
+            if not next_cursor or next_cursor == cursor:
+                break
+            cursor = next_cursor
     except Exception as e:
         log.debug(f"Gamma expiry fetch failed: {e}")
 

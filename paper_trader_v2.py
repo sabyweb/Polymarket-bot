@@ -752,20 +752,31 @@ def fetch_all_reward_markets() -> list[dict]:
     # Step 2: Fetch ALL Gamma markets for details (paginated, up to 10K)
     # Weather/temperature markets are beyond offset 2000, need full coverage
     log.info("  Fetching Gamma market details...")
+    # Gamma keyset pagination — `offset` was deprecated 2026-04-10.
     gamma_all = []
-    for offset in range(0, 10000, 100):
+    cursor = ""
+    for _ in range(100):
         try:
+            params = {"limit": 100, "closed": "false"}
+            if cursor:
+                params["next_cursor"] = cursor
             resp = requests.get(
-                "https://gamma-api.polymarket.com/markets",
-                params={"limit": 100, "offset": offset, "closed": "false"},
-                timeout=15,
+                "https://gamma-api.polymarket.com/markets/keyset",
+                params=params, timeout=15,
             )
-            batch = resp.json()
+            data = resp.json()
         except Exception:
             break
+        if not isinstance(data, dict):
+            break
+        batch = data.get("markets") or []
         if not batch:
             break
         gamma_all.extend(batch)
+        next_cursor = data.get("next_cursor") or ""
+        if not next_cursor or next_cursor == cursor:
+            break
+        cursor = next_cursor
     log.info(f"  Gamma: {len(gamma_all)} markets")
 
     gamma_by_cid = {m.get("conditionId", ""): m for m in gamma_all}
