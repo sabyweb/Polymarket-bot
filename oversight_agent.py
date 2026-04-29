@@ -14,6 +14,7 @@ Usage:
 """
 
 import argparse
+import collections
 import logging
 import os
 import signal
@@ -571,3 +572,218 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Oversight evaluation hook (v5.1 — SHADOW mode)
+# ══════════════════════════════════════════════════════════════════════
+# Called once per farmer cycle from reward_farmer.run_cycle.
+# Spec: see Polymarket bot architecture v5.1.md §4.21.
+# Invariants honoured: synchronous, no DB, no HTTP, no threads, no raise.
+#
+# STAGE 1 — SHADOW: this implementation NEVER returns pause/kill. All
+# triggered conditions are logged via [OVERSIGHT_SHADOW] for offline
+# review. evaluate() returns {"action": "continue", "reason": "shadow"}
+# unconditionally. Promoting to live control is a follow-up patch that
+# flips _SHADOW_ONLY = False and selectively activates pause/kill.
+
+_SHADOW_ONLY = True
+
+# Ring buffer length: 30 snapshots ≈ 15 min at 30 s cadence. Bounds the
+# longest detector window (10-cycle CF trajectory) with headroom.
+_HISTORY_LEN = 30
+_GUARD_HISTORY: collections.deque = collections.deque(maxlen=_HISTORY_LEN)
+
+# Signal A — notional drift (avg ratio over last N cycles)
+_NOTIONAL_DRIFT_WINDOW = 5
+_NOTIONAL_DRIFT_THRESHOLD = 1.8
+
+# Signal B — cluster breadth (≥ M blocked clusters for N consecutive cycles)
+_CLUSTER_BREADTH_WINDOW = 3
+_CLUSTER_BREADTH_MIN_BLOCKED = 2
+
+# Signal C — CF soft-zone persistence (cf in band for N consecutive cycles)
+_CF_SOFT_LO = 0.01
+_CF_SOFT_HI = 0.03
+_CF_SOFT_WINDOW = 5
+
+# Signal D — cancel pressure (avg cancels > K × avg places, sustained N cycles)
+# Per design decision: kill-switch cancels are NOT filtered out. Oversight
+# reads what the system did, not why; if a kill happens and the process
+# continues, an extra pause signal is benign.
+_CANCEL_PRESSURE_WINDOW = 6
+_CANCEL_PRESSURE_RATIO = 2.0
+_CANCEL_PRESSURE_MIN_PLACES = 1   # avoid div-by-zero / single-cycle false positives
+
+# Signal E — CF trajectory collapse (would_kill)
+_CF_TRAJECTORY_WINDOW = 10
+_CF_TRAJECTORY_DROP_PCT = 0.50
+
+# Signal F — slow bleed (daily_loss > frac·T sustained N cycles)
+_SLOW_BLEED_WINDOW = 6
+_SLOW_BLEED_LOSS_FRAC = 0.05
+
+
+def _snapshot(guard: dict) -> dict:
+    """Reduce a guard dict to the minimal fields the detectors need.
+    Keeps the ring buffer small and avoids retaining cluster/live dicts."""
+    live_by_cid = guard.get("live_by_cid") or {}
+    blocked = guard.get("blocked_clusters") or set()
+    return {
+        "ts": time.time(),
+        "notional_ratio": guard.get("notional_ratio"),
+        "cf": guard.get("cf"),
+        "daily_loss": guard.get("daily_loss"),
+        "total_capital": guard.get("total_capital"),
+        "blocked_count": len(blocked),
+        "deployed_count": sum(1 for v in live_by_cid.values() if (v or 0) > 0),
+        "orders_placed": int(guard.get("orders_placed_prev_cycle", 0) or 0),
+        "orders_cancelled": int(guard.get("orders_cancelled_prev_cycle", 0) or 0),
+    }
+
+
+def _signal_notional_drift() -> tuple:
+    """A — avg(notional_ratio) over last N cycles ≥ threshold."""
+    if len(_GUARD_HISTORY) < _NOTIONAL_DRIFT_WINDOW:
+        return False, None, "insufficient_history"
+    window = list(_GUARD_HISTORY)[-_NOTIONAL_DRIFT_WINDOW:]
+    vals = [s["notional_ratio"] for s in window if s["notional_ratio"] is not None]
+    if len(vals) < _NOTIONAL_DRIFT_WINDOW:
+        return False, None, "missing_data"
+    avg = sum(vals) / len(vals)
+    return avg >= _NOTIONAL_DRIFT_THRESHOLD, avg, "ok"
+
+
+def _signal_cluster_breadth() -> tuple:
+    """B — blocked_count ≥ min on every one of the last N cycles."""
+    if len(_GUARD_HISTORY) < _CLUSTER_BREADTH_WINDOW:
+        return False, None, "insufficient_history"
+    window = list(_GUARD_HISTORY)[-_CLUSTER_BREADTH_WINDOW:]
+    counts = [s["blocked_count"] for s in window]
+    triggered = all(c >= _CLUSTER_BREADTH_MIN_BLOCKED for c in counts)
+    return triggered, max(counts), "ok"
+
+
+def _signal_cf_soft_zone() -> tuple:
+    """C — cf in [_CF_SOFT_LO, _CF_SOFT_HI] on every one of last N cycles."""
+    if len(_GUARD_HISTORY) < _CF_SOFT_WINDOW:
+        return False, None, "insufficient_history"
+    window = list(_GUARD_HISTORY)[-_CF_SOFT_WINDOW:]
+    cfs = [s["cf"] for s in window]
+    if any(cf is None for cf in cfs):
+        return False, None, "missing_data"
+    triggered = all(_CF_SOFT_LO <= cf <= _CF_SOFT_HI for cf in cfs)
+    return triggered, sum(cfs) / len(cfs), "ok"
+
+
+def _signal_cancel_pressure() -> tuple:
+    """D — avg(cancels) ≥ ratio × avg(places) over last N cycles."""
+    if len(_GUARD_HISTORY) < _CANCEL_PRESSURE_WINDOW:
+        return False, None, "insufficient_history"
+    window = list(_GUARD_HISTORY)[-_CANCEL_PRESSURE_WINDOW:]
+    avg_places = sum(s["orders_placed"] for s in window) / len(window)
+    avg_cancels = sum(s["orders_cancelled"] for s in window) / len(window)
+    if avg_places < _CANCEL_PRESSURE_MIN_PLACES:
+        return False, None, "insufficient_activity"
+    ratio = avg_cancels / avg_places
+    return ratio >= _CANCEL_PRESSURE_RATIO, ratio, "ok"
+
+
+def _signal_cf_trajectory() -> tuple:
+    """E — cf has dropped ≥ pct from cycle-now-minus-N to cycle-now,
+    AND deployed_count is declining over the same window."""
+    if len(_GUARD_HISTORY) < _CF_TRAJECTORY_WINDOW:
+        return False, None, "insufficient_history"
+    window = list(_GUARD_HISTORY)[-_CF_TRAJECTORY_WINDOW:]
+    cf_first = window[0]["cf"]
+    cf_last = window[-1]["cf"]
+    if cf_first is None or cf_last is None or cf_first <= 0:
+        return False, None, "missing_data"
+    drop = (cf_first - cf_last) / cf_first
+    deployed_first = window[0]["deployed_count"]
+    deployed_last = window[-1]["deployed_count"]
+    declining = deployed_last < deployed_first
+    triggered = drop >= _CF_TRAJECTORY_DROP_PCT and declining
+    return triggered, drop, "ok"
+
+
+def _signal_slow_bleed() -> tuple:
+    """F — daily_loss > frac·total_capital on every one of last N cycles."""
+    if len(_GUARD_HISTORY) < _SLOW_BLEED_WINDOW:
+        return False, None, "insufficient_history"
+    window = list(_GUARD_HISTORY)[-_SLOW_BLEED_WINDOW:]
+    fracs = []
+    for s in window:
+        loss, cap = s["daily_loss"], s["total_capital"]
+        if loss is None or cap is None or cap <= 0:
+            return False, None, "missing_data"
+        fracs.append(loss / cap)
+    triggered = all(f > _SLOW_BLEED_LOSS_FRAC for f in fracs)
+    return triggered, max(fracs), "ok"
+
+
+_SIGNALS = (
+    ("notional_drift",   _signal_notional_drift,   "would_pause"),
+    ("cluster_breadth",  _signal_cluster_breadth,  "would_pause"),
+    ("cf_soft_zone",     _signal_cf_soft_zone,     "would_pause"),
+    ("cancel_pressure",  _signal_cancel_pressure,  "would_pause"),
+    ("slow_bleed",       _signal_slow_bleed,       "would_pause"),
+    ("cf_trajectory",    _signal_cf_trajectory,    "would_kill"),
+)
+
+
+def _fmt(v) -> str:
+    if v is None:
+        return "None"
+    if isinstance(v, float):
+        return f"{v:.4f}"
+    return str(v)
+
+
+def _check_signals_and_log(guard: dict) -> None:
+    """Run all six detectors. Emit one [OVERSIGHT_SHADOW] line per
+    triggered signal + one summary line if any fired."""
+    fired_pause = []
+    fired_kill = []
+    for name, fn, kind in _SIGNALS:
+        triggered, value, status = fn()
+        if triggered:
+            log.warning(
+                "[OVERSIGHT_SHADOW] signal=%s value=%s window_status=%s "
+                "kind=%s triggered=True",
+                name, _fmt(value), status, kind,
+            )
+            (fired_kill if kind == "would_kill" else fired_pause).append(name)
+        elif status not in ("ok", "insufficient_history"):
+            # Missing data / insufficient activity — log once so we can
+            # count gap-frequency in the validation log review.
+            log.info(
+                "[OVERSIGHT_SHADOW] signal=%s status=%s triggered=False",
+                name, status,
+            )
+    if fired_pause or fired_kill:
+        log.warning(
+            "[OVERSIGHT_SHADOW] would_pause=%s would_kill=%s "
+            "pause_reasons=%s kill_reasons=%s",
+            bool(fired_pause), bool(fired_kill),
+            ",".join(fired_pause) or "-",
+            ",".join(fired_kill) or "-",
+        )
+
+
+def evaluate(guard: dict) -> dict:
+    """Oversight evaluation hook. See architecture doc §4.21.
+
+    SHADOW STAGE 1: always returns {"action": "continue", "reason": "shadow"}.
+    Triggered signals are logged at [OVERSIGHT_SHADOW] for offline review.
+    """
+    try:
+        _GUARD_HISTORY.append(_snapshot(guard))
+        _check_signals_and_log(guard)
+    except Exception as e:
+        # Defence in depth — the caller in reward_farmer.run_cycle
+        # already wraps this in try/except, but we never want a shadow
+        # bug to surface as [OVERSIGHT_ERROR] noise on the operator's
+        # dashboard.
+        log.error("[OVERSIGHT_SHADOW_ERROR] internal: %s", e)
+    return {"action": "continue", "reason": "shadow"}

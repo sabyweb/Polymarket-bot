@@ -1328,6 +1328,10 @@ class RewardFarmer:
         }
         log.info(f"[GUARDRAIL] {json.dumps(tele, sort_keys=True)}")
 
+        # Previous-cycle order/cancel counters from the rolling-stats deque
+        # so the oversight shadow evaluator can compute cancel-pressure
+        # (signal D, §4.21). Empty on the first cycle; falls back to 0.
+        prev_stat = self._rolling_stats[-1] if self._rolling_stats else {}
         result = {
             "kill_switch": bool(kill_reasons),
             "kill_reason": "; ".join(kill_reasons),
@@ -1341,6 +1345,8 @@ class RewardFarmer:
             "total_capital": total_capital,
             "cf": cf,
             "daily_loss": daily_loss,
+            "orders_placed_prev_cycle": int(prev_stat.get("orders", 0) or 0),
+            "orders_cancelled_prev_cycle": int(prev_stat.get("cancels", 0) or 0),
         }
         # Cached for the cycle-summary emitter so it doesn't re-query.
         self._last_guard = result
