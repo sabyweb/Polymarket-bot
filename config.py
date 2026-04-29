@@ -24,6 +24,12 @@ CLOB_PASS_PHRASE: str | None = os.getenv("CLOB_PASS_PHRASE")
 FUNDER: str | None = os.getenv("FUNDER")
 SIGNATURE_TYPE: int = 2  # 2 = POLY_GNOSIS_SAFE for Polymarket proxy wallet
 
+# Builder code (bytes32, public) for builder-fee attribution. Pasted from
+# https://polymarket.com/settings?tab=builder. The V2 SDK auto-injects
+# this on every order via BuilderConfig (see ClobClient construction
+# sites). Set to "" to disable builder attribution.
+BUILDER_CODE: str = "0x3669771781fd877ef7e97e494c46157aaeb863e6c60c417441d6e0c17d66ff6f"
+
 HOST: str = "https://clob.polymarket.com"
 CHAIN_ID: int = 137  # Polygon mainnet
 
@@ -313,7 +319,7 @@ OVERRIDES_FILE: str = os.path.join(os.path.dirname(__file__), "config_overrides.
 _IMMUTABLE: frozenset = frozenset({
     "PRIVATE_KEY", "WALLET_ADDRESS", "CLOB_API_KEY", "CLOB_SECRET",
     "CLOB_PASS_PHRASE", "FUNDER", "SIGNATURE_TYPE", "HOST", "CHAIN_ID",
-    "GAMMA_API", "DISCORD_WEBHOOK_URL",
+    "BUILDER_CODE", "GAMMA_API", "DISCORD_WEBHOOK_URL",
 })
 
 

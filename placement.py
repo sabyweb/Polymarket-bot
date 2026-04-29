@@ -7,8 +7,8 @@ dry-run support.
 
 import logging
 import time as _time
-from py_clob_client.clob_types import OrderArgs
-from py_clob_client.order_builder.constants import BUY
+from py_clob_client_v2.clob_types import OrderArgs
+from py_clob_client_v2.order_builder.constants import BUY
 import config
 from config import DRY_RUN  # truly immutable at runtime
 from alerts import alert_order_failure, log_order_placed

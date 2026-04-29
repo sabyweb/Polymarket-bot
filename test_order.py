@@ -11,16 +11,16 @@ Usage:
 
 import time
 import logging
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import (
-    ApiCreds, OrderArgs, BalanceAllowanceParams, AssetType,
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.clob_types import (
+    ApiCreds, OrderArgs, BalanceAllowanceParams, AssetType, BuilderConfig,
 )
-from py_clob_client.order_builder.constants import BUY
+from py_clob_client_v2.order_builder.constants import BUY
 
 from config import (
     HOST, CHAIN_ID, PRIVATE_KEY,
     CLOB_API_KEY, CLOB_SECRET, CLOB_PASS_PHRASE,
-    FUNDER, SIGNATURE_TYPE,
+    FUNDER, SIGNATURE_TYPE, BUILDER_CODE,
 )
 from market import get_rewards_markets
 
@@ -43,6 +43,7 @@ def main() -> None:
         creds=creds,
         signature_type=SIGNATURE_TYPE,
         funder=FUNDER,
+        builder_config=BuilderConfig(builder_code=BUILDER_CODE) if BUILDER_CODE else None,
     )
     print("Connected to CLOB API")
     print(f"FUNDER:          {FUNDER}")
@@ -149,7 +150,9 @@ def main() -> None:
     if exchange_order_id:
         print(f"Cancelling order {exchange_order_id}...")
         try:
-            result = client.cancel(exchange_order_id)
+            # V2 SDK: cancel_order takes an OrderPayload, not a bare string.
+            from py_clob_client_v2.clob_types import OrderPayload
+            result = client.cancel_order(OrderPayload(orderID=exchange_order_id))
             if isinstance(result, dict) and result.get("canceled"):
                 print(f"  Order cancelled successfully!")
             else:

@@ -302,8 +302,8 @@ def _place_edge_order(session, market, book_cache, shares_per_side):
     # Place YES bid
     if not orders.get("yes_oid"):
         try:
-            from py_clob_client.clob_types import OrderArgs
-            from py_clob_client.order_builder.constants import BUY
+            from py_clob_client_v2.clob_types import OrderArgs
+            from py_clob_client_v2.order_builder.constants import BUY
             resp = pc.create_and_post_order(
                 OrderArgs(token_id=yes_tid, price=edge_bid, size=float(yes_shares), side=BUY)
             )
@@ -325,8 +325,8 @@ def _place_edge_order(session, market, book_cache, shares_per_side):
     # Place NO ask
     if not orders.get("no_oid"):
         try:
-            from py_clob_client.clob_types import OrderArgs
-            from py_clob_client.order_builder.constants import BUY
+            from py_clob_client_v2.clob_types import OrderArgs
+            from py_clob_client_v2.order_builder.constants import BUY
             resp = pc.create_and_post_order(
                 OrderArgs(token_id=no_tid, price=no_clob, size=float(no_shares), side=BUY)
             )
@@ -643,14 +643,18 @@ def parse_duration(s: str) -> int:
 def create_real_client():
     from config import (
         CLOB_API_KEY, CLOB_SECRET, CLOB_PASS_PHRASE,
-        HOST, PRIVATE_KEY, CHAIN_ID, SIGNATURE_TYPE, FUNDER,
+        HOST, PRIVATE_KEY, CHAIN_ID, SIGNATURE_TYPE, FUNDER, BUILDER_CODE,
     )
-    from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import ApiCreds
+    from py_clob_client_v2.client import ClobClient
+    from py_clob_client_v2.clob_types import ApiCreds, BuilderConfig
     from rate_limiter import RateLimitedClient
 
     creds = ApiCreds(api_key=CLOB_API_KEY, api_secret=CLOB_SECRET, api_passphrase=CLOB_PASS_PHRASE)
-    raw = ClobClient(HOST, key=PRIVATE_KEY, chain_id=CHAIN_ID, signature_type=SIGNATURE_TYPE, funder=FUNDER, creds=creds)
+    raw = ClobClient(
+        HOST, key=PRIVATE_KEY, chain_id=CHAIN_ID,
+        signature_type=SIGNATURE_TYPE, funder=FUNDER, creds=creds,
+        builder_config=BuilderConfig(builder_code=BUILDER_CODE) if BUILDER_CODE else None,
+    )
     return RateLimitedClient(raw)
 
 

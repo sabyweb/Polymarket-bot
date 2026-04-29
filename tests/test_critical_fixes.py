@@ -247,11 +247,11 @@ class TestDumpUnknownThreshold(unittest.TestCase):
 
 
 def _ensure_clob_types_mock():
-    """Ensure py_clob_client.clob_types is importable (mocked if missing)."""
-    if "py_clob_client" not in sys.modules:
+    """Ensure py_clob_client_v2.clob_types is importable (mocked if missing)."""
+    if "py_clob_client_v2" not in sys.modules:
         mock_clob = MagicMock()
-        sys.modules["py_clob_client"] = mock_clob
-        sys.modules["py_clob_client.clob_types"] = mock_clob.clob_types
+        sys.modules["py_clob_client_v2"] = mock_clob
+        sys.modules["py_clob_client_v2.clob_types"] = mock_clob.clob_types
 
 
 class TestDumpPhantomFillGuard(unittest.TestCase):

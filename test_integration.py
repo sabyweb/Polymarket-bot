@@ -1,7 +1,7 @@
 """
 Integration tests for the Polymarket market-making bot.
 
-Mocks py_clob_client and simulates full trading cycles:
+Mocks py_clob_client_v2 and simulates full trading cycles:
   - Place BUY → fill detected → position recorded → halt triggered
   - Unwind SELL placed → decay → filled → position reduced → resume
   - Cancel failure → order stays tracked
@@ -23,17 +23,17 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import logging
 logging.basicConfig(level=logging.WARNING)
 
-# Mock py_clob_client before importing order_manager (not installed in test env)
+# Mock py_clob_client_v2 before importing order_manager (not installed in test env)
 try:
-    import py_clob_client  # noqa: F401
+    import py_clob_client_v2  # noqa: F401
 except ImportError:
     from unittest.mock import MagicMock as _MM
     _clob = _MM()
-    sys.modules["py_clob_client"] = _clob
-    sys.modules["py_clob_client.client"] = _clob.client
-    sys.modules["py_clob_client.clob_types"] = _clob.clob_types
-    sys.modules["py_clob_client.order_builder"] = _clob.order_builder
-    sys.modules["py_clob_client.order_builder.constants"] = _clob.order_builder.constants
+    sys.modules["py_clob_client_v2"] = _clob
+    sys.modules["py_clob_client_v2.client"] = _clob.client
+    sys.modules["py_clob_client_v2.clob_types"] = _clob.clob_types
+    sys.modules["py_clob_client_v2.order_builder"] = _clob.order_builder
+    sys.modules["py_clob_client_v2.order_builder.constants"] = _clob.order_builder.constants
 
 from order_manager import TrackedOrder, UnwindOrder
 

@@ -16,13 +16,13 @@ from unittest.mock import MagicMock, patch, PropertyMock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Mock py_clob_client before importing order_lifecycle
-if "py_clob_client" not in sys.modules:
+# Mock py_clob_client_v2 before importing order_lifecycle
+if "py_clob_client_v2" not in sys.modules:
     mock_clob = MagicMock()
-    sys.modules["py_clob_client"] = mock_clob
-    sys.modules["py_clob_client.clob_types"] = mock_clob.clob_types
-    sys.modules["py_clob_client.order_builder"] = mock_clob.order_builder
-    sys.modules["py_clob_client.order_builder.constants"] = mock_clob.order_builder.constants
+    sys.modules["py_clob_client_v2"] = mock_clob
+    sys.modules["py_clob_client_v2.clob_types"] = mock_clob.clob_types
+    sys.modules["py_clob_client_v2.order_builder"] = mock_clob.order_builder
+    sys.modules["py_clob_client_v2.order_builder.constants"] = mock_clob.order_builder.constants
     mock_clob.order_builder.constants.BUY = "BUY"
     mock_clob.order_builder.constants.SELL = "SELL"
 
@@ -127,7 +127,7 @@ class TestStaleOrderCheck(unittest.TestCase):
         ol._check_stale_order(ms, "yes", ms.orders["yes"])
 
         # Order should be cancelled
-        ol.client.cancel.assert_called_once_with("oid_partial")
+        ol.client.cancel_order.assert_called_once()
         ol.db.delete_active_order.assert_called_with("oid_partial")
 
         # Slot should be cleared
@@ -157,7 +157,7 @@ class TestStaleOrderCheck(unittest.TestCase):
         ol._check_stale_order(ms, "yes", ms.orders["yes"])
 
         # Order cancelled and slot cleared
-        ol.client.cancel.assert_called_once_with("oid_full")
+        ol.client.cancel_order.assert_called_once()
         self.assertIsNone(ms.orders["yes"].order_id)
 
     def test_stale_check_api_error_backoff(self):
@@ -247,7 +247,7 @@ class TestDetectFillsIntegration(unittest.TestCase):
         # get_order was called (stale check triggered)
         ol.client.get_order.assert_called_once_with("oid_live")
         # Order was cancelled (partial fill detected)
-        ol.client.cancel.assert_called_once()
+        ol.client.cancel_order.assert_called_once()
         self.assertIsNone(ms.orders["yes"].order_id)
 
     def test_order_not_in_open_ids_uses_normal_path(self):

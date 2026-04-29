@@ -20,15 +20,15 @@ from models import MarketState, OrderSlot
 from config import SPORTS_KEYWORDS
 
 
-# ── py_clob_client mock (not installed in test env) ──────────────────────────
+# ── py_clob_client_v2 mock (not installed in test env) ──────────────────────────
 def _ensure_clob_types_mock():
-    """Mock py_clob_client so order_lifecycle can import OrderArgs/BUY."""
-    if "py_clob_client" not in sys.modules:
+    """Mock py_clob_client_v2 so order_lifecycle can import OrderArgs/BUY."""
+    if "py_clob_client_v2" not in sys.modules:
         mock_clob = MagicMock()
-        sys.modules["py_clob_client"] = mock_clob
-        sys.modules["py_clob_client.clob_types"] = mock_clob.clob_types
-        sys.modules["py_clob_client.order_builder"] = mock_clob.order_builder
-        sys.modules["py_clob_client.order_builder.constants"] = mock_clob.order_builder.constants
+        sys.modules["py_clob_client_v2"] = mock_clob
+        sys.modules["py_clob_client_v2.clob_types"] = mock_clob.clob_types
+        sys.modules["py_clob_client_v2.order_builder"] = mock_clob.order_builder
+        sys.modules["py_clob_client_v2.order_builder.constants"] = mock_clob.order_builder.constants
         # BUY constant needs to be a string
         mock_clob.order_builder.constants.BUY = "BUY"
         mock_clob.order_builder.constants.SELL = "SELL"

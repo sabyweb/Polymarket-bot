@@ -60,7 +60,7 @@ class DumpManager:
                         phantom = False
                         if actual_matched > 0:
                             try:
-                                from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+                                from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
                                 tid = ms.yes_tid if side == "yes" else ms.no_tid
                                 bal = self.client.get_balance_allowance(
                                     BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=tid)
@@ -177,7 +177,7 @@ class DumpManager:
             return
 
         try:
-            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
             for tid in [ms.yes_tid, ms.no_tid]:
                 self.client.update_balance_allowance(
                     BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=tid)
@@ -227,8 +227,8 @@ class DumpManager:
         T+5m to T+30m: passive mode (reprice to merged book every 5m)
         T+30m: abandon
         """
-        from py_clob_client.clob_types import OrderArgs
-        from py_clob_client.order_builder.constants import SELL
+        from py_clob_client_v2.clob_types import OrderArgs
+        from py_clob_client_v2.order_builder.constants import SELL
 
         tid = ms.yes_tid if side == "yes" else ms.no_tid
         tick = ms.tick_size
@@ -239,7 +239,7 @@ class DumpManager:
             return
 
         try:
-            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
             try:
                 bal = self.client.get_balance_allowance(
                     BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=tid)

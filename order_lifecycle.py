@@ -42,11 +42,15 @@ class OrderLifecycle:
         self._batch_idx = 0
 
     def cancel_order(self, order_id: str, reason: str = "") -> bool:
-        """Cancel an order on the exchange. Returns True on success."""
+        """Cancel an order on the exchange. Returns True on success.
+
+        V2 SDK: cancel_order takes an OrderPayload, not a bare string.
+        """
         if self.dry_run:
             return True
         try:
-            self.client.cancel(order_id)
+            from py_clob_client_v2.clob_types import OrderPayload
+            self.client.cancel_order(OrderPayload(orderID=order_id))
             log.debug(f"Cancelled {order_id[:16]} ({reason})")
             return True
         except Exception as e:
@@ -188,8 +192,8 @@ class OrderLifecycle:
 
     def place_orders_for_market(self, ms: MarketState):
         """Fetch book + place edge orders for one market."""
-        from py_clob_client.clob_types import OrderArgs
-        from py_clob_client.order_builder.constants import BUY
+        from py_clob_client_v2.clob_types import OrderArgs
+        from py_clob_client_v2.order_builder.constants import BUY
 
         # Skip book fetch if both sides already have orders — saves 2 API calls.
         # Still fetch if a book refresh is due (every 5 min) so repricing and
@@ -512,7 +516,7 @@ class OrderLifecycle:
         stays in sync.
         """
         try:
-            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
             tid = ms.yes_tid if side == "yes" else ms.no_tid
             bal = self.client.get_balance_allowance(
                 BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=tid)

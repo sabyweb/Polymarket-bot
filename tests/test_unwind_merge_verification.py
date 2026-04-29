@@ -18,14 +18,14 @@ from unittest.mock import MagicMock, patch, PropertyMock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Mock py_clob_client before importing
-if "py_clob_client" not in sys.modules:
+# Mock py_clob_client_v2 before importing
+if "py_clob_client_v2" not in sys.modules:
     mock_clob = MagicMock()
-    sys.modules["py_clob_client"] = mock_clob
-    sys.modules["py_clob_client.clob_types"] = mock_clob.clob_types
-    sys.modules["py_clob_client.client"] = mock_clob.client
-    sys.modules["py_clob_client.order_builder"] = mock_clob.order_builder
-    sys.modules["py_clob_client.order_builder.constants"] = mock_clob.order_builder.constants
+    sys.modules["py_clob_client_v2"] = mock_clob
+    sys.modules["py_clob_client_v2.clob_types"] = mock_clob.clob_types
+    sys.modules["py_clob_client_v2.client"] = mock_clob.client
+    sys.modules["py_clob_client_v2.order_builder"] = mock_clob.order_builder
+    sys.modules["py_clob_client_v2.order_builder.constants"] = mock_clob.order_builder.constants
     mock_clob.order_builder.constants.BUY = "BUY"
     mock_clob.order_builder.constants.SELL = "SELL"
 

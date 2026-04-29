@@ -1,4 +1,4 @@
-py-clob-client==0.34.6
+py-clob-client-v2==1.0.0
 requests==2.32.5
 python-dotenv==1.2.2
 web3==7.14.1

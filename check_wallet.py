@@ -1,9 +1,11 @@
 """
 Diagnostic script to verify wallet setup before trading.
 
-Checks FUNDER contract type, USDC.e balances, on-chain allowances,
-CTF approvals, and CLOB API-side balance/allowance status.  Run this
-before starting the bot to catch misconfigurations early.
+Checks FUNDER contract type, pUSD (V2 collateral) and legacy USDC.e
+balances, on-chain allowances against the V2 Exchange / V2 NegRisk
+Exchange / V2 NegRisk Adapter, CTF approvals, and CLOB API-side
+balance/allowance status.  Run this before starting the bot to catch
+misconfigurations early.
 
 Usage:
     python check_wallet.py
@@ -13,13 +15,13 @@ from web3 import Web3
 from dotenv import load_dotenv
 import os
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds, BalanceAllowanceParams, AssetType
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.clob_types import ApiCreds, BalanceAllowanceParams, AssetType, BuilderConfig
 
 from config import (
     HOST, CHAIN_ID, PRIVATE_KEY,
     CLOB_API_KEY, CLOB_SECRET, CLOB_PASS_PHRASE,
-    FUNDER, SIGNATURE_TYPE, WALLET_ADDRESS,
+    FUNDER, SIGNATURE_TYPE, BUILDER_CODE, WALLET_ADDRESS,
 )
 
 load_dotenv()
@@ -29,11 +31,14 @@ RPC_URL = "https://polygon-mainnet.g.alchemy.com/v2/" + os.getenv(
     "ALCHEMY_KEY", "alfo528x9kBrHK0G5JSfF"
 )
 
-# Polymarket contract addresses on Polygon
-USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+# Polymarket V2 contract addresses on Polygon (post-2026-04-28 cutover).
+# pUSD replaces USDC.e as the collateral token; CTF address is unchanged.
+PUSD_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"   # V2 collateral
+USDC_E_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # legacy (pre-V2)
 CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
-EXCHANGE_ADDRESS = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
-NEG_RISK_ADDRESS = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
+EXCHANGE_ADDRESS = "0xE111180000d2663C0091e4f400237545B87B996B"     # V2 Exchange
+NEG_RISK_ADDRESS = "0xe2222d279d744050d28e00520010520000310F59"     # V2 NegRisk Exchange
+NEG_RISK_ADAPTER_ADDRESS = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"  # V2 NegRisk Adapter
 
 # Minimal ABIs for read-only calls
 ERC20_ABI = [
@@ -79,14 +84,14 @@ def fmt_allowance(value: int) -> str:
         value: Raw uint256 allowance from the contract.
 
     Returns:
-        Formatted string like "UNLIMITED (MAX_INT)" or "123.45 USDC".
+        Formatted string like "UNLIMITED (MAX_INT)" or "123.45 pUSD".
     """
     if value >= MAX_INT:
         return "UNLIMITED (MAX_INT)"
     elif value == 0:
         return "0 (NOT SET)"
     else:
-        return f"{value / 1e6:.2f} USDC"
+        return f"{value / 1e6:.2f} pUSD"
 
 
 def main() -> None:
@@ -119,51 +124,66 @@ def main() -> None:
         print("   -> FUNDER is an EOA, SIGNATURE_TYPE should be 0")
     print()
 
-    # ── 2. Check USDC.e balances ─────────────────────────────────────────────
-    usdc = w3.eth.contract(
-        address=Web3.to_checksum_address(USDC_ADDRESS), abi=ERC20_ABI
+    # ── 2. Check pUSD balances (V2) + legacy USDC.e balances ─────────────────
+    pusd = w3.eth.contract(
+        address=Web3.to_checksum_address(PUSD_ADDRESS), abi=ERC20_ABI
+    )
+    usdc_e = w3.eth.contract(
+        address=Web3.to_checksum_address(USDC_E_ADDRESS), abi=ERC20_ABI
     )
 
-    funder_balance = usdc.functions.balanceOf(funder_addr).call()
-    eoa_balance = usdc.functions.balanceOf(eoa_addr).call()
+    funder_pusd = pusd.functions.balanceOf(funder_addr).call()
+    eoa_pusd = pusd.functions.balanceOf(eoa_addr).call()
+    funder_usdc_e = usdc_e.functions.balanceOf(funder_addr).call()
+    eoa_usdc_e = usdc_e.functions.balanceOf(eoa_addr).call()
 
+    funder_balance = funder_pusd  # used in summary block below
     print(f"{'=' * 60}")
-    print(f"2. USDC.e BALANCES (token: {USDC_ADDRESS})")
-    print(f"   FUNDER balance:  ${funder_balance / 1e6:.2f}")
-    print(f"   EOA balance:     ${eoa_balance / 1e6:.2f}")
-    if funder_balance == 0:
-        print("   WARNING: FUNDER has no USDC.e! Check if funds are in native USDC.")
+    print(f"2. COLLATERAL BALANCES")
+    print(f"   pUSD (V2,  {PUSD_ADDRESS}):")
+    print(f"     FUNDER:  ${funder_pusd / 1e6:.2f}")
+    print(f"     EOA:     ${eoa_pusd / 1e6:.2f}")
+    print(f"   USDC.e (legacy, {USDC_E_ADDRESS}):")
+    print(f"     FUNDER:  ${funder_usdc_e / 1e6:.2f}")
+    print(f"     EOA:     ${eoa_usdc_e / 1e6:.2f}")
+    if funder_pusd == 0 and funder_usdc_e == 0:
+        print("   NOTE: FUNDER has no pUSD and no USDC.e. Either the wallet is unfunded "
+              "or funds are elsewhere.")
     print()
 
-    # ── 3. Check USDC.e allowances FROM FUNDER ───────────────────────────────
-    funder_to_exchange = usdc.functions.allowance(
+    # ── 3. pUSD allowances FROM FUNDER on V2 contracts ───────────────────────
+    funder_to_exchange = pusd.functions.allowance(
         funder_addr, Web3.to_checksum_address(EXCHANGE_ADDRESS)
     ).call()
-    funder_to_negrisk = usdc.functions.allowance(
+    funder_to_negrisk = pusd.functions.allowance(
         funder_addr, Web3.to_checksum_address(NEG_RISK_ADDRESS)
+    ).call()
+    funder_to_negrisk_adapter = pusd.functions.allowance(
+        funder_addr, Web3.to_checksum_address(NEG_RISK_ADAPTER_ADDRESS)
     ).call()
 
     print(f"{'=' * 60}")
-    print("3. USDC.e ALLOWANCES FROM FUNDER (proxy wallet)")
-    print(f"   FUNDER -> Exchange:  {fmt_allowance(funder_to_exchange)}")
-    print(f"   FUNDER -> Neg Risk:  {fmt_allowance(funder_to_negrisk)}")
-    if funder_to_exchange == 0 or funder_to_negrisk == 0:
+    print("3. pUSD ALLOWANCES FROM FUNDER (proxy wallet) — V2 contracts")
+    print(f"   FUNDER -> V2 Exchange:           {fmt_allowance(funder_to_exchange)}")
+    print(f"   FUNDER -> V2 Neg Risk Exchange:  {fmt_allowance(funder_to_negrisk)}")
+    print(f"   FUNDER -> V2 Neg Risk Adapter:   {fmt_allowance(funder_to_negrisk_adapter)}")
+    if funder_to_exchange == 0 or funder_to_negrisk == 0 or funder_to_negrisk_adapter == 0:
         print("   PROBLEM: Allowances from FUNDER are not set!")
-        print("   -> Run the updated set_allowances.py to fix this.")
+        print("   -> Run set_allowances.py.")
     print()
 
-    # ── 4. Check USDC.e allowances FROM EOA ──────────────────────────────────
-    eoa_to_exchange = usdc.functions.allowance(
+    # ── 4. pUSD allowances FROM EOA on V2 contracts ──────────────────────────
+    eoa_to_exchange = pusd.functions.allowance(
         eoa_addr, Web3.to_checksum_address(EXCHANGE_ADDRESS)
     ).call()
-    eoa_to_negrisk = usdc.functions.allowance(
+    eoa_to_negrisk = pusd.functions.allowance(
         eoa_addr, Web3.to_checksum_address(NEG_RISK_ADDRESS)
     ).call()
 
     print(f"{'=' * 60}")
-    print("4. USDC.e ALLOWANCES FROM EOA")
-    print(f"   EOA -> Exchange:  {fmt_allowance(eoa_to_exchange)}")
-    print(f"   EOA -> Neg Risk:  {fmt_allowance(eoa_to_negrisk)}")
+    print("4. pUSD ALLOWANCES FROM EOA — V2 contracts")
+    print(f"   EOA -> V2 Exchange:           {fmt_allowance(eoa_to_exchange)}")
+    print(f"   EOA -> V2 Neg Risk Exchange:  {fmt_allowance(eoa_to_negrisk)}")
     print()
 
     # ── 5. Check CTF approvals ───────────────────────────────────────────────
@@ -177,6 +197,9 @@ def main() -> None:
     funder_ctf_negrisk = ctf.functions.isApprovedForAll(
         funder_addr, Web3.to_checksum_address(NEG_RISK_ADDRESS)
     ).call()
+    funder_ctf_negrisk_adapter = ctf.functions.isApprovedForAll(
+        funder_addr, Web3.to_checksum_address(NEG_RISK_ADAPTER_ADDRESS)
+    ).call()
     eoa_ctf_exchange = ctf.functions.isApprovedForAll(
         eoa_addr, Web3.to_checksum_address(EXCHANGE_ADDRESS)
     ).call()
@@ -185,11 +208,12 @@ def main() -> None:
     ).call()
 
     print(f"{'=' * 60}")
-    print("5. CTF (ERC1155) APPROVALS")
-    print(f"   FUNDER -> Exchange:  {funder_ctf_exchange}")
-    print(f"   FUNDER -> Neg Risk:  {funder_ctf_negrisk}")
-    print(f"   EOA -> Exchange:     {eoa_ctf_exchange}")
-    print(f"   EOA -> Neg Risk:     {eoa_ctf_negrisk}")
+    print("5. CTF (ERC1155) APPROVALS — V2 contracts")
+    print(f"   FUNDER -> V2 Exchange:           {funder_ctf_exchange}")
+    print(f"   FUNDER -> V2 Neg Risk Exchange:  {funder_ctf_negrisk}")
+    print(f"   FUNDER -> V2 Neg Risk Adapter:   {funder_ctf_negrisk_adapter}")
+    print(f"   EOA -> V2 Exchange:              {eoa_ctf_exchange}")
+    print(f"   EOA -> V2 Neg Risk Exchange:     {eoa_ctf_negrisk}")
     print()
 
     # ── 6. Check CLOB-side balance/allowance ─────────────────────────────────
@@ -208,6 +232,7 @@ def main() -> None:
             creds=creds,
             signature_type=SIGNATURE_TYPE,
             funder=FUNDER,
+            builder_config=BuilderConfig(builder_code=BUILDER_CODE) if BUILDER_CODE else None,
         )
 
         collateral = client.get_balance_allowance(
@@ -231,15 +256,19 @@ def main() -> None:
     if not is_contract:
         issues.append("FUNDER is not a contract — check wallet setup")
     if funder_balance == 0:
-        issues.append("FUNDER has 0 USDC.e — funds may be in wrong token")
+        issues.append("FUNDER has 0 pUSD — wallet may be unfunded post-V2-migration")
     if funder_to_exchange == 0:
-        issues.append("FUNDER has no USDC allowance for Exchange — run set_allowances.py")
+        issues.append("FUNDER has no pUSD allowance for V2 Exchange — run set_allowances.py")
     if funder_to_negrisk == 0:
-        issues.append("FUNDER has no USDC allowance for Neg Risk — run set_allowances.py")
+        issues.append("FUNDER has no pUSD allowance for V2 Neg Risk Exchange — run set_allowances.py")
+    if funder_to_negrisk_adapter == 0:
+        issues.append("FUNDER has no pUSD allowance for V2 Neg Risk Adapter — run set_allowances.py")
     if not funder_ctf_exchange:
-        issues.append("FUNDER has no CTF approval for Exchange — run set_allowances.py")
+        issues.append("FUNDER has no CTF approval for V2 Exchange — run set_allowances.py")
     if not funder_ctf_negrisk:
-        issues.append("FUNDER has no CTF approval for Neg Risk — run set_allowances.py")
+        issues.append("FUNDER has no CTF approval for V2 Neg Risk Exchange — run set_allowances.py")
+    if not funder_ctf_negrisk_adapter:
+        issues.append("FUNDER has no CTF approval for V2 Neg Risk Adapter — run set_allowances.py")
     if SIGNATURE_TYPE == 2 and is_contract:
         issues.append(
             "SIGNATURE_TYPE=2 (Gnosis Safe) — verify this is correct, "

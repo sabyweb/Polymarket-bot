@@ -12,7 +12,7 @@ import math
 import threading
 import time as _time
 from dataclasses import dataclass, field
-from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
 from config import (
     ORDER_REFRESH_SECS,
     MAX_ORDER_FAILURES, DRY_RUN, MAX_ORDERBOOK_SPREAD,
@@ -407,7 +407,9 @@ class OrderManager(PricingMixin, PlacementMixin, FillsMixin, UnwindMixin):
             return True
 
         try:
-            self.client.cancel(order_id)
+            # V2 SDK: cancel_order takes an OrderPayload, not a bare string.
+            from py_clob_client_v2.clob_types import OrderPayload
+            self.client.cancel_order(OrderPayload(orderID=order_id))
             log_order_cancelled(order_id, reason)
             if order_id in self.active_orders:
                 del self.active_orders[order_id]
@@ -432,7 +434,9 @@ class OrderManager(PricingMixin, PlacementMixin, FillsMixin, UnwindMixin):
         if include_unwinds:
             for order_id in list(self.unwind_orders.keys()):
                 try:
-                    self.client.cancel(order_id)
+                    # V2 SDK: cancel_order takes an OrderPayload, not a bare string.
+                    from py_clob_client_v2.clob_types import OrderPayload
+                    self.client.cancel_order(OrderPayload(orderID=order_id))
                     log_order_cancelled(order_id, f"unwind-{reason}")
                     del self.unwind_orders[order_id]
                 except Exception as e:

@@ -17,14 +17,14 @@ from unittest.mock import MagicMock, patch, call
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Mock py_clob_client before importing
-if "py_clob_client" not in sys.modules:
+# Mock py_clob_client_v2 before importing
+if "py_clob_client_v2" not in sys.modules:
     mock_clob = MagicMock()
-    sys.modules["py_clob_client"] = mock_clob
-    sys.modules["py_clob_client.clob_types"] = mock_clob.clob_types
-    sys.modules["py_clob_client.client"] = mock_clob.client
-    sys.modules["py_clob_client.order_builder"] = mock_clob.order_builder
-    sys.modules["py_clob_client.order_builder.constants"] = mock_clob.order_builder.constants
+    sys.modules["py_clob_client_v2"] = mock_clob
+    sys.modules["py_clob_client_v2.clob_types"] = mock_clob.clob_types
+    sys.modules["py_clob_client_v2.client"] = mock_clob.client
+    sys.modules["py_clob_client_v2.order_builder"] = mock_clob.order_builder
+    sys.modules["py_clob_client_v2.order_builder.constants"] = mock_clob.order_builder.constants
     mock_clob.order_builder.constants.BUY = "BUY"
     mock_clob.order_builder.constants.SELL = "SELL"
 
@@ -111,7 +111,7 @@ class TestStartupBuyFillRecovery(unittest.TestCase):
         self.assertAlmostEqual(shares, 30.0, delta=0.5)
 
         # Order should still be cancelled
-        stub.client.cancel.assert_called_once_with("oid_buy")
+        stub.client.cancel_order.assert_called_once()
 
         # Fill should be logged
         stub.db.log_fill.assert_called_once()
@@ -159,7 +159,7 @@ class TestStartupBuyFillRecovery(unittest.TestCase):
         self.assertAlmostEqual(shares, 0.0, delta=0.5)
 
         # Still cancelled
-        stub.client.cancel.assert_called_once_with("oid_clean")
+        stub.client.cancel_order.assert_called_once()
 
         # No fill logged
         stub.db.log_fill.assert_not_called()
@@ -260,7 +260,7 @@ class TestStartupMixedScenarios(unittest.TestCase):
         RewardFarmer._reconcile_on_startup(stub)
 
         # Both cancelled
-        self.assertEqual(stub.client.cancel.call_count, 2)
+        self.assertEqual(stub.client.cancel_order.call_count, 2)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -294,7 +294,7 @@ class TestStartupErrorHandling(unittest.TestCase):
         )
 
         # Both orders still cancelled
-        self.assertEqual(stub.client.cancel.call_count, 2)
+        self.assertEqual(stub.client.cancel_order.call_count, 2)
 
     def test_get_orders_failure_still_purges_db(self):
         """get_orders() fails → can't cancel, but DB still purged."""
@@ -321,7 +321,7 @@ class TestStartupDryRun(unittest.TestCase):
 
         stub.client.get_orders.assert_not_called()
         stub.client.get_order.assert_not_called()
-        stub.client.cancel.assert_not_called()
+        stub.client.cancel_order.assert_not_called()
         stub.db.purge_all_active_orders.assert_not_called()
 
 

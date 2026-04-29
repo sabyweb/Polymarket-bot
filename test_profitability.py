@@ -346,7 +346,7 @@ try:
     check("_find_exchange_order_id removed",
           not hasattr(orders.OrderManager, '_find_exchange_order_id'))
 except ImportError:
-    # py_clob_client not installed in test environment — verify via source.
+    # py_clob_client_v2 not installed in test environment — verify via source.
     # After the god-class split, methods live in separate mixin files.
     import ast
     all_methods = set()

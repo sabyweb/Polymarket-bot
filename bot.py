@@ -9,15 +9,15 @@ import signal
 import time
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds, BalanceAllowanceParams, AssetType
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.clob_types import ApiCreds, BalanceAllowanceParams, AssetType, BuilderConfig
 
 from config import (
     HOST, CHAIN_ID, PRIVATE_KEY,
     CLOB_API_KEY, CLOB_SECRET, CLOB_PASS_PHRASE,
     MAX_MARKETS, MIN_SCORE_THRESHOLD,
     MARKET_REFRESH_SECS, ORDER_REFRESH_SECS,
-    ORDER_SIZE, FUNDER, SIGNATURE_TYPE,
+    ORDER_SIZE, FUNDER, SIGNATURE_TYPE, BUILDER_CODE,
     HYSTERESIS_SCORE_MARGIN, HEARTBEAT_TIMEOUT_SECS,
     REWARD_LOG_INTERVAL_SECS,
     ARB_ENABLED, ARB_MIN_PROFIT_PCT, ARB_MAX_PAIRS,
@@ -89,6 +89,7 @@ class MarketMakerBot:
                 creds=creds,
                 signature_type=SIGNATURE_TYPE,
                 funder=FUNDER,
+                builder_config=BuilderConfig(builder_code=BUILDER_CODE) if BUILDER_CODE else None,
             )
             self.client = RateLimitedClient(raw_client)
             self.balance_gate = BalanceGate(self.client)
@@ -556,7 +557,7 @@ class MarketMakerBot:
 
         log.info(f"Verifying {len(positions)} position(s) against exchange...")
 
-        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+        from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
 
         # We need token IDs to check balances — fetch from rewards/market data
         # For positions loaded from disk, we may not have token_ids yet.
@@ -636,7 +637,7 @@ class MarketMakerBot:
         lightweight — it only checks markets that have an active manager
         with token_ids already available.
         """
-        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+        from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
 
         corrections = 0
         for cid, manager in self.order_managers.items():
@@ -893,7 +894,9 @@ class MarketMakerBot:
                 side_label = order.get("side", "?")
                 price = order.get("price", "?")
                 try:
-                    self.client.cancel(order["id"])
+                    # V2 SDK: cancel_order takes an OrderPayload, not a bare string.
+                    from py_clob_client_v2.clob_types import OrderPayload
+                    self.client.cancel_order(OrderPayload(orderID=order["id"]))
                     log.info(
                         f"Cancelled orphaned order {order['id'][:16]}... "
                         f"({side_label} @ {price})"
