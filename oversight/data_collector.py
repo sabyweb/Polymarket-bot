@@ -222,12 +222,14 @@ def _load_reward_markets_cache(db_path: str, min_rate: float) -> dict[str, dict]
 
 def _fetch_reward_market_expiries(condition_ids: list[str] | None = None,
                                    db_path: str = "bot_history.db") -> dict[str, dict[str, str]]:
-    """Fetch end_date_iso and game_start_time for markets.
+    """Fetch end_date_iso, game_start_time, and question text for markets.
 
-    Returns {condition_id: {"end_date_iso": str, "game_start_time": str}}.
+    Returns {condition_id: {"end_date_iso": str, "game_start_time": str, "question": str}}.
     game_start_time is the actual event/kickoff time (ISO 8601); it is only
     populated for markets fetched via CLOB (Gamma API does not expose this
     field). Gamma-routed markets will have game_start_time="".
+    question is the human-readable market question; it gates safety controls
+    in market_scorer (sports detection) and allocator (per-group concentration cap).
 
     Cache-first: loads from market_expiry_cache table, only fetches
     for CIDs not in cache or with stale entries (>24h old).
@@ -241,7 +243,7 @@ def _fetch_reward_market_expiries(condition_ids: list[str] | None = None,
     cutoff = time.time() - cache_ttl
     rows = _query_with_retry(
         db_path,
-        "SELECT condition_id, end_date_iso, game_start_time FROM market_expiry_cache WHERE fetched_at > ?",
+        "SELECT condition_id, end_date_iso, game_start_time, question FROM market_expiry_cache WHERE fetched_at > ?",
         (cutoff,),
     )
     if rows:
@@ -249,6 +251,7 @@ def _fetch_reward_market_expiries(condition_ids: list[str] | None = None,
             result[r["condition_id"]] = {
                 "end_date_iso": r["end_date_iso"] or "",
                 "game_start_time": r["game_start_time"] or "",
+                "question": r["question"] or "",
             }
         log.debug(f"Expiry cache: {len(result)} markets loaded from DB")
 
@@ -262,7 +265,7 @@ def _fetch_reward_market_expiries(condition_ids: list[str] | None = None,
 
     # Step 1: Bulk fetch from Gamma (fast, covers most markets).
     # Uses keyset pagination — `offset` was deprecated 2026-04-10.
-    gamma_fetched: dict[str, str] = {}
+    gamma_fetched: dict[str, dict[str, str]] = {}
     try:
         cursor = ""
         for _ in range(100):
@@ -284,8 +287,9 @@ def _fetch_reward_market_expiries(condition_ids: list[str] | None = None,
             for m in batch:
                 cid = m.get("conditionId", "")
                 end_date = m.get("endDateIso") or m.get("end_date_iso", "")
+                question = m.get("question", "") or ""
                 if cid and end_date:
-                    gamma_fetched[cid] = end_date
+                    gamma_fetched[cid] = {"end_date_iso": end_date, "question": question}
             next_cursor = data.get("next_cursor") or ""
             if not next_cursor or next_cursor == cursor:
                 break
@@ -296,7 +300,11 @@ def _fetch_reward_market_expiries(condition_ids: list[str] | None = None,
     # Apply Gamma results (no game_start_time available from Gamma)
     for cid in need_fetch:
         if cid in gamma_fetched:
-            result[cid] = {"end_date_iso": gamma_fetched[cid], "game_start_time": ""}
+            result[cid] = {
+                "end_date_iso": gamma_fetched[cid]["end_date_iso"],
+                "game_start_time": "",
+                "question": gamma_fetched[cid]["question"],
+            }
 
     # Step 2: CLOB fallback for markets still missing — CLOB exposes
     # game_start_time for sports markets (~73% of CLOB markets).
@@ -312,8 +320,13 @@ def _fetch_reward_market_expiries(condition_ids: list[str] | None = None,
                     mkt = resp.json()
                     end_date = mkt.get("end_date_iso", "") or ""
                     game_start = mkt.get("game_start_time", "") or ""
+                    question = mkt.get("question", "") or ""
                     if end_date or game_start:
-                        result[cid] = {"end_date_iso": end_date, "game_start_time": game_start}
+                        result[cid] = {
+                            "end_date_iso": end_date,
+                            "game_start_time": game_start,
+                            "question": question,
+                        }
             except Exception:
                 pass
 
@@ -325,8 +338,8 @@ def _fetch_reward_market_expiries(condition_ids: list[str] | None = None,
             now = time.time()
             db.executemany(
                 "INSERT OR REPLACE INTO market_expiry_cache "
-                "(condition_id, end_date_iso, game_start_time, fetched_at) VALUES (?, ?, ?, ?)",
-                [(cid, v["end_date_iso"], v["game_start_time"], now)
+                "(condition_id, end_date_iso, game_start_time, question, fetched_at) VALUES (?, ?, ?, ?, ?)",
+                [(cid, v["end_date_iso"], v["game_start_time"], v.get("question", ""), now)
                  for cid, v in new_entries.items()],
             )
             db.commit()
@@ -1378,7 +1391,11 @@ def collect_all(
         else:
             daily_rate = stat_data.get("rate", 0)
 
-        question = stat_data.get("question") or pos_data.get("question", "")
+        question = (
+            stat_data.get("question")
+            or pos_data.get("question", "")
+            or expiry_map.get(cid, {}).get("question", "")
+        )
         fill_cost = fill_data["cost"]
         dump_rev = dump_data["revenue"]
         net_pnl = dump_rev - fill_cost

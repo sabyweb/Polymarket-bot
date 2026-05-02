@@ -142,6 +142,7 @@ class TestMarketExpiryCacheGameStartTime(unittest.TestCase):
                 condition_id    TEXT PRIMARY KEY,
                 end_date_iso    TEXT NOT NULL,
                 game_start_time TEXT NOT NULL DEFAULT '',
+                question        TEXT NOT NULL DEFAULT '',
                 fetched_at      REAL NOT NULL
             )
         """)
@@ -186,8 +187,8 @@ class TestMarketExpiryCacheGameStartTime(unittest.TestCase):
         self.assertEqual(result["0xcid_politics"]["game_start_time"], "")
 
     def test_fetch_returns_dict_of_dicts_shape(self):
-        """The function now returns dict[cid, dict[str, str]] with both
-        'end_date_iso' and 'game_start_time' keys always present."""
+        """The function now returns dict[cid, dict[str, str]] with
+        'end_date_iso', 'game_start_time', and 'question' keys always present."""
         self.db.execute(
             "INSERT INTO market_expiry_cache "
             "(condition_id, end_date_iso, game_start_time, fetched_at) VALUES (?, ?, ?, ?)",
@@ -201,6 +202,43 @@ class TestMarketExpiryCacheGameStartTime(unittest.TestCase):
         self.assertIsInstance(result["0xcid_a"], dict)
         self.assertIn("end_date_iso", result["0xcid_a"])
         self.assertIn("game_start_time", result["0xcid_a"])
+        self.assertIn("question", result["0xcid_a"])
+
+    def test_cache_round_trip_preserves_question(self):
+        """A cached row with non-empty question text is returned via
+        _fetch_reward_market_expiries. Gates safety controls that depend on
+        m.question (sports detection, per-group cluster cap, keyword filters)."""
+        self.db.execute(
+            "INSERT INTO market_expiry_cache "
+            "(condition_id, end_date_iso, game_start_time, question, fetched_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("0xcid_q", "2026-05-15T00:00:00Z", "",
+             "Will Lakers beat Warriors on May 15?", time.time()),
+        )
+        self.db.commit()
+        result = _fetch_reward_market_expiries(
+            condition_ids=["0xcid_q"], db_path=self.db_path
+        )
+        self.assertIn("0xcid_q", result)
+        self.assertEqual(
+            result["0xcid_q"]["question"],
+            "Will Lakers beat Warriors on May 15?",
+        )
+
+    def test_cache_handles_empty_question(self):
+        """A cached row with empty question (legacy pre-fix-3 row) returns
+        the empty string cleanly — not None or missing key."""
+        self.db.execute(
+            "INSERT INTO market_expiry_cache "
+            "(condition_id, end_date_iso, fetched_at) VALUES (?, ?, ?)",
+            ("0xcid_legacy", "2026-12-31T23:59:59Z", time.time()),
+        )
+        self.db.commit()
+        result = _fetch_reward_market_expiries(
+            condition_ids=["0xcid_legacy"], db_path=self.db_path
+        )
+        self.assertIn("0xcid_legacy", result)
+        self.assertEqual(result["0xcid_legacy"]["question"], "")
 
 
 class TestPoisonedRowHeuristic(unittest.TestCase):

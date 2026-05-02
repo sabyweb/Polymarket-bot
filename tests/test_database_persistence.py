@@ -210,6 +210,33 @@ class TestMarketExpiryCacheMigration(unittest.TestCase):
         finally:
             db.close()
 
+    def test_migration_adds_question_column(self):
+        """Simulate an older DB missing the question column, then run
+        BotDatabase init and verify the column has been added with the
+        correct default ('')."""
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("""
+            CREATE TABLE market_expiry_cache (
+                condition_id    TEXT PRIMARY KEY,
+                end_date_iso    TEXT NOT NULL,
+                game_start_time TEXT NOT NULL DEFAULT '',
+                fetched_at      REAL NOT NULL
+            )
+        """)
+        conn.commit()
+        cols_before = {row[1] for row in conn.execute("PRAGMA table_info(market_expiry_cache)")}
+        conn.close()
+        self.assertNotIn("question", cols_before)
+
+        db = BotDatabase(self.db_path)
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cols_after = {row[1] for row in conn.execute("PRAGMA table_info(market_expiry_cache)")}
+            conn.close()
+            self.assertIn("question", cols_after)
+        finally:
+            db.close()
+
 
 if __name__ == "__main__":
     unittest.main()
