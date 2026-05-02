@@ -580,6 +580,54 @@ class TestCapitalRedistribution(unittest.TestCase):
             cost = _est_market_cost(a["shares_per_side"], a.get("max_spread", 0.045))
             self.assertLessEqual(cost, 2000.0 * 0.15 + 1.0)  # allow $1 rounding
 
+    def test_compute_allocations_stamps_total_capital(self):
+        """Every deploy row carries _total_capital matching the input
+        total_capital (rounded to 2 dp). Mirrors profit/allocator.py:379.
+        Read by reward_farmer._guardrail_total_capital_from_alloc to gate
+        notional/cluster/loss safety checks and the notional_drift /
+        slow_bleed shadow oversight signals."""
+        from oversight.allocation_writer import compute_allocations
+        scored = [
+            ScoredMarket(condition_id="cidA", question="A?", score=10.0,
+                         action="deploy", recommended_shares=50, reason="test",
+                         confidence="high", actual_reward_total=0,
+                         fill_damage=0, fill_count=0, daily_rate=100,
+                         min_size=50, max_spread=0.045),
+            ScoredMarket(condition_id="cidB", question="B?", score=8.0,
+                         action="deploy", recommended_shares=50, reason="test",
+                         confidence="high", actual_reward_total=0,
+                         fill_damage=0, fill_count=0, daily_rate=80,
+                         min_size=50, max_spread=0.045),
+        ]
+        allocs = compute_allocations(scored, total_capital=1234.567)
+        deployed = [a for a in allocs if a["action"] == "deploy"]
+        self.assertGreater(len(deployed), 0, "expected at least one deploy")
+        for a in deployed:
+            self.assertIn("_total_capital", a,
+                          f"deploy row missing _total_capital: {a['condition_id']}")
+            self.assertEqual(a["_total_capital"], 1234.57,
+                             "stamp must be round(total_capital, 2)")
+
+    def test_compute_allocations_avoid_rows_not_stamped(self):
+        """Avoid rows do NOT carry _total_capital; the stamp is deploy-only.
+        Mirrors the reader at reward_farmer.py:1082 which filters
+        action == 'deploy' before reading the stamp."""
+        from oversight.allocation_writer import compute_allocations
+        scored = [
+            ScoredMarket(condition_id="cidA", question="A?", score=10.0,
+                         action="avoid", recommended_shares=0,
+                         reason="below threshold",
+                         confidence="low", actual_reward_total=0,
+                         fill_damage=0, fill_count=0, daily_rate=2,
+                         min_size=50, max_spread=0.045),
+        ]
+        allocs = compute_allocations(scored, total_capital=1000.0)
+        avoided = [a for a in allocs if a["action"] == "avoid"]
+        self.assertGreater(len(avoided), 0)
+        for a in avoided:
+            self.assertNotIn("_total_capital", a,
+                             "avoid rows should not be stamped")
+
 
 class TestRebalanceCredit(unittest.TestCase):
     """Test that avoided markets with locked capital free budget for new deploys."""

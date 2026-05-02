@@ -381,16 +381,18 @@ def run_once(
         log.warning(f"Learning loop failed (proceeding neutral): {e}")
         learning_state = None
 
-    # Step 4: Allocate — profit engine when calibrator ready, else legacy
+    # Step 4: Allocate — profit engine when calibrator ready, else legacy.
+    # capital_scale is applied uniformly across both paths so the allocator
+    # sees a single total_capital input. Neutral (1.0) when learning_state
+    # is None or in OFF/SHADOW; non-neutral only after the LearningController
+    # gate promotes to ACTIVE.
+    cap_scale = 1.0
+    if learning_state is not None:
+        cap_scale = float(getattr(learning_state, "capital_scale", 1.0))
+    alloc_capital = available_capital * cap_scale
+
     if calibrator is not None and calibrator.is_ready():
         from profit import allocate_portfolio
-        # capital_scale is applied HERE (outside the continuous allocator)
-        # so the allocator sees a single total_capital input. Neutral when
-        # learning_state is None or in OFF/SHADOW.
-        cap_scale = 1.0
-        if learning_state is not None:
-            cap_scale = float(getattr(learning_state, "capital_scale", 1.0))
-        alloc_capital = available_capital * cap_scale
         log.info(
             f"Profit engine allocation "
             f"(${available_capital:.0f} × cap_scale {cap_scale:.2f} = "
@@ -404,8 +406,12 @@ def run_once(
             learning_state=learning_state,
         )
     else:
-        log.info(f"Legacy allocation (${available_capital:.0f} available)...")
-        allocations = compute_allocations(scored, total_capital=available_capital)
+        log.info(
+            f"Legacy allocation "
+            f"(${available_capital:.0f} × cap_scale {cap_scale:.2f} = "
+            f"${alloc_capital:.0f})..."
+        )
+        allocations = compute_allocations(scored, total_capital=alloc_capital)
 
     # Step 4b: SAFETY GATE — filter allocations based on system state
     allocations = safety.filter_allocations(allocations, available_capital)

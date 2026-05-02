@@ -209,6 +209,15 @@ def compute_allocations(
     avoided = [a for a in allocations if a["action"] == "avoid"]
     total_deployed = total_capital - remaining_capital
 
+    # Stamp _total_capital on every deploy row to mirror profit/allocator.py:379.
+    # Read by reward_farmer._guardrail_total_capital_from_alloc, which gates
+    # notional_ratio, per-cluster cap, daily-loss kill-switch, and the
+    # notional_drift / slow_bleed shadow oversight signals. Without this stamp
+    # those guardrails fail-open (returning None) and the shadow signals
+    # remain in missing_data state.
+    for a in deployed:
+        a["_total_capital"] = round(total_capital, 2)
+
     log.info(
         f"Allocation: {len(deployed)} deploy, {len(avoided)} avoid | "
         f"${total_deployed:.0f} of ${total_capital:.0f} deployed"
