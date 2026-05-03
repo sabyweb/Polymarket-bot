@@ -849,7 +849,14 @@ class LearningMetrics:
             return None, 0.0, {}, 0.0, None
 
         if isinstance(alloc, dict):
-            items = alloc.get("allocations", [])
+            # The writer (oversight/allocation_writer.py:write_allocations)
+            # serialises under "markets". Earlier this read "allocations",
+            # which silently returned no deploy rows and pinned every
+            # downstream metric (reward_efficiency, reward_error,
+            # loss_per_capital, expected_util) at None — _metrics_complete
+            # never returned True, so valid_cycles_observed never advanced
+            # and the LearningController gate was effectively dead.
+            items = alloc.get("markets", [])
         elif isinstance(alloc, list):
             items = alloc
         else:

@@ -292,8 +292,13 @@ def _insert_outcomes(
 
 
 def _write_alloc_file(alloc_path: str, allocations: list[dict]) -> None:
-    """Atomic JSON write used by LearningMetrics._read_alloc_file."""
-    payload = {"allocations": allocations}
+    """Atomic JSON write used by LearningMetrics._read_alloc_file.
+
+    Key matches the production writer (oversight/allocation_writer.py:275)
+    so the reader (profit/learning.py:_read_alloc_file) sees the same shape
+    in simulation as in production.
+    """
+    payload = {"markets": allocations}
     with open(alloc_path, "w") as f:
         json.dump(payload, f)
 

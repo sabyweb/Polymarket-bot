@@ -291,7 +291,7 @@ class TestFrontierProbe(unittest.TestCase):
             db.commit()
             db.close()
             with open(alloc_path, "w") as f:
-                json.dump({"allocations": [
+                json.dump({"markets": [
                     {"condition_id": "M0", "action": "deploy",
                      "daily_rate": 1.0, "q_share_pct": 10.0,
                      "est_capital_cost": 50.0},
@@ -492,7 +492,7 @@ class TestRecencyWeighting(unittest.TestCase):
         alloc_path = tempfile.mktemp(suffix=".json")
         try:
             with open(alloc_path, "w") as f:
-                json.dump({"allocations": [
+                json.dump({"markets": [
                     {"condition_id": "M0", "action": "deploy",
                      "daily_rate": 1.0, "q_share_pct": 10.0,
                      "est_capital_cost": 50.0},
@@ -511,7 +511,7 @@ class TestRecencyWeighting(unittest.TestCase):
         alloc_path = tempfile.mktemp(suffix=".json")
         try:
             with open(alloc_path, "w") as f:
-                json.dump({"allocations": [
+                json.dump({"markets": [
                     {"condition_id": "M0", "action": "deploy",
                      "daily_rate": 1.0, "q_share_pct": 10.0,
                      "est_capital_cost": 100.0},
