@@ -30,6 +30,7 @@ from profit.learning import (
     EMA_ALPHA, TRUST_DOWN, TRUST_REVERSION_RATE,
     PREDICTED_LOSS_PER_FILL_BASELINE,
     LOSS_PER_CAPITAL_HIGH, BASELINE_MIN_DAYS,
+    GATE_ACTIVE_CYCLES,
 )
 
 
@@ -147,12 +148,14 @@ class TestLearningGate(unittest.TestCase):
 
     def test_shadow_when_cycles_insufficient_for_active(self):
         m = {"fills_total": 300, "fill_unwind_pairs_total": 150,
-             "reward_days": 10, "valid_cycles_observed": 49}
+             "reward_days": 10,
+             "valid_cycles_observed": GATE_ACTIVE_CYCLES - 1}
         self.assertEqual(LearningGate.evaluate_activation(m), MODE_SHADOW)
 
     def test_active_at_exact_boundary(self):
         m = {"fills_total": 200, "fill_unwind_pairs_total": 100,
-             "reward_days": 5, "valid_cycles_observed": 50}
+             "reward_days": 5,
+             "valid_cycles_observed": GATE_ACTIVE_CYCLES}
         self.assertEqual(LearningGate.evaluate_activation(m), MODE_ACTIVE)
 
 

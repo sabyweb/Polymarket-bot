@@ -37,6 +37,7 @@ from profit.learning import (
     EXPANSION_CAP_UP, EXPANSION_AGGR_UP,
     EXPANSION_EFFICIENCY_FLOOR_FRAC,
     COLD_START_FRONTIER_MULT,
+    GATE_ACTIVE_CYCLES,
 )
 
 
@@ -375,7 +376,11 @@ class TestStabilityGatedProbe(unittest.TestCase):
             ctrl = LearningController(db_path, alloc_path)
             ctrl.persist_state(
                 LearningState(
-                    valid_cycles_observed=60,
+                    # Past the ACTIVE-cycles gate so step() actually evaluates
+                    # the stability filter (otherwise it would short-circuit
+                    # to SHADOW where probes never fire — making the test
+                    # pass for the wrong reason).
+                    valid_cycles_observed=GATE_ACTIVE_CYCLES + 10,
                     last_probe_cycle=0,
                     prev_reward_efficiency=None,   # instability
                     mode=MODE_ACTIVE,
@@ -404,7 +409,7 @@ class TestStabilityGatedProbe(unittest.TestCase):
             ctrl = LearningController(db_path, alloc_path)
             ctrl.persist_state(
                 LearningState(
-                    valid_cycles_observed=50,
+                    valid_cycles_observed=GATE_ACTIVE_CYCLES,
                     last_probe_cycle=0,
                     prev_reward_efficiency=0.0,
                     mode=MODE_ACTIVE,

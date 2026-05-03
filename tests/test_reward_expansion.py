@@ -28,6 +28,7 @@ from profit.learning import (
     EFFICIENCY_DELTA_COLLAPSE, EFFICIENCY_DELTA_COLLAPSE_CAP,
     RECENCY_WEIGHT,
     EMA_ALPHA,
+    GATE_ACTIVE_CYCLES,
 )
 # _compute_exploration_pct was a helper in the deleted legacy allocator.
 # Its tests (class TestExplorationPct) are skipped below — the continuous
@@ -298,13 +299,13 @@ class TestFrontierProbe(unittest.TestCase):
                 ]}, f)
 
             ctrl = LearningController(db_path, alloc_path)
-            # Seed counter=50 (meets ACTIVE gate) with no prior probe.
+            # Seed counter at the ACTIVE-gate boundary with no prior probe.
             # Patch 4: seed prev_reward_efficiency = 0.0 so the new
             # stability gate (|cur - prev| < 0.05) is satisfied — the
             # seeded DB has no reward_attribution so cur_eff will be 0.0.
             ctrl.persist_state(
                 LearningState(
-                    valid_cycles_observed=50,
+                    valid_cycles_observed=GATE_ACTIVE_CYCLES,
                     last_probe_cycle=0,
                     prev_reward_efficiency=0.0,
                     mode=MODE_ACTIVE,
@@ -312,17 +313,20 @@ class TestFrontierProbe(unittest.TestCase):
                 MODE_ACTIVE,
             )
             r = ctrl.step()
-            # valid_cycles_observed advanced to 51; 51 - 0 >= PROBE_INTERVAL
+            # valid_cycles_observed advanced past gate; >= PROBE_INTERVAL
+            # since last_probe_cycle=0
             self.assertEqual(r.mode, MODE_ACTIVE)
             self.assertTrue(r.metrics.get("is_probe_cycle"))
             s = ctrl.load_state()
-            self.assertEqual(s.last_probe_cycle, 51)
+            self.assertEqual(s.last_probe_cycle, GATE_ACTIVE_CYCLES + 1)
 
-            # Second step: counter=52, last_probe=51 → diff=1 → NOT a probe
+            # Second step: counter advances by 1, diff=1 → NOT a probe.
+            # last_probe_cycle stays at its previous value (set by the
+            # first step's probe firing).
             r2 = ctrl.step()
             self.assertFalse(r2.metrics.get("is_probe_cycle"))
             s2 = ctrl.load_state()
-            self.assertEqual(s2.last_probe_cycle, 51)
+            self.assertEqual(s2.last_probe_cycle, GATE_ACTIVE_CYCLES + 1)
         finally:
             if os.path.exists(db_path):
                 os.unlink(db_path)

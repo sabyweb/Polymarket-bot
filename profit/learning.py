@@ -63,7 +63,17 @@ GATE_SHADOW_DAYS = 3
 GATE_ACTIVE_FILLS = 200
 GATE_ACTIVE_PAIRS = 100
 GATE_ACTIVE_DAYS = 5
-GATE_ACTIVE_CYCLES = 50
+GATE_ACTIVE_CYCLES = 2000  # TEMP: bumped from 50 (≈25min) to 2000 (≈16.7h)
+                           # to enforce a SHADOW soak window after the
+                           # _read_alloc_file dict-key fix landed in commit
+                           # 4f102e3. The fix reactivated the metrics pipeline,
+                           # so valid_cycles_observed now advances and the
+                           # ACTIVE-promotion path is reachable for the first
+                           # time in production. Soak gives operator time to
+                           # observe [LEARNING_SHADOW] would_apply log lines
+                           # for sane β/cap_scale/trust trajectories before
+                           # applied state can shift. Revert to 50 once
+                           # trajectory is verified.
 
 # ── METRIC WINDOWS ─────────────────────────────────────────────
 METRIC_WINDOW_SECS = 86400   # 24h

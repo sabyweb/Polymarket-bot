@@ -14,6 +14,7 @@ not absolute values.
 import json
 import os
 import unittest
+from unittest.mock import patch
 
 from simulation.engine import SimulationEngine
 from simulation.market_env import (
@@ -233,14 +234,27 @@ class TestScenarioDirections(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        # 150 cycles is enough to: clear SHADOW (>= 50 valid cycles
-        # post-gate-open), accumulate >= 60 ACTIVE updates, and let
-        # the slow scalars (reward_trust drifts ~2% per cycle, EMA
+        # 150 cycles is enough to: clear SHADOW (>= GATE_ACTIVE_CYCLES
+        # valid cycles post-gate-open), accumulate ACTIVE updates, and
+        # let the slow scalars (reward_trust drifts ~2% per cycle, EMA
         # alpha=0.2 on contractions) actually move the needle.
+        #
+        # Production GATE_ACTIVE_CYCLES is bumped (≈2000) as a SHADOW-
+        # soak safety belt for the live bot; that exceeds the 150-cycle
+        # simulation budget. Patch it down to its pre-bump value here so
+        # the simulation can exercise ACTIVE-mode behaviour the way the
+        # direction-of-learning assertions require. Patch is scoped to
+        # this class — production constant is unchanged.
+        cls._gate_patch = patch("profit.learning.GATE_ACTIVE_CYCLES", 50)
+        cls._gate_patch.start()
         cls.engine = SimulationEngine(seed=42)
         cls.results = {
             s: cls.engine.run(s, cycles=150) for s in SCENARIOS
         }
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._gate_patch.stop()
 
     def test_over_aggressive_contracts_capital(self):
         r = self.results["over_aggressive"]
