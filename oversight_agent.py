@@ -587,13 +587,31 @@ if __name__ == "__main__":
 # Spec: see Polymarket bot architecture v5.1.md §4.21.
 # Invariants honoured: synchronous, no DB, no HTTP, no threads, no raise.
 #
-# STAGE 1 — SHADOW: this implementation NEVER returns pause/kill. All
-# triggered conditions are logged via [OVERSIGHT_SHADOW] for offline
-# review. evaluate() returns {"action": "continue", "reason": "shadow"}
-# unconditionally. Promoting to live control is a follow-up patch that
-# flips _SHADOW_ONLY = False and selectively activates pause/kill.
+# Promotion ladder per architecture §4.21.7:
+#   Stage 1 — SHADOW: _SHADOW_ONLY=True (master gate). All triggered
+#             conditions are logged via [OVERSIGHT_SHADOW] but evaluate()
+#             returns {"action": "continue", "reason": "shadow"} regardless
+#             of fired signals. Safe default state.
+#   Stage 2 — PAUSE active: _SHADOW_ONLY=False, _PAUSE_ENABLED=True.
+#             would_pause signals translate to real pause returns; the
+#             farmer skips placements for that cycle.
+#   Stage 3 — KILL active: _SHADOW_ONLY=False, _KILL_ENABLED=True.
+#             would_kill signals translate to real kill returns; the
+#             farmer activates the kill switch (cancel-all + halt).
+#
+# Each stage flip is operator-driven after the per-stage soak gate
+# (no false positives in healthy regime, triggers fire before hard
+# guardrails, no flapping). When _KILL_ENABLED=False but a would_kill
+# signal fires AND _PAUSE_ENABLED=True, the action falls through to pause
+# — preserves safety intent without escalating to terminal.
+#
+# Wiring of these flags into evaluate() lands in a follow-up commit;
+# this commit introduces them as additive constants with zero behaviour
+# change.
 
-_SHADOW_ONLY = True
+_SHADOW_ONLY = True       # Master gate — when True, evaluate returns continue/shadow
+_PAUSE_ENABLED = False    # Stage 2: would_pause signals → pause action
+_KILL_ENABLED = False     # Stage 3: would_kill signals → kill action
 
 # Ring buffer length: 30 snapshots ≈ 15 min at 30 s cadence. Bounds the
 # longest detector window (10-cycle CF trajectory) with headroom.
