@@ -764,13 +764,28 @@ def _fmt(v) -> str:
     return str(v)
 
 
-def _check_signals_and_log(guard: dict) -> None:
+def _check_signals_and_log(guard: dict) -> tuple[list[str], list[str]]:
     """Run all six detectors. Emit one [OVERSIGHT_SHADOW] line per
-    triggered signal + one summary line if any fired."""
-    fired_pause = []
-    fired_kill = []
+    triggered signal + one summary line if any fired.
+
+    Returns (fired_pause, fired_kill): names of signals that triggered,
+    partitioned by their declared kind in _SIGNALS. evaluate() consumes
+    these lists to map promotion-flag state into pause/kill actions.
+
+    Per-signal try/except hardening: a detector that raises only loses
+    its own cycle (logged at [OVERSIGHT_SHADOW_ERROR]) — the remaining
+    five detectors still run.
+    """
+    fired_pause: list[str] = []
+    fired_kill: list[str] = []
     for name, fn, kind in _SIGNALS:
-        triggered, value, status = fn()
+        try:
+            triggered, value, status = fn()
+        except Exception as e:
+            log.error(
+                "[OVERSIGHT_SHADOW_ERROR] signal=%s failed: %s", name, e,
+            )
+            continue
         if triggered:
             log.warning(
                 "[OVERSIGHT_SHADOW] signal=%s value=%s window_status=%s "
@@ -793,21 +808,67 @@ def _check_signals_and_log(guard: dict) -> None:
             ",".join(fired_pause) or "-",
             ",".join(fired_kill) or "-",
         )
+    return fired_pause, fired_kill
 
 
 def evaluate(guard: dict) -> dict:
     """Oversight evaluation hook. See architecture doc §4.21.
 
-    SHADOW STAGE 1: always returns {"action": "continue", "reason": "shadow"}.
-    Triggered signals are logged at [OVERSIGHT_SHADOW] for offline review.
+    Returns one of:
+      {"action": "continue", "reason": "shadow"}     — master gate on
+      {"action": "continue", "reason": "no_signal"}  — master off, no triggers
+      {"action": "pause",    "reason": "<sig,sig>"}  — Stage 2, pause fired
+      {"action": "kill",     "reason": "<sig>"}      — Stage 3, kill fired
+
+    Promotion ladder (per the comment block above and architecture
+    §4.21.7):
+      Stage 1: _SHADOW_ONLY=True (default). Master gate forces continue
+               regardless of fired signals.
+      Stage 2: _SHADOW_ONLY=False + _PAUSE_ENABLED=True. would_pause
+               signals translate to pause; the farmer skips placements
+               for that cycle.
+      Stage 3: + _KILL_ENABLED=True. would_kill signals translate to
+               kill; the farmer activates the kill switch (cancel-all
+               + halt, manual restart to recover).
+
+    Multi-signal precedence: strict severity. If any would_kill signal
+    fires AND _KILL_ENABLED, return kill (the kill_reasons line). Else
+    if any signal fires (kill or pause) AND _PAUSE_ENABLED, return pause
+    (would_kill falls through to pause when _KILL_ENABLED=False —
+    preserves safety intent without escalating to terminal). Else
+    continue/no_signal.
     """
+    fired_pause: list[str] = []
+    fired_kill: list[str] = []
     try:
         _GUARD_HISTORY.append(_snapshot(guard))
-        _check_signals_and_log(guard)
+        fired_pause, fired_kill = _check_signals_and_log(guard)
     except Exception as e:
         # Defence in depth — the caller in reward_farmer.run_cycle
         # already wraps this in try/except, but we never want a shadow
         # bug to surface as [OVERSIGHT_ERROR] noise on the operator's
-        # dashboard.
+        # dashboard. fired_* default to empty so the action mapping
+        # below cleanly falls through to the safe continue branch.
         log.error("[OVERSIGHT_SHADOW_ERROR] internal: %s", e)
-    return {"action": "continue", "reason": "shadow"}
+
+    # Master gate: Stage 1 behaviour. Returns continue regardless of
+    # fired signals. Operator flips _SHADOW_ONLY to False to enter the
+    # Stage 2/3 promotion ladder.
+    if _SHADOW_ONLY:
+        return {"action": "continue", "reason": "shadow"}
+
+    # Stage 3: would_kill signals are real kill returns when enabled.
+    if fired_kill and _KILL_ENABLED:
+        reason = ",".join(fired_kill)[:200]
+        return {"action": "kill", "reason": reason}
+
+    # Stage 2: would_pause signals are real pause returns when enabled.
+    # would_kill signals fall through to pause here when _KILL_ENABLED
+    # is False (Phase C decision: preserve safety intent).
+    if (fired_pause or fired_kill) and _PAUSE_ENABLED:
+        names = fired_kill + fired_pause  # kill first, more visible in logs
+        reason = ",".join(names)[:200]
+        return {"action": "pause", "reason": reason}
+
+    # No actionable signal under current flag state.
+    return {"action": "continue", "reason": "no_signal"}

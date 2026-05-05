@@ -164,3 +164,188 @@ def test_kill_summary_line_on_cf_trajectory(fresh_module, caplog):
         live = {f"c{i}": 1.0 for i in range(dep)}
         fresh_module.evaluate(_g(cf=cf, live_by_cid=live))
     assert any("would_kill=True" in r.message for r in caplog.records)
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Phase C — Stage 2/3 promotion: action mapping
+#
+# These tests flip _SHADOW_ONLY=False and selectively enable
+# _PAUSE_ENABLED / _KILL_ENABLED to verify evaluate() produces the
+# correct action when signals fire under each promotion configuration.
+# fresh_module reload ensures each test starts from default flag state
+# (Stage 1, all gating off).
+# ═════════════════════════════════════════════════════════════════════
+
+
+def _trigger_kill_sequence(fresh_module, **extra_guard):
+    """Helper: feed 10 cycles that satisfy cf_trajectory's trigger.
+    Optional extra_guard fields (e.g. notional_ratio=2.0) layered on
+    top of the cf/deployed pattern."""
+    cfs = [0.5, 0.45, 0.4, 0.35, 0.3, 0.25, 0.2, 0.15, 0.1, 0.05]
+    deployed = [40, 38, 35, 33, 30, 28, 25, 22, 18, 15]
+    result = None
+    for cf, dep in zip(cfs, deployed):
+        live = {f"c{i}": 1.0 for i in range(dep)}
+        result = fresh_module.evaluate(_g(cf=cf, live_by_cid=live, **extra_guard))
+    return result
+
+
+def test_pause_returned_on_notional_drift_when_promoted(fresh_module):
+    fresh_module._SHADOW_ONLY = False
+    fresh_module._PAUSE_ENABLED = True
+    result = None
+    for _ in range(5):
+        result = fresh_module.evaluate(_g(notional_ratio=1.85))
+    assert result["action"] == "pause"
+    assert "notional_drift" in result["reason"]
+
+
+def test_pause_returned_on_cluster_breadth_when_promoted(fresh_module):
+    fresh_module._SHADOW_ONLY = False
+    fresh_module._PAUSE_ENABLED = True
+    result = None
+    for _ in range(3):
+        result = fresh_module.evaluate(_g(blocked_clusters={1, 2}))
+    assert result["action"] == "pause"
+    assert "cluster_breadth" in result["reason"]
+
+
+def test_pause_returned_on_cf_soft_zone_when_promoted(fresh_module):
+    fresh_module._SHADOW_ONLY = False
+    fresh_module._PAUSE_ENABLED = True
+    result = None
+    for _ in range(5):
+        result = fresh_module.evaluate(_g(cf=0.02))
+    assert result["action"] == "pause"
+    assert "cf_soft_zone" in result["reason"]
+
+
+def test_pause_returned_on_cancel_pressure_when_promoted(fresh_module):
+    fresh_module._SHADOW_ONLY = False
+    fresh_module._PAUSE_ENABLED = True
+    result = None
+    for _ in range(6):
+        result = fresh_module.evaluate(
+            _g(orders_placed_prev_cycle=3, orders_cancelled_prev_cycle=8)
+        )
+    assert result["action"] == "pause"
+    assert "cancel_pressure" in result["reason"]
+
+
+def test_pause_returned_on_slow_bleed_when_promoted(fresh_module):
+    fresh_module._SHADOW_ONLY = False
+    fresh_module._PAUSE_ENABLED = True
+    result = None
+    for _ in range(6):
+        result = fresh_module.evaluate(_g(daily_loss=120.0, total_capital=2000.0))
+    assert result["action"] == "pause"
+    assert "slow_bleed" in result["reason"]
+
+
+def test_kill_returned_on_cf_trajectory_when_promoted(fresh_module):
+    fresh_module._SHADOW_ONLY = False
+    fresh_module._KILL_ENABLED = True
+    result = _trigger_kill_sequence(fresh_module)
+    assert result["action"] == "kill"
+    assert "cf_trajectory" in result["reason"]
+
+
+def test_kill_overrides_pause_when_both_fire(fresh_module):
+    """Strict severity — when both a would_kill (cf_trajectory) and a
+    would_pause (notional_drift) signal fire, kill wins."""
+    fresh_module._SHADOW_ONLY = False
+    fresh_module._PAUSE_ENABLED = True
+    fresh_module._KILL_ENABLED = True
+    # cf_trajectory's 10-cycle window also satisfies notional_drift's
+    # 5-cycle window since notional_ratio=2.0 ≥ 1.8 in every cycle.
+    result = _trigger_kill_sequence(fresh_module, notional_ratio=2.0)
+    assert result["action"] == "kill"
+    assert "cf_trajectory" in result["reason"]
+
+
+def test_continue_no_signal_when_master_off_and_healthy(fresh_module):
+    fresh_module._SHADOW_ONLY = False
+    fresh_module._PAUSE_ENABLED = True
+    fresh_module._KILL_ENABLED = True
+    result = None
+    for _ in range(20):
+        result = fresh_module.evaluate(_g())
+    assert result == {"action": "continue", "reason": "no_signal"}
+
+
+def test_pause_reason_includes_signal_name(fresh_module):
+    fresh_module._SHADOW_ONLY = False
+    fresh_module._PAUSE_ENABLED = True
+    result = None
+    for _ in range(5):
+        result = fresh_module.evaluate(_g(notional_ratio=1.85))
+    assert result["action"] == "pause"
+    assert "notional_drift" in result["reason"]
+
+
+def test_kill_reason_includes_signal_name(fresh_module):
+    fresh_module._SHADOW_ONLY = False
+    fresh_module._KILL_ENABLED = True
+    result = _trigger_kill_sequence(fresh_module)
+    assert result["action"] == "kill"
+    assert "cf_trajectory" in result["reason"]
+
+
+def test_reason_within_200_chars(fresh_module):
+    """Defensive 200-char slice on the reason string. Worst-case real
+    signal names total ~80 chars so the slice never truncates today,
+    but the slice operation must not raise on any string."""
+    fresh_module._SHADOW_ONLY = False
+    fresh_module._PAUSE_ENABLED = True
+    result = None
+    for _ in range(5):
+        result = fresh_module.evaluate(_g(notional_ratio=1.85))
+    assert isinstance(result["reason"], str)
+    assert len(result["reason"]) <= 200
+
+
+def test_evaluate_handles_malformed_signal_returns(fresh_module, caplog):
+    """Per-signal try/except hardening (Phase C decision C6). One bad
+    detector logs an error but does NOT suppress the remaining detectors,
+    nor does it raise out of evaluate()."""
+    caplog.set_level(logging.ERROR, logger="oversight")
+
+    def bad_signal_fn():
+        raise RuntimeError("synthetic detector failure")
+
+    # Inject a bad would_pause signal alongside the real six.
+    fresh_module._SIGNALS = list(fresh_module._SIGNALS) + [
+        ("bad_signal", bad_signal_fn, "would_pause"),
+    ]
+    fresh_module._SHADOW_ONLY = False
+    fresh_module._PAUSE_ENABLED = True
+
+    result = None
+    for _ in range(5):
+        result = fresh_module.evaluate(_g(notional_ratio=1.85))
+
+    # The bad signal logged an error.
+    assert any("[OVERSIGHT_SHADOW_ERROR]" in r.message
+               and "bad_signal" in r.message
+               for r in caplog.records)
+    # The real notional_drift signal still produced its action.
+    assert result["action"] == "pause"
+    assert "notional_drift" in result["reason"]
+
+
+def test_check_signals_returns_lists(fresh_module):
+    """Signature change: _check_signals_and_log now returns
+    (fired_pause, fired_kill). Smoke test that the return shape is
+    correct in both healthy and triggered states."""
+    healthy = fresh_module._check_signals_and_log(_g())
+    assert healthy == ([], [])
+
+    # Force the ring buffer with notional_drift triggers.
+    for _ in range(5):
+        fresh_module._GUARD_HISTORY.append(
+            fresh_module._snapshot(_g(notional_ratio=1.85))
+        )
+    fired = fresh_module._check_signals_and_log(_g(notional_ratio=1.85))
+    assert isinstance(fired, tuple) and len(fired) == 2
+    assert "notional_drift" in fired[0]   # would_pause list
+    assert fired[1] == []                 # would_kill list empty
