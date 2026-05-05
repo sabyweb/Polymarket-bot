@@ -349,3 +349,83 @@ def test_check_signals_returns_lists(fresh_module):
     assert isinstance(fired, tuple) and len(fired) == 2
     assert "notional_drift" in fired[0]   # would_pause list
     assert fired[1] == []                 # would_kill list empty
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Phase C — promotion-flag isolation
+#
+# These tests fix one or more flags to specific non-default values to
+# verify each flag is independently honoured. The full 2x2x2 flag
+# matrix isn't enumerated — only the cells that exercise distinct
+# code paths in evaluate().
+# ═════════════════════════════════════════════════════════════════════
+
+
+def test_pause_disabled_returns_continue_even_when_signal_fires(fresh_module):
+    """Master gate off, _PAUSE_ENABLED=False, _KILL_ENABLED=False: a
+    would_pause signal still fires (logged) but evaluate returns
+    continue/no_signal because no promotion flag activates the action."""
+    fresh_module._SHADOW_ONLY = False
+    fresh_module._PAUSE_ENABLED = False
+    fresh_module._KILL_ENABLED = False
+    result = None
+    for _ in range(5):
+        result = fresh_module.evaluate(_g(notional_ratio=1.85))
+    assert result == {"action": "continue", "reason": "no_signal"}
+
+
+def test_kill_signal_falls_to_pause_when_kill_disabled(fresh_module):
+    """Phase C decision C3: when _KILL_ENABLED=False but _PAUSE_ENABLED=True,
+    a fired would_kill signal falls through to pause action — preserves
+    safety intent (skip placements while operator investigates) without
+    escalating to terminal kill state."""
+    fresh_module._SHADOW_ONLY = False
+    fresh_module._PAUSE_ENABLED = True
+    fresh_module._KILL_ENABLED = False
+    result = _trigger_kill_sequence(fresh_module)
+    assert result["action"] == "pause"
+    assert "cf_trajectory" in result["reason"]
+
+
+def test_master_shadow_only_overrides_promotion_flags(fresh_module):
+    """_SHADOW_ONLY=True is the master gate — even with both promotion
+    flags True and signals firing, evaluate returns continue/shadow.
+    This is the single-flag revert path: flipping master back to True
+    restores Stage 1 behaviour without code change."""
+    fresh_module._SHADOW_ONLY = True
+    fresh_module._PAUSE_ENABLED = True
+    fresh_module._KILL_ENABLED = True
+    result = None
+    for _ in range(5):
+        result = fresh_module.evaluate(_g(notional_ratio=1.85))
+    assert result == {"action": "continue", "reason": "shadow"}
+
+
+def test_kill_enabled_without_pause_still_acts_on_kill_signals(fresh_module):
+    """_KILL_ENABLED=True alone (without _PAUSE_ENABLED=True) is a valid
+    state: would_kill signals translate to kill, would_pause signals
+    are silently ignored (would fall to no_signal). Permits a
+    promotion path that activates Stage 3 directly without Stage 2 if
+    the operator chooses."""
+    fresh_module._SHADOW_ONLY = False
+    fresh_module._PAUSE_ENABLED = False
+    fresh_module._KILL_ENABLED = True
+
+    # Kill signal still fires its action.
+    result = _trigger_kill_sequence(fresh_module)
+    assert result["action"] == "kill"
+    assert "cf_trajectory" in result["reason"]
+
+
+def test_pause_signal_with_kill_only_promotion_returns_continue(fresh_module):
+    """_KILL_ENABLED=True, _PAUSE_ENABLED=False: a would_pause signal
+    fires but evaluate returns continue/no_signal — no action because
+    pause flag is off and the kill flag is irrelevant for would_pause
+    signals."""
+    fresh_module._SHADOW_ONLY = False
+    fresh_module._PAUSE_ENABLED = False
+    fresh_module._KILL_ENABLED = True
+    result = None
+    for _ in range(5):
+        result = fresh_module.evaluate(_g(notional_ratio=1.85))
+    assert result == {"action": "continue", "reason": "no_signal"}
