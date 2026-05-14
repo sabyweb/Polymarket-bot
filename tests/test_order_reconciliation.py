@@ -84,7 +84,7 @@ class TestReconcileGhostBuyOrders(unittest.TestCase):
         stub = _make_farmer_stub(markets)
 
         # Exchange has no orders at all
-        stub.client.get_orders.return_value = []
+        stub.client.get_open_orders.return_value = []
         # get_order says: CANCELLED, no fills
         stub.client.get_order.return_value = {
             "status": "CANCELLED", "size_matched": 0, "price": "0.48",
@@ -107,7 +107,7 @@ class TestReconcileGhostBuyOrders(unittest.TestCase):
         markets = {ms.cid: ms}
         stub = _make_farmer_stub(markets)
 
-        stub.client.get_orders.return_value = []
+        stub.client.get_open_orders.return_value = []
         # get_order says: MATCHED with 50 shares
         stub.client.get_order.return_value = {
             "status": "MATCHED", "size_matched": 50, "price": "0.48",
@@ -132,7 +132,7 @@ class TestReconcileGhostBuyOrders(unittest.TestCase):
         stub = _make_farmer_stub(markets)
 
         # Exchange has our order
-        stub.client.get_orders.return_value = [{"id": "valid_buy"}]
+        stub.client.get_open_orders.return_value = [{"id": "valid_buy"}]
 
         from reward_farmer import RewardFarmer
         RewardFarmer._reconcile_orders(stub)
@@ -155,7 +155,7 @@ class TestReconcileGhostBuyOrders(unittest.TestCase):
         markets = {ms.cid: ms}
         stub = _make_farmer_stub(markets)
 
-        stub.client.get_orders.return_value = []
+        stub.client.get_open_orders.return_value = []
         stub.client.get_order.return_value = {
             "status": "CANCELLED", "size_matched": 0, "price": "0.50",
         }
@@ -184,7 +184,7 @@ class TestReconcileGhostDumpOrders(unittest.TestCase):
         markets = {ms.cid: ms}
         stub = _make_farmer_stub(markets)
 
-        stub.client.get_orders.return_value = []
+        stub.client.get_open_orders.return_value = []
 
         from reward_farmer import RewardFarmer
         RewardFarmer._reconcile_orders(stub)
@@ -206,7 +206,7 @@ class TestReconcileGhostDumpOrders(unittest.TestCase):
         markets = {ms.cid: ms}
         stub = _make_farmer_stub(markets)
 
-        stub.client.get_orders.return_value = [{"id": "valid_dump"}]
+        stub.client.get_open_orders.return_value = [{"id": "valid_dump"}]
 
         from reward_farmer import RewardFarmer
         RewardFarmer._reconcile_orders(stub)
@@ -231,7 +231,7 @@ class TestReconcileGhostDumpOrders(unittest.TestCase):
         markets = {ms.cid: ms}
         stub = _make_farmer_stub(markets)
 
-        stub.client.get_orders.return_value = []
+        stub.client.get_open_orders.return_value = []
         stub.client.get_order.return_value = {
             "status": "CANCELLED", "size_matched": 0, "price": "0.48",
         }
@@ -262,7 +262,7 @@ class TestReconcileErrorHandling(unittest.TestCase):
         markets = {ms.cid: ms}
         stub = _make_farmer_stub(markets)
 
-        stub.client.get_orders.side_effect = Exception("API down")
+        stub.client.get_open_orders.side_effect = Exception("API down")
 
         from reward_farmer import RewardFarmer
         RewardFarmer._reconcile_orders(stub)
@@ -280,7 +280,7 @@ class TestReconcileErrorHandling(unittest.TestCase):
         markets = {ms.cid: ms}
         stub = _make_farmer_stub(markets)
 
-        stub.client.get_orders.return_value = []
+        stub.client.get_open_orders.return_value = []
         stub.client.get_order.side_effect = Exception("API timeout")
 
         from reward_farmer import RewardFarmer
@@ -293,7 +293,7 @@ class TestReconcileErrorHandling(unittest.TestCase):
         """Empty markets dict → reconciliation completes cleanly."""
         markets = {}
         stub = _make_farmer_stub(markets)
-        stub.client.get_orders.return_value = []
+        stub.client.get_open_orders.return_value = []
 
         from reward_farmer import RewardFarmer
         RewardFarmer._reconcile_orders(stub)
@@ -317,7 +317,7 @@ class TestReconcileDryRun(unittest.TestCase):
         RewardFarmer._reconcile_orders(stub)
 
         # No API calls
-        stub.client.get_orders.assert_not_called()
+        stub.client.get_open_orders.assert_not_called()
         # Order untouched
         self.assertEqual(ms.orders["yes"].order_id, "should_survive")
 

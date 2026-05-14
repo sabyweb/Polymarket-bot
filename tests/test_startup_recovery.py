@@ -96,7 +96,7 @@ class TestStartupBuyFillRecovery(unittest.TestCase):
         ]
 
         # Exchange still has the order (partially filled)
-        stub.client.get_orders.return_value = [{"id": "oid_buy"}]
+        stub.client.get_open_orders.return_value = [{"id": "oid_buy"}]
 
         # get_order reveals 30/50 shares matched
         stub.client.get_order.return_value = {
@@ -125,7 +125,7 @@ class TestStartupBuyFillRecovery(unittest.TestCase):
         ]
 
         # Exchange does NOT have the order (fully filled, removed)
-        stub.client.get_orders.return_value = []
+        stub.client.get_open_orders.return_value = []
 
         # get_order reveals fully matched
         stub.client.get_order.return_value = {
@@ -146,7 +146,7 @@ class TestStartupBuyFillRecovery(unittest.TestCase):
         stub.db.load_active_orders.return_value = [
             _make_db_order("oid_clean", side="yes", price=0.48, shares=50),
         ]
-        stub.client.get_orders.return_value = [{"id": "oid_clean"}]
+        stub.client.get_open_orders.return_value = [{"id": "oid_clean"}]
         stub.client.get_order.return_value = {
             "status": "LIVE", "size_matched": 0, "price": "0.48",
         }
@@ -183,7 +183,7 @@ class TestStartupDumpRecovery(unittest.TestCase):
             _make_db_order("oid_dump", side="yes", order_type="dump_sell",
                            price=0.47, shares=50),
         ]
-        stub.client.get_orders.return_value = []
+        stub.client.get_open_orders.return_value = []
         stub.client.get_order.return_value = {
             "status": "MATCHED", "size_matched": 50, "price": "0.47",
         }
@@ -219,7 +219,7 @@ class TestStartupMixedScenarios(unittest.TestCase):
                            order_type="dump_sell", price=0.48, shares=80),
             _make_db_order("oid_clean", condition_id="cid_003", side="yes", price=0.50, shares=30),
         ]
-        stub.client.get_orders.return_value = [{"id": "oid_clean"}]
+        stub.client.get_open_orders.return_value = [{"id": "oid_clean"}]
 
         def _get_order(oid):
             if oid == "oid_buy":
@@ -251,7 +251,7 @@ class TestStartupMixedScenarios(unittest.TestCase):
         stub = _make_farmer_stub()
 
         stub.db.load_active_orders.return_value = []
-        stub.client.get_orders.return_value = [
+        stub.client.get_open_orders.return_value = [
             {"id": "unknown_oid_1"},
             {"id": "unknown_oid_2"},
         ]
@@ -277,7 +277,7 @@ class TestStartupErrorHandling(unittest.TestCase):
             _make_db_order("oid_err", side="yes", price=0.48, shares=50),
             _make_db_order("oid_ok", condition_id="cid_002", side="no", price=0.52, shares=30),
         ]
-        stub.client.get_orders.return_value = [{"id": "oid_err"}, {"id": "oid_ok"}]
+        stub.client.get_open_orders.return_value = [{"id": "oid_err"}, {"id": "oid_ok"}]
 
         def _get_order(oid):
             if oid == "oid_err":
@@ -301,7 +301,7 @@ class TestStartupErrorHandling(unittest.TestCase):
         stub = _make_farmer_stub()
 
         stub.db.load_active_orders.return_value = []
-        stub.client.get_orders.side_effect = Exception("Network error")
+        stub.client.get_open_orders.side_effect = Exception("Network error")
 
         from reward_farmer import RewardFarmer
         RewardFarmer._reconcile_on_startup(stub)
@@ -319,7 +319,7 @@ class TestStartupDryRun(unittest.TestCase):
         from reward_farmer import RewardFarmer
         RewardFarmer._reconcile_on_startup(stub)
 
-        stub.client.get_orders.assert_not_called()
+        stub.client.get_open_orders.assert_not_called()
         stub.client.get_order.assert_not_called()
         stub.client.cancel_order.assert_not_called()
         stub.db.purge_all_active_orders.assert_not_called()

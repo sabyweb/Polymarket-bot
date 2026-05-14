@@ -62,7 +62,8 @@ class FillsMixin:
             # Build map of this market's exchange orders
             market_tokens = set(self.market["token_ids"])
             if exchange_orders is None:
-                exchange_orders = self.client.get_orders() or []
+                # V2 SDK: get_open_orders replaces V1's get_orders.
+                exchange_orders = self.client.get_open_orders() or []
             open_map: dict[str, dict] = {
                 o["id"]: o for o in exchange_orders
                 if o.get("asset_id") in market_tokens

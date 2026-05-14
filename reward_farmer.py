@@ -260,7 +260,9 @@ class RewardFarmer:
         # Step 2: Get exchange orders
         existing = []
         try:
-            existing = self.client.get_orders() or []
+            # V2 SDK renamed get_orders → get_open_orders (drop-in compatible,
+            # no args, returns list of open exchange orders for this account).
+            existing = self.client.get_open_orders() or []
         except Exception as e:
             log.warning(f"Startup get_orders failed: {e}")
 
@@ -430,7 +432,8 @@ class RewardFarmer:
         if self.dry_run:
             return
         try:
-            exchange_orders = self.client.get_orders() or []
+            # V2 SDK: get_open_orders replaces V1's get_orders.
+            exchange_orders = self.client.get_open_orders() or []
             open_ids = {o["id"] for o in exchange_orders}
         except Exception as e:
             log.warning(f"Order reconciliation: get_orders failed: {e}")
@@ -1748,7 +1751,8 @@ class RewardFarmer:
             open_ids = set()
         else:
             try:
-                exchange_orders = self.client.get_orders() or []
+                # V2 SDK: get_open_orders replaces V1's get_orders.
+                exchange_orders = self.client.get_open_orders() or []
             except Exception as e:
                 log.error(f"get_orders failed: {e}")
                 self._emit_cycle_telemetry()
