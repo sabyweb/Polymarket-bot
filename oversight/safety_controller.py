@@ -874,6 +874,21 @@ class SafetyController:
             return None
         latest_ts = row[0] if row else None
         if latest_ts is None or latest_ts == 0:
+            # Bootstrap distinction: an empty scoring_snapshots can mean either
+            #   (a) cold-start DB — no orders have ever been placed → freshness N/A,
+            #   (b) orders exist but the scoring pipeline is broken → real failure.
+            # Differentiate by lifetime orders_placed count. On (a) treat as fresh so
+            # I9 does not deadlock the SafetyController in DATA_UNAVAILABLE; this is
+            # the documented chicken-and-egg of §4.14 + §10.3 v5.1.4 lessons. Once
+            # the bot places its first order ever, the row count is non-zero and
+            # this branch reverts to the original defensive None.
+            orders_ever = _query_with_retry(
+                self.db_path,
+                "SELECT COUNT(*) FROM orders_placed",
+                fetch="one",
+            )
+            if orders_ever is not None and orders_ever[0] == 0:
+                return 0.0
             return None
         return time.time() - latest_ts
 
