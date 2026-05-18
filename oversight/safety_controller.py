@@ -332,11 +332,20 @@ class SafetyController:
         if _portfolio_val <= 0:
             _portfolio_val = exchange_balance
         if _portfolio_val <= 0:
-            violations.append(Violation(
-                "drawdown", PRIORITY_CRITICAL, DATA_UNAVAILABLE,
-                0, MAX_DRAWDOWN_PCT,
-                "Portfolio value unavailable — no fallback",
-            ))
+            # Cold-start branch (FX-002): no orders ever placed, no fills observed,
+            # so by definition no drawdown can have occurred. Skip I3 silently — the
+            # DATA_UNAVAILABLE violation here is what locks fresh-DB bootstraps in
+            # the state machine while the wallet read propagates (§4.14 chicken-and-
+            # egg). Once the bot places its first order ever, this branch never
+            # fires again.
+            if self._is_genuine_cold_start():
+                log.info("I3 skipped on genuine cold start (no portfolio history yet)")
+            else:
+                violations.append(Violation(
+                    "drawdown", PRIORITY_CRITICAL, DATA_UNAVAILABLE,
+                    0, MAX_DRAWDOWN_PCT,
+                    "Portfolio value unavailable — no fallback",
+                ))
         else:
             self._update_portfolio_peak(_portfolio_val, exchange_balance)
             if self._portfolio_peak > 0:
@@ -877,20 +886,39 @@ class SafetyController:
             # Bootstrap distinction: an empty scoring_snapshots can mean either
             #   (a) cold-start DB — no orders have ever been placed → freshness N/A,
             #   (b) orders exist but the scoring pipeline is broken → real failure.
-            # Differentiate by lifetime orders_placed count. On (a) treat as fresh so
-            # I9 does not deadlock the SafetyController in DATA_UNAVAILABLE; this is
-            # the documented chicken-and-egg of §4.14 + §10.3 v5.1.4 lessons. Once
-            # the bot places its first order ever, the row count is non-zero and
-            # this branch reverts to the original defensive None.
-            orders_ever = _query_with_retry(
+            # On (a) treat as fresh so I9 doesn't deadlock the SafetyController in
+            # DATA_UNAVAILABLE; on (b) preserve the defensive None. Once the bot
+            # places its first order ever, _is_genuine_cold_start returns False and
+            # this branch reverts to original behaviour.
+            if self._is_genuine_cold_start():
+                return 0.0
+            return None
+        return time.time() - latest_ts
+
+    def _is_genuine_cold_start(self) -> bool:
+        # True iff the bot has never placed an order AND has never observed a fill
+        # in this DB's lifetime. Drives two cold-start branches:
+        #   I9 data_freshness (FX-001) and I3 drawdown (FX-002).
+        # Returns False on query failure — conservative default treats unknown
+        # state as a warm DB so existing defences still fire.
+        try:
+            orders = _query_with_retry(
                 self.db_path,
                 "SELECT COUNT(*) FROM orders_placed",
                 fetch="one",
             )
-            if orders_ever is not None and orders_ever[0] == 0:
-                return 0.0
-            return None
-        return time.time() - latest_ts
+            if orders is None or orders[0] > 0:
+                return False
+            fills = _query_with_retry(
+                self.db_path,
+                "SELECT COUNT(*) FROM fills",
+                fetch="one",
+            )
+            if fills is None or fills[0] > 0:
+                return False
+            return True
+        except Exception:
+            return False
 
     def _query_recent_fill_storms(self) -> int | None:
         cutoff = time.time() - FILL_STORM_LOOKBACK_SECS
