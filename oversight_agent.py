@@ -542,9 +542,19 @@ def run_loop(
     shutdown = False
 
     def _sig(signum, frame):
+        # FX-015: structured `[SHUTDOWN]` log channel + name the signal so
+        # the operator can tell SIGINT (Ctrl+C) from SIGTERM (systemctl)
+        # in journalctl. The agent doesn't trade, so there's nothing to
+        # cancel — flipping ``shutdown`` is enough to exit the main loop
+        # at the next iteration.
         nonlocal shutdown
+        name = (
+            "SIGINT" if signum == signal.SIGINT
+            else "SIGTERM" if signum == signal.SIGTERM
+            else f"signal {signum}"
+        )
         shutdown = True
-        log.info("Shutdown requested...")
+        log.info(f"[SHUTDOWN] {name} received — exiting loop")
 
     signal.signal(signal.SIGINT, _sig)
     signal.signal(signal.SIGTERM, _sig)
@@ -564,7 +574,7 @@ def run_loop(
                 break
             time.sleep(1)
 
-    log.info("Oversight agent stopped")
+    log.info("[SHUTDOWN] Oversight agent stopped")
 
 
 def main():

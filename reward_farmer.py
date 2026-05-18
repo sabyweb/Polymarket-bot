@@ -1764,8 +1764,14 @@ class RewardFarmer:
             )
             return False
         try:
+            # Phase 5 audit: propagate force_execute into OL so it bypasses
+            # its own dry_run short-circuit. Without this, kill-switch /
+            # shutdown cancels in SHADOW would log success but never call
+            # the real API, leaking operator-poked orders.
             ok = bool(
-                self.order_lifecycle.cancel_order(order_id, reason=reason)
+                self.order_lifecycle.cancel_order(
+                    order_id, reason=reason, force=force_execute,
+                )
             )
         except Exception as e:
             log.debug(f"[GATED] cancel error {order_id}: {e}")
@@ -2158,9 +2164,20 @@ class RewardFarmer:
     def run(self, duration_secs: int = 0):
         """Main loop."""
         def _sig(signum, frame):
+            # FX-015: handle SIGINT (Ctrl+C) and SIGTERM (systemctl stop)
+            # identically. Both flip _shutdown so the main loop exits at the
+            # next cycle boundary, then _shutdown_cleanup cancels any live
+            # orders before the process returns. Logging the name aids
+            # operator debugging from journalctl ("which signal killed me?").
+            name = (
+                "SIGINT" if signum == signal.SIGINT
+                else "SIGTERM" if signum == signal.SIGTERM
+                else f"signal {signum}"
+            )
             self._shutdown = True
-            log.info("Shutdown requested...")
+            log.info(f"[SHUTDOWN] {name} received — exiting at next cycle boundary")
         signal.signal(signal.SIGINT, _sig)
+        signal.signal(signal.SIGTERM, _sig)
 
         self.refresh_markets()
         if not self.markets:
@@ -2287,18 +2304,92 @@ class RewardFarmer:
         self._shutdown_cleanup()
 
     def _shutdown_cleanup(self):
-        """Cancel ALL orders, save state."""
-        log.info("Shutting down...")
+        """Cancel ALL orders, save state.
+
+        FX-015 + Phase 5 audit: uses the V2 SDK's ``cancel_orders`` batch
+        endpoint — a single API call cancels every tracked order, fitting
+        comfortably under ``TimeoutStopSec=30`` even at the worst-case
+        60-markets × 4 sides = 240 orders. The per-order ``cancel_order``
+        loop is preserved as a fallback for when the batch call itself
+        raises (rate-limit, network, malformed payload).
+
+        ``_kill_switch_active = True`` is set first so any fallback
+        per-order cancels bypass OL's ``dry_run`` short-circuit via the
+        ``force=True`` propagation in ``_gated_cancel_order``. Direct
+        ``self.client.cancel_orders`` calls bypass OL entirely so the
+        flag isn't strictly needed for the batch path, but setting it
+        keeps the semantics consistent if the fallback fires.
+        """
+        # Enumerate pending orders first so the [SHUTDOWN] log line has
+        # accurate counts before we start cancelling. Skip dry-run
+        # placeholders ("dry_yes" / "dry_no" written by OL's internal
+        # dry_run branches) — they have no Polymarket counterpart and
+        # the batch endpoint would reject the request.
+        live_buys: list[str] = []
+        live_dumps: list[str] = []
         for ms in self.markets.values():
-            for side in ["yes", "no"]:
+            for side in ("yes", "no"):
                 oid = ms.orders[side].order_id
-                if oid and oid != "dry_yes" and oid != "dry_no":
-                    self._gated_cancel_order(oid, reason="shutdown")
+                if oid and oid not in ("dry_yes", "dry_no"):
+                    live_buys.append(oid)
                 dump_oid = ms.dump_orders[side]
                 if dump_oid:
-                    self._gated_cancel_order(dump_oid, reason="shutdown_dump")
-        self.rewards._save()
-        log.info("All orders cancelled. Shutdown complete.")
+                    live_dumps.append(dump_oid)
+
+        log.info(
+            f"[SHUTDOWN] cleanup beginning: {len(live_buys)} buy orders + "
+            f"{len(live_dumps)} dump orders across {len(self.markets)} markets"
+        )
+
+        # Force-execute flag for the per-order fallback path. Idempotent
+        # (the kill-switch may have already armed it earlier this run).
+        self._kill_switch_active = True
+
+        all_oids = live_buys + live_dumps
+        cancelled = 0
+        failed = 0
+
+        if all_oids:
+            # Batch path — one API call to cancel everything. Latency cliff
+            # mitigation: at the worst-case 240 orders this would take
+            # ~24s at 100ms/cancel via per-order loop; the batch returns
+            # in well under a second.
+            try:
+                self.client.cancel_orders(all_oids)
+                cancelled = len(all_oids)
+                log.info(
+                    f"[SHUTDOWN] batch cancel succeeded: {cancelled} orders "
+                    f"in 1 API call"
+                )
+            except Exception as e:
+                log.warning(
+                    f"[SHUTDOWN] batch cancel failed ({e}) — falling back "
+                    f"to per-order cancels"
+                )
+                # Per-order fallback: each cancel goes through the gated
+                # wrapper, which propagates force=True so OL's dry_run
+                # shortcut is bypassed.
+                for oid in live_buys:
+                    if self._gated_cancel_order(oid, reason="shutdown"):
+                        cancelled += 1
+                    else:
+                        failed += 1
+                for oid in live_dumps:
+                    if self._gated_cancel_order(oid, reason="shutdown_dump"):
+                        cancelled += 1
+                    else:
+                        failed += 1
+
+        try:
+            self.rewards._save()
+        except Exception as e:
+            log.warning(f"[SHUTDOWN] reward state save failed: {e}")
+
+        total = len(all_oids)
+        log.info(
+            f"[SHUTDOWN] cleanup complete: cancelled {cancelled}/{total} orders "
+            f"({failed} failed)"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════

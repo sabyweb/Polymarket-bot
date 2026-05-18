@@ -41,12 +41,20 @@ class OrderLifecycle:
         self.cycle_count = 0
         self._batch_idx = 0
 
-    def cancel_order(self, order_id: str, reason: str = "") -> bool:
+    def cancel_order(self, order_id: str, reason: str = "", force: bool = False) -> bool:
         """Cancel an order on the exchange. Returns True on success.
 
         V2 SDK: cancel_order takes an OrderPayload, not a bare string.
+
+        ``force=True`` bypasses the dry_run short-circuit and fires a real
+        API cancel even in DRY/SHADOW. Used by the farmer's kill-switch
+        override path (`_gated_cancel_order` propagates the flag) and by
+        `_shutdown_cleanup` so any operator-poked real orders get
+        cancelled before exit regardless of mode. Phase 5 audit caught
+        this — previously the DRY return-True hard-shortcut defeated the
+        advertised kill-switch override.
         """
-        if self.dry_run:
+        if self.dry_run and not force:
             return True
         try:
             from py_clob_client_v2.clob_types import OrderPayload

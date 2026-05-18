@@ -27,11 +27,28 @@ class RateLimitedClient:
     to enforce rate limits.
     """
 
-    # Methods that make API calls and should be rate-limited
+    # Methods that make API calls and should be rate-limited.
+    # The V2 SDK migration (commit ee6abdf) renamed:
+    #   - get_orders → get_open_orders
+    #   - cancel → cancel_order (now takes an OrderPayload, not a bare id)
+    # and added batch cancel methods. The set must list every V2 name
+    # production code actually calls — missing names leak through to the
+    # raw client without rate-limit / retry protection, which manifests
+    # most visibly as silent failure under 429 storms (e.g. shutdown
+    # cancels leaking orders if the CLOB throttles). Phase 5 audit caught
+    # the gap. Both V1 and V2 names are kept so a mixed-SDK fixture
+    # (legacy tests) doesn't break.
     _RATE_LIMITED_METHODS = {
-        "get_order_book", "get_orders", "get_order",
-        "create_and_post_order", "cancel",
-        "get_balance_allowance", "update_balance_allowance",
+        # Read paths
+        "get_order_book", "get_orders", "get_open_orders", "get_order",
+        "get_balance_allowance",
+        # Write paths
+        "create_and_post_order", "update_balance_allowance",
+        # Cancel paths (V1 + V2 + V2 batch — used by _shutdown_cleanup)
+        "cancel", "cancel_order", "cancel_orders", "cancel_all",
+        "cancel_market_orders",
+        # Position-management paths
+        "are_orders_scoring", "merge_positions",
     }
 
     def __init__(self, client: object) -> None:
