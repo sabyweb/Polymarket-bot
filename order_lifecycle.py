@@ -198,18 +198,28 @@ class OrderLifecycle:
         ``orderID`` from ``client.create_and_post_order`` AND wrote a row
         to the ``orders_placed`` DB table contribute to this count. Early
         returns (no book, wide spread, resolution proximity, sports block,
-        has-both shortcut) and DRY-run-mode placements return 0 — those
-        do not write to ``orders_placed``.
+        has-both shortcut, unliquidatable-gate) and DRY-run-mode
+        placements return 0 — those do not write to ``orders_placed``.
 
         Drives FX-004 (telemetry / DB consistency): the caller accumulates
         this value into ``_cycle_orders_placed`` so ``[CYCLE_SUMMARY]
         orders_placed`` matches ``SELECT COUNT(*) FROM orders_placed`` for
         the cycle window.
+
+        FX-005 / FX-007: gates on ``db.is_unliquidatable(cid)`` before
+        fetching the book; the orderbook for a marked cid is known dead
+        and any further BUY would just 400 again.
         """
         from py_clob_client_v2.clob_types import OrderArgs
         from py_clob_client_v2.order_builder.constants import BUY
 
         placed_count = 0
+
+        # FX-005 / FX-007 gate: skip BUY placement on cids whose orderbook
+        # the bot has already confirmed dead. Re-enabled only by the
+        # periodic re-probe (FX-028) in reward_farmer.
+        if self.db.is_unliquidatable(ms.cid):
+            return placed_count
 
         # Skip book fetch if both sides already have orders — saves 2 API calls.
         # Still fetch if a book refresh is due (every 5 min) so repricing and
@@ -405,6 +415,24 @@ class OrderLifecycle:
                             log.warning(f"YES order got no orderID | {ms.question[:25]}")
                     except Exception as e:
                         err_str = str(e).lower()
+                        # FX-005 / FX-007: definitive dead-orderbook signal.
+                        # Canonical V2 SDK body: "the orderbook {cid} does
+                        # not exist". Require BOTH substrings; tight enough
+                        # to skip "insufficient balance" / "rate limit" /
+                        # "market does not exist", loose enough to handle
+                        # the cid in the middle.
+                        orderbook_dead = (
+                            "orderbook" in err_str and "does not exist" in err_str
+                        )
+                        if orderbook_dead:
+                            log.warning(
+                                f"Marking {ms.cid[:16]} unliquidatable: orderbook gone "
+                                f"(YES BUY) | {ms.question[:30]}"
+                            )
+                            self.db.mark_unliquidatable(ms.cid, reason="buy_yes_orderbook_gone")
+                            self.db.write_placement_feedback(ms.cid, "yes", "failed", "orderbook_gone")
+                            # Don't try NO either — same orderbook is dead.
+                            return placed_count
                         if "insufficient" in err_str or "balance" in err_str or "not enough" in err_str:
                             failed_cost = yes_shares * edge_bid
                             prev = self.capital_ceiling
@@ -448,6 +476,23 @@ class OrderLifecycle:
                             log.warning(f"NO order got no orderID | {ms.question[:25]}")
                     except Exception as e:
                         err_str = str(e).lower()
+                        # FX-005 / FX-007: definitive dead-orderbook signal.
+                        # Canonical V2 SDK body: "the orderbook {cid} does
+                        # not exist". Require BOTH substrings; tight enough
+                        # to skip "insufficient balance" / "rate limit" /
+                        # "market does not exist", loose enough to handle
+                        # the cid in the middle.
+                        orderbook_dead = (
+                            "orderbook" in err_str and "does not exist" in err_str
+                        )
+                        if orderbook_dead:
+                            log.warning(
+                                f"Marking {ms.cid[:16]} unliquidatable: orderbook gone "
+                                f"(NO BUY) | {ms.question[:30]}"
+                            )
+                            self.db.mark_unliquidatable(ms.cid, reason="buy_no_orderbook_gone")
+                            self.db.write_placement_feedback(ms.cid, "no", "failed", "orderbook_gone")
+                            return placed_count
                         if "insufficient" in err_str or "balance" in err_str or "not enough" in err_str:
                             failed_cost = no_shares * no_clob
                             prev = self.capital_ceiling

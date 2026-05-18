@@ -226,9 +226,23 @@ class DumpManager:
         T+0 to T+5m: aggressive decay (fill_price - N ticks per minute)
         T+5m to T+30m: passive mode (reprice to merged book every 5m)
         T+30m: abandon
+
+        FX-007: skips silently when the cid is in the unliquidatable_markets
+        table. The bot has already confirmed the orderbook is gone; retrying
+        produces only 400 spam.
         """
         from py_clob_client_v2.clob_types import OrderArgs
         from py_clob_client_v2.order_builder.constants import SELL
+
+        # FX-007 gate: if this cid has been confirmed dead at the orderbook
+        # level, abandon any in-flight dump_state and return without an API
+        # call. The periodic re-probe (FX-028) is the only path that
+        # un-marks; un-marking re-enables this method on subsequent calls.
+        if self.db.is_unliquidatable(ms.cid):
+            if ms.dump_state[side]:
+                ms.dump_state[side] = None
+                self.db.delete_dump_state(ms.cid, side)
+            return
 
         tid = ms.yes_tid if side == "yes" else ms.no_tid
         tick = ms.tick_size
@@ -344,5 +358,32 @@ class DumpManager:
                 ms.dump_failures += 1
 
         except Exception as e:
-            log.error(f"Dump {side} FAILED: {e} | {ms.question[:30]}")
-            ms.dump_failures += 1
+            # FX-007 + FX-009: definitive "orderbook does not exist" → mark
+            # unliquidatable + clean the dump_state we just saved (the row
+            # was saved on first-attempt init before the post; on a dead
+            # orderbook there's nothing to retry on later cycles). Other
+            # exceptions (transient API, balance, network) leave the state
+            # alone for the next cycle to retry.
+            err_str = str(e).lower()
+            # Canonical V2 SDK 400 body: "the orderbook {cid} does not exist".
+            # The cid sits between "orderbook" and "does not exist", so we
+            # require BOTH substrings — strict enough that "insufficient
+            # balance" / "rate limit" / "market does not exist" don't
+            # match, loose enough to catch the canonical form regardless
+            # of the cid in the middle.
+            orderbook_dead = (
+                "orderbook" in err_str and "does not exist" in err_str
+            )
+            if orderbook_dead:
+                log.warning(
+                    f"Marking {ms.cid[:16]} unliquidatable: orderbook gone "
+                    f"({side.upper()} dump) | {ms.question[:30]}"
+                )
+                self.db.mark_unliquidatable(ms.cid, reason=f"dump_{side}_orderbook_gone")
+                if ms.dump_state[side]:
+                    ms.dump_state[side] = None
+                self.db.delete_dump_state(ms.cid, side)
+                ms.dump_failures += 1
+            else:
+                log.error(f"Dump {side} FAILED: {e} | {ms.question[:30]}")
+                ms.dump_failures += 1

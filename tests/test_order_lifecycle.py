@@ -44,13 +44,21 @@ def _healthy_book() -> dict:
 def _make_lifecycle(dry_run: bool = False, ms: MarketState | None = None) -> OrderLifecycle:
     """Build an OrderLifecycle with a single market registered when ``ms`` is
     given. ``can_place`` requires the market to be in ``self.markets``; without
-    it every call short-circuits with ``no_market`` and the count stays 0."""
+    it every call short-circuits with ``no_market`` and the count stays 0.
+
+    The DB mock is configured with ``is_unliquidatable -> False`` so the
+    FX-007 gate doesn't short-circuit every call (auto-MagicMock returns a
+    truthy MagicMock instance by default). Tests covering the gate set the
+    return value explicitly.
+    """
     positions = MagicMock()
     positions.get_shares.return_value = 0
     positions.can_quote.return_value = True
+    db = MagicMock()
+    db.is_unliquidatable.return_value = False
     markets = {ms.cid: ms} if ms is not None else {}
     ol = OrderLifecycle(
-        client=MagicMock(), db=MagicMock(), positions=positions,
+        client=MagicMock(), db=db, positions=positions,
         rewards=MagicMock(), markets=markets, dry_run=dry_run,
     )
     ol.capital_ceiling = None

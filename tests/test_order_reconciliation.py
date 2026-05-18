@@ -54,6 +54,9 @@ def _make_farmer_stub(markets):
     stub.dry_run = False
     stub.client = MagicMock()
     stub.db = MagicMock()
+    # FX-007 gate must default-allow under MagicMock'd DB so non-FX-007 tests
+    # exercise their intended code paths.
+    stub.db.is_unliquidatable.return_value = False
     stub.positions = MagicMock()
     stub.positions.get_shares.return_value = 0
     stub.positions.can_quote.return_value = True

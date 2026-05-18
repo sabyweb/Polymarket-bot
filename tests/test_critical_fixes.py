@@ -27,15 +27,21 @@ def _make_ms(cid="cid_001", agent_shares=50, agent_approved=True):
 
 
 def _make_lifecycle(markets_dict):
-    """Create an OrderLifecycle with minimal mocks."""
+    """Create an OrderLifecycle with minimal mocks.
+
+    DB mock is configured with ``is_unliquidatable -> False`` so the new
+    FX-007 gate doesn't short-circuit these tests.
+    """
     from order_lifecycle import OrderLifecycle
 
     positions = MagicMock()
     positions.get_shares.return_value = 0
     positions.can_quote.return_value = True
 
+    db = MagicMock()
+    db.is_unliquidatable.return_value = False
     ol = OrderLifecycle(
-        client=MagicMock(), db=MagicMock(), positions=positions,
+        client=MagicMock(), db=db, positions=positions,
         rewards=MagicMock(), markets=markets_dict, dry_run=True,
     )
     ol.capital_ceiling = None
@@ -43,7 +49,11 @@ def _make_lifecycle(markets_dict):
 
 
 def _make_dump_manager(positions=None):
-    """Create a DumpManager with minimal mocks."""
+    """Create a DumpManager with minimal mocks.
+
+    DB mock is configured with ``is_unliquidatable -> False`` so the new
+    FX-007 gate doesn't short-circuit these tests.
+    """
     from dump_manager import DumpManager
 
     if positions is None:
@@ -51,8 +61,10 @@ def _make_dump_manager(positions=None):
         positions.get_shares.return_value = 0
         positions.get_avg_price.return_value = 0.5
 
+    db = MagicMock()
+    db.is_unliquidatable.return_value = False
     dm = DumpManager(
-        client=MagicMock(), db=MagicMock(), positions=positions,
+        client=MagicMock(), db=db, positions=positions,
         cancel_fn=MagicMock(), dry_run=False,
     )
     return dm

@@ -42,14 +42,20 @@ def _make_ms(cid="cid_001", agent_approved=True):
 
 
 def _make_lifecycle(markets_dict):
-    """Create an OrderLifecycle with minimal mocks."""
+    """Create an OrderLifecycle with minimal mocks.
+
+    DB mock is configured with ``is_unliquidatable -> False`` so the new
+    FX-007 gate doesn't short-circuit these tests.
+    """
     positions = MagicMock()
     positions.get_shares.return_value = 0
     positions.can_quote.return_value = True
     positions.get_avg_price.return_value = 0.5
 
+    db = MagicMock()
+    db.is_unliquidatable.return_value = False
     ol = OrderLifecycle(
-        client=MagicMock(), db=MagicMock(), positions=positions,
+        client=MagicMock(), db=db, positions=positions,
         rewards=MagicMock(), markets=markets_dict, dry_run=False,
     )
     ol.capital_ceiling = None

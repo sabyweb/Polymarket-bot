@@ -250,6 +250,17 @@ CREATE TABLE IF NOT EXISTS dump_states (
     PRIMARY KEY (condition_id, side)
 );
 
+-- Markets the bot has definitively confirmed are dead at the orderbook level
+-- (create_and_post_order returned "orderbook does not exist"). Once a cid
+-- lands here, every order path skips it until the periodic re-probe finds the
+-- orderbook alive again (FX-007 / FX-005 / FX-006 / FX-008 / FX-009 / FX-028).
+CREATE TABLE IF NOT EXISTS unliquidatable_markets (
+    condition_id  TEXT PRIMARY KEY,
+    reason        TEXT NOT NULL DEFAULT '',
+    marked_at     REAL NOT NULL,
+    last_retry_at REAL NOT NULL DEFAULT 0
+);
+
 -- Active orders placed by the bot (persisted for crash recovery)
 CREATE TABLE IF NOT EXISTS active_orders (
     order_id     TEXT PRIMARY KEY,
@@ -1296,6 +1307,102 @@ class BotDatabase:
             self._get_conn().commit()
         except Exception as e:
             log.debug(f"delete_dump_state error: {e}")
+
+    # ── Unliquidatable Markets (FX-005/006/007/008/009/028) ──────────
+    # A market lands in this table when the bot definitively confirms its
+    # orderbook is dead (create_and_post_order returned "orderbook does not
+    # exist"). Both BUY (order_lifecycle) and SELL (dump_manager) paths
+    # consult this table to skip the cid. The periodic re-probe (every ~6h,
+    # FX-028) clears entries whose orderbook has returned.
+
+    def mark_unliquidatable(self, condition_id: str, reason: str = "") -> None:
+        """Persist a cid as unliquidatable. Idempotent — INSERT OR REPLACE
+        means re-marking refreshes the reason + marked_at without creating
+        duplicates."""
+        try:
+            self._get_conn().execute(
+                """INSERT OR REPLACE INTO unliquidatable_markets
+                   (condition_id, reason, marked_at, last_retry_at)
+                   VALUES (?, ?, ?, 0)""",
+                (condition_id, reason, time.time()),
+            )
+            self._get_conn().commit()
+        except Exception as e:
+            log.debug(f"mark_unliquidatable error: {e}")
+
+    def is_unliquidatable(self, condition_id: str) -> bool:
+        """Single-cid lookup. Returns False on DB errors (conservative —
+        don't block legitimate placements on a transient DB hiccup)."""
+        try:
+            row = self._get_conn().execute(
+                "SELECT 1 FROM unliquidatable_markets WHERE condition_id = ?",
+                (condition_id,),
+            ).fetchone()
+            return row is not None
+        except Exception as e:
+            log.debug(f"is_unliquidatable error: {e}")
+            return False
+
+    def delete_unliquidatable(self, condition_id: str) -> None:
+        """Re-enable retries for a cid (used by the periodic re-probe when
+        the orderbook returns to life)."""
+        try:
+            self._get_conn().execute(
+                "DELETE FROM unliquidatable_markets WHERE condition_id = ?",
+                (condition_id,),
+            )
+            self._get_conn().commit()
+        except Exception as e:
+            log.debug(f"delete_unliquidatable error: {e}")
+
+    def update_unliquidatable_retry(self, condition_id: str) -> None:
+        """Stamp last_retry_at without un-marking (re-probe found the
+        orderbook still dead)."""
+        try:
+            self._get_conn().execute(
+                "UPDATE unliquidatable_markets SET last_retry_at = ? "
+                "WHERE condition_id = ?",
+                (time.time(), condition_id),
+            )
+            self._get_conn().commit()
+        except Exception as e:
+            log.debug(f"update_unliquidatable_retry error: {e}")
+
+    def load_unliquidatable_set(self) -> set[str]:
+        """Return the full set of unliquidatable cids.
+
+        Currently used by tooling / future operator scripts only — the
+        production hot paths consult ``is_unliquidatable(cid)`` per call
+        (a single indexed PK lookup, ~µs on local SQLite, well under any
+        meaningful cycle budget). Kept as a stable API surface so a
+        startup cache can be wired in later without breaking callers.
+        Empty set on DB errors so the farmer doesn't crash."""
+        try:
+            rows = self._get_conn().execute(
+                "SELECT condition_id FROM unliquidatable_markets"
+            ).fetchall()
+            return {r["condition_id"] for r in rows}
+        except Exception as e:
+            log.debug(f"load_unliquidatable_set error: {e}")
+            return set()
+
+    def get_unliquidatable_for_reprobe(self, stale_secs: float) -> list[tuple[str, float]]:
+        """Return (cid, last_retry_at) pairs whose last_retry_at is older
+        than stale_secs (or 0 = never retried). Drives the periodic
+        re-probe (FX-028); the farmer calls get_merged_book on each
+        returned cid and either delete_unliquidatable (on success) or
+        update_unliquidatable_retry (on continued failure)."""
+        try:
+            cutoff = time.time() - stale_secs
+            rows = self._get_conn().execute(
+                "SELECT condition_id, last_retry_at FROM unliquidatable_markets "
+                "WHERE last_retry_at < ? OR last_retry_at = 0",
+                (cutoff,),
+            ).fetchall()
+            return [(r["condition_id"], r["last_retry_at"]) for r in rows]
+        except Exception as e:
+            log.debug(f"get_unliquidatable_for_reprobe error: {e}")
+            return []
 
     # ── Active Order Persistence (crash recovery) ────────────────────
 

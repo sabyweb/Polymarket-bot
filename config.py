@@ -245,6 +245,7 @@ RF_DUMP_ABANDON_MINS: float = 30.0          # Hard timeout: give up on dump
 RF_DUMP_EXIT_DEPTH_BUFFER: float = 0.02     # Max price buffer for exit depth check
 RF_UNKNOWN_RETRY_THRESHOLD: int = 2         # Retries before clearing UNKNOWN status order (was 5, reduced)
 RF_DUMP_MAX_FAILURES: int = 3               # Dump failures before blocking placement
+RF_UNLIQUIDATABLE_REPROBE_SECS: float = 6 * 3600  # FX-028: re-probe each unliquidatable market every ~6h via get_merged_book
 RF_MAX_BOOK_SPREAD: float = 0.15            # Skip if merged book spread exceeds this
 RF_ALLOCATION_TTL_HOURS: float = 2.0        # Max age of oversight agent allocations
 RF_FILL_BREAKER_WINDOW: int = 180            # Fill-rate breaker window (seconds)

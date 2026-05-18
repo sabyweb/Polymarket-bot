@@ -190,6 +190,11 @@ class RewardFarmer:
         self._alloc_mtime = 0.0
         self._last_reconcile = 0.0
         self._last_exchange_sync = 0.0
+        # FX-028: timestamp of the last unliquidatable_markets re-probe sweep.
+        # The actual per-cid staleness gate is RF_UNLIQUIDATABLE_REPROBE_SECS
+        # (~6h); this loop-level timestamp throttles the SWEEP itself so the
+        # 30-s cycle doesn't issue the DB query 720× per probe window.
+        self._last_unliquidatable_reprobe = 0.0
         # Issue 3: Cross-market fill storm detector
         self._global_fill_times: list[float] = []  # timestamps of all fills across all markets
         self._fill_storm_until: float = 0.0  # if > time.time(), halt new placements
@@ -548,6 +553,13 @@ class RewardFarmer:
             orphans_found = 0
 
             for cid, question in candidates:
+                # FX-007: skip cids the bot has already confirmed have a
+                # dead orderbook. Without this gate, the scan keeps finding
+                # the same on-chain CTF balance (the orphan tokens never
+                # leave the wallet — CTF redemption is manual UI-only) and
+                # re-queueing a dump that immediately 400s.
+                if self.db.is_unliquidatable(cid):
+                    continue
                 # Fetch token_ids from CLOB API
                 try:
                     mkt_resp = requests.get(
@@ -673,6 +685,15 @@ class RewardFarmer:
             orphan_cids = exchange_cids - tracked_cids
             orphans_found = 0
             for cid in orphan_cids:
+                # FX-007: skip cids the bot has already confirmed have a
+                # dead orderbook. The CTF balance on-exchange never clears
+                # (CTF redemption is manual UI-only); without this gate
+                # the 30-min sync would re-register the same orphan into
+                # self.markets every cycle indefinitely. The downstream
+                # dump_position gate blocks the SELL, but the MarketState
+                # would still accumulate.
+                if self.db.is_unliquidatable(cid):
+                    continue
                 sides = exchange_by_cid[cid]
                 question = next(iter(sides.values()))["question"]
 
@@ -762,7 +783,14 @@ class RewardFarmer:
             log.warning(f"Exchange position sync failed: {e}")
 
     def _restore_dump_states(self):
-        """Restore dump states from DB after crash/restart."""
+        """Restore dump states from DB after crash/restart.
+
+        FX-008: silently drops rows for unliquidatable cids. Without this
+        gate, a restart would re-load the failing Tamilaga-style dump_state
+        and re-trigger the 400 spam loop, since the in-memory
+        unliquidatable cache is loaded at the same startup phase as this
+        method (both before the main farming loop).
+        """
         if self.dry_run:
             return
         saved = self.db.load_all_dump_states()
@@ -770,11 +798,18 @@ class RewardFarmer:
             return
         restored = 0
         cleaned = 0
+        unliquidatable_skipped = 0
         for (cid, side), state in saved.items():
             ms = self.markets.get(cid)
             if not ms:
                 self.db.delete_dump_state(cid, side)
                 cleaned += 1
+                continue
+            if self.db.is_unliquidatable(cid):
+                # FX-008: the orderbook is dead; the saved dump_state would
+                # just re-trigger the 400 loop. Drop the row and move on.
+                self.db.delete_dump_state(cid, side)
+                unliquidatable_skipped += 1
                 continue
             elapsed_min = (time.time() - state["started_at"]) / 60.0
             if elapsed_min >= cfg("RF_DUMP_ABANDON_MINS"):
@@ -786,8 +821,79 @@ class RewardFarmer:
             ms.dump_orders[side] = saved_oid if saved_oid else None
             restored += 1
             log.info(f"Restored dump {side.upper()} {state['shares']:.0f}sh @ {state['fill_price']:.4f} ({elapsed_min:.0f}m elapsed) | {ms.question[:30]}")
-        if restored or cleaned:
-            log.info(f"Dump state recovery: restored {restored}, cleaned {cleaned}")
+        if restored or cleaned or unliquidatable_skipped:
+            log.info(
+                f"Dump state recovery: restored {restored}, cleaned {cleaned}, "
+                f"skipped {unliquidatable_skipped} on unliquidatable cids"
+            )
+
+    def _reprobe_unliquidatable(self):
+        """FX-028: periodic re-probe of unliquidatable cids.
+
+        For each cid whose ``last_retry_at`` is older than
+        ``RF_UNLIQUIDATABLE_REPROBE_SECS`` (default 6h), call
+        ``get_merged_book``. If both YES + NO books return data → un-mark
+        (the orderbook has come back to life, very rare but possible).
+        Otherwise stamp ``last_retry_at`` and leave the row in place.
+
+        Called from the main loop on a cycle-counter cadence, NOT every
+        cycle, so the cost is bounded. The DB query already filters
+        on staleness, so an empty result set returns immediately.
+        """
+        if self.dry_run:
+            return
+        try:
+            stale_secs = cfg("RF_UNLIQUIDATABLE_REPROBE_SECS")
+            candidates = self.db.get_unliquidatable_for_reprobe(stale_secs)
+            if not candidates:
+                return
+            from market_discovery import get_merged_book
+            unmarked = 0
+            still_dead = 0
+            for cid, _last_retry in candidates:
+                # We need token_ids to probe. Try the in-memory markets
+                # first; fall back to a CLOB market lookup if absent.
+                yes_tid = None
+                no_tid = None
+                ms = self.markets.get(cid)
+                if ms:
+                    yes_tid, no_tid = ms.yes_tid, ms.no_tid
+                else:
+                    try:
+                        import requests
+                        resp = requests.get(
+                            f"https://clob.polymarket.com/markets/{cid}", timeout=10,
+                        )
+                        if resp.status_code == 200:
+                            tokens = resp.json().get("tokens") or []
+                            if len(tokens) >= 2:
+                                yes_tid = tokens[0]["token_id"]
+                                no_tid = tokens[1]["token_id"]
+                    except Exception:
+                        pass
+                if not yes_tid or not no_tid:
+                    # Can't probe without token_ids — leave alone, stamp retry.
+                    self.db.update_unliquidatable_retry(cid)
+                    still_dead += 1
+                    continue
+                merged = get_merged_book(self.client, yes_tid, no_tid)
+                if merged and merged.get("bids") and merged.get("asks"):
+                    log.info(
+                        f"Re-enabling {cid[:16]}: orderbook returned to life "
+                        f"after being marked unliquidatable"
+                    )
+                    self.db.delete_unliquidatable(cid)
+                    unmarked += 1
+                else:
+                    self.db.update_unliquidatable_retry(cid)
+                    still_dead += 1
+            if unmarked or still_dead:
+                log.info(
+                    f"Unliquidatable re-probe: {unmarked} un-marked, "
+                    f"{still_dead} still dead"
+                )
+        except Exception as e:
+            log.debug(f"Unliquidatable re-probe failed: {e}")
 
     # ── Market Management ───────────────────────────────────────────
 
@@ -1952,7 +2058,9 @@ class RewardFarmer:
                     f"(> {CLUSTER_NOTIONAL_LIMIT_FRAC:.0%}·T)"
                 )
 
-        # Step 4b: Remove dead markets (3+ consecutive book failures = resolved/delisted)
+        # Step 4b: Remove dead markets (3+ consecutive book failures = resolved/delisted).
+        # FX-006: also cascade to dump_states + mark unliquidatable so the
+        # orphan scan + dump restore don't re-create dumps for the dead cid.
         BOOK_FAILURE_LIMIT = 3
         dead_cids = [
             cid for cid, ms in self.markets.items()
@@ -1966,6 +2074,14 @@ class RewardFarmer:
                 if oid:
                     self._gated_cancel_order(oid, reason="dead_market")
                     self.db.delete_active_order(oid)
+                # FX-006: cascade to dump_states so a saved dump for this
+                # cid doesn't survive into the next restart's restore.
+                self.db.delete_dump_state(cid, side)
+            # FX-006 / FX-007: mark the cid unliquidatable. book_failures
+            # is a strong indication the orderbook is gone (get_merged_book
+            # returned None 3 cycles running); future BUY / dump attempts
+            # for this cid are blocked at the gate.
+            self.db.mark_unliquidatable(cid, reason="dead_market_book_failures")
             del self.markets[cid]
 
         # Step 5: Record rewards
@@ -2131,6 +2247,13 @@ class RewardFarmer:
             if not self.dry_run and time.time() - self._last_exchange_sync >= 1800:
                 self._sync_exchange_positions()
                 self._last_exchange_sync = time.time()
+
+            # FX-028: re-probe unliquidatable markets every ~6h. Per-cid
+            # staleness check is enforced inside the DB query, so this loop
+            # is a no-op when nothing has aged out.
+            if not self.dry_run and time.time() - self._last_unliquidatable_reprobe >= 1800:
+                self._reprobe_unliquidatable()
+                self._last_unliquidatable_reprobe = time.time()
 
             # Status every 5 min
             if time.time() - last_status >= 300:

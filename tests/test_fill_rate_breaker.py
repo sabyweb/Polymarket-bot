@@ -17,15 +17,21 @@ def _make_ms(cid="test_cid"):
 
 
 def _make_lifecycle(ms):
-    """Create an OrderLifecycle with minimal mocks, wired to the given MarketState."""
+    """Create an OrderLifecycle with minimal mocks, wired to the given MarketState.
+
+    DB mock is configured with ``is_unliquidatable -> False`` so the new
+    FX-007 gate doesn't short-circuit these tests.
+    """
     from order_lifecycle import OrderLifecycle
 
     positions = MagicMock()
     positions.get_shares.return_value = 0
     positions.can_quote.return_value = True
 
+    db = MagicMock()
+    db.is_unliquidatable.return_value = False
     ol = OrderLifecycle(
-        client=MagicMock(), db=MagicMock(), positions=positions,
+        client=MagicMock(), db=db, positions=positions,
         rewards=MagicMock(), markets={ms.cid: ms}, dry_run=True,
     )
     ol.capital_ceiling = None
