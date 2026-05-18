@@ -190,10 +190,26 @@ class OrderLifecycle:
         """Set reference to DumpManager (avoids circular import at init)."""
         self._dump_mgr = dump_mgr
 
-    def place_orders_for_market(self, ms: MarketState):
-        """Fetch book + place edge orders for one market."""
+    def place_orders_for_market(self, ms: MarketState) -> int:
+        """Fetch book + place edge orders for one market.
+
+        Returns the number of API-confirmed placements this call produced
+        (0, 1, or 2). Only LIVE-mode placements that received a valid
+        ``orderID`` from ``client.create_and_post_order`` AND wrote a row
+        to the ``orders_placed`` DB table contribute to this count. Early
+        returns (no book, wide spread, resolution proximity, sports block,
+        has-both shortcut) and DRY-run-mode placements return 0 — those
+        do not write to ``orders_placed``.
+
+        Drives FX-004 (telemetry / DB consistency): the caller accumulates
+        this value into ``_cycle_orders_placed`` so ``[CYCLE_SUMMARY]
+        orders_placed`` matches ``SELECT COUNT(*) FROM orders_placed`` for
+        the cycle window.
+        """
         from py_clob_client_v2.clob_types import OrderArgs
         from py_clob_client_v2.order_builder.constants import BUY
+
+        placed_count = 0
 
         # Skip book fetch if both sides already have orders — saves 2 API calls.
         # Still fetch if a book refresh is due (every 5 min) so repricing and
@@ -201,12 +217,12 @@ class OrderLifecycle:
         has_both = ms.orders["yes"].order_id and ms.orders["no"].order_id
         book_age = time.time() - ms.last_book_fetch
         if has_both and book_age < 300:
-            return
+            return placed_count
 
         merged = get_merged_book(self.client, ms.yes_tid, ms.no_tid)
         if not merged or not merged["bids"] or not merged["asks"]:
             ms.book_failures += 1
-            return
+            return placed_count
 
         ms.book_failures = 0  # reset on success
         best_bid = float(merged["bids"][0]["price"])
@@ -235,7 +251,7 @@ class OrderLifecycle:
         if best_ask - best_bid > cfg("RF_MAX_BOOK_SPREAD"):
             self.db.write_placement_feedback(ms.cid, "yes", "skipped", "wide_spread")
             self.db.write_placement_feedback(ms.cid, "no", "skipped", "wide_spread")
-            return
+            return placed_count
 
         # ── Resolution proximity guard (real-time) ──
         # The agent detects this every ~30min, but markets can move fast.
@@ -255,7 +271,7 @@ class OrderLifecycle:
                     if self.cancel_order(slot.order_id, reason="resolution_proximity"):
                         self.db.delete_active_order(slot.order_id)
                         slot.order_id = None
-            return
+            return placed_count
 
         # ── Live sports guard (Layer 2) ──
         # Sports markets near expiry have extreme adverse selection risk.
@@ -313,7 +329,7 @@ class OrderLifecycle:
                             if self.cancel_order(slot.order_id, reason=_block_reason):
                                 self.db.delete_active_order(slot.order_id)
                                 slot.order_id = None
-                    return
+                    return placed_count
 
         tick = ms.tick_size
         decimals = max(2, len(str(tick).rstrip('0').split('.')[-1]))
@@ -381,6 +397,7 @@ class OrderLifecycle:
                             self.db.log_order_placed(condition_id=ms.cid, side="yes", price=edge_bid, size=float(yes_shares), order_id=oid)
                             self.db.save_active_order(oid, ms.cid, "yes", "buy", edge_bid, yes_shares)
                             self.db.write_placement_feedback(ms.cid, "yes", "placed", "")
+                            placed_count += 1
                             if self.cycle_count <= 3:
                                 log.info(f"BID YES @ {edge_bid:.3f} ({yes_shares:.0f}sh) | {ms.question[:30]}")
                         else:
@@ -423,6 +440,7 @@ class OrderLifecycle:
                             self.db.log_order_placed(condition_id=ms.cid, side="no", price=edge_ask, size=float(no_shares), order_id=oid)
                             self.db.save_active_order(oid, ms.cid, "no", "buy", edge_ask, no_shares)
                             self.db.write_placement_feedback(ms.cid, "no", "placed", "")
+                            placed_count += 1
                             if self.cycle_count <= 3:
                                 log.info(f"ASK NO @ {edge_ask:.3f} (clob={no_clob:.3f}, {no_shares:.0f}sh) | {ms.question[:30]}")
                         else:
@@ -445,6 +463,8 @@ class OrderLifecycle:
             else:
                 if reason not in ("already_has_order", "dump_pending"):
                     self.db.write_placement_feedback(ms.cid, "no", "skipped", reason)
+
+        return placed_count
 
     def get_priority_batch(self, market_list: list) -> list:
         """Priority-based batch: empty slots first (highest daily_rate), then rotation."""

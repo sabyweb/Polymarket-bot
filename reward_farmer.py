@@ -1596,9 +1596,22 @@ class RewardFarmer:
     def _gated_place_orders_for_market(self, ms) -> None:
         """Mode-gated wrapper around OrderLifecycle.place_orders_for_market
         (§4.2). In non-LIVE modes: emit structured intent log and return.
-        In LIVE: delegate + increment the cycle counter. Stub-safe: when
-        self.mode is missing (test fixtures), defaults to LIVE so the
-        delegated call still fires."""
+        In LIVE: delegate + accumulate the cycle counter by the count of
+        API-confirmed placements returned by the wrapped call (FX-004).
+        Returns None for backwards-compat; callers don't consume the value.
+
+        Counter semantics (FX-004): _cycle_orders_placed accumulates only
+        the LIVE-mode placements that received a valid orderID from the
+        API and wrote a row to the orders_placed DB table. Early returns
+        (no book, wide spread, sports block, resolution proximity, etc.)
+        and API failures contribute 0. Telemetry's [CYCLE_SUMMARY]
+        orders_placed therefore matches SELECT COUNT(*) FROM orders_placed
+        for the cycle window — operator can trust the counter.
+
+        Stub-safe: when self.mode is missing (test fixtures), defaults to
+        LIVE so the delegated call still fires. AttributeError guard on
+        the counter accumulation preserves the same stub-tolerance pattern
+        the v5.0 wrapper used."""
         mode = getattr(self, "mode", MODE_LIVE)
         if mode != MODE_LIVE:
             self._log_dry_run_intent(
@@ -1606,9 +1619,12 @@ class RewardFarmer:
                 question=str(ms.question)[:40],
             )
             return
-        self.order_lifecycle.place_orders_for_market(ms)
+        n_placed = self.order_lifecycle.place_orders_for_market(ms)
+        # Defensive: pre-FX-004 stubs may return None; treat as 0.
+        if not isinstance(n_placed, int):
+            n_placed = 0
         try:
-            self._cycle_orders_placed += 1
+            self._cycle_orders_placed += n_placed
         except AttributeError:
             pass
 
