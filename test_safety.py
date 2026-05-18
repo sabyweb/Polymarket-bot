@@ -258,14 +258,15 @@ if __name__ == "__main__":
     check("compute_clob_rate_delta importable", callable(compute_clob_rate_delta), "")
 
     # ═══════════════════════════════════════════════════
-    print("\n=== TEST 14: 6-State Machine ===")
-    from oversight.safety_controller import STATE_PERMISSIONS, ALL_STATES
+    print("\n=== TEST 14: 7-State Machine ===")
+    from oversight.safety_controller import STATE_PERMISSIONS, ALL_STATES, BOOTSTRAP
     check("LEARNING == MILDLY", LEARNING == MILDLY_MISCALIBRATED, "")
-    check("6 states have permissions", len(STATE_PERMISSIONS) == 6, "")
-    check("Severity ordering",
+    check("7 states have permissions", len(STATE_PERMISSIONS) == 7, f"Got {len(STATE_PERMISSIONS)}")
+    check("Severity ordering with BOOTSTRAP between MILDLY and SEVERELY",
           STATE_SEVERITY[CALIBRATED] < STATE_SEVERITY[MILDLY_MISCALIBRATED]
-          < STATE_SEVERITY[SEVERELY_MISCALIBRATED] < STATE_SEVERITY[DEGRADED]
-          < STATE_SEVERITY[DATA_UNAVAILABLE] < STATE_SEVERITY[UNSAFE], "")
+          < STATE_SEVERITY[BOOTSTRAP] < STATE_SEVERITY[SEVERELY_MISCALIBRATED]
+          < STATE_SEVERITY[DEGRADED] < STATE_SEVERITY[DATA_UNAVAILABLE]
+          < STATE_SEVERITY[UNSAFE], "")
     p = create_test_db()
     sc_m = SafetyController(db_path=p)
     sc_m.evaluate(correction_factor_raw=0.025, estimated_daily_total=30, actual_daily_payout=10.0,
@@ -373,6 +374,7 @@ if __name__ == "__main__":
     print("\n=== TEST 21: State Permissions ===")
     check("CALIBRATED: 60/100%", STATE_PERMISSIONS[CALIBRATED]["max_markets"]==60 and STATE_PERMISSIONS[CALIBRATED]["capital_pct"]==1.0, "")
     check("MILDLY: 40/70%", STATE_PERMISSIONS[MILDLY_MISCALIBRATED]["max_markets"]==40, "")
+    check("BOOTSTRAP: 10/30%/trials", STATE_PERMISSIONS[BOOTSTRAP]["max_markets"]==10 and STATE_PERMISSIONS[BOOTSTRAP]["capital_pct"]==0.30 and STATE_PERMISSIONS[BOOTSTRAP]["trials"], "")
     check("SEVERELY: 20/40%/no trials", STATE_PERMISSIONS[SEVERELY_MISCALIBRATED]["max_markets"]==20 and not STATE_PERMISSIONS[SEVERELY_MISCALIBRATED]["trials"], "")
     check("DEGRADED: 10/20%", STATE_PERMISSIONS[DEGRADED]["max_markets"]==10, "")
     check("DATA_UNAVAIL: 5/10%", STATE_PERMISSIONS[DATA_UNAVAILABLE]["max_markets"]==5, "")

@@ -1,8 +1,9 @@
 """SafetyController — non-bypassable safety layer for reward farming.
 
-6-state machine with graduated response:
+7-state machine with graduated response:
   CALIBRATED              — full deployment permitted
   MILDLY_MISCALIBRATED    — conservative deployment, minor CF drift
+  BOOTSTRAP               — fresh-DB cold-start ease-in (10 markets, 30%, trials)
   SEVERELY_MISCALIBRATED  — reduced deployment, significant CF error
   DEGRADED                — minimal deployment, operational issues
   DATA_UNAVAILABLE        — near-probe deployment, data pipeline broken
@@ -36,6 +37,7 @@ log = logging.getLogger("oversight.safety")
 
 CALIBRATED = "CALIBRATED"
 MILDLY_MISCALIBRATED = "MILDLY_MISCALIBRATED"
+BOOTSTRAP = "BOOTSTRAP"
 SEVERELY_MISCALIBRATED = "SEVERELY_MISCALIBRATED"
 DEGRADED = "DEGRADED"
 DATA_UNAVAILABLE = "DATA_UNAVAILABLE"
@@ -43,20 +45,29 @@ UNSAFE = "UNSAFE"
 
 LEARNING = MILDLY_MISCALIBRATED
 
+# BOOTSTRAP sits between MILDLY (1) and SEVERELY (3) on the severity axis:
+# more cautious than MILDLY (10 markets vs 40, 30% capital vs 70%) but still
+# permitting trials, so the bot can build calibration data while it's young.
+# Comparisons against STATE_SEVERITY[DEGRADED] etc. are relative — renumbering
+# preserves all >=/< checks elsewhere in this file.
 STATE_SEVERITY = {
     CALIBRATED: 0,
     MILDLY_MISCALIBRATED: 1,
-    SEVERELY_MISCALIBRATED: 2,
-    DEGRADED: 3,
-    DATA_UNAVAILABLE: 4,
-    UNSAFE: 5,
+    BOOTSTRAP: 2,
+    SEVERELY_MISCALIBRATED: 3,
+    DEGRADED: 4,
+    DATA_UNAVAILABLE: 5,
+    UNSAFE: 6,
 }
 
 ALL_STATES = set(STATE_SEVERITY.keys())
 
+# Worst → best. BOOTSTRAP sits between SEVERELY and MILDLY; recovery from a
+# downgrade still climbs straight to MILDLY (BOOTSTRAP is a once-only
+# initial state, not a re-entrant rung — see _handle_upgrade).
 _UPGRADE_ORDER = [
     UNSAFE, DATA_UNAVAILABLE, DEGRADED,
-    SEVERELY_MISCALIBRATED, MILDLY_MISCALIBRATED, CALIBRATED,
+    SEVERELY_MISCALIBRATED, BOOTSTRAP, MILDLY_MISCALIBRATED, CALIBRATED,
 ]
 
 _STATE_ALIASES = {"LEARNING": MILDLY_MISCALIBRATED}
@@ -95,6 +106,13 @@ STATE_PERMISSIONS = {
     },
     MILDLY_MISCALIBRATED: {
         "max_markets": 40, "capital_pct": 0.70, "trials": True,
+    },
+    # BOOTSTRAP: fresh-DB ease-in. Trials are ON because every market is a trial
+    # on a cold start (fill_count=0, confidence=low); without trials the bot
+    # can't accumulate the data needed to leave BOOTSTRAP. Capital is held to
+    # 30% to keep first-cycle exposure bounded.
+    BOOTSTRAP: {
+        "max_markets": 10, "capital_pct": 0.30, "trials": True,
     },
     SEVERELY_MISCALIBRATED: {
         "max_markets": 20, "capital_pct": 0.40, "trials": False,
@@ -189,6 +207,13 @@ FILL_STORM_LOOKBACK_SECS = 3600
 UPGRADE_TO_CALIBRATED = 3
 UPGRADE_STEP = 2
 
+# ── BOOTSTRAP exit ──
+# Exit BOOTSTRAP for MILDLY_MISCALIBRATED on EITHER condition (whichever fires
+# first). The fills threshold is the fast path during healthy operation; the
+# clean-cycles threshold is the slow path when markets are dry.
+UPGRADE_FROM_BOOTSTRAP = 3       # consecutive cycles with no CRITICAL violations
+BOOTSTRAP_FILL_EXIT = 10         # lifetime fills observed
+
 # ── UNSAFE auto-recovery ──
 UNSAFE_RECOVERY_CYCLES = 3
 
@@ -220,12 +245,19 @@ class SafetyController:
 
     def __init__(self, db_path: str = "bot_history.db"):
         self.db_path = db_path
+        # Sensible mid-rung default. _load_state immediately overrides — on a
+        # genuine cold start (no orders, no fills, no recent safety_state row)
+        # it will set BOOTSTRAP. The MILDLY value here only matters if
+        # _load_state is bypassed (test fixtures, programmatic state poking).
         self.state = MILDLY_MISCALIBRATED
         self.consecutive_good = 0
         self._last_state_change = time.time()
         self._last_violations: list[Violation] = []
         self._portfolio_peak: float = 0.0
         self._unsafe_no_critical_count: int = 0
+        # Counts cycles in BOOTSTRAP with no CRITICAL violations. Reset by
+        # _transition. Drives the slow-path BOOTSTRAP → MILDLY exit.
+        self._bootstrap_clean_cycles: int = 0
 
         self._ensure_tables()
         self._load_state()
@@ -670,6 +702,24 @@ class SafetyController:
 
     def _handle_upgrade(self, num_scoring, cf_raw, est_actual_ratio,
                         fill_damage_24h, reward_24h):
+        # BOOTSTRAP exit (FX-003) runs first — independent of is_fully_calibrated.
+        # On a cold start num_scoring is often < 5 for many cycles even when
+        # everything is healthy, so we can't reuse the calibration gate here;
+        # _handle_upgrade only runs in the no-violations branch, so reaching
+        # this code path with state == BOOTSTRAP IS a clean cycle by definition.
+        if self.state == BOOTSTRAP:
+            self._bootstrap_clean_cycles += 1
+            fills = self._query_lifetime_fills_count()
+            if (fills is not None and fills >= BOOTSTRAP_FILL_EXIT) \
+                    or self._bootstrap_clean_cycles >= UPGRADE_FROM_BOOTSTRAP:
+                reason = (
+                    f"BOOTSTRAP exit: {fills} lifetime fills ≥ {BOOTSTRAP_FILL_EXIT}"
+                    if fills is not None and fills >= BOOTSTRAP_FILL_EXIT
+                    else f"BOOTSTRAP exit: {self._bootstrap_clean_cycles} clean cycles"
+                )
+                self._transition(MILDLY_MISCALIBRATED, [reason])
+            return
+
         is_fully_calibrated = (
             (cf_raw == 0 or CF_CALIBRATED_LOW <= cf_raw <= CF_CALIBRATED_HIGH)
             and est_actual_ratio < EST_ACTUAL_CALIBRATED
@@ -897,8 +947,8 @@ class SafetyController:
 
     def _is_genuine_cold_start(self) -> bool:
         # True iff the bot has never placed an order AND has never observed a fill
-        # in this DB's lifetime. Drives two cold-start branches:
-        #   I9 data_freshness (FX-001) and I3 drawdown (FX-002).
+        # in this DB's lifetime. Drives three cold-start branches:
+        #   I9 data_freshness (FX-001), I3 drawdown (FX-002), BOOTSTRAP entry (FX-003).
         # Returns False on query failure — conservative default treats unknown
         # state as a warm DB so existing defences still fire.
         try:
@@ -919,6 +969,22 @@ class SafetyController:
             return True
         except Exception:
             return False
+
+    def _query_lifetime_fills_count(self) -> int | None:
+        # Used by the BOOTSTRAP-exit fast path. Returns None on query failure
+        # (missing table, locked DB, etc.) so the caller falls through to the
+        # clean-cycles slow path rather than mis-classifying the threshold.
+        try:
+            row = _query_with_retry(
+                self.db_path,
+                "SELECT COUNT(*) FROM fills",
+                fetch="one",
+            )
+            if row is None:
+                return None
+            return int(row[0])
+        except Exception:
+            return None
 
     def _query_recent_fill_storms(self) -> int | None:
         cutoff = time.time() - FILL_STORM_LOOKBACK_SECS
@@ -1027,6 +1093,9 @@ class SafetyController:
         old_state = self.state
         self.state = new_state
         self.consecutive_good = 0
+        # Once we leave BOOTSTRAP we never return — clear the counter so it
+        # doesn't accidentally affect any later branch that might inspect it.
+        self._bootstrap_clean_cycles = 0
         self._last_state_change = time.time()
         level = (
             logging.CRITICAL if new_state == UNSAFE
@@ -1084,20 +1153,35 @@ class SafetyController:
                     self.state = stored_state
                     self.consecutive_good = max(0, stored_good - 1)
                 elif age_hours < 6:
-                    self.state = MILDLY_MISCALIBRATED
+                    self.state = self._cold_start_or(MILDLY_MISCALIBRATED)
                     if STATE_SEVERITY.get(stored_state, 0) >= STATE_SEVERITY[DEGRADED]:
                         self.consecutive_good = 0
                     else:
                         self.consecutive_good = max(0, stored_good - 1)
                 else:
-                    self.state = MILDLY_MISCALIBRATED
+                    self.state = self._cold_start_or(MILDLY_MISCALIBRATED)
                     self.consecutive_good = 0
             else:
-                self.state = MILDLY_MISCALIBRATED
+                # No prior safety_state row — usually a brand-new DB. BOOTSTRAP
+                # if we've never placed an order and never seen a fill, else
+                # MILDLY (someone wiped safety_state but kept orders/fills,
+                # treat as a warm restart).
+                self.state = self._cold_start_or(MILDLY_MISCALIBRATED)
                 self.consecutive_good = 0
         except Exception as e:
             log.debug(f"Safety state load failed: {e}")
+            # Conservative fallback — MILDLY, not BOOTSTRAP. If even _load_state
+            # can't query the DB then _is_genuine_cold_start would fail too,
+            # and we'd rather keep the existing MILDLY safety posture.
             self.state = MILDLY_MISCALIBRATED
+
+    def _cold_start_or(self, default_state: str) -> str:
+        # Returns BOOTSTRAP on a genuine cold start, else default_state.
+        # Used by _load_state to enter BOOTSTRAP only when we have no
+        # operational history (no orders ever placed, no fills observed).
+        if self._is_genuine_cold_start():
+            return BOOTSTRAP
+        return default_state
 
     def _write_alert_file(self, old_state, new_state, reasons):
         import os, datetime
