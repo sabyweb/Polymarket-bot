@@ -1251,6 +1251,525 @@ class TestEvaluateMultipleViolations(_ControllerTestBase):
         self.assertEqual(copy_1, copy_2)
 
 
+# ───────────────────────────────────────────────────────────────────────────
+# Block E — Persistence round-trip (_persist_state / _load_state)
+# ───────────────────────────────────────────────────────────────────────────
+
+
+class TestPersistAndLoadState(unittest.TestCase):
+    """``_persist_state`` writes safety_state rows; ``_load_state`` consumes them.
+
+    Age branches (``_load_state`` lines 1183-1194):
+
+    * < 2h   — use stored state, ``consecutive_good = max(0, stored - 1)``
+    * 2-6h   — fall back to ``_cold_start_or(MILDLY)``; if stored was already
+      DEGRADED+ then ``consecutive_good = 0``, else preserve stored - 1
+    * > 6h   — fall back to ``_cold_start_or(MILDLY)``; ``consecutive_good = 0``
+    * no row — fall back to ``_cold_start_or(MILDLY)``; ``consecutive_good = 0``
+    """
+
+    def setUp(self):
+        self.path = _fresh_db_with_scoring_snapshot()
+        _warm_db_with_one_order(self.path)
+
+    def tearDown(self):
+        os.unlink(self.path)
+
+    def _seed_state(self, state: str, good: int, ts_offset_s: float):
+        # Write a safety_state row at the given age (seconds ago).
+        db = sqlite3.connect(self.path)
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS safety_state ("
+            "id INTEGER PRIMARY KEY, ts REAL NOT NULL, state TEXT NOT NULL, "
+            "reason TEXT NOT NULL DEFAULT '', "
+            "consecutive_good INTEGER NOT NULL DEFAULT 0)"
+        )
+        db.execute(
+            "INSERT INTO safety_state (ts, state, reason, consecutive_good) "
+            "VALUES (?, ?, ?, ?)",
+            (time.time() - ts_offset_s, state, "seeded", good),
+        )
+        db.commit()
+        db.close()
+
+    def test_recent_row_within_2h_restored(self):
+        self._seed_state(DEGRADED, good=5, ts_offset_s=600)
+        sc = SafetyController(db_path=self.path)
+        self.assertEqual(DEGRADED, sc.state)
+        # stored - 1 = 4
+        self.assertEqual(4, sc.consecutive_good)
+
+    def test_medium_age_healthy_state_preserves_good(self):
+        # 4h old, stored state was MILDLY (healthy) → defaults to MILDLY,
+        # consecutive_good preserved as stored - 1.
+        self._seed_state(MILDLY_MISCALIBRATED, good=3, ts_offset_s=4 * 3600)
+        sc = SafetyController(db_path=self.path)
+        self.assertEqual(MILDLY_MISCALIBRATED, sc.state)
+        self.assertEqual(2, sc.consecutive_good)
+
+    def test_medium_age_degraded_clears_good(self):
+        # 4h old + stored state was DEGRADED (severe). _load_state still
+        # defaults state to MILDLY but clears consecutive_good entirely.
+        self._seed_state(DEGRADED, good=5, ts_offset_s=4 * 3600)
+        sc = SafetyController(db_path=self.path)
+        self.assertEqual(MILDLY_MISCALIBRATED, sc.state)
+        self.assertEqual(0, sc.consecutive_good)
+
+    def test_old_row_beyond_6h_resets_to_mildly(self):
+        self._seed_state(DEGRADED, good=10, ts_offset_s=8 * 3600)
+        sc = SafetyController(db_path=self.path)
+        self.assertEqual(MILDLY_MISCALIBRATED, sc.state)
+        self.assertEqual(0, sc.consecutive_good)
+
+    def test_round_trip_persist_and_reload(self):
+        sc1 = SafetyController(db_path=self.path)
+        sc1.state = SEVERELY_MISCALIBRATED
+        sc1.consecutive_good = 3
+        sc1._persist_state(reasons=["round-trip test"])
+        sc2 = SafetyController(db_path=self.path)
+        self.assertEqual(SEVERELY_MISCALIBRATED, sc2.state)
+        # stored - 1 = 2
+        self.assertEqual(2, sc2.consecutive_good)
+
+    def test_persist_trims_to_100_rows(self):
+        sc = SafetyController(db_path=self.path)
+        for i in range(105):
+            sc.state = MILDLY_MISCALIBRATED if i % 2 == 0 else DEGRADED
+            sc._persist_state(reasons=[f"row {i}"])
+        db = sqlite3.connect(self.path)
+        count = db.execute("SELECT COUNT(*) FROM safety_state").fetchone()[0]
+        db.close()
+        self.assertEqual(100, count)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Block F — Helpers (_query_*, _compute_portfolio_value, _capital_floor,
+#                    confidence_score, public query methods)
+# ───────────────────────────────────────────────────────────────────────────
+
+
+class TestQueryFillDamage(unittest.TestCase):
+
+    def setUp(self):
+        self.path = _fresh_db_with_scoring_snapshot()
+        _warm_db_with_one_order(self.path)
+        self.sc = SafetyController(db_path=self.path)
+
+    def tearDown(self):
+        os.unlink(self.path)
+
+    def test_empty_returns_zero(self):
+        self.assertEqual(0.0, self.sc._query_fill_damage(hours=24))
+
+    def test_fills_inside_window(self):
+        _insert_fill(self.path, ts_offset_s=60, clob_cost=25.0)
+        _insert_fill(self.path, ts_offset_s=120, clob_cost=15.0)
+        self.assertEqual(40.0, self.sc._query_fill_damage(hours=24))
+
+    def test_fills_outside_window_excluded(self):
+        _insert_fill(self.path, ts_offset_s=2 * 24 * 3600, clob_cost=100.0)
+        self.assertEqual(0.0, self.sc._query_fill_damage(hours=24))
+
+    def test_unwinds_offset_fills(self):
+        _insert_fill(self.path, ts_offset_s=60, clob_cost=100.0)
+        db = sqlite3.connect(self.path)
+        db.execute(
+            "INSERT INTO unwinds (ts, condition_id, usd_value) VALUES (?, ?, ?)",
+            (time.time() - 60, "cid", 40.0),
+        )
+        db.commit()
+        db.close()
+        # fills - unwinds = 100 - 40 = 60
+        self.assertEqual(60.0, self.sc._query_fill_damage(hours=24))
+
+    def test_stop_losses_added(self):
+        db = sqlite3.connect(self.path)
+        db.execute(
+            "INSERT INTO stop_losses (ts, condition_id, loss_usd) VALUES (?, ?, ?)",
+            (time.time() - 60, "cid", 25.0),
+        )
+        db.commit()
+        db.close()
+        self.assertEqual(25.0, self.sc._query_fill_damage(hours=24))
+
+    def test_clamped_at_zero(self):
+        # unwinds exceed fills → result clamped at 0.0, never negative.
+        _insert_fill(self.path, ts_offset_s=60, clob_cost=10.0)
+        db = sqlite3.connect(self.path)
+        db.execute(
+            "INSERT INTO unwinds (ts, condition_id, usd_value) VALUES (?, ?, ?)",
+            (time.time() - 60, "cid", 100.0),
+        )
+        db.commit()
+        db.close()
+        self.assertEqual(0.0, self.sc._query_fill_damage(hours=24))
+
+    def test_query_failure_returns_none(self):
+        db = sqlite3.connect(self.path)
+        db.execute("DROP TABLE fills")
+        db.commit()
+        db.close()
+        self.assertIsNone(self.sc._query_fill_damage(hours=24))
+
+
+class TestQueryDataFreshness(unittest.TestCase):
+
+    def setUp(self):
+        self.path = _fresh_db_with_scoring_snapshot()
+
+    def tearDown(self):
+        os.unlink(self.path)
+
+    def test_with_row_returns_age(self):
+        sc = SafetyController(db_path=self.path)
+        # Fixture inserted a row 60s ago.
+        age = sc._query_data_freshness()
+        self.assertIsNotNone(age)
+        self.assertGreater(age, 30)  # at least 30s
+        self.assertLess(age, 300)    # less than 5 min
+
+    def test_empty_table_cold_start_returns_zero(self):
+        db = sqlite3.connect(self.path)
+        db.execute("DELETE FROM scoring_snapshots")
+        db.commit()
+        db.close()
+        sc = SafetyController(db_path=self.path)
+        # Cold start (no orders) + empty scoring → 0.0 (treat as fresh).
+        self.assertEqual(0.0, sc._query_data_freshness())
+
+    def test_empty_table_warm_db_returns_none(self):
+        # FX-001's defensive branch: empty scoring + warm DB → None.
+        _warm_db_with_one_order(self.path)
+        db = sqlite3.connect(self.path)
+        db.execute("DELETE FROM scoring_snapshots")
+        db.commit()
+        db.close()
+        sc = SafetyController(db_path=self.path)
+        self.assertIsNone(sc._query_data_freshness())
+
+
+class TestQueryLifetimeFillsCount(unittest.TestCase):
+
+    def setUp(self):
+        self.path = _fresh_db_with_scoring_snapshot()
+        _warm_db_with_one_order(self.path)
+        self.sc = SafetyController(db_path=self.path)
+
+    def tearDown(self):
+        os.unlink(self.path)
+
+    def test_empty_returns_zero(self):
+        self.assertEqual(0, self.sc._query_lifetime_fills_count())
+
+    def test_with_fills(self):
+        for i in range(7):
+            _insert_fill(self.path, ts_offset_s=60, clob_cost=0.0,
+                         condition_id=f"cid_{i}")
+        self.assertEqual(7, self.sc._query_lifetime_fills_count())
+
+    def test_missing_table_returns_none(self):
+        db = sqlite3.connect(self.path)
+        db.execute("DROP TABLE fills")
+        db.commit()
+        db.close()
+        self.assertIsNone(self.sc._query_lifetime_fills_count())
+
+
+class TestQueryLastKnownBalance(unittest.TestCase):
+
+    def setUp(self):
+        self.path = _fresh_db_with_scoring_snapshot()
+        _warm_db_with_one_order(self.path)
+        self.sc = SafetyController(db_path=self.path)
+
+    def tearDown(self):
+        os.unlink(self.path)
+
+    def _insert_snapshot(self, ts_offset_s: float, balance: float):
+        db = sqlite3.connect(self.path)
+        db.execute(
+            "INSERT INTO portfolio_snapshots "
+            "(ts, total_value, exchange_balance, locked_capital, peak_value) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (time.time() - ts_offset_s, balance, balance, 0.0, balance),
+        )
+        db.commit()
+        db.close()
+
+    def test_no_snapshots_returns_none(self):
+        self.assertIsNone(self.sc._query_last_known_balance())
+
+    def test_recent_positive_returns_value(self):
+        self._insert_snapshot(ts_offset_s=60, balance=200.0)
+        self.assertEqual(200.0, self.sc._query_last_known_balance())
+
+    def test_too_old_snapshot_excluded(self):
+        # > 6h ago → excluded.
+        self._insert_snapshot(ts_offset_s=7 * 3600, balance=200.0)
+        self.assertIsNone(self.sc._query_last_known_balance())
+
+    def test_below_floor_excluded(self):
+        # The query filters `exchange_balance > CAPITAL_FLOOR_USD` ($50) at the
+        # SQL level. A balance of $30 fails that gate.
+        self._insert_snapshot(ts_offset_s=60, balance=30.0)
+        self.assertIsNone(self.sc._query_last_known_balance())
+
+
+class TestComputePortfolioValue(unittest.TestCase):
+
+    def setUp(self):
+        self.path = _fresh_db_with_scoring_snapshot()
+        _warm_db_with_one_order(self.path)
+        self.sc = SafetyController(db_path=self.path)
+
+    def tearDown(self):
+        os.unlink(self.path)
+
+    def test_zero_balance_returns_zero(self):
+        self.assertEqual(0.0, self.sc._compute_portfolio_value(0.0))
+        self.assertEqual(0.0, self.sc._compute_portfolio_value(-10.0))
+
+    def test_no_positions_returns_balance(self):
+        # No positions or dump_states tables → graceful fallback to balance.
+        self.assertEqual(200.0, self.sc._compute_portfolio_value(200.0))
+
+    def test_includes_positions(self):
+        db = sqlite3.connect(self.path)
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS positions ("
+            "condition_id TEXT, side TEXT, shares REAL, avg_cost_per_share REAL)"
+        )
+        db.execute(
+            "INSERT INTO positions (condition_id, side, shares, avg_cost_per_share) "
+            "VALUES (?, ?, ?, ?)",
+            ("cid", "yes", 100.0, 0.40),
+        )
+        db.commit()
+        db.close()
+        # balance + locked = 200 + 40 = 240
+        self.assertEqual(240.0, self.sc._compute_portfolio_value(200.0))
+
+    def test_includes_active_dumps(self):
+        db = sqlite3.connect(self.path)
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS dump_states ("
+            "condition_id TEXT, status TEXT, remaining_shares REAL, target_price REAL)"
+        )
+        db.execute(
+            "INSERT INTO dump_states (condition_id, status, remaining_shares, target_price) "
+            "VALUES (?, ?, ?, ?)",
+            ("cid", "aggressive", 50.0, 0.60),
+        )
+        db.commit()
+        db.close()
+        # balance + locked = 200 + 30 = 230
+        self.assertEqual(230.0, self.sc._compute_portfolio_value(200.0))
+
+
+class TestCapitalFloorScaling(unittest.TestCase):
+
+    def setUp(self):
+        self.path = _fresh_db_with_scoring_snapshot()
+        _warm_db_with_one_order(self.path)
+        self.sc = SafetyController(db_path=self.path)
+
+    def tearDown(self):
+        os.unlink(self.path)
+
+    def test_small_wallet_uses_absolute_minimum(self):
+        # $200 wallet → 10% = $20 < $50 minimum → returns $50.
+        floor = self.sc._capital_floor(exchange_balance=200.0,
+                                       portfolio_value=200.0)
+        self.assertEqual(50.0, floor)
+
+    def test_large_wallet_uses_scaled(self):
+        # $1500 wallet → 10% = $150 > $50 → returns $150.
+        floor = self.sc._capital_floor(exchange_balance=1500.0,
+                                       portfolio_value=1500.0)
+        self.assertEqual(150.0, floor)
+
+    def test_peak_dominates_reference(self):
+        # Drawdown scenario: current balance is $300 but peak was $2000.
+        # Floor should use the peak, not the current value, so a drawdown
+        # doesn't shrink the floor.
+        self.sc._portfolio_peak = 2000.0
+        floor = self.sc._capital_floor(exchange_balance=300.0,
+                                       portfolio_value=300.0)
+        self.assertEqual(200.0, floor)
+
+
+class TestConfidenceScore(unittest.TestCase):
+
+    def setUp(self):
+        self.path = _fresh_db_with_scoring_snapshot()
+        _warm_db_with_one_order(self.path)
+        self.sc = SafetyController(db_path=self.path)
+
+    def tearDown(self):
+        os.unlink(self.path)
+
+    def test_no_violations_full_confidence(self):
+        self.sc._last_violations = []
+        self.assertEqual(1.0, self.sc.confidence_score)
+
+    def test_data_unavailable_zeros_dq_component(self):
+        from oversight.safety_controller import Violation as V
+        self.sc._last_violations = [
+            V("data_freshness", PRIORITY_MEDIUM, DATA_UNAVAILABLE, 99, 0, "stale"),
+        ]
+        # dq=0.0, cf=0.30, pc=0.30 → 0.60
+        self.assertAlmostEqual(0.60, self.sc.confidence_score, places=2)
+
+    def test_data_degraded_haircuts_dq(self):
+        from oversight.safety_controller import Violation as V
+        self.sc._last_violations = [
+            V("data_completeness", PRIORITY_MEDIUM, DEGRADED, 0.7, 0.8, "warn"),
+        ]
+        # dq capped at 0.15; cf=0.30, pc=0.30 → 0.75
+        self.assertAlmostEqual(0.75, self.sc.confidence_score, places=2)
+
+    def test_cf_unsafe_zeros_cf_component(self):
+        from oversight.safety_controller import Violation as V
+        self.sc._last_violations = [
+            V("cf_corroborated", PRIORITY_CRITICAL, UNSAFE, 0.001, 0.005, "cf"),
+        ]
+        # dq=0.40, cf=0.0, pc=0.30 → 0.70
+        self.assertAlmostEqual(0.70, self.sc.confidence_score, places=2)
+
+    def test_est_actual_unsafe_zeros_pc(self):
+        from oversight.safety_controller import Violation as V
+        self.sc._last_violations = [
+            V("est_actual", PRIORITY_HIGH, SEVERELY_MISCALIBRATED, 100.0, 50.0, "x"),
+        ]
+        # est_actual.value > EST_ACTUAL_UNSAFE (50) → pc=0.0. dq=0.40, cf=0.30 → 0.70
+        self.assertAlmostEqual(0.70, self.sc.confidence_score, places=2)
+
+    def test_three_unsafe_components_floor_at_zero(self):
+        from oversight.safety_controller import Violation as V
+        self.sc._last_violations = [
+            V("data_freshness", PRIORITY_MEDIUM, DATA_UNAVAILABLE, 99, 0, "stale"),
+            V("cf_corroborated", PRIORITY_CRITICAL, UNSAFE, 0.001, 0.005, "cf"),
+            V("est_actual", PRIORITY_HIGH, SEVERELY_MISCALIBRATED, 100.0, 50.0, "x"),
+        ]
+        # All three components zero → confidence = 0.0
+        self.assertAlmostEqual(0.0, self.sc.confidence_score, places=2)
+
+
+class TestPublicQueryMethods(unittest.TestCase):
+
+    def setUp(self):
+        self.path = _fresh_db_with_scoring_snapshot()
+        _warm_db_with_one_order(self.path)
+        self.sc = SafetyController(db_path=self.path)
+
+    def tearDown(self):
+        os.unlink(self.path)
+
+    def test_query_24h_fill_damage_returns_zero_on_failure(self):
+        # Drop the fills table → underlying _query_fill_damage returns None,
+        # but the public wrapper substitutes 0.0.
+        db = sqlite3.connect(self.path)
+        db.execute("DROP TABLE fills")
+        db.commit()
+        db.close()
+        self.assertEqual(0.0, self.sc.query_24h_fill_damage())
+
+    def test_query_24h_fill_damage_returns_value_on_success(self):
+        _insert_fill(self.path, ts_offset_s=60, clob_cost=42.0)
+        self.assertEqual(42.0, self.sc.query_24h_fill_damage())
+
+    def test_query_7d_fill_damage_includes_old_fills(self):
+        _insert_fill(self.path, ts_offset_s=3 * 24 * 3600, clob_cost=100.0)
+        # 3 days old is inside the 7d window.
+        self.assertEqual(100.0, self.sc.query_7d_fill_damage())
+
+    def test_count_scoring_markets_distinct(self):
+        # Fixture inserts one row with condition_id="t". Add two more
+        # distinct condition_ids.
+        db = sqlite3.connect(self.path)
+        db.execute(
+            "INSERT INTO scoring_snapshots (ts, order_id, condition_id, side, "
+            "scoring, price, shares) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (time.time() - 60, "o2", "cid_b", "yes", 1, 0.5, 100),
+        )
+        db.execute(
+            "INSERT INTO scoring_snapshots (ts, order_id, condition_id, side, "
+            "scoring, price, shares) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (time.time() - 60, "o3", "cid_c", "yes", 1, 0.5, 100),
+        )
+        db.commit()
+        db.close()
+        self.assertEqual(3, self.sc.count_scoring_markets(window_hours=4.0))
+
+    def test_count_scoring_markets_window(self):
+        # Insert a row 6h ago → outside default 4h window.
+        db = sqlite3.connect(self.path)
+        db.execute(
+            "INSERT INTO scoring_snapshots (ts, order_id, condition_id, side, "
+            "scoring, price, shares) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (time.time() - 6 * 3600, "o2", "cid_b", "yes", 1, 0.5, 100),
+        )
+        db.commit()
+        db.close()
+        # Original fixture row is still inside the 4h window.
+        self.assertEqual(1, self.sc.count_scoring_markets(window_hours=4.0))
+        # Widen window to capture both.
+        self.assertEqual(2, self.sc.count_scoring_markets(window_hours=8.0))
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Block G — Alert-file writers (_write_alert_file / _clear_alert_file)
+# ───────────────────────────────────────────────────────────────────────────
+
+
+class TestAlertFileWriters(unittest.TestCase):
+
+    def setUp(self):
+        # tempdir holds both DB + the SAFETY_ALERT.txt the controller writes
+        # alongside it. _write_alert_file derives the alert path from
+        # ``os.path.dirname(self.db_path) or "."``.
+        self.tmpdir = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmpdir, "bot_history.db")
+        # Create the schema the controller expects.
+        seed = _fresh_db_with_scoring_snapshot()
+        os.replace(seed, self.path)
+        _warm_db_with_one_order(self.path)
+        self.sc = SafetyController(db_path=self.path)
+        self.alert = os.path.join(self.tmpdir, "SAFETY_ALERT.txt")
+
+    def tearDown(self):
+        for f in os.listdir(self.tmpdir):
+            os.unlink(os.path.join(self.tmpdir, f))
+        os.rmdir(self.tmpdir)
+
+    def test_transition_to_degraded_writes_alert(self):
+        # MILDLY (severity 1) → DEGRADED (severity 4) crosses the
+        # `>= DEGRADED` threshold that triggers the write.
+        self.sc.state = MILDLY_MISCALIBRATED
+        self.sc._transition(DEGRADED, ["test transition"])
+        self.assertTrue(os.path.exists(self.alert))
+        contents = open(self.alert).read()
+        self.assertIn("DEGRADED", contents)
+        self.assertIn("test transition", contents)
+        self.assertIn("Confidence:", contents)
+
+    def test_transition_to_calibrated_clears_alert(self):
+        # First write an alert.
+        with open(self.alert, "w") as f:
+            f.write("stale alert from prior run\n")
+        self.assertTrue(os.path.exists(self.alert))
+        # Transition to CALIBRATED clears the alert.
+        self.sc.state = MILDLY_MISCALIBRATED
+        self.sc._transition(CALIBRATED, ["fully calibrated again"])
+        self.assertFalse(os.path.exists(self.alert))
+
+    def test_mildly_transition_does_not_write_alert(self):
+        # CALIBRATED → MILDLY does NOT cross the DEGRADED threshold; no alert.
+        self.sc.state = CALIBRATED
+        self.sc._transition(MILDLY_MISCALIBRATED, ["minor drift"])
+        self.assertFalse(os.path.exists(self.alert))
+
+
 class TestEvaluateBackwardCompatWrapper(_ControllerTestBase):
 
     def test_evaluate_delegates_to_evaluate_state(self):
