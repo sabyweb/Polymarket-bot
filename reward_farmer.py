@@ -48,8 +48,11 @@ def CYCLE_SECS(): return cfg("RF_CYCLE_SECS")
 def BATCH_SIZE(): return cfg("RF_BATCH_SIZE")
 def MARKET_REFRESH_SECS(): return cfg("RF_MARKET_REFRESH_SECS")
 def PLACEMENT_TICKS_INSIDE(): return cfg("RF_PLACEMENT_TICKS_INSIDE")
-def MAX_COST_PER_MARKET(): return cfg("RF_MAX_COST_PER_MARKET")
-def MAX_TOTAL_EXPOSURE(): return cfg("RF_MAX_TOTAL_EXPOSURE")
+# FX-011: MAX_COST_PER_MARKET / MAX_TOTAL_EXPOSURE accessors were here but
+# never called by production code. Per-market and total exposure are
+# enforced by the v5.0 runtime guardrails (notional ratio, cluster cap,
+# hard-enforcement multi-cancel, kill switch) downstream. Deleted with
+# their config constants 2026-05-18.
 
 
 # ── Runtime safety guardrails (applied after allocation, before placement) ──
@@ -2216,6 +2219,16 @@ class RewardFarmer:
             except Exception as e:
                 log.error(f"Cycle error: {e}")
             cycle_duration = time.time() - t0
+
+            # FX-013: write usdc_balance on cycle 1 (in addition to every 10
+            # cycles below) so the oversight agent has a fresh balance row
+            # from the very first oversight cycle. Without this, the agent
+            # falls through to the legacy `--capital` value (which itself is
+            # now None by default per FX-025) for up to ~5 min on a fresh
+            # LIVE cutover, calibrating safety thresholds against a value
+            # that may not reflect the wallet.
+            if self.cycle_count == 1 and not self.dry_run:
+                self._save_usdc_balance()
 
             # Metrics + USDC balance snapshot every 10 cycles (~5 min)
             if self.cycle_count % 10 == 0 and self.cycle_count > 0:

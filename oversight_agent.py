@@ -221,12 +221,19 @@ def run_once(
     db_path: str = "bot_history.db",
     output_path: str = "market_allocations.json",
     hours: float = 24,
-    capital: float = 1500.0,
+    capital: float | None = None,
     dry_run: bool = False,
 ) -> dict:
     """One full cycle: collect → score → allocate → safety check → write.
 
     Returns summary dict for logging/testing.
+
+    Capital resolution (FX-013 / FX-025): the agent prefers a fresh
+    ``usdc_balance`` row written by the farmer (`<30 min` old). If that
+    is missing or stale and ``capital`` is None, the cycle is skipped
+    with a ``[CAPITAL_SOURCE] source=none`` log line. If ``capital`` is
+    an explicit operator override, the cycle proceeds with that value.
+    No silent ``$1500`` fallback any more.
     """
     from oversight.data_collector import collect_all, compute_available_capital
     from oversight.market_scorer import rank_markets
@@ -239,10 +246,15 @@ def run_once(
     safety = SafetyController(db_path=db_path)
 
     # Step 1: Compute available capital
-    # Prefer actual USDC balance from exchange (written by bot every ~5 min)
-    # over the hardcoded --capital flag. This makes the agent balance-aware.
+    # FX-013 / FX-024: prefer fresh `usdc_balance` row written by the farmer
+    # (cycle 1 + every 10 cycles thereafter, ~5 min). When stale or absent,
+    # fall through to the operator's `--capital` override; if neither is
+    # available, skip the cycle rather than silently using a hardcoded
+    # `$1500`. Every decision emits a structured `[CAPITAL_SOURCE]` line so
+    # the operator sees which path was used.
     from database import get_db
     exchange_bal = None
+    capital_age_min = None
     try:
         _db = get_db()
         _bal, _ts = _db.load_usdc_balance()
@@ -251,16 +263,28 @@ def run_once(
             age_min = (_time.time() - _ts) / 60
             if age_min < 30:  # only trust balance data < 30 min old
                 exchange_bal = _bal
-                log.info(
-                    f"Exchange USDC balance: ${_bal:.2f} (age={age_min:.0f}m)"
-                )
-            else:
-                log.warning(
-                    f"Exchange balance stale ({age_min:.0f}m old) — "
-                    f"falling back to --capital=${capital:.0f}"
-                )
+                capital_age_min = age_min
     except Exception as e:
         log.warning(f"Could not read exchange balance: {e}")
+
+    # Decide the source + emit structured log
+    if exchange_bal is not None:
+        log.info(
+            f"[CAPITAL_SOURCE] source=usdc_db value=${exchange_bal:.2f} "
+            f"age_min={capital_age_min:.0f}"
+        )
+    elif capital is not None:
+        log.warning(
+            f"[CAPITAL_SOURCE] source=flag value=${capital:.2f} age_min=- "
+            f"(operator override; no fresh usdc_balance row)"
+        )
+    else:
+        log.warning(
+            "[CAPITAL_SOURCE] source=none value=- age_min=- "
+            "(no fresh usdc_balance row AND --capital not provided — "
+            "skipping cycle; pass --capital=X to override)"
+        )
+        return {"status": "no_capital", "markets": 0}
 
     available_capital = compute_available_capital(
         db_path, total_capital=capital, exchange_balance=exchange_bal,
@@ -551,7 +575,12 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Analyze only, don't write")
     parser.add_argument("--interval", type=int, default=1800, help="Loop interval in seconds (default: 30min)")
     parser.add_argument("--hours", type=float, default=24, help="Lookback window in hours")
-    parser.add_argument("--capital", type=float, default=1500.0, help="Total capital available")
+    parser.add_argument(
+        "--capital", type=float, default=None,
+        help="Total capital override. By default (None) the agent reads the "
+             "live USDC balance the farmer writes to bot_history.db; pass an "
+             "explicit value only to override that, e.g. for dry-run sims.",
+    )
     parser.add_argument("--db", default="bot_history.db", help="Path to bot_history.db")
     parser.add_argument("--output", default="market_allocations.json", help="Output path")
     args = parser.parse_args()

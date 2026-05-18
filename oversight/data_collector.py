@@ -1057,19 +1057,25 @@ def query_recent_prices(db_path: str, lookback_hours: float = 3.0) -> dict[str, 
 
 def compute_available_capital(
     db_path: str,
-    total_capital: float = 1500.0,
+    total_capital: float | None = None,
     exchange_balance: float | None = None,
 ) -> float:
     """Compute available capital for new order deployment.
 
     When ``exchange_balance`` is provided (real USDC balance from the
-    exchange, written to DB by the bot every ~5 min), the function uses
-    it directly as the available capital — the exchange already accounts
-    for pending orders.  Positions and dumps are still logged for
-    transparency and used to reconstruct total portfolio value.
+    exchange, written to DB by the bot every ~5 min, FX-013), the
+    function uses it directly as the available capital — the exchange
+    already accounts for pending orders. Positions and dumps are still
+    logged for transparency and used to reconstruct total portfolio
+    value.
 
-    When ``exchange_balance`` is None (no bot data yet), falls back to
-    the legacy behaviour: ``total_capital`` minus DB-derived locked items.
+    When ``exchange_balance`` is None, falls back to the legacy path:
+    ``total_capital`` minus DB-derived locked items. ``total_capital``
+    is itself None by default (FX-025); callers that reach this branch
+    with both inputs None get ``0.0`` back. The agent's outer flow
+    short-circuits with `[CAPITAL_SOURCE] source=none` before reaching
+    this function in that case, so the 0.0 return is a defensive floor
+    rather than the primary path.
 
     Returns actual deployable capital (never negative, floors at 0).
     """
@@ -1116,6 +1122,18 @@ def compute_available_capital(
         return max(0, available)
 
     # ── Legacy path: hardcoded total minus DB-derived locked ──
+    # FX-025: total_capital can be None now. The agent's outer flow
+    # short-circuits before reaching this branch in that case, but we
+    # add a defensive floor so the function returns a sensible 0.0
+    # rather than raising on None arithmetic.
+    if total_capital is None:
+        log.warning(
+            "compute_available_capital: total_capital is None and "
+            "exchange_balance is None — returning 0.0. "
+            "The agent's outer flow should have short-circuited earlier."
+        )
+        return 0.0
+
     locked = locked_positions + locked_dumps + locked_pending
 
     # Sanity check: if locked capital exceeds total by a wide margin,

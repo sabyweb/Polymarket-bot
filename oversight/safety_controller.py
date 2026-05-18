@@ -168,7 +168,15 @@ LOSS_REWARD_RATIO_MILD = 1.5
 MAX_DRAWDOWN_PCT = 0.15
 
 # ── Capital protection ──
-CAPITAL_FLOOR_USD = 50.0
+# FX-010: I4 floor scales with wallet — max($50 absolute, 10% of the
+# wallet reference). The reference is max(portfolio_peak, current
+# portfolio_value, exchange_balance) so a drawdown doesn't shrink the
+# floor. The $50 minimum survives because below that the bot can't
+# meaningfully operate (smallest order ~$0.50 × 100 = $50 budget).
+# Backwards compat: for wallets ≤ $500, the 10% scale never exceeds the
+# $50 minimum, so behaviour is unchanged. Tightens only on larger wallets.
+CAPITAL_FLOOR_USD = 50.0            # absolute minimum (operational floor)
+CAPITAL_FLOOR_PCT = 0.10            # fraction of wallet reference
 MAX_CAPITAL_AT_RISK_PCT = 0.80
 MAX_CAPITAL_AT_RISK_UNSAFE_PCT = 0.90
 
@@ -393,25 +401,29 @@ class SafetyController:
         # ── I4: Capital floor (CRITICAL) ──────────────────────────
         # balance > 0 but < floor → UNSAFE (proven).
         # balance <= 0: check history to distinguish API failure vs real loss.
+        # FX-010: floor is wallet-scaled — max($50 absolute, 10% of the
+        # wallet reference) so the threshold meaning stays consistent
+        # across wallet sizes.
+        _floor = self._capital_floor(exchange_balance, _portfolio_val)
         if exchange_balance <= 0:
             last_known = self._query_last_known_balance()
             if last_known is not None:
                 violations.append(Violation(
                     "capital_floor", PRIORITY_CRITICAL, UNSAFE,
-                    exchange_balance, CAPITAL_FLOOR_USD,
+                    exchange_balance, _floor,
                     f"Balance dropped to $0 (was ${last_known:.0f}) — sustained zero",
                 ))
             else:
                 violations.append(Violation(
                     "capital_floor", PRIORITY_CRITICAL, DATA_UNAVAILABLE,
-                    exchange_balance, CAPITAL_FLOOR_USD,
+                    exchange_balance, _floor,
                     "Exchange balance unavailable — no recent history",
                 ))
-        elif exchange_balance < CAPITAL_FLOOR_USD:
+        elif exchange_balance < _floor:
             violations.append(Violation(
                 "capital_floor", PRIORITY_CRITICAL, UNSAFE,
-                exchange_balance, CAPITAL_FLOOR_USD,
-                f"Balance ${exchange_balance:.0f} < floor ${CAPITAL_FLOOR_USD}",
+                exchange_balance, _floor,
+                f"Balance ${exchange_balance:.0f} < floor ${_floor:.0f}",
             ))
 
         # ── I5: CF drift (HIGH — model-derived, not ground truth) ─
@@ -969,6 +981,25 @@ class SafetyController:
             return True
         except Exception:
             return False
+
+    def _capital_floor(self, exchange_balance: float, portfolio_value: float) -> float:
+        """Return the I4 capital-floor threshold for this evaluation.
+
+        FX-010: floor is wallet-scaled. Reference = the largest of
+        (`portfolio_peak`, `portfolio_value`, `exchange_balance`) so a
+        drawdown does NOT shrink the floor as the wallet shrinks.
+        Floor = max($50, reference * 10%).
+
+        - $200 wallet → max($50, $20)  = $50  (unchanged from constant)
+        - $1500 wallet → max($50, $150) = $150
+        - $10000 wallet → max($50, $1000) = $1000
+
+        The $50 minimum is an operational floor: smallest market order is
+        ~$0.50, so $50 lets you place ~100 orders. Below that the bot
+        can't function meaningfully regardless of wallet size.
+        """
+        reference = max(self._portfolio_peak, portfolio_value, exchange_balance)
+        return max(CAPITAL_FLOOR_USD, reference * CAPITAL_FLOOR_PCT)
 
     def _query_lifetime_fills_count(self) -> int | None:
         # Used by the BOOTSTRAP-exit fast path. Returns None on query failure
