@@ -738,6 +738,16 @@ class SafetyController:
             and num_scoring >= 5
             and fill_damage_24h <= max(reward_24h * 2, 50)
         )
+        # UNSAFE is special — it must NOT take the fast-path upgrade here
+        # (fixit.md::FX-030). The architecture doc (§10.3, §4.14, §7) pins
+        # the recovery contract: UNSAFE → DEGRADED via the auto-recovery
+        # path in evaluate_state (3 cycles), then DEGRADED → MILDLY via the
+        # standard fast path (2 cycles). The fast-path else-branch below
+        # would otherwise jump UNSAFE → MILDLY in 2 cycles, bypassing the
+        # documented DEGRADED step. Helsinki is past UNSAFE risk (no cold
+        # start, calibrated CF) but this matters for any genuine recovery.
+        if self.state == UNSAFE:
+            return
         if is_fully_calibrated:
             self.consecutive_good += 1
             if self.state == CALIBRATED:
@@ -836,18 +846,25 @@ class SafetyController:
             if a["action"] == "deploy" and a.get("q_share_pct", 0) > Q_SHARE_MAX:
                 a["q_share_pct"] = Q_SHARE_MAX
 
+        # Per-market exposure cap — fixit.md::FX-029. Both the scaling
+        # decision and the post-cap valuation use the same internal formula
+        # (shares × est_price × 2) so the cap is honoured even if the
+        # caller's est_capital_cost is inconsistent with that formula. The
+        # min_size floor still wins by design — markets where min_size at
+        # est_price exceeds $200 deploy at min_size (operational floor; sub-
+        # min_size orders aren't accepted by the venue).
         for a in allocations:
-            if a["action"] == "deploy":
-                est_cost = a.get("est_capital_cost", 0)
-                if est_cost > MAX_PER_MARKET_EXPOSURE_USD:
-                    scale = MAX_PER_MARKET_EXPOSURE_USD / est_cost
-                    a["shares_per_side"] = max(
-                        int(a.get("min_size", 50)),
-                        int(a["shares_per_side"] * scale),
-                    )
-                    spread = a.get("max_spread", 0.045)
-                    est_price = max(0.10, (1.0 - 2 * spread) / 2)
-                    a["est_capital_cost"] = round(a["shares_per_side"] * est_price * 2, 2)
+            if a["action"] != "deploy":
+                continue
+            spread = a.get("max_spread", 0.045)
+            est_price = max(0.10, (1.0 - 2 * spread) / 2)
+            min_sz = int(a.get("min_size", 50))
+            shares = a.get("shares_per_side", min_sz)
+            actual_cost = shares * est_price * 2
+            if actual_cost > MAX_PER_MARKET_EXPOSURE_USD:
+                target_shares = int(MAX_PER_MARKET_EXPOSURE_USD / (est_price * 2))
+                a["shares_per_side"] = max(min_sz, target_shares)
+                a["est_capital_cost"] = round(a["shares_per_side"] * est_price * 2, 2)
 
         final_deploy = sum(1 for a in allocations if a["action"] == "deploy")
         final_capital = sum(

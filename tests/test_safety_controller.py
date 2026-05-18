@@ -963,40 +963,57 @@ class TestDowngradeBehavior(_ControllerTestBase):
 
 
 class TestUnsafeAutoRecovery(_ControllerTestBase):
-    """UNSAFE exit semantics.
+    """UNSAFE exit semantics — architecture doc §10.3 / §4.14 / §7.
 
-    Two distinct paths leave UNSAFE on a no-violations cycle:
+    Documented recovery contract (fixit.md::FX-030):
 
-    1. **Slow path (auto-recovery)** — 3 clean cycles where each is NOT
-       fully-calibrated (so ``_handle_upgrade`` is a no-op) but each lacks
-       a CRITICAL-UNSAFE violation + has valid data. After cycle 3,
-       state transitions UNSAFE → DEGRADED via the explicit transition at
-       ``evaluate_state`` line 657-664.
+      UNSAFE → (UNSAFE_RECOVERY_CYCLES=3) → DEGRADED
+             → (UPGRADE_STEP=2) → MILDLY_MISCALIBRATED
+             → (UPGRADE_STEP=2) → ... (or UPGRADE_TO_CALIBRATED=3) → CALIBRATED
 
-    2. **Fast path (_handle_upgrade)** — UPGRADE_STEP=2 cycles where each
-       is fully calibrated (cf in [0.05,3], est/actual<5, ≥5 scoring,
-       fd24 reasonable). State transitions UNSAFE → MILDLY via the
-       upgrade-by-step ladder, bypassing DEGRADED entirely. This is by
-       design: full calibration is a stronger signal than mere absence of
-       CRITICAL violations, so it earns a faster exit.
+    The minimum cycle count from UNSAFE back to MILDLY is 3 + 2 = 5
+    (slow-path auto-recovery in evaluate_state:658-664 caps at DEGRADED;
+    `_handle_upgrade` then takes DEGRADED → MILDLY in 2). The
+    `_handle_upgrade` else-branch is skipped when state == UNSAFE so the
+    fast path can NOT bypass the DEGRADED step.
     """
 
-    def test_slow_path_unsafe_to_degraded_after_3_cycles(self):
+    def test_unsafe_to_degraded_after_3_cycles_not_fully_calibrated(self):
         self.sc.state = UNSAFE
         self.sc._unsafe_no_critical_count = 0
-        # num_scoring_markets=3 < 5 → _handle_upgrade fast path declines
-        # (is_fully_calibrated=False), so only the auto-recovery path runs.
+        # num_scoring_markets=3 < 5 → is_fully_calibrated=False; only the
+        # auto-recovery path can transition.
         for _ in range(UNSAFE_RECOVERY_CYCLES):
             self._eval(actual_daily_payout=10.0, num_scoring_markets=3)
         self.assertEqual(DEGRADED, self.sc.state)
 
-    def test_fast_path_unsafe_to_mildly_after_2_calibrated_cycles(self):
+    def test_unsafe_to_degraded_after_3_cycles_fully_calibrated(self):
+        # FX-030: even with fully-calibrated inputs, UNSAFE must step
+        # through DEGRADED. `_handle_upgrade` is no-op when state==UNSAFE.
         self.sc.state = UNSAFE
         self.sc.consecutive_good = 0
         self.sc._unsafe_no_critical_count = 0
-        # Fully calibrated inputs (cf in zone, est==actual, ≥5 markets,
-        # no losses) → UPGRADE_STEP=2 fast path fires before the slow
-        # path reaches its 3-cycle gate.
+        # 2 fully-calibrated cycles — pre-FX-030 this would have jumped
+        # straight to MILDLY. Now it stays UNSAFE until the slow path.
+        self._eval(actual_daily_payout=10.0)
+        self._eval(actual_daily_payout=10.0)
+        self.assertEqual(UNSAFE, self.sc.state)
+        # Cycle 3 hits the auto-recovery slow path → DEGRADED.
+        self._eval(actual_daily_payout=10.0)
+        self.assertEqual(DEGRADED, self.sc.state)
+
+    def test_full_recovery_unsafe_to_mildly_takes_at_least_5_cycles(self):
+        # FX-030 contract: minimum UNSAFE → MILDLY transit is 5 cycles
+        # (3 auto-recovery + 2 step-upgrade).
+        self.sc.state = UNSAFE
+        self.sc.consecutive_good = 0
+        self.sc._unsafe_no_critical_count = 0
+        # Cycles 1-3: UNSAFE auto-recovery counter ticks, hits 3 → DEGRADED.
+        for _ in range(3):
+            self._eval(actual_daily_payout=10.0)
+        self.assertEqual(DEGRADED, self.sc.state)
+        # Cycles 4-5: DEGRADED fast path to MILDLY (consecutive_good reset
+        # by the transition, so the 2-cycle gate starts fresh).
         self._eval(actual_daily_payout=10.0)
         self._eval(actual_daily_payout=10.0)
         self.assertEqual(MILDLY_MISCALIBRATED, self.sc.state)
@@ -1196,19 +1213,35 @@ class TestFilterAllocationsQShareCap(_ControllerTestBase):
 class TestFilterAllocationsPerMarketExposure(_ControllerTestBase):
 
     def test_per_market_over_200_scaled_down(self):
-        # MAX_PER_MARKET_EXPOSURE_USD = $200. The cap scales shares by
-        # 200/input_est_cost, then recomputes new est_cost from the internal
-        # formula ``shares × est_price × 2`` where est_price depends on spread.
-        # For the cap to actually land at ≤ $200, the caller's input est_cost
-        # must match the same internal formula on the original shares (it's a
-        # "best-effort" cap — assumes consistent inputs). With spread=0.045 →
-        # est_price=0.455. shares=500 → 500*0.455*2 = $455. Pass that.
+        # FX-029: cap uses the internal formula `shares × est_price × 2` for
+        # both the decision and the recomputation. Caller's est_cost is now
+        # informational only — the cap holds regardless.
         self.sc.state = CALIBRATED
         allocs = [_allocation(shares=500, est_cost=455.0, min_size=50)]
         self.sc.filter_allocations(allocs, available_capital=10000.0)
         self.assertLessEqual(allocs[0]["est_capital_cost"], 200.0)
         self.assertLess(allocs[0]["shares_per_side"], 500)
         self.assertGreaterEqual(allocs[0]["shares_per_side"], 50)
+
+    def test_per_market_cap_holds_with_mismatched_caller_est_cost(self):
+        # FX-029 regression: with shares=500, spread=0.045, internal
+        # valuation is 500 × 0.455 × 2 = $455. A caller passing est_cost=300
+        # (under-estimate) used to slip past the gate then overshoot post-cap.
+        # After the fix, the internal formula drives the decision.
+        self.sc.state = CALIBRATED
+        allocs = [_allocation(shares=500, est_cost=300.0, min_size=50)]
+        self.sc.filter_allocations(allocs, available_capital=10000.0)
+        self.assertLessEqual(allocs[0]["est_capital_cost"], 200.0)
+
+    def test_per_market_cap_holds_with_narrow_spread(self):
+        # FX-029 regression: with very narrow spread (high est_price),
+        # caller's stale est_cost could understate cost dramatically.
+        # spread=0.001 → est_price=0.499 → 500 shares = $499 internal.
+        self.sc.state = CALIBRATED
+        allocs = [_allocation(shares=500, est_cost=201.0,
+                              min_size=50, max_spread=0.001)]
+        self.sc.filter_allocations(allocs, available_capital=10000.0)
+        self.assertLessEqual(allocs[0]["est_capital_cost"], 200.0)
 
 
 # ───────────────────────────────────────────────────────────────────────────
