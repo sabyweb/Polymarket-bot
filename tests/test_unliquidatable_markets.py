@@ -565,17 +565,30 @@ class TestReprobeTokenIdFallback(unittest.TestCase):
 
 
 class TestDeadMarketCleanupCascade(unittest.TestCase):
-    """FX-006: when book_failures triggers dead-market cleanup, the loop
-    must cascade to dump_states + mark the cid unliquidatable.
+    """FX-006 / FX-032: when book_failures triggers dead-market cleanup,
+    the loop must cascade to dump_states (FX-006) but MUST NOT mark the
+    cid as unliquidatable (FX-032).
 
-    We exercise the actual loop block in run_cycle via a focused replay —
-    constructing the exact ``dead_cids`` shape the loop produces and
-    asserting the DB side-effects."""
+    The dead-market threshold is `book_failures >= 3` consecutive
+    failures of ``get_merged_book``. That gate fires for a much wider
+    class of conditions than the canonical FX-007 "orderbook does not
+    exist" body — SDK parse errors, transient network hiccups, brief
+    empty-book windows, etc. Marking those cids as permanently
+    unliquidatable was an FX-006 cascade overreach that bit Helsinki at
+    v5.1.14 startup: 60 healthy markets (one paying $200/day in rewards)
+    got flagged at 03:23:38 and the FX-028 re-probe couldn't un-mark
+    them. The canonical FX-007 path in ``OrderLifecycle`` / ``DumpManager``
+    is the SOLE source of truth for unliquidatable marking.
 
-    def test_cleanup_loop_cascades(self):
-        # Re-construct the loop body from reward_farmer.py:1955-1979 with a
-        # minimal stub. This is a logic-shape regression test: if the loop
-        # gets restructured but the cascade is preserved, it stays green.
+    Source under test is the actual loop in
+    ``RewardFarmer.run_cycle`` (Step 4b).
+    """
+
+    def test_dead_market_cascade_clears_dump_states_but_does_not_mark_unliquidatable(self):
+        # Replay the actual loop block from reward_farmer.py Step 4b.
+        # Logic-shape regression: if the loop is restructured but the
+        # FX-032 contract (no mark_unliquidatable here) is preserved, it
+        # stays green.
         BOOK_FAILURE_LIMIT = 3
         ms = _make_ms()
         ms.book_failures = BOOK_FAILURE_LIMIT
@@ -588,18 +601,44 @@ class TestDeadMarketCleanupCascade(unittest.TestCase):
         ]
         self.assertEqual([ms.cid], dead_cids)
 
+        # Loop body (FX-032 — no mark_unliquidatable call):
         for cid in dead_cids:
             for side in ["yes", "no"]:
                 db.delete_dump_state(cid, side)
-            db.mark_unliquidatable(cid, reason="dead_market_book_failures")
             del markets[cid]
 
+        # FX-006 cascade preserved: dump_states cleaned both sides
         db.delete_dump_state.assert_any_call(ms.cid, "yes")
         db.delete_dump_state.assert_any_call(ms.cid, "no")
-        db.mark_unliquidatable.assert_called_once_with(
-            ms.cid, reason="dead_market_book_failures"
-        )
+        # FX-032: this path must NOT mark unliquidatable. Only the
+        # canonical FX-007 "orderbook does not exist" body in
+        # OrderLifecycle/DumpManager exception handlers is allowed to.
+        db.mark_unliquidatable.assert_not_called()
+        # Market removed from active set (still appropriate — it can
+        # reappear via the next reward-markets refresh and get another
+        # chance, which is what we want for transient failure modes).
         self.assertEqual({}, markets)
+
+    def test_actual_reward_farmer_cleanup_does_not_call_mark_unliquidatable(self):
+        # Stronger assertion: read the source and check the production
+        # code path doesn't have `mark_unliquidatable` in the dead-market
+        # cleanup block. This catches a future regression that re-adds
+        # the call.
+        import inspect
+        from reward_farmer import RewardFarmer
+        src = inspect.getsource(RewardFarmer.run_cycle)
+        # Find the Step 4b block
+        start = src.find("Step 4b")
+        self.assertNotEqual(-1, start, "Step 4b marker missing from run_cycle")
+        end = src.find("Step 5", start)
+        self.assertNotEqual(-1, end, "Step 5 marker missing — block extraction failed")
+        block = src[start:end]
+        self.assertIn("delete_dump_state", block, "FX-006 cascade must be preserved")
+        self.assertNotIn(
+            "mark_unliquidatable", block,
+            "FX-032: dead-market cleanup must not call mark_unliquidatable "
+            "(only the canonical FX-007 path in OL/DM is allowed to)"
+        )
 
 
 if __name__ == "__main__":

@@ -2067,9 +2067,26 @@ class RewardFarmer:
                     f"(> {CLUSTER_NOTIONAL_LIMIT_FRAC:.0%}·T)"
                 )
 
-        # Step 4b: Remove dead markets (3+ consecutive book failures = resolved/delisted).
-        # FX-006: also cascade to dump_states + mark unliquidatable so the
-        # orphan scan + dump restore don't re-create dumps for the dead cid.
+        # Step 4b: Remove dead markets (3+ consecutive book failures).
+        # FX-006: also cascade to dump_states so a saved dump for this cid
+        # doesn't survive into the next restart's restore.
+        # FX-032: no longer mark these cids as unliquidatable. `book_failures`
+        # is incremented whenever `get_merged_book` returns None — which
+        # happens for a much wider class of conditions than the canonical
+        # "orderbook does not exist" body (SDK parse errors, transient
+        # network hiccups, empty bids/asks in a brief market lull). Marking
+        # those as permanently unliquidatable was overreach: on Helsinki's
+        # v5.1.14 startup, 60 healthy markets (incl. one paying $200/day in
+        # rewards) got flagged at 03:23:38 and the FX-028 re-probe couldn't
+        # un-mark them within the working window. The canonical FX-007 path
+        # in `OrderLifecycle` and `DumpManager` remains the ONLY source of
+        # truth for unliquidatable marking — it only fires when the V2 SDK
+        # returns a 400 with both "orderbook" AND "does not exist" in the
+        # body, which is the actual resolved-market signal. Markets removed
+        # from `self.markets` here will reappear on the next
+        # `_refresh_reward_markets` call and get another chance — appropriate
+        # for transient failure modes, conservative for genuine dead markets
+        # (which the FX-007 path will catch on the next placement attempt).
         BOOK_FAILURE_LIMIT = 3
         dead_cids = [
             cid for cid, ms in self.markets.items()
@@ -2086,11 +2103,6 @@ class RewardFarmer:
                 # FX-006: cascade to dump_states so a saved dump for this
                 # cid doesn't survive into the next restart's restore.
                 self.db.delete_dump_state(cid, side)
-            # FX-006 / FX-007: mark the cid unliquidatable. book_failures
-            # is a strong indication the orderbook is gone (get_merged_book
-            # returned None 3 cycles running); future BUY / dump attempts
-            # for this cid are blocked at the gate.
-            self.db.mark_unliquidatable(cid, reason="dead_market_book_failures")
             del self.markets[cid]
 
         # Step 5: Record rewards
