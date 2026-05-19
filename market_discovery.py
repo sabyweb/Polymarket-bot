@@ -252,31 +252,80 @@ def fetch_all_reward_markets() -> list[dict]:
     return merged
 
 
+def _book_entries(ob, key: str) -> list[tuple[float, float]]:
+    """Extract (price, size) tuples from an orderbook bids/asks list.
+
+    fixit.md::FX-035 — py-clob-client-v2 v1.0.0 returns `get_order_book`
+    as a **dict** with string-valued `'bids'`/`'asks'` entries like
+    ``[{'price': '0.02', 'size': '2250'}, ...]``. Pre-FX-035 the code used
+    `getattr(ob, "bids", [])` and `float(b.price)`, which assumed an
+    object-with-attributes shape (the format test mocks produce). On the
+    real V2 SDK return, `getattr(dict, "bids")` returns the default (`[]`),
+    so get_merged_book always returned None on production — invisible to
+    unit tests but catastrophic in LIVE mode (Helsinki bot couldn't fetch
+    a single book for 4 days). This normalizer handles both forms so the
+    function works under SDK + mocks alike.
+    """
+    if ob is None:
+        return []
+    # V2 SDK dict-form: {'bids': [{'price': str, 'size': str}, ...]}
+    if isinstance(ob, dict):
+        raw = ob.get(key, []) or []
+        out = []
+        for e in raw:
+            if isinstance(e, dict):
+                p = float(e.get("price", 0))
+                s = float(e.get("size", 0))
+            else:
+                p = float(getattr(e, "price", 0))
+                s = float(getattr(e, "size", 0))
+            out.append((p, s))
+        return out
+    # Object-form (test mocks, possibly future SDK changes):
+    raw = getattr(ob, key, []) or []
+    out = []
+    for e in raw:
+        if isinstance(e, dict):
+            p = float(e.get("price", 0))
+            s = float(e.get("size", 0))
+        else:
+            p = float(getattr(e, "price", 0))
+            s = float(getattr(e, "size", 0))
+        out.append((p, s))
+    return out
+
+
 def get_merged_book(client, yes_tid: str, no_tid: str) -> dict | None:
-    """Fetch YES + NO order books and merge into YES-equivalent view."""
+    """Fetch YES + NO order books and merge into YES-equivalent view.
+
+    Handles both V2 SDK dict-return and test-mock object-return shapes
+    via _book_entries (fixit.md::FX-035).
+    """
     try:
         ob_yes = client.get_order_book(yes_tid)
         if not ob_yes:
             return None
 
-        all_bids = []
-        all_asks = []
+        all_bids: list[tuple[float, float]] = []
+        all_asks: list[tuple[float, float]] = []
 
-        for b in getattr(ob_yes, "bids", []):
-            all_bids.append((float(b.price), float(b.size)))
-        for a in getattr(ob_yes, "asks", []):
-            all_asks.append((float(a.price), float(a.size)))
+        for p, s in _book_entries(ob_yes, "bids"):
+            all_bids.append((p, s))
+        for p, s in _book_entries(ob_yes, "asks"):
+            all_asks.append((p, s))
 
         ob_no = client.get_order_book(no_tid)
         if ob_no:
-            for a in getattr(ob_no, "asks", []):
-                derived = round(1.0 - float(a.price), 4)
+            # NO-side asks → YES-side bids at (1 - price)
+            for p, s in _book_entries(ob_no, "asks"):
+                derived = round(1.0 - p, 4)
                 if derived > 0:
-                    all_bids.append((derived, float(a.size)))
-            for b in getattr(ob_no, "bids", []):
-                derived = round(1.0 - float(b.price), 4)
+                    all_bids.append((derived, s))
+            # NO-side bids → YES-side asks at (1 - price)
+            for p, s in _book_entries(ob_no, "bids"):
+                derived = round(1.0 - p, 4)
                 if derived < 1:
-                    all_asks.append((derived, float(b.size)))
+                    all_asks.append((derived, s))
 
         all_bids.sort(key=lambda x: x[0], reverse=True)
         all_asks.sort(key=lambda x: x[0])

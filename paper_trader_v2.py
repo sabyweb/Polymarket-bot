@@ -75,48 +75,11 @@ VOLATILE_KEYWORDS = [
 def get_merged_book(book_provider, yes_tid: str, no_tid: str) -> dict | None:
     """Fetch YES + NO order books and merge into a single YES-equivalent view.
 
-    Mirrors order_manager.get_order_book() logic:
-    - NO asks → derived YES bids (1 - ask_price)
-    - NO bids → derived YES asks (1 - bid_price)
-    Returns dict with "bids" and "asks" keys, each list of {"price": float, "size": float}.
+    Delegates to ``market_discovery.get_merged_book`` so paper trading
+    benefits from the same V2 SDK dict-form handling (fixit.md::FX-035).
     """
-    try:
-        ob_yes = book_provider.get_order_book(yes_tid)
-        if not ob_yes:
-            return None
-
-        all_bids = []  # (price, size) tuples
-        all_asks = []
-
-        for b in getattr(ob_yes, "bids", []):
-            all_bids.append((float(b.price), float(b.size)))
-        for a in getattr(ob_yes, "asks", []):
-            all_asks.append((float(a.price), float(a.size)))
-
-        # Merge NO book
-        ob_no = book_provider.get_order_book(no_tid)
-        if ob_no:
-            for a in getattr(ob_no, "asks", []):
-                derived = round(1.0 - float(a.price), 4)
-                if derived > 0:
-                    all_bids.append((derived, float(a.size)))
-            for b in getattr(ob_no, "bids", []):
-                derived = round(1.0 - float(b.price), 4)
-                if derived < 1:
-                    all_asks.append((derived, float(b.size)))
-
-        all_bids.sort(key=lambda x: x[0], reverse=True)
-        all_asks.sort(key=lambda x: x[0])
-
-        if not all_bids or not all_asks:
-            return None
-
-        return {
-            "bids": [{"price": p, "size": s} for p, s in all_bids],
-            "asks": [{"price": p, "size": s} for p, s in all_asks],
-        }
-    except Exception:
-        return None
+    from market_discovery import get_merged_book as _impl
+    return _impl(book_provider, yes_tid, no_tid)
 
 
 def is_volatile(question: str) -> bool:

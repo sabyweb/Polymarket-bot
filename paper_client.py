@@ -369,30 +369,30 @@ class FillEngine:
 
     def _check_buy(self, paper_client: PaperClient, order: PaperOrder, book):
         """Check if a BUY order fills (asks crossing our bid)."""
-        asks = getattr(book, "asks", [])
+        from market_discovery import _book_entries  # FX-035: handle dict + object forms
+        asks = _book_entries(book, "asks")
         if not asks:
             return
 
         # Calculate crossing volume
         crossing_volume = 0.0
-        for ask in asks:
-            ask_price = float(ask.price)
+        for ask_price, ask_size in asks:
             if self.fill_model == "cross_through":
                 if ask_price < order.price:  # strictly less
-                    crossing_volume += float(ask.size)
+                    crossing_volume += ask_size
             else:  # "touch"
                 if ask_price <= order.price:
-                    crossing_volume += float(ask.size)
+                    crossing_volume += ask_size
 
         if crossing_volume <= 0:
             return
 
         # Queue position: how many shares ahead of us at our price level?
-        bids = getattr(book, "bids", [])
+        bids = _book_entries(book, "bids")
         queue_ahead = 0.0
-        for bid in bids:
-            if abs(float(bid.price) - order.price) < 0.002:
-                queue_ahead += float(bid.size)
+        for bid_price, bid_size in bids:
+            if abs(bid_price - order.price) < 0.002:
+                queue_ahead += bid_size
 
         # Our share of fills at this level
         total_at_level = queue_ahead + order.remaining
@@ -411,28 +411,28 @@ class FillEngine:
 
     def _check_sell(self, paper_client: PaperClient, order: PaperOrder, book):
         """Check if a SELL order fills (bids crossing our ask)."""
-        bids = getattr(book, "bids", [])
+        from market_discovery import _book_entries  # FX-035: handle dict + object forms
+        bids = _book_entries(book, "bids")
         if not bids:
             return
 
         crossing_volume = 0.0
-        for bid in bids:
-            bid_price = float(bid.price)
+        for bid_price, bid_size in bids:
             if self.fill_model == "cross_through":
                 if bid_price > order.price:  # strictly greater
-                    crossing_volume += float(bid.size)
+                    crossing_volume += bid_size
             else:
                 if bid_price >= order.price:
-                    crossing_volume += float(bid.size)
+                    crossing_volume += bid_size
 
         if crossing_volume <= 0:
             return
 
-        asks = getattr(book, "asks", [])
+        asks = _book_entries(book, "asks")
         queue_ahead = 0.0
-        for ask in asks:
-            if abs(float(ask.price) - order.price) < 0.002:
-                queue_ahead += float(ask.size)
+        for ask_price, ask_size in asks:
+            if abs(ask_price - order.price) < 0.002:
+                queue_ahead += ask_size
 
         total_at_level = queue_ahead + order.remaining
         our_share = (order.remaining / total_at_level) if total_at_level > 0 else 1.0
