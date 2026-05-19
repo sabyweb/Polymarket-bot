@@ -240,10 +240,10 @@ def main() -> None:
         )
         print(f"   Collateral: {collateral}")
 
-        conditional = client.get_balance_allowance(
-            BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL)
-        )
-        print(f"   Conditional: {conditional}")
+        # CONDITIONAL balance/allowance is checked at trade-time against a
+        # specific token_id; calling it here with no token_id produced a
+        # cosmetic 400 (`fixit.md::FX-019`). The COLLATERAL line above is the
+        # useful pre-trade check.
     except Exception as e:
         print(f"   ERROR: {e}")
     print()
