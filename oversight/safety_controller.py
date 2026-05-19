@@ -826,21 +826,53 @@ class SafetyController:
                     a["est_capital_cost"] = round(min_sz * est_price * 2, 2)
                     a["reason"] = f"PROBE: min_size={min_sz} (data collection only)"
 
-        running_cost = 0.0
-        for a in allocations:
+        # Capital-cap scaling — fixit.md::FX-031. The allocator sizes
+        # individual deploys assuming the full available_capital budget.
+        # Per-state caps (BOOTSTRAP 30%, MILDLY 70%, etc.) can be smaller
+        # than a single allocator deploy, in which case the previous
+        # wholesale-reject behaviour would block ALL deploys — observed
+        # on Helsinki post-restart where BOOTSTRAP's $60 cap rejected
+        # 3 candidates at $84-$89 each. Now we scale shares down to fit
+        # the remaining budget, so the top scorer still gets a (smaller)
+        # deploy. We iterate `deploys` (already sorted score-desc above)
+        # rather than `allocations` so the highest-scoring market gets
+        # first claim on the constrained budget. Reject only when even
+        # min_size shares wouldn't fit — the venue rejects sub-min orders.
+        remaining = max_capital
+        for a in deploys:
             if a["action"] != "deploy":
+                # Already blocked by an earlier filter (trial gate, max_markets).
                 continue
+            spread = a.get("max_spread", 0.045)
+            est_price = max(0.10, (1.0 - 2 * spread) / 2)
+            min_sz = int(a.get("min_size", 50))
+            min_cost = min_sz * est_price * 2
+
             est_cost = a.get("est_capital_cost", 0)
             if est_cost <= 0:
-                spread = a.get("max_spread", 0.045)
-                est_price = max(0.10, (1.0 - 2 * spread) / 2)
-                est_cost = a.get("shares_per_side", 50) * est_price * 2
-            if running_cost + est_cost > max_capital:
+                est_cost = a.get("shares_per_side", min_sz) * est_price * 2
+
+            if remaining < min_cost:
                 a["action"] = "avoid"
                 a["shares_per_side"] = 0
-                a["reason"] = f"SafetyController: capital cap ${max_capital:.0f}"
-            else:
-                running_cost += est_cost
+                a["reason"] = (
+                    f"SafetyController: capital exhausted "
+                    f"(${remaining:.0f} < min ${min_cost:.0f})"
+                )
+                continue
+
+            if est_cost > remaining:
+                target_shares = int(remaining / (est_price * 2))
+                a["shares_per_side"] = max(min_sz, target_shares)
+                a["est_capital_cost"] = round(
+                    a["shares_per_side"] * est_price * 2, 2
+                )
+                est_cost = a["est_capital_cost"]
+                a["reason"] = (
+                    f"SafetyController: scaled to fit ${max_capital:.0f} cap"
+                )
+
+            remaining -= est_cost
 
         for a in allocations:
             if a["action"] == "deploy" and a.get("q_share_pct", 0) > Q_SHARE_MAX:

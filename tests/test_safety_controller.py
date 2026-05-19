@@ -1138,6 +1138,106 @@ class TestFilterAllocationsCapitalCap(_ControllerTestBase):
         self.assertEqual(14, deploys)
 
 
+class TestFilterAllocationsCapitalCapScaling(_ControllerTestBase):
+    """FX-031 — capital cap scales oversized deploys, doesn't wholesale-reject.
+
+    The allocator sizes individual deploys assuming full `available_capital`,
+    but per-state caps (BOOTSTRAP 30%, MILDLY 70%) can be smaller than a
+    single allocator deploy. Previous behaviour: any deploy whose
+    `est_capital_cost` exceeded `remaining_budget` was rejected entirely,
+    so a $89 deploy in BOOTSTRAP (cap = $60) blocked itself AND every
+    subsequent deploy. Now we scale shares down to fit, and only fall
+    through to "avoid" when even ``min_size`` shares wouldn't fit.
+    """
+
+    def test_oversized_top_scorer_scaled_to_fit(self):
+        # BOOTSTRAP cap = $200 * 0.30 = $60. Deploy est_cost $89 (bigger than
+        # cap). Pre-FX-031: rejected entirely. Post-FX-031: shares scale
+        # down so the deploy fits under $60.
+        self.sc.state = BOOTSTRAP
+        allocs = [_allocation(shares=200, est_cost=89.0, max_spread=0.055)]
+        self.sc.filter_allocations(allocs, available_capital=200.0)
+        self.assertEqual("deploy", allocs[0]["action"])
+        self.assertLessEqual(allocs[0]["est_capital_cost"], 60.0)
+        self.assertLess(allocs[0]["shares_per_side"], 200)
+
+    def test_top_scorer_drains_budget_subsequent_rejected(self):
+        # BOOTSTRAP cap = $60. Three deploys at $89 each (each > cap).
+        # Scores 24/23/22. Top scorer should claim the budget; the rest
+        # get "capital exhausted".
+        self.sc.state = BOOTSTRAP
+        allocs = [
+            _allocation(shares=200, est_cost=89.0, max_spread=0.055),
+            _allocation(shares=200, est_cost=89.0, max_spread=0.055),
+            _allocation(shares=200, est_cost=89.0, max_spread=0.055),
+        ]
+        # Assign different scores to verify score-desc iteration order
+        allocs[0]["score"] = 24.0
+        allocs[1]["score"] = 23.0
+        allocs[2]["score"] = 22.0
+        self.sc.filter_allocations(allocs, available_capital=200.0)
+        deploys = [a for a in allocs if a["action"] == "deploy"]
+        rejected = [a for a in allocs if a["action"] == "avoid"]
+        self.assertEqual(1, len(deploys))
+        self.assertEqual(2, len(rejected))
+        # The deploy that survived should be the highest-scoring one
+        self.assertEqual(24.0, deploys[0]["score"])
+        # The rejected ones should cite capital exhaustion (not a max_markets
+        # or trial-gate reason)
+        for r in rejected:
+            self.assertIn("capital exhausted", r["reason"])
+
+    def test_iterates_in_score_order_not_input_order(self):
+        # Same budget scenario, but input order is reversed (lowest score
+        # first). FX-031 iterates the sorted `deploys` list, so the top
+        # scorer still wins regardless of input order.
+        self.sc.state = BOOTSTRAP
+        allocs = [
+            _allocation(shares=200, est_cost=89.0, max_spread=0.055),
+            _allocation(shares=200, est_cost=89.0, max_spread=0.055),
+            _allocation(shares=200, est_cost=89.0, max_spread=0.055),
+        ]
+        allocs[0]["score"] = 10.0   # lowest score, first in list
+        allocs[1]["score"] = 20.0
+        allocs[2]["score"] = 30.0   # highest score, last in list
+        self.sc.filter_allocations(allocs, available_capital=200.0)
+        deploys = [a for a in allocs if a["action"] == "deploy"]
+        self.assertEqual(1, len(deploys))
+        # Highest-score deploy survived even though it was last in input order
+        self.assertEqual(30.0, deploys[0]["score"])
+
+    def test_rejects_below_min_size_cost(self):
+        # When remaining budget can't fit even one min_size order, reject
+        # cleanly (not scale down below min_size — the venue rejects those).
+        # BOOTSTRAP cap = $200 * 0.30 = $60. First deploy claims most of it.
+        # Second deploy then sees ~$0 remaining, which is below min_cost ($45.5
+        # for min_size=50 at spread=0.045 → est_price=0.455).
+        self.sc.state = BOOTSTRAP
+        allocs = [
+            _allocation(shares=200, est_cost=89.0, max_spread=0.045),
+            _allocation(shares=50, est_cost=46.0, max_spread=0.045),
+        ]
+        allocs[0]["score"] = 30.0
+        allocs[1]["score"] = 10.0
+        self.sc.filter_allocations(allocs, available_capital=200.0)
+        # First (high score) deploys after scaling; second rejected as exhausted
+        self.assertEqual("deploy", allocs[0]["action"])
+        self.assertEqual("avoid", allocs[1]["action"])
+        self.assertIn("capital exhausted", allocs[1]["reason"])
+
+    def test_min_size_floor_respected_even_if_remaining_smaller(self):
+        # If remaining > min_cost, the deploy is scaled to remaining. If
+        # remaining < min_cost, the deploy is rejected (not scaled below
+        # min_size). FX-031 guarantees scaled shares stay ≥ min_size.
+        self.sc.state = BOOTSTRAP
+        allocs = [_allocation(shares=200, est_cost=89.0, max_spread=0.045,
+                              min_size=50)]
+        self.sc.filter_allocations(allocs, available_capital=200.0)
+        self.assertEqual("deploy", allocs[0]["action"])
+        # Either scaled to fit (still ≥ min_size) or kept at min_size
+        self.assertGreaterEqual(allocs[0]["shares_per_side"], 50)
+
+
 class TestFilterAllocationsProbeMode(_ControllerTestBase):
 
     def test_unsafe_forces_min_size_only(self):
