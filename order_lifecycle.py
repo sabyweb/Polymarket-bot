@@ -16,6 +16,108 @@ log = logging.getLogger("reward_farmer")
 def SHARES_PER_SIDE(): return cfg("RF_SHARES_PER_SIDE")
 def PLACEMENT_TICKS_INSIDE(): return cfg("RF_PLACEMENT_TICKS_INSIDE")
 def BATCH_SIZE(): return cfg("RF_BATCH_SIZE")
+def TARGET_QUEUE_AHEAD_USD(): return cfg("RF_TARGET_QUEUE_AHEAD_USD")
+
+
+def _queue_aware_edge(
+    side: str,
+    book_levels,
+    midpoint: float,
+    max_spread: float,
+    tick: float,
+    target_queue_usd: float,
+    decimals: int,
+):
+    """FX-036: walk one side of the merged book accumulating $ queue ahead.
+
+    For ``side="bid"``, ``book_levels`` is ``merged["bids"]`` (sorted highest
+    price → lowest, i.e., closest to mid → furthest). For ``side="ask"``, it
+    is ``merged["asks"]`` (lowest → highest). At each level we add
+    ``price × size`` to the running total; when the total first reaches
+    ``target_queue_usd``, we sit one tick BEHIND that level (deeper from
+    mid by one tick) so the accumulated queue shields us from fills while
+    we earn the higher reward density of the inner zone.
+
+    Returns ``None`` to signal "fall back to the legacy zone-edge formula"
+    when:
+
+    - ``target_queue_usd <= 0`` (operator escape hatch)
+    - the book is empty
+    - we walk to the zone boundary without crossing the threshold (thin
+      book — current behaviour is appropriate)
+    - the one-tick step behind the chosen level would itself fall outside
+      the reward zone (defensive — never place outside the zone)
+
+    The merged book is YES-equivalent on both sides (real YES bids + NO-
+    derived asks on the bid side; real YES asks + NO-derived bids on the
+    ask side — see ``market_discovery.get_merged_book``). Both contribute
+    to ``cum_queue`` because they're arbitrage-linked competitors for the
+    same liquidity.
+    """
+    if target_queue_usd <= 0 or not book_levels:
+        return None
+    cum_queue = 0.0
+    for level in book_levels:
+        try:
+            price = float(level["price"])
+            size = float(level["size"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        d = abs(price - midpoint)
+        if d >= max_spread:
+            return None  # walked past the zone before crossing threshold
+        cum_queue += price * size
+        if cum_queue >= target_queue_usd:
+            edge = price - tick if side == "bid" else price + tick
+            if abs(edge - midpoint) >= max_spread:
+                return None  # one-tick step would exit the zone
+            return round(edge, decimals)
+    return None
+
+
+def _compute_edge_prices(
+    merged: dict,
+    midpoint: float,
+    max_spread: float,
+    tick: float,
+    decimals: int,
+    ticks_inside: int,
+    target_queue_usd: float,
+) -> tuple[float, float]:
+    """Return ``(edge_bid, edge_ask)`` for placement.
+
+    FX-036 (fixit.md::FX-036, arch doc §4.23): queue-depth-aware placement.
+    The legacy formula sits at ``max_spread - tick·ticks_inside`` from
+    midpoint — the far edge of the reward zone, which earns the LOWEST
+    reward density inside the zone (Polymarket's reward weight is
+    ``1 - d/max_spread``). On the 5.5¢ Iran market that was ~9% of the
+    theoretical maximum density per share-minute. Queue-aware placement
+    sits as close to mid as the operator-chosen ``target_queue_usd`` of
+    queue-ahead permits, capturing multiples more reward density while
+    still being shielded from fills by the queue we sit behind.
+
+    Falls back to the legacy zone-edge formula when the queue-aware walk
+    returns ``None`` (thin book, escape hatch, or zone-boundary edge case).
+    Final values are clamped to ``[0.01, 0.99]`` for safety.
+    """
+    legacy_bid = round(midpoint - max_spread + tick * ticks_inside, decimals)
+    legacy_ask = round(midpoint + max_spread - tick * ticks_inside, decimals)
+
+    qa_bid = _queue_aware_edge(
+        "bid", merged.get("bids", []),
+        midpoint, max_spread, tick, target_queue_usd, decimals,
+    )
+    qa_ask = _queue_aware_edge(
+        "ask", merged.get("asks", []),
+        midpoint, max_spread, tick, target_queue_usd, decimals,
+    )
+
+    edge_bid = qa_bid if qa_bid is not None else legacy_bid
+    edge_ask = qa_ask if qa_ask is not None else legacy_ask
+
+    edge_bid = max(0.01, edge_bid)
+    edge_ask = min(0.99, edge_ask)
+    return edge_bid, edge_ask
 
 
 class OrderLifecycle:
@@ -351,10 +453,15 @@ class OrderLifecycle:
 
         tick = ms.tick_size
         decimals = max(2, len(str(tick).rstrip('0').split('.')[-1]))
-        edge_bid = round(midpoint - ms.max_spread + tick * PLACEMENT_TICKS_INSIDE(), decimals)
-        edge_ask = round(midpoint + ms.max_spread - tick * PLACEMENT_TICKS_INSIDE(), decimals)
-        edge_bid = max(0.01, edge_bid)
-        edge_ask = min(0.99, edge_ask)
+        edge_bid, edge_ask = _compute_edge_prices(
+            merged=merged,
+            midpoint=midpoint,
+            max_spread=ms.max_spread,
+            tick=tick,
+            decimals=decimals,
+            ticks_inside=PLACEMENT_TICKS_INSIDE(),
+            target_queue_usd=TARGET_QUEUE_AHEAD_USD(),
+        )
 
         # Reprice stale orders outside reward window
         for side, edge_price in [("yes", edge_bid), ("no", edge_ask)]:

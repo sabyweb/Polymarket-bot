@@ -227,7 +227,8 @@ DISCORD_WEBHOOK_URL: str | None = os.getenv("DISCORD_WEBHOOK_URL")
 # ── Reward Farmer Parameters ───────────────��────────────────────────────────
 # All parameters for reward_farmer.py. Hot-reloadable via config_overrides.json.
 RF_SHARES_PER_SIDE: int = 50               # Default order size per side
-RF_PLACEMENT_TICKS_INSIDE: int = 1          # Ticks inside from midpoint edge
+RF_PLACEMENT_TICKS_INSIDE: int = 1          # Ticks inside from midpoint edge (legacy fallback used by FX-036 helper)
+RF_TARGET_QUEUE_AHEAD_USD: float = 1000.0   # FX-036: place 1 tick behind the level where cumulative book queue first reaches this $ amount; falls back to zone-edge formula on thin books or when set <= 0
 RF_MIN_DAILY_RATE: float = 10.0             # Minimum reward rate ($/day) to consider market
 RF_MAX_LIQUIDITY: int = 5000                # Skip markets with on-book depth above this
 # FX-011: RF_MAX_COST_PER_MARKET (=$50) and RF_MAX_TOTAL_EXPOSURE (=$1500)
