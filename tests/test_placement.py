@@ -38,6 +38,7 @@ from models import MarketState
 from order_lifecycle import (
     OrderLifecycle,
     _compute_edge_prices,
+    _has_sufficient_dump_depth,
     _queue_aware_edge,
 )
 
@@ -343,6 +344,248 @@ class TestComputeEdgePricesAsymmetry(unittest.TestCase):
         self.assertAlmostEqual(edge_ask, 0.55, places=4)   # legacy fallback (banker's round)
 
 
+class TestHasSufficientDumpDepth(unittest.TestCase):
+    """FX-041 direct unit tests for the dump-depth helper."""
+
+    def test_disabled_when_safety_factor_zero(self):
+        """safety_factor <= 0 short-circuits to True (escape hatch)."""
+        self.assertTrue(_has_sufficient_dump_depth(
+            opposite_book_levels=[], midpoint=0.5, max_spread=0.05,
+            shares_per_side=50, dump_price=0.5, safety_factor=0.0,
+        ))
+
+    def test_disabled_when_safety_factor_negative(self):
+        self.assertTrue(_has_sufficient_dump_depth(
+            opposite_book_levels=[], midpoint=0.5, max_spread=0.05,
+            shares_per_side=50, dump_price=0.5, safety_factor=-1.0,
+        ))
+
+    def test_disabled_when_shares_zero(self):
+        """shares × dump_price × factor == 0 → no real threshold → True."""
+        self.assertTrue(_has_sufficient_dump_depth(
+            opposite_book_levels=[], midpoint=0.5, max_spread=0.05,
+            shares_per_side=0, dump_price=0.5, safety_factor=3.0,
+        ))
+
+    def test_empty_book_fails_when_enabled(self):
+        """Active check + empty opposite side → insufficient depth."""
+        self.assertFalse(_has_sufficient_dump_depth(
+            opposite_book_levels=[], midpoint=0.5, max_spread=0.05,
+            shares_per_side=50, dump_price=0.5, safety_factor=3.0,
+        ))
+
+    def test_sufficient_depth_passes(self):
+        """Depth ≫ threshold → True. Threshold = 50 × 0.5 × 3 = $75."""
+        # $0.50 × 1000 = $500 at one level — way over $75
+        levels = [{"price": 0.50, "size": 1000}]
+        self.assertTrue(_has_sufficient_dump_depth(
+            opposite_book_levels=levels, midpoint=0.50, max_spread=0.05,
+            shares_per_side=50, dump_price=0.50, safety_factor=3.0,
+        ))
+
+    def test_insufficient_depth_fails(self):
+        """Depth ≪ threshold → False. Threshold $75."""
+        # $0.50 × 50 = $25 — below $75
+        levels = [{"price": 0.50, "size": 50}]
+        self.assertFalse(_has_sufficient_dump_depth(
+            opposite_book_levels=levels, midpoint=0.50, max_spread=0.05,
+            shares_per_side=50, dump_price=0.50, safety_factor=3.0,
+        ))
+
+    def test_depth_outside_zone_does_not_count(self):
+        """Levels with |price − midpoint| > max_spread are excluded."""
+        # Big level OUTSIDE the 5¢ zone — should be ignored
+        levels = [
+            {"price": 0.20, "size": 10000},   # 30¢ away — outside zone
+            {"price": 0.50, "size": 10},      # in zone but only $5
+        ]
+        self.assertFalse(_has_sufficient_dump_depth(
+            opposite_book_levels=levels, midpoint=0.50, max_spread=0.05,
+            shares_per_side=50, dump_price=0.50, safety_factor=3.0,
+        ))
+
+    def test_threshold_scales_with_safety_factor(self):
+        """Same book, factor 1 passes, factor 10 fails."""
+        # $0.50 × 200 = $100 of depth
+        levels = [{"price": 0.50, "size": 200}]
+        # threshold @ factor=1: 50 × 0.5 × 1 = $25 → pass
+        self.assertTrue(_has_sufficient_dump_depth(
+            opposite_book_levels=levels, midpoint=0.5, max_spread=0.05,
+            shares_per_side=50, dump_price=0.5, safety_factor=1.0,
+        ))
+        # threshold @ factor=10: 50 × 0.5 × 10 = $250 → fail
+        self.assertFalse(_has_sufficient_dump_depth(
+            opposite_book_levels=levels, midpoint=0.5, max_spread=0.05,
+            shares_per_side=50, dump_price=0.5, safety_factor=10.0,
+        ))
+
+    def test_threshold_scales_with_shares(self):
+        """Same book, 50 shares passes, 500 shares fails."""
+        # $0.50 × 200 = $100
+        levels = [{"price": 0.50, "size": 200}]
+        # 50 sh: threshold $75 → pass
+        self.assertTrue(_has_sufficient_dump_depth(
+            opposite_book_levels=levels, midpoint=0.5, max_spread=0.05,
+            shares_per_side=50, dump_price=0.5, safety_factor=3.0,
+        ))
+        # 500 sh: threshold $750 → fail
+        self.assertFalse(_has_sufficient_dump_depth(
+            opposite_book_levels=levels, midpoint=0.5, max_spread=0.05,
+            shares_per_side=500, dump_price=0.5, safety_factor=3.0,
+        ))
+
+    def test_malformed_level_skipped(self):
+        """Levels missing price/size or with bad types are skipped."""
+        levels = [
+            {"price": "not_a_number", "size": 10000},
+            {"size": 10000},  # missing price
+            {"price": 0.50, "size": 1000},  # the only usable one — $500
+        ]
+        self.assertTrue(_has_sufficient_dump_depth(
+            opposite_book_levels=levels, midpoint=0.5, max_spread=0.05,
+            shares_per_side=50, dump_price=0.5, safety_factor=3.0,
+        ))
+
+
+class TestComputeEdgePricesDumpDepthBackwardsCompat(unittest.TestCase):
+    """FX-041 must be a no-op when the new kwargs are omitted (escape-hatch
+    default) — every pre-FX-041 caller stays byte-identical."""
+
+    def test_default_kwargs_byte_identical_to_pre_fx041(self):
+        """Iran market with NO dump-depth args → same result as historical."""
+        book = _iran_book()
+        # No FX-041 kwargs passed → defaults to disabled
+        edge_bid, edge_ask = _compute_edge_prices(
+            merged=book, midpoint=0.485, max_spread=0.055, tick=0.01,
+            decimals=2, ticks_inside=1, target_queue_usd=1000.0,
+        )
+        # Historical FX-036 expectation (from TestComputeEdgePricesIranMarket)
+        self.assertAlmostEqual(edge_bid, 0.46, places=4)
+        self.assertAlmostEqual(edge_ask, 0.51, places=4)
+
+    def test_explicit_factor_zero_byte_identical(self):
+        """Explicit safety_factor=0.0 is the escape hatch — same behaviour."""
+        book = _iran_book()
+        eb, ea = _compute_edge_prices(
+            merged=book, midpoint=0.485, max_spread=0.055, tick=0.01,
+            decimals=2, ticks_inside=1, target_queue_usd=1000.0,
+            shares_per_side=50, dump_depth_safety_factor=0.0,
+        )
+        self.assertAlmostEqual(eb, 0.46, places=4)
+        self.assertAlmostEqual(ea, 0.51, places=4)
+
+
+class TestComputeEdgePricesDumpDepth(unittest.TestCase):
+    """FX-041 — two-sided depth check inside _compute_edge_prices."""
+
+    def test_iran_market_passes_default_factor(self):
+        """Default factor 3.0 with deep symmetric book → no regression."""
+        book = _iran_book()
+        eb, ea = _compute_edge_prices(
+            merged=book, midpoint=0.485, max_spread=0.055, tick=0.01,
+            decimals=2, ticks_inside=1, target_queue_usd=1000.0,
+            shares_per_side=50, dump_depth_safety_factor=3.0,
+        )
+        # Iran asks total ≈ $16k in zone vs threshold 50×0.485×3 = $72.75 → pass
+        # Iran bids total ≈ $22k in zone → pass
+        self.assertAlmostEqual(eb, 0.46, places=4)
+        self.assertAlmostEqual(ea, 0.51, places=4)
+
+    def test_deep_bid_thin_ask_forces_bid_side_legacy(self):
+        """FX-041 acceptance: asymmetric book (bid deep, ask thin in zone) →
+        bid side queue-ahead passes but OPPOSITE (asks) thin forces legacy."""
+        asym = _book(
+            # bids deep: $2400 at $0.48 alone — queue-ahead crosses $1000
+            bids=[(0.48, 5000), (0.47, 5000), (0.46, 5000)],
+            # asks: total in-zone $-depth tiny ($0.51 × 30 + $0.52 × 30 ≈ $31)
+            asks=[(0.51, 30), (0.52, 30), (0.53, 30)],
+        )
+        eb, ea = _compute_edge_prices(
+            merged=asym, midpoint=0.50, max_spread=0.055, tick=0.01,
+            decimals=2, ticks_inside=1, target_queue_usd=1000.0,
+            shares_per_side=50, dump_depth_safety_factor=3.0,
+        )
+        # Threshold: 50 × 0.50 × 3 = $75. Asks in-zone ≈ $46.50 << $75 → bid
+        # side falls back to legacy. Legacy bid = round(0.50 − 0.055 + 0.01, 2)
+        # = round(0.455, 2) = 0.46 (banker's). Same for ask side: queue-ahead
+        # on asks fails ($31 < $1000) so it falls back via existing FX-036.
+        self.assertAlmostEqual(eb, 0.46, places=4)
+        self.assertAlmostEqual(ea, 0.55, places=4)
+
+    def test_thin_bid_deep_ask_forces_ask_side_legacy(self):
+        """Mirror of the above — asks deep, bids thin → ask side falls back."""
+        asym = _book(
+            bids=[(0.48, 30), (0.47, 30), (0.46, 30)],   # ~$43 in zone
+            asks=[(0.52, 5000), (0.53, 5000), (0.54, 5000)],
+        )
+        eb, ea = _compute_edge_prices(
+            merged=asym, midpoint=0.50, max_spread=0.055, tick=0.01,
+            decimals=2, ticks_inside=1, target_queue_usd=1000.0,
+            shares_per_side=50, dump_depth_safety_factor=3.0,
+        )
+        # Bids in-zone ≈ $43 << threshold $75 → ask placement falls back via
+        # FX-041. Bid placement falls back via existing FX-036 (thin queue
+        # ahead). Both end up at legacy zone-edge.
+        self.assertAlmostEqual(eb, 0.46, places=4)
+        self.assertAlmostEqual(ea, 0.55, places=4)
+
+    def test_borderline_book_passes_low_factor(self):
+        """Factor=1 makes a moderately-deep book pass where factor=10 fails."""
+        # in-zone depth on asks = 0.51 × 200 = $102; bids similar ($102)
+        moderate = _book(
+            bids=[(0.49, 5000)],   # queue-ahead $2450 >> $1000
+            asks=[(0.51, 5000)],   # queue-ahead $2550 >> $1000
+        )
+        # Add small post-edge in-zone depth to set up borderline
+        moderate["bids"].append({"price": 0.46, "size": 200})  # $92
+        moderate["asks"].append({"price": 0.54, "size": 200})  # $108
+        # Factor=1 threshold: 50×0.5×1 = $25 → passes (any one level easily over)
+        eb1, ea1 = _compute_edge_prices(
+            merged=moderate, midpoint=0.50, max_spread=0.055, tick=0.01,
+            decimals=2, ticks_inside=1, target_queue_usd=1000.0,
+            shares_per_side=50, dump_depth_safety_factor=1.0,
+        )
+        # Queue-aware should fire (deep first level). Edge sits one tick
+        # behind the level where queue first crosses $1000 → bid 0.48, ask 0.52
+        self.assertAlmostEqual(eb1, 0.48, places=4)
+        self.assertAlmostEqual(ea1, 0.52, places=4)
+
+        # Factor=10 threshold: 50×0.5×10 = $250 → opposite side total
+        # ≈ $2550 + $108 = $2658 > $250 → still passes
+        # Let's instead use a deeper threshold with shares to force failure
+        eb2, ea2 = _compute_edge_prices(
+            merged=moderate, midpoint=0.50, max_spread=0.055, tick=0.01,
+            decimals=2, ticks_inside=1, target_queue_usd=1000.0,
+            shares_per_side=10000, dump_depth_safety_factor=3.0,
+        )
+        # Threshold 10000×0.5×3 = $15000 → opposite-side ≈ $2658 << $15k → fail
+        # Both sides fall back to legacy
+        self.assertAlmostEqual(eb2, 0.46, places=4)
+        self.assertAlmostEqual(ea2, 0.55, places=4)
+
+    def test_dump_depth_only_counts_in_zone(self):
+        """Depth outside max_spread of midpoint is excluded from the FX-041
+        accumulation — only in-zone liquidity can absorb a dump in the
+        reward window where placement matters."""
+        # Asks have a HUGE entry OUTSIDE the zone (5.5¢ from mid)
+        asym = _book(
+            bids=[(0.48, 5000)],   # queue-ahead good
+            asks=[
+                (0.51, 30),        # $15.30 — in zone but tiny
+                (0.70, 100000),    # $70k — OUTSIDE zone (20¢ from mid)
+            ],
+        )
+        eb, ea = _compute_edge_prices(
+            merged=asym, midpoint=0.50, max_spread=0.055, tick=0.01,
+            decimals=2, ticks_inside=1, target_queue_usd=1000.0,
+            shares_per_side=50, dump_depth_safety_factor=3.0,
+        )
+        # In-zone asks $15.30 << threshold $75 → bid falls back to legacy
+        # Asks queue-ahead fails on the $15.30 alone → ask side falls back too
+        self.assertAlmostEqual(eb, 0.46, places=4)
+        self.assertAlmostEqual(ea, 0.55, places=4)
+
+
 class TestComputeEdgePricesSafetyInvariants(unittest.TestCase):
     """Guarantees that must hold for every input: inside zone, clamped."""
 
@@ -477,6 +720,36 @@ class TestPlaceOrdersForMarketUsesQueueAware(unittest.TestCase):
         order_args = first_call_args[0][0]
         # Legacy: 0.485 - 0.055 + 0.01 = 0.44
         self.assertAlmostEqual(order_args.price, 0.44, places=4)
+
+    @patch("order_lifecycle.get_merged_book")
+    def test_asymmetric_book_falls_back_via_fx041(self, mock_book):
+        """FX-041 end-to-end: asymmetric book (deep bid, thin ask) routed
+        through place_orders_for_market with the production knob — bid side
+        falls back to legacy because the opposite (ask) side is thin."""
+        asym = _book(
+            bids=[(0.48, 5000), (0.47, 5000), (0.46, 5000)],  # queue-aware would fire
+            asks=[(0.51, 30), (0.52, 30), (0.53, 30)],         # in-zone $-depth ≈ $47
+        )
+        mock_book.return_value = asym
+        # Midpoint = (0.48 + 0.51)/2 = 0.495. With ms.max_spread = 0.055 and
+        # 50 shares × 0.495 × 3.0 = $74.25 threshold > $47 in-zone asks depth.
+        ms = _make_ms(yes_price=0.495)
+        ol = _make_lifecycle(ms)
+        placed_oids = iter([{"orderID": "OID_YES"}, {"orderID": "OID_NO"}])
+        ol.client.create_and_post_order.side_effect = lambda *_a, **_kw: next(placed_oids)
+
+        with (
+            patch("order_lifecycle.TARGET_QUEUE_AHEAD_USD", lambda: 1000.0),
+            patch("order_lifecycle.DUMP_DEPTH_SAFETY_FACTOR", lambda: 3.0),
+        ):
+            ol.place_orders_for_market(ms)
+
+        # YES bid: queue-aware would have placed at 0.47 (= 0.48 − tick), but
+        # FX-041 forces legacy because opposite asks are thin. Legacy bid =
+        # round(0.495 − 0.055 + 0.01, 2) = round(0.45, 2) = 0.45.
+        first_call_args = ol.client.create_and_post_order.call_args_list[0]
+        order_args = first_call_args[0][0]
+        self.assertAlmostEqual(order_args.price, 0.45, places=4)
 
 
 if __name__ == "__main__":

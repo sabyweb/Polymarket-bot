@@ -17,6 +17,7 @@ def SHARES_PER_SIDE(): return cfg("RF_SHARES_PER_SIDE")
 def PLACEMENT_TICKS_INSIDE(): return cfg("RF_PLACEMENT_TICKS_INSIDE")
 def BATCH_SIZE(): return cfg("RF_BATCH_SIZE")
 def TARGET_QUEUE_AHEAD_USD(): return cfg("RF_TARGET_QUEUE_AHEAD_USD")
+def DUMP_DEPTH_SAFETY_FACTOR(): return cfg("RF_DUMP_DEPTH_SAFETY_FACTOR")
 
 
 def _queue_aware_edge(
@@ -75,6 +76,54 @@ def _queue_aware_edge(
     return None
 
 
+def _has_sufficient_dump_depth(
+    opposite_book_levels,
+    midpoint: float,
+    max_spread: float,
+    shares_per_side: int,
+    dump_price: float,
+    safety_factor: float,
+) -> bool:
+    """FX-041: gate queue-aware placement on enough OPPOSITE-side $-depth
+    in the reward zone to host a passive dump if our order gets filled.
+
+    For a ``"bid"`` placement (YES BID, lives at ``merged["bids"]``) the
+    opposite side is ``merged["asks"]``. For an ``"ask"`` placement (NO
+    BID, lives at ``merged["asks"]`` in YES-equivalent terms) the opposite
+    side is ``merged["bids"]``. Threshold is
+    ``shares_per_side × dump_price × safety_factor`` USD.
+
+    The existing same-side ``yes_exit_depth`` / ``no_exit_depth`` check at
+    the placement call site (within ``RF_DUMP_EXIT_DEPTH_BUFFER`` of edge,
+    in shares) already guards same-side near-edge depth; FX-041 adds a
+    complementary axis: asymmetric books (one side deep, the other thin)
+    look safe to FX-036's bid-side queue check but expose us to high
+    passive-dump slippage post-fill — exactly the 2026-05-19 OpenAI
+    cascade. The opposite-side check catches the asymmetry.
+
+    Returns ``True`` when disabled (``safety_factor <= 0`` or threshold
+    ≤ 0) — operator escape hatch reverts to FX-036-only behaviour.
+    """
+    if safety_factor <= 0:
+        return True
+    required = shares_per_side * dump_price * safety_factor
+    if required <= 0:
+        return True
+    cum = 0.0
+    for level in opposite_book_levels:
+        try:
+            price = float(level["price"])
+            size = float(level["size"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        if abs(price - midpoint) > max_spread:
+            continue  # outside reward zone — doesn't count toward in-zone dump depth
+        cum += price * size
+        if cum >= required:
+            return True
+    return False
+
+
 def _compute_edge_prices(
     merged: dict,
     midpoint: float,
@@ -83,6 +132,8 @@ def _compute_edge_prices(
     decimals: int,
     ticks_inside: int,
     target_queue_usd: float,
+    shares_per_side: int = 0,
+    dump_depth_safety_factor: float = 0.0,
 ) -> tuple[float, float]:
     """Return ``(edge_bid, edge_ask)`` for placement.
 
@@ -96,9 +147,18 @@ def _compute_edge_prices(
     queue-ahead permits, capturing multiples more reward density while
     still being shielded from fills by the queue we sit behind.
 
-    Falls back to the legacy zone-edge formula when the queue-aware walk
-    returns ``None`` (thin book, escape hatch, or zone-boundary edge case).
-    Final values are clamped to ``[0.01, 0.99]`` for safety.
+    FX-041 (fixit.md::FX-041): each queue-aware result is additionally
+    gated on the OPPOSITE merged-book side carrying enough $-weighted
+    depth in the reward zone to absorb a passive dump if filled. Catches
+    asymmetric books that FX-036's bid-side check alone misses. Defaults
+    ``shares_per_side=0, dump_depth_safety_factor=0.0`` keep the helper
+    backwards-compatible — callers that don't pass these args get
+    pre-FX-041 behaviour.
+
+    Falls back to the legacy zone-edge formula when either the queue-aware
+    walk or the dump-depth check fails on a side (thin book, escape hatch,
+    zone-boundary edge case, or insufficient opposite-side depth). Final
+    values are clamped to ``[0.01, 0.99]`` for safety.
     """
     legacy_bid = round(midpoint - max_spread + tick * ticks_inside, decimals)
     legacy_ask = round(midpoint + max_spread - tick * ticks_inside, decimals)
@@ -111,6 +171,20 @@ def _compute_edge_prices(
         "ask", merged.get("asks", []),
         midpoint, max_spread, tick, target_queue_usd, decimals,
     )
+
+    # FX-041: two-sided dump-depth check. If either queue-aware result
+    # would place close to mid but the opposite side is too thin to host
+    # a passive dump, revert that side to legacy zone-edge placement.
+    if qa_bid is not None and not _has_sufficient_dump_depth(
+        merged.get("asks", []), midpoint, max_spread,
+        shares_per_side, midpoint, dump_depth_safety_factor,
+    ):
+        qa_bid = None
+    if qa_ask is not None and not _has_sufficient_dump_depth(
+        merged.get("bids", []), midpoint, max_spread,
+        shares_per_side, midpoint, dump_depth_safety_factor,
+    ):
+        qa_ask = None
 
     edge_bid = qa_bid if qa_bid is not None else legacy_bid
     edge_ask = qa_ask if qa_ask is not None else legacy_ask
@@ -461,6 +535,8 @@ class OrderLifecycle:
             decimals=decimals,
             ticks_inside=PLACEMENT_TICKS_INSIDE(),
             target_queue_usd=TARGET_QUEUE_AHEAD_USD(),
+            shares_per_side=ms.agent_shares if ms.agent_shares > 0 else SHARES_PER_SIDE(),
+            dump_depth_safety_factor=DUMP_DEPTH_SAFETY_FACTOR(),
         )
 
         # Reprice stale orders outside reward window
