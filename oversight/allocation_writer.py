@@ -10,6 +10,7 @@ import os
 import tempfile
 import time
 from datetime import datetime, timezone
+from config import cfg
 from .market_scorer import ScoredMarket
 
 log = logging.getLogger("oversight.allocator")
@@ -18,6 +19,33 @@ log = logging.getLogger("oversight.allocator")
 MAX_PER_MARKET = 200.0
 DEFAULT_SHARES = 50
 MIN_SHARES = 20
+
+
+def _is_trial_market(sm: ScoredMarket) -> bool:
+    """FX-040: returns True iff `sm` has not yet accumulated enough
+    scoring snapshots for the bot to have a measured q_share.
+
+    Markets in trial mode are operating on the cold-start prior (0.10)
+    or on too-thin a sample to trust. Until they graduate, the allocator
+    caps share count at ``RF_TRIAL_MIN_SHARES`` and rejects them when
+    the cumulative trial budget is exhausted.
+
+    Trial mode lifts when ``q_score_samples >= RF_TRIAL_SCORING_SAMPLES``.
+    """
+    threshold = int(cfg("RF_TRIAL_SCORING_SAMPLES"))
+    return getattr(sm, "q_score_samples", 0) < threshold
+
+
+def _trial_target_shares(sm: ScoredMarket) -> int:
+    """FX-040: target share count for a trial-mode deploy.
+
+    Takes the larger of ``RF_TRIAL_MIN_SHARES`` and the market's ``min_size``
+    so the order is venue-valid (sub-min_size orders earn no rewards).
+    Caller is responsible for the trial-budget gate, which rejects markets
+    whose trial cost would exceed ``RF_TRIAL_BUDGET_PCT * total_capital``.
+    """
+    trial_min = int(cfg("RF_TRIAL_MIN_SHARES"))
+    return max(int(sm.min_size), trial_min)
 
 
 def _est_market_cost(shares: int, max_spread: float) -> float:
@@ -85,6 +113,18 @@ def compute_allocations(
     # ── Pass 1: Base allocation with concentration limits ──
     group_capital: dict[str, float] = {}  # group_key → capital allocated
 
+    # FX-040: track cumulative trial-mode exposure across this cycle.
+    # Untested markets (q_score_samples < RF_TRIAL_SCORING_SAMPLES) are sized
+    # at RF_TRIAL_MIN_SHARES (floor min_size) and rejected once the cumulative
+    # cost would exceed RF_TRIAL_BUDGET_PCT × total_capital. Bounds discovery
+    # exposure on cold-start markets where the prior 0.10 q_share is often
+    # 100× too optimistic and the allocator would otherwise full-size into a
+    # thin-book trap (root cause of 2026-05-19 OpenAI cascade).
+    trial_budget_cap = float(cfg("RF_TRIAL_BUDGET_PCT")) * effective_capital
+    trial_budget_used = 0.0
+    trial_count_deployed = 0
+    trial_count_rejected = 0
+
     for sm in scored_markets:
         if sm.action == "avoid":
             allocations.append(_to_dict(sm, shares=0))
@@ -98,6 +138,36 @@ def compute_allocations(
         if int(sm.min_size) > 0:
             shares = max(shares, int(sm.min_size))
         spread = getattr(sm, "max_spread", 0.045)
+
+        # FX-040: cap untested markets at RF_TRIAL_MIN_SHARES (or min_size,
+        # whichever is larger) BEFORE per-market / per-group cap checks. If
+        # the trial would exceed the cumulative trial budget, avoid the
+        # market with an explicit reason — the operator can spot trial
+        # rejections in the allocation file.
+        is_trial = _is_trial_market(sm)
+        trial_tag = ""
+        if is_trial:
+            trial_shares = _trial_target_shares(sm)
+            shares = min(shares, trial_shares) if trial_shares < shares else trial_shares
+            trial_cost_est = _est_market_cost(shares, spread)
+            if trial_budget_used + trial_cost_est > trial_budget_cap + 0.01:
+                trial_count_rejected += 1
+                allocations.append(_to_dict(
+                    sm, shares=0, action_override="avoid",
+                    reason_override=(
+                        f"Trial budget exhausted "
+                        f"(${trial_budget_used:.0f}+${trial_cost_est:.0f}>${trial_budget_cap:.0f}, "
+                        f"samples={getattr(sm, 'q_score_samples', 0)})"
+                    ),
+                ))
+                continue
+            trial_budget_used += trial_cost_est
+            trial_count_deployed += 1
+            trial_tag = (
+                f" [TRIAL: {shares}sh, samples={getattr(sm, 'q_score_samples', 0)}"
+                f"/{int(cfg('RF_TRIAL_SCORING_SAMPLES'))}]"
+            )
+
         est_cost = _est_market_cost(shares, spread)
 
         # If this market exceeds per-market cap, reduce shares to fit.
@@ -141,12 +211,22 @@ def compute_allocations(
         remaining_capital -= est_cost
         if group_key:
             group_capital[group_key] = group_capital.get(group_key, 0) + est_cost
-        allocations.append(_to_dict(sm, shares=shares))
+        # FX-040: append the trial tag to the reason so the operator can
+        # tell at a glance which deploys are trial-sized vs full-sized.
+        if trial_tag:
+            sm_reason = sm.reason + trial_tag
+            allocations.append(_to_dict(sm, shares=shares, reason_override=sm_reason))
+        else:
+            allocations.append(_to_dict(sm, shares=shares))
 
     # ── Pass 2: Redistribute surplus capital ──
+    # FX-040: trial-mode markets are excluded from redistribution. The
+    # whole point of the trial cap is to limit cold-start exposure; if
+    # redistribution adds shares back, the cap is meaningless.
     deployed_indices = [
         i for i, a in enumerate(allocations)
         if a["action"] == "deploy" and a["score"] > 0
+        and "[TRIAL:" not in a.get("reason", "")
     ]
     surplus_threshold = total_capital * 0.10
 
@@ -222,6 +302,15 @@ def compute_allocations(
         f"Allocation: {len(deployed)} deploy, {len(avoided)} avoid | "
         f"${total_deployed:.0f} of ${total_capital:.0f} deployed"
     )
+
+    # FX-040: surface trial-mode telemetry so the operator can see how much
+    # of the cycle was discovery (trial sizing) vs exploitation (graduated).
+    if trial_count_deployed or trial_count_rejected:
+        log.info(
+            f"[FX-040 trial] deployed={trial_count_deployed} rejected={trial_count_rejected} "
+            f"budget_used=${trial_budget_used:.0f}/${trial_budget_cap:.0f} "
+            f"({float(cfg('RF_TRIAL_BUDGET_PCT')):.0%} cap)"
+        )
 
     return allocations
 

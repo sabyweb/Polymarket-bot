@@ -229,6 +229,9 @@ DISCORD_WEBHOOK_URL: str | None = os.getenv("DISCORD_WEBHOOK_URL")
 RF_SHARES_PER_SIDE: int = 50               # Default order size per side
 RF_PLACEMENT_TICKS_INSIDE: int = 1          # Ticks inside from midpoint edge (legacy fallback used by FX-036 helper)
 RF_TARGET_QUEUE_AHEAD_USD: float = 1000.0   # FX-036: place 1 tick behind the level where cumulative book queue first reaches this $ amount; falls back to zone-edge formula on thin books or when set <= 0
+RF_TRIAL_MIN_SHARES: int = 20               # FX-040: untested markets (q_score_samples < RF_TRIAL_SCORING_SAMPLES) deploy at exactly this share count (floored at min_size for venue eligibility). Limits the "143-share trap" exposed by 2026-05-19 cascade.
+RF_TRIAL_SCORING_SAMPLES: int = 5           # FX-040: scoring snapshots required before a market graduates from trial sizing to full sizing.
+RF_TRIAL_BUDGET_PCT: float = 0.25           # FX-040: max cumulative trial-market exposure as fraction of total_capital. Default 25% covers 1-3 trials on a $200 wallet with typical min_size=50. Trials beyond this budget are rejected with reason="trial budget exhausted". Operator can raise via config_overrides.json to fund more discovery, or lower to be more conservative.
 RF_MIN_DAILY_RATE: float = 10.0             # Minimum reward rate ($/day) to consider market
 RF_MAX_LIQUIDITY: int = 5000                # Skip markets with on-book depth above this
 # FX-011: RF_MAX_COST_PER_MARKET (=$50) and RF_MAX_TOTAL_EXPOSURE (=$1500)

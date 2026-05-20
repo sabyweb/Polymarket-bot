@@ -35,6 +35,7 @@ class ScoredMarket:
     locked_position_usd: float = 0.0  # $ currently locked in open positions
     question_group: str = ""       # topic group for concentration limits
     q_share_pct: float = 0.0       # our share of Q-score pool (competition signal)
+    q_score_samples: int = 0       # FX-040: scoring snapshots seen for this market. allocation_writer applies trial-mode sizing while samples < RF_TRIAL_SCORING_SAMPLES.
     end_date_iso: str = ""         # market expiry / resolution deadline (ISO format)
     game_start_time: str = ""      # actual event start time (ISO 8601); sports only
 
@@ -147,7 +148,9 @@ def classify_market(
             daily_rate=m.daily_rate, min_size=m.min_size, max_spread=m.max_spread,
             est_capital_cost=0.0, locked_position_usd=m.current_position_usd,
             question_group=getattr(m, "question_group", ""),
-            q_share_pct=m.q_share_pct, end_date_iso=getattr(m, "end_date_iso", ""),
+            q_share_pct=m.q_share_pct,
+            q_score_samples=getattr(m, "q_score_samples", 0),
+            end_date_iso=getattr(m, "end_date_iso", ""),
             game_start_time=getattr(m, "game_start_time", ""),
         )
 
@@ -396,6 +399,7 @@ def classify_market(
         locked_position_usd=m.current_position_usd,
         question_group=getattr(m, "question_group", ""),
         q_share_pct=m.q_share_pct,
+        q_score_samples=getattr(m, "q_score_samples", 0),
         end_date_iso=getattr(m, "end_date_iso", ""),
         game_start_time=getattr(m, "game_start_time", ""),
     )

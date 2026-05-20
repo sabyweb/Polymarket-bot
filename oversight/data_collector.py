@@ -468,6 +468,7 @@ class MarketMetrics:
     adverse_fills: int = 0         # fills where we lost to adverse selection
     reward_window_pct: float = 0.0 # fraction of cycles in reward spread window
     total_market_q: float = 0.0    # total market Q-score (competition depth)
+    q_score_samples: int = 0       # FX-040: scoring snapshots accumulated for this market. Used by allocation_writer to gate trial-mode sizing — markets with samples < RF_TRIAL_SCORING_SAMPLES deploy at RF_TRIAL_MIN_SHARES regardless of computed share count.
     # Recent prices (from cycle_snapshots, last few hours — fresher than lifetime avg)
     recent_bid: float = 0.0        # median best_bid over recent cycles
     recent_ask: float = 0.0        # median best_ask over recent cycles
@@ -1006,6 +1007,7 @@ def query_reward_stats(db_path: str) -> dict[str, dict]:
                 "cycles_in_reward_window": d.get("cycles_in_reward_window", 0),
                 "cycles_both_in_window": d.get("cycles_both_in_window", 0),
                 "total_market_q": total_market_q,
+                "q_score_samples": d.get("q_score_samples", 0),  # FX-040: graduates from trial sizing when samples ≥ RF_TRIAL_SCORING_SAMPLES
             }
         if windowed_used or stale_decayed or stale_excluded or prior_used or poisoned_skipped:
             log.info(
@@ -1446,6 +1448,7 @@ def collect_all(
             adverse_fills=stat_data.get("adverse_fills", 0),
             reward_window_pct=reward_window_pct,
             total_market_q=stat_data.get("total_market_q", 0),
+            q_score_samples=stat_data.get("q_score_samples", 0),
             recent_bid=recent_prices.get(cid, {}).get("recent_bid", 0.0),
             recent_ask=recent_prices.get(cid, {}).get("recent_ask", 0.0),
         ))

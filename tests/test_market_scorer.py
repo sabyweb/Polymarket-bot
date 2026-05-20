@@ -541,19 +541,27 @@ class TestCapitalRedistribution(unittest.TestCase):
     """Test the two-pass allocation with redistribution."""
 
     def test_surplus_gets_redistributed(self):
-        """When budget > base allocation, surplus goes to top markets."""
+        """When budget > base allocation, surplus goes to top markets.
+
+        FX-040: redistribution only applies to graduated markets (those with
+        ``q_score_samples >= RF_TRIAL_SCORING_SAMPLES``). Trial-mode markets
+        are excluded so the trial cap actually binds — see
+        ``tests/test_trial_sizing.py::test_redistribution_skips_trial_markets``.
+        This test sets ``q_score_samples=10`` so the markets graduate and the
+        redistribution pass applies as it did pre-FX-040.
+        """
         from oversight.allocation_writer import compute_allocations
         scored = [
             ScoredMarket(condition_id="top", question="Top?", score=100.0,
                          action="deploy", recommended_shares=50, reason="test",
                          confidence="high", actual_reward_total=10.0,
                          fill_damage=0, fill_count=0, daily_rate=100,
-                         min_size=50, max_spread=0.045),
+                         min_size=50, max_spread=0.045, q_score_samples=10),
             ScoredMarket(condition_id="mid", question="Mid?", score=50.0,
                          action="deploy", recommended_shares=50, reason="test",
                          confidence="high", actual_reward_total=5.0,
                          fill_damage=0, fill_count=0, daily_rate=50,
-                         min_size=50, max_spread=0.045),
+                         min_size=50, max_spread=0.045, q_score_samples=10),
         ]
         # Base cost: 2 markets × 50sh × $0.455 × 2 = ~$91. With $500 budget,
         # there's surplus to redistribute.
