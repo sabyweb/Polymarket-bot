@@ -264,6 +264,18 @@ class OrderLifecycle:
                         matched = 0
 
                     if matched > 0 and order_status in ("MATCHED", "CANCELLED"):
+                        # FX-037: BUY-side phantom-fill defense.
+                        # On 2026-05-19 the V2 SDK reported size_matched=158 NO
+                        # shares for an order that delivered only 38 on-chain;
+                        # the inflated fills row cascaded I7 → SafetyController
+                        # → kill switch (realized loss $19.55). Mirror
+                        # DumpManager.check_dump_fills' on-chain probe (see
+                        # dump_manager.py:60-87) on the BUY side. Symmetric
+                        # defense — fail-open on probe error preserves SDK
+                        # value so legitimate fills aren't lost to network
+                        # blips.
+                        matched = self._check_buy_phantom_fill(ms, side, matched)
+                    if matched > 0 and order_status in ("MATCHED", "CANCELLED"):
                         fill_type = "FULL" if matched >= slot.shares - 0.5 else "PARTIAL"
                         # API returns token-specific CLOB price; convert to
                         # YES-equiv so all internal pricing is consistent.
@@ -281,6 +293,11 @@ class OrderLifecycle:
                                 f"(order {order_status}) | {ms.question[:30]}"
                             )
                         self.handle_fill(ms, side, slot, actual_shares=matched, actual_price=actual_price)
+                        ms.unknown_count[side] = 0
+                    elif matched <= 0 and order_status in ("MATCHED", "CANCELLED"):
+                        # FX-037: phantom check zeroed the fill (full phantom).
+                        # SDK said size_matched > 0 but on-chain delta was 0.
+                        # Treat as no-fill — clear the slot below, do not record.
                         ms.unknown_count[side] = 0
                     elif order_status == "UNKNOWN":
                         ms.unknown_count[side] = ms.unknown_count.get(side, 0) + 1
@@ -763,6 +780,54 @@ class OrderLifecycle:
         if recent_fills >= cfg("RF_FILL_BREAKER_THRESHOLD"):
             return False, "fill_rate_breaker"
         return True, ""
+
+    def _check_buy_phantom_fill(self, ms: MarketState, side: str, matched: float) -> float:
+        """FX-037: BUY-side phantom-fill defense.
+
+        After the SDK reports a BUY fill, verify the on-chain CTF balance
+        actually increased by the expected amount. The V2 SDK has been
+        observed (2026-05-19, Iran NO) to over-report ``size_matched`` for
+        orders that only partially delivered on-chain. Trusting the SDK
+        value writes an inflated row to the ``fills`` table which biases
+        SafetyController I7 hourly_loss and can trigger the kill switch on
+        phantom damage.
+
+        Returns the corrected fill quantity (≤ ``matched``). On API failure
+        we fail OPEN with a warning — preserving the SDK value avoids
+        losing legitimate fills during transient network issues. Worst case
+        on fail-open: we record a phantom; orphan-scan + reconciliation
+        will surface the discrepancy next cycle. Worst case if we fail-
+        closed: a real fill is dropped and the position diverges silently
+        — strictly worse.
+
+        Symmetric with ``DumpManager.check_dump_fills`` lines 60-87
+        (SELL-side phantom defense shipped in v5.1.9 / FX-007).
+        """
+        if matched <= 0:
+            return matched
+        try:
+            from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
+            tid = ms.yes_tid if side == "yes" else ms.no_tid
+            bal = self.client.get_balance_allowance(
+                BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=tid)
+            )
+            on_chain = float(bal.get("balance", 0)) / 1e6
+            pre_fill_tracked = self.positions.get_shares(ms.cid, side)
+            actual_delta = max(0.0, on_chain - pre_fill_tracked)
+            if actual_delta < matched - 0.5:
+                log.critical(
+                    f"PHANTOM FILL: SDK size_matched={matched:.0f}sh but on-chain "
+                    f"delta only {actual_delta:.0f}sh (pre_tracked={pre_fill_tracked:.0f}, "
+                    f"post_on_chain={on_chain:.0f}) | {side.upper()} | {ms.question[:30]}"
+                )
+                return actual_delta
+            return matched
+        except Exception as e:
+            log.warning(
+                f"BUY phantom check failed (fail-open, using SDK matched={matched:.0f}sh): "
+                f"{e} | {side.upper()} | {ms.question[:30]}"
+            )
+            return matched
 
     def _reconcile_after_unknown(self, ms: MarketState, side: str, slot: OrderSlot):
         """Check exchange balance when clearing an UNKNOWN order.

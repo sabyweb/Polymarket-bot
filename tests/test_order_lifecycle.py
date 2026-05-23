@@ -13,10 +13,60 @@ full success), and assert the returned count.
 import os
 import sys
 import time
+import types
 import unittest
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+# ── py_clob_client_v2 mock (not installed in local dev env) ─────────────────
+# Mirrors the pattern in test_sports_protection.py / test_critical_fixes.py.
+# The mock provides MINIMALLY real ``BalanceAllowanceParams`` and
+# ``OrderPayload`` shims that pass kwargs through to attributes, so
+# FX-037 token_id-routing assertions can introspect what was constructed.
+# Plain MagicMock would silently absorb ``token_id=...`` and return another
+# MagicMock when accessed — making the contract test pass for the wrong
+# reason. R6: tests encode contracts, not implementation details.
+
+def _ensure_clob_types_mock() -> None:
+    if "py_clob_client_v2" in sys.modules:
+        # Could be a real install OR a partial MagicMock left by a sibling
+        # test (see test_placement.py::_drop_stale_clob_mocks). Either way,
+        # don't clobber.
+        return
+    mock_clob = MagicMock()
+
+    class _PassthroughDataclass:
+        """A class that stores constructor kwargs as attributes."""
+        def __init__(self, **kwargs):
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+
+    class _EnumLike:
+        """Stand-in for AssetType enum — sentinel attributes."""
+        COLLATERAL = "COLLATERAL"
+        CONDITIONAL = "CONDITIONAL"
+
+    clob_types = types.ModuleType("py_clob_client_v2.clob_types")
+    clob_types.BalanceAllowanceParams = _PassthroughDataclass
+    clob_types.OrderPayload = _PassthroughDataclass
+    clob_types.OrderArgs = _PassthroughDataclass
+    clob_types.AssetType = _EnumLike
+
+    order_builder = types.ModuleType("py_clob_client_v2.order_builder")
+    constants_mod = types.ModuleType("py_clob_client_v2.order_builder.constants")
+    constants_mod.BUY = "BUY"
+    constants_mod.SELL = "SELL"
+    order_builder.constants = constants_mod
+
+    sys.modules["py_clob_client_v2"] = mock_clob
+    sys.modules["py_clob_client_v2.clob_types"] = clob_types
+    sys.modules["py_clob_client_v2.order_builder"] = order_builder
+    sys.modules["py_clob_client_v2.order_builder.constants"] = constants_mod
+
+_ensure_clob_types_mock()
+
 
 from models import MarketState, OrderSlot
 from order_lifecycle import OrderLifecycle
@@ -272,6 +322,231 @@ class TestGatedWrapperAccumulation(unittest.TestCase):
         self.assertEqual(0, self.farmer._cycle_orders_placed)
         self.farmer.order_lifecycle.place_orders_for_market.assert_not_called()
         self.farmer._log_dry_run_intent.assert_called_once()
+
+
+# ── FX-037: BUY-side phantom-fill defense ───────────────────────────────────
+#
+# Contracts encoded by these tests (per R6 in the META charter):
+#
+#   C1: When the SDK over-reports ``size_matched`` (on-chain delta is less
+#       than reported), the helper returns the on-chain truth, not the
+#       SDK value. Recorded fills then reflect what was actually delivered.
+#
+#   C2: When the SDK reports honestly (on-chain delta ≥ matched - 0.5),
+#       the helper returns ``matched`` unchanged — behaviour identical to
+#       pre-FX-037.
+#
+#   C3: When ``get_balance_allowance`` raises, the helper fails OPEN with
+#       a log.warning, returning ``matched``. Losing a legitimate fill is
+#       strictly worse than recording a phantom (which orphan-scan +
+#       reconciliation will catch next cycle).
+#
+#   C4: ``matched <= 0`` is a no-op (no SDK call, no DB hit). Documented
+#       precondition: the caller already checked this branch is a fill.
+#
+#   C5: When the helper detects a phantom, a ``log.critical`` line tagged
+#       ``PHANTOM FILL:`` is emitted for operator visibility — the same
+#       channel DumpManager uses for SELL-side phantoms.
+#
+#   C6: Token ID routing — YES side probes ``ms.yes_tid``, NO side probes
+#       ``ms.no_tid``. Wrong-token probe would defeat the defense.
+#
+#   C7: ``actual_delta`` is clamped at ``max(0, on_chain - pre_fill_tracked)``
+#       so a positions-table desync (tracker thinks we have more than
+#       on-chain) doesn't produce a negative fill quantity.
+
+
+class TestCheckBuyPhantomFill(unittest.TestCase):
+    """FX-037: ``_check_buy_phantom_fill`` unit tests.
+
+    Mirror of DumpManager's PHANTOM FILL check at dump_manager.py:60-87.
+    """
+
+    def setUp(self):
+        self.ms = _make_ms(cid="cid_phantom", yes_tid="ytid_xyz", no_tid="ntid_abc")
+        self.ol = _make_lifecycle(ms=self.ms)
+        # Default: positions tracker shows 0 shares pre-fill.
+        self.ol.positions.get_shares = MagicMock(return_value=0)
+
+    def _set_on_chain_balance(self, shares: float) -> None:
+        """Configure the mocked client to return the given on-chain balance.
+
+        The SDK returns balance in 6-decimal units, so we multiply by 1e6
+        on the way out — matches the production reading at
+        ``order_lifecycle.py: ... float(bal.get("balance", 0)) / 1e6``.
+        """
+        self.ol.client.get_balance_allowance = MagicMock(
+            return_value={"balance": str(int(shares * 1e6))}
+        )
+
+    # ── C1: phantom detected → return on-chain truth ────────────────────
+
+    def test_phantom_detected_returns_on_chain_delta(self):
+        """SDK reports 158 sh matched but on-chain delta is 38 → return 38."""
+        self._set_on_chain_balance(38)
+        out = self.ol._check_buy_phantom_fill(self.ms, "no", matched=158)
+        self.assertEqual(38, out)
+
+    def test_phantom_detected_emits_critical_log(self):
+        """Phantom detection must emit log.critical with 'PHANTOM FILL:' tag (C5)."""
+        self._set_on_chain_balance(38)
+        with self.assertLogs("reward_farmer", level="CRITICAL") as cap:
+            self.ol._check_buy_phantom_fill(self.ms, "no", matched=158)
+        self.assertTrue(
+            any("PHANTOM FILL" in line for line in cap.output),
+            f"Expected 'PHANTOM FILL' in log output, got: {cap.output}",
+        )
+
+    # ── C2: no phantom → return matched unchanged ───────────────────────
+
+    def test_honest_sdk_returns_matched_unchanged(self):
+        """On-chain delta exactly matches SDK report → return matched."""
+        self._set_on_chain_balance(50)
+        out = self.ol._check_buy_phantom_fill(self.ms, "yes", matched=50)
+        self.assertEqual(50, out)
+
+    def test_on_chain_exceeds_matched_returns_matched(self):
+        """On-chain delta > matched (e.g. concurrent silent fill) → still trust SDK.
+
+        We can only attribute up to ``matched`` shares to THIS order. The
+        surplus is a separate concern that ``_reconcile_after_unknown``
+        handles.
+        """
+        self._set_on_chain_balance(100)
+        out = self.ol._check_buy_phantom_fill(self.ms, "yes", matched=50)
+        self.assertEqual(50, out)
+
+    def test_within_tolerance_returns_matched_unchanged(self):
+        """Tolerance window: actual_delta = matched - 0.4 should not trip."""
+        # The threshold in the helper is ``actual_delta < matched - 0.5``.
+        # 49.6 < 50 - 0.5 = 49.5 is False, so we trust SDK and return 50.
+        self._set_on_chain_balance(49.6)
+        out = self.ol._check_buy_phantom_fill(self.ms, "yes", matched=50)
+        self.assertEqual(50, out)
+
+    def test_just_below_tolerance_triggers_phantom(self):
+        """Tolerance window: actual_delta = matched - 1 should trip."""
+        self._set_on_chain_balance(49)
+        out = self.ol._check_buy_phantom_fill(self.ms, "yes", matched=50)
+        self.assertEqual(49, out)
+
+    # ── C3: API failure → fail-open with warning ────────────────────────
+
+    def test_api_exception_returns_matched_and_warns(self):
+        """get_balance_allowance raising → fail-open, log.warning."""
+        self.ol.client.get_balance_allowance = MagicMock(
+            side_effect=ConnectionError("transient network blip")
+        )
+        with self.assertLogs("reward_farmer", level="WARNING") as cap:
+            out = self.ol._check_buy_phantom_fill(self.ms, "no", matched=158)
+        self.assertEqual(158, out, "Fail-open MUST preserve SDK value")
+        self.assertTrue(
+            any("phantom check failed" in line.lower() for line in cap.output),
+            f"Expected 'phantom check failed' in warning, got: {cap.output}",
+        )
+
+    # ── C4: matched <= 0 → no-op ────────────────────────────────────────
+
+    def test_matched_zero_short_circuits(self):
+        """matched = 0 → return 0, no SDK call (defensive against UNKNOWN path)."""
+        self.ol.client.get_balance_allowance = MagicMock()
+        out = self.ol._check_buy_phantom_fill(self.ms, "yes", matched=0)
+        self.assertEqual(0, out)
+        self.ol.client.get_balance_allowance.assert_not_called()
+
+    def test_matched_negative_short_circuits(self):
+        """Negative matched (shouldn't happen but defensive) → return as-is."""
+        self.ol.client.get_balance_allowance = MagicMock()
+        out = self.ol._check_buy_phantom_fill(self.ms, "yes", matched=-5)
+        self.assertEqual(-5, out)
+        self.ol.client.get_balance_allowance.assert_not_called()
+
+    # ── C6: token_id routing per side ───────────────────────────────────
+
+    def test_yes_side_probes_yes_tid(self):
+        """YES side fill must probe ms.yes_tid, not ms.no_tid."""
+        self._set_on_chain_balance(50)
+        self.ol._check_buy_phantom_fill(self.ms, "yes", matched=50)
+        params = self.ol.client.get_balance_allowance.call_args[0][0]
+        self.assertEqual("ytid_xyz", params.token_id)
+
+    def test_no_side_probes_no_tid(self):
+        """NO side fill must probe ms.no_tid, not ms.yes_tid."""
+        self._set_on_chain_balance(50)
+        self.ol._check_buy_phantom_fill(self.ms, "no", matched=50)
+        params = self.ol.client.get_balance_allowance.call_args[0][0]
+        self.assertEqual("ntid_abc", params.token_id)
+
+    # ── C7: actual_delta clamped at zero ────────────────────────────────
+
+    def test_negative_delta_clamps_to_zero(self):
+        """positions tracker > on-chain (rare desync) → actual_delta = 0, full phantom."""
+        # Tracker thinks we have 100 sh; on-chain says 50. Pre-fill mismatch
+        # of -50 should clamp to 0 actual_delta, treating the fill as full
+        # phantom rather than negative.
+        self.ol.positions.get_shares.return_value = 100
+        self._set_on_chain_balance(50)
+        out = self.ol._check_buy_phantom_fill(self.ms, "yes", matched=10)
+        self.assertEqual(0, out)
+
+
+class TestDetectFillsPhantomIntegration(unittest.TestCase):
+    """FX-037: end-to-end integration — detect_fills must apply the phantom
+    check before invoking handle_fill, and route a zeroed result through
+    the clean-slot path without recording a fill.
+    """
+
+    def setUp(self):
+        self.ms = _make_ms(cid="cid_int", yes_tid="ytid", no_tid="ntid")
+        # Pre-populate a known NO BUY slot we'll claim "filled"
+        self.ms.orders["no"] = OrderSlot(
+            order_id="OID_PHANTOM_001", price=0.53, shares=158, placed_at=time.time()
+        )
+        self.ol = _make_lifecycle(ms=self.ms)
+        self.ol.positions.get_shares = MagicMock(return_value=0)
+        # SDK returns the inflated size_matched (the FX-037 bug shape)
+        self.ol.client.get_order = MagicMock(
+            return_value={"status": "MATCHED", "size_matched": 158, "price": 0.53}
+        )
+        # On-chain only delivered 38 NO shares (the actual payload)
+        self.ol.client.get_balance_allowance = MagicMock(
+            return_value={"balance": str(int(38 * 1e6))}
+        )
+        # Replace handle_fill with a recording mock so we can assert what
+        # quantity actually reached the DB-writing path.
+        self.ol.handle_fill = MagicMock()
+
+    def test_detect_fills_records_on_chain_truth_not_sdk_inflation(self):
+        """The 2026-05-19 Iran NO regression: SDK says 158, chain says 38.
+
+        Contract: handle_fill is invoked with actual_shares=38, NOT 158.
+        Without FX-037 this test would fail with the SDK-value 158.
+        """
+        # open_ids does NOT contain our order — that triggers the get_order
+        # → matched branch in detect_fills.
+        self.ol.detect_fills(open_ids=set())
+        self.ol.handle_fill.assert_called_once()
+        kwargs = self.ol.handle_fill.call_args.kwargs
+        self.assertEqual(38, kwargs["actual_shares"],
+                         "FX-037: recorded fill must reflect on-chain delta, not SDK report")
+
+    def test_detect_fills_skips_record_on_full_phantom(self):
+        """If on-chain delta is 0, no fill is recorded. Slot still cleared."""
+        # On-chain delta = 0 (full phantom)
+        self.ol.client.get_balance_allowance.return_value = {"balance": "0"}
+        self.ol.detect_fills(open_ids=set())
+        self.ol.handle_fill.assert_not_called()
+        # Slot cleared regardless — exchange has confirmed the order isn't open
+        self.assertIsNone(self.ms.orders["no"].order_id)
+
+    def test_detect_fills_unchanged_on_honest_sdk(self):
+        """Backwards compat: honest SDK fill (matched == on-chain delta) → unchanged."""
+        # On-chain shows full 158 sh delivered — no phantom
+        self.ol.client.get_balance_allowance.return_value = {"balance": str(int(158 * 1e6))}
+        self.ol.detect_fills(open_ids=set())
+        self.ol.handle_fill.assert_called_once()
+        kwargs = self.ol.handle_fill.call_args.kwargs
+        self.assertEqual(158, kwargs["actual_shares"])
 
 
 if __name__ == "__main__":
