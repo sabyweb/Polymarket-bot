@@ -29,25 +29,74 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # MagicMock when accessed — making the contract test pass for the wrong
 # reason. R6: tests encode contracts, not implementation details.
 
-def _ensure_clob_types_mock() -> None:
-    if "py_clob_client_v2" in sys.modules:
-        # Could be a real install OR a partial MagicMock left by a sibling
-        # test (see test_placement.py::_drop_stale_clob_mocks). Either way,
-        # don't clobber.
+class _PassthroughDataclass:
+    """A class that stores constructor kwargs as attributes — replaces SDK
+    dataclasses (BalanceAllowanceParams, OrderPayload, OrderArgs) so tests
+    can introspect what production code constructed via ``call_args``.
+
+    Plain MagicMock would silently absorb ``token_id=...`` and return another
+    MagicMock when accessed, making FX-037 contract tests pass for the wrong
+    reason.
+    """
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+
+class _EnumLike:
+    """Stand-in for AssetType enum — sentinel attributes."""
+    COLLATERAL = "COLLATERAL"
+    CONDITIONAL = "CONDITIONAL"
+
+
+def _install_passthrough_clob_shim() -> None:
+    """Ensure ``py_clob_client_v2`` is importable with passthrough semantics
+    for FX-037 token_id-routing tests.
+
+    Protocol (works in both local-dev and Helsinki/Ubuntu CI):
+
+    1. Drop any MagicMock-based partial mocks left by sibling tests
+       (test_critical_fixes / test_sports_protection set
+       ``sys.modules["py_clob_client_v2"]`` to a MagicMock at their own
+       module load and never clean up; mirrors
+       test_placement.py::_drop_stale_clob_mocks).
+    2. Try to import the real SDK. If it imports cleanly, return — the
+       real ``BalanceAllowanceParams`` is a dataclass and naturally
+       supports ``instance.token_id`` introspection. This is the Helsinki
+       CI path (Ubuntu 24.04 + Python 3.14 with the SDK in
+       requirements.txt).
+    3. Otherwise install passthrough stand-ins so the FX-037 tests can
+       introspect what was constructed via ``call_args``. This is the
+       local-dev path where the SDK isn't installed.
+
+    Bug history: CI run 26329526380 (2026-05-23, commit 0ec898a) failed
+    2/770 tests because the prior version had an early-return guard that
+    didn't distinguish "real SDK installed" from "sibling left a
+    MagicMock". When the sibling-set MagicMock was present,
+    ``BalanceAllowanceParams(token_id=tid).token_id`` returned a
+    MagicMock instead of the string, defeating the token_id-routing
+    contracts. Fixed by dropping MagicMocks first and re-trying the real
+    import.
+    """
+    # 1. Drop stale MagicMock-based partial mocks from sibling tests.
+    stale = [
+        k for k in list(sys.modules)
+        if (k == "py_clob_client_v2" or k.startswith("py_clob_client_v2."))
+        and isinstance(sys.modules[k], MagicMock)
+    ]
+    for k in stale:
+        del sys.modules[k]
+
+    # 2. If the real SDK is available, use it as-is (Helsinki CI path).
+    try:
+        import py_clob_client_v2.clob_types  # noqa: F401
+        import py_clob_client_v2.order_builder.constants  # noqa: F401
         return
+    except ImportError:
+        pass
+
+    # 3. Real SDK absent (local dev). Install passthrough stand-ins.
     mock_clob = MagicMock()
-
-    class _PassthroughDataclass:
-        """A class that stores constructor kwargs as attributes."""
-        def __init__(self, **kwargs):
-            for k, v in kwargs.items():
-                setattr(self, k, v)
-
-    class _EnumLike:
-        """Stand-in for AssetType enum — sentinel attributes."""
-        COLLATERAL = "COLLATERAL"
-        CONDITIONAL = "CONDITIONAL"
-
     clob_types = types.ModuleType("py_clob_client_v2.clob_types")
     clob_types.BalanceAllowanceParams = _PassthroughDataclass
     clob_types.OrderPayload = _PassthroughDataclass
@@ -65,7 +114,8 @@ def _ensure_clob_types_mock() -> None:
     sys.modules["py_clob_client_v2.order_builder"] = order_builder
     sys.modules["py_clob_client_v2.order_builder.constants"] = constants_mod
 
-_ensure_clob_types_mock()
+
+_install_passthrough_clob_shim()
 
 
 from models import MarketState, OrderSlot
