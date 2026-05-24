@@ -261,6 +261,33 @@ CREATE TABLE IF NOT EXISTS unliquidatable_markets (
     last_retry_at REAL NOT NULL DEFAULT 0
 );
 
+-- FX-049: Wallet-invariant reconciliation history. Defense-in-depth backstop
+-- against any cash-accounting drift between bot DB and on-chain wallet. Each
+-- row captures one reconcile event: the bot's expected vs actual wallet pUSD
+-- and the divergence at that moment. The LATEST row's wallet snapshot serves
+-- as the BASELINE for the next reconcile cycle — divergences are computed
+-- incrementally over the window since the prior baseline (rolling
+-- comparison, not all-time).
+--
+-- Status values:
+--   'baseline'   — first reconcile run (no prior row); just snapshotted
+--   'ok'         — |divergence| ≤ threshold
+--   'desync'     — |divergence| > threshold; [CRITICAL] WALLET_DESYNC fired
+--   'fail_open'  — data fetch error; preserved row but no alert
+CREATE TABLE IF NOT EXISTS wallet_reconcile_history (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts                 REAL NOT NULL,
+    actual_wallet      REAL NOT NULL,
+    expected_wallet    REAL NOT NULL,
+    divergence         REAL NOT NULL,
+    status             TEXT NOT NULL DEFAULT 'ok',
+    baseline_ts        REAL NOT NULL,
+    baseline_wallet    REAL NOT NULL,
+    fills_delta        REAL NOT NULL DEFAULT 0,
+    unwinds_delta      REAL NOT NULL DEFAULT 0,
+    rewards_delta      REAL NOT NULL DEFAULT 0
+);
+
 -- Active orders placed by the bot (persisted for crash recovery)
 CREATE TABLE IF NOT EXISTS active_orders (
     order_id     TEXT PRIMARY KEY,
@@ -1438,6 +1465,85 @@ class BotDatabase:
             self._get_conn().commit()
         except Exception as e:
             log.debug(f"delete_active_order error: {e}")
+
+    # ── FX-049: Wallet reconciliation history ───────────────────────────
+
+    def load_latest_wallet_reconcile(self) -> dict | None:
+        """Return the most recent reconcile row, or None on first run.
+
+        Used by ``oversight.wallet_reconciliation`` to establish the
+        BASELINE for incremental divergence computation. None on first run
+        triggers the baseline-snapshot path (no alert, just stamp).
+        """
+        try:
+            r = self._get_conn().execute(
+                "SELECT * FROM wallet_reconcile_history ORDER BY ts DESC LIMIT 1"
+            ).fetchone()
+            return dict(r) if r else None
+        except Exception as e:
+            log.debug(f"load_latest_wallet_reconcile error: {e}")
+            return None
+
+    def insert_wallet_reconcile(
+        self, *, actual_wallet: float, expected_wallet: float,
+        divergence: float, status: str,
+        baseline_ts: float, baseline_wallet: float,
+        fills_delta: float = 0.0, unwinds_delta: float = 0.0,
+        rewards_delta: float = 0.0,
+    ) -> None:
+        """Persist one reconcile event. Caller computes the math; this is
+        a thin write-through. ``status`` is one of 'baseline' / 'ok' /
+        'desync' / 'fail_open'.
+        """
+        try:
+            conn = self._get_conn()
+            conn.execute(
+                """INSERT INTO wallet_reconcile_history
+                   (ts, actual_wallet, expected_wallet, divergence, status,
+                    baseline_ts, baseline_wallet,
+                    fills_delta, unwinds_delta, rewards_delta)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (time.time(), actual_wallet, expected_wallet, divergence,
+                 status, baseline_ts, baseline_wallet,
+                 fills_delta, unwinds_delta, rewards_delta),
+            )
+            conn.commit()
+        except Exception as e:
+            log.debug(f"insert_wallet_reconcile error: {e}")
+
+    def sum_fills_usd_since(self, since_ts: float) -> float:
+        """Σ usd_value of fills strictly after ``since_ts``. 0 on empty/err.
+
+        Used by FX-049 reconciler to compute bot-DB's expected wallet
+        outflow attributable to BUY fills in the window.
+        """
+        try:
+            row = self._get_conn().execute(
+                "SELECT COALESCE(SUM(usd_value), 0) FROM fills WHERE ts > ?",
+                (since_ts,),
+            ).fetchone()
+            return float(row[0] or 0)
+        except Exception as e:
+            log.debug(f"sum_fills_usd_since error: {e}")
+            return 0.0
+
+    def sum_unwinds_usd_since(self, since_ts: float) -> float:
+        """Σ usd_value of unwinds strictly after ``since_ts``. 0 on empty/err.
+
+        Used by FX-049 reconciler to compute bot-DB's expected wallet
+        inflow attributable to dump SELLs in the window. Post-FX-050 this
+        is fee-adjusted to net cash received, matching wallet ground
+        truth.
+        """
+        try:
+            row = self._get_conn().execute(
+                "SELECT COALESCE(SUM(usd_value), 0) FROM unwinds WHERE ts > ?",
+                (since_ts,),
+            ).fetchone()
+            return float(row[0] or 0)
+        except Exception as e:
+            log.debug(f"sum_unwinds_usd_since error: {e}")
+            return 0.0
 
     def clear_all_active_orders(self) -> None:
         """Clear all active orders (called on clean startup)."""

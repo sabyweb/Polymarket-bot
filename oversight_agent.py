@@ -290,6 +290,34 @@ def run_once(
         db_path, total_capital=capital, exchange_balance=exchange_bal,
     )
 
+    # FX-049: Wallet-invariant reconciliation (defense-in-depth backstop).
+    # Runs once per agent cycle. Compares bot-DB's expected wallet movement
+    # against on-chain truth; emits [CRITICAL] WALLET_DESYNC on divergence
+    # > RF_WALLET_DESYNC_THRESHOLD_USD. Catches the SYMPTOM of any cash-
+    # accounting drift even if the ROOT cause is unknown (e.g. FX-050
+    # Polymarket taker fee was the first known instance — fixed in same
+    # commit, but the reconciler stays as the permanent invariant for any
+    # future unknown unknowns: silent fill misses, phantom unwinds, manual
+    # operator deposits/withdrawals).
+    #
+    # Fail-open on errors: a transient data-api blip writes a 'fail_open'
+    # row, no alert. Strictly safer than fail-closed.
+    try:
+        from oversight.wallet_reconciliation import reconcile_wallet_invariant
+        from database import get_db
+        from config import cfg
+        if exchange_bal is not None:
+            _db = get_db()
+            _funder = os.getenv("FUNDER", "") or os.getenv("WALLET_ADDRESS", "")
+            reconcile_wallet_invariant(
+                _db,
+                actual_wallet_now=float(exchange_bal),
+                funder=_funder,
+                threshold_usd=float(cfg("RF_WALLET_DESYNC_THRESHOLD_USD")),
+            )
+    except Exception as e:
+        log.warning(f"[WALLET_RECONCILE] reconciliation pass failed (fail-open): {e}")
+
     # Step 2: Collect metrics + correction factor
     log.info(f"Collecting metrics (lookback={hours:.0f}h, db={db_path})...")
     collect_result = collect_all(db_path=db_path, hours=hours)

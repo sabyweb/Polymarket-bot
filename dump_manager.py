@@ -86,7 +86,21 @@ class DumpManager:
                             self.db.delete_dump_state(ms.cid, side)
                             continue
 
-                        sell_revenue = actual_matched * actual_price if actual_price > 0 else 0
+                        # FX-050: Polymarket charges a taker fee (~0.88-0.9%)
+                        # on orders that cross the spread. DumpManager's passive
+                        # mode (dump_manager.py:308-327) sets the dump SELL
+                        # price to the best opposite-side bid, crossing the
+                        # spread → we are the taker → fee applies. The SDK's
+                        # `price` field reports the book match price, not the
+                        # cash actually settled to the wallet. Without this
+                        # correction, recorded usd_value is the gross revenue
+                        # and pnl is under-magnitude vs reality. Empirical
+                        # calibration: 2026-05-22 dump on 0x0ed3f07970 →
+                        # bot recorded pnl=−$1.00, wallet actual −$1.34
+                        # (gap = 0.88% taker fee on $39 gross).
+                        gross_revenue = actual_matched * actual_price if actual_price > 0 else 0
+                        _taker_fee = cfg("RF_POLYMARKET_TAKER_FEE")
+                        sell_revenue = gross_revenue * (1.0 - _taker_fee)
 
                         from price import to_clob
                         avg_p = self.positions.get_avg_price(ms.cid, side)
@@ -94,7 +108,8 @@ class DumpManager:
 
                         log.info(
                             f"DUMP CONFIRMED {side.upper()} {actual_matched:.0f}sh @ {actual_price:.4f} | "
-                            f"rev=${sell_revenue:.2f} cost=${vwap_cost:.2f} pnl=${sell_revenue - vwap_cost:+.2f} | "
+                            f"gross=${gross_revenue:.2f} fee={_taker_fee*100:.2f}% net=${sell_revenue:.2f} "
+                            f"cost=${vwap_cost:.2f} pnl=${sell_revenue - vwap_cost:+.2f} | "
                             f"{ms.question[:30]}"
                         )
 
