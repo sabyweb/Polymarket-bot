@@ -324,14 +324,23 @@ def test_C14_output_json_has_required_farmer_fields():
         assert "total_capital_deployed" in payload
         assert "markets" in payload
 
-        # Per-deploy schema (the bits the farmer reads)
+        # Per-deploy schema (the bits the farmer reads — verified by grep audit of
+        # reward_farmer.py:950-1000 — farmer reads condition_id (mandatory), action,
+        # shares_per_side (NOT "shares"), daily_rate, min_size, max_spread, end_date_iso,
+        # _total_capital).
         deploys = [m for m in payload["markets"] if m.get("action") == "deploy"]
         if deploys:
             d = deploys[0]
-            for field in ["condition_id", "yes_tid", "no_tid", "action",
-                          "shares", "daily_rate", "max_spread", "min_size",
-                          "est_capital_cost", "_total_capital"]:
+            required = ["condition_id", "action", "shares_per_side", "daily_rate",
+                        "min_size", "max_spread", "end_date_iso", "est_capital_cost",
+                        "_total_capital"]
+            for field in required:
                 assert field in d, f"deploy row missing required field: {field}"
+            # Negative assertion — guard against accidental rename back to "shares"
+            assert "shares" not in d or "shares_per_side" in d, (
+                "schema regression: 'shares' present without 'shares_per_side' "
+                "(farmer reads 'shares_per_side')"
+            )
     finally:
         os.unlink(out_path)
 

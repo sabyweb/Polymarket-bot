@@ -418,16 +418,25 @@ class SimpleAllocator:
         """
         markets_json = []
 
+        # Schema must match `oversight/allocation_writer._to_dict` output
+        # so the farmer (reward_farmer.py:950-1000) reads the same fields.
+        # Critical fields per the farmer audit:
+        #   condition_id (mandatory; no fallback)
+        #   action (filter "deploy" vs "avoid")
+        #   shares_per_side (NOT "shares" — farmer reads this exact name)
+        #   _total_capital (stamped per row; runtime guardrails depend on it)
+        # Optional with fallbacks: daily_rate, min_size, max_spread, end_date_iso
         for m in result.deploys:
             markets_json.append({
                 "condition_id": m.condition_id,
-                "yes_tid": m.yes_tid,
-                "no_tid": m.no_tid,
+                "yes_tid": m.yes_tid,         # extra; farmer fetches from CLOB if missing
+                "no_tid": m.no_tid,           # extra; farmer fetches from CLOB if missing
                 "action": "deploy",
-                "shares": m.target_shares,
+                "shares_per_side": m.target_shares,
                 "daily_rate": m.daily_rate,
                 "max_spread": m.max_spread / 100.0 if m.max_spread > 1 else m.max_spread,
                 "min_size": m.min_size,
+                "end_date_iso": "",           # farmer fetches from CLOB if missing
                 "score": round(m.expected_daily_reward, 6),
                 "q_share_pct": round(m.expected_q_share, 6),
                 "q_share_source": m.q_share_source,
@@ -440,7 +449,7 @@ class SimpleAllocator:
             markets_json.append({
                 "condition_id": m.condition_id,
                 "action": "avoid",
-                "shares": 0,
+                "shares_per_side": 0,
                 "daily_rate": m.daily_rate,
                 "max_spread": m.max_spread / 100.0 if m.max_spread > 1 else m.max_spread,
                 "min_size": m.min_size,
