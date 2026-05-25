@@ -154,4 +154,44 @@ $1-4/day regardless of architecture.
 **Status:** Open. Operator decision required.
 
 ## Resolved
-(none yet)
+
+### D4 — SimpleAllocator integration SHIPPED 2026-05-25 08:39 UTC
+
+Live on Helsinki. Systemd swapped to `simple_oversight.py --loop`. First cycle:
+- num_deploy: 20 (was 1-3)
+- capital_deployed: $1160 / $1223 (was $33-127 / $225)
+- notional_ratio: 58% (was 7-12%)
+- expected_total_reward: $134.62/day (model — cold-start prior 0.5% × Σ daily_rate)
+- kill_switch: false, no errors
+
+Farmer picked up new alloc on next cycle: `Loaded 20 market allocations from
+oversight agent. Using agent allocations: 19/20 markets (after validation)`.
+1 market dropped in validation (likely token_id fetch failure or sub-min_size).
+
+3 minutes post-swap, 8 LIVE orders across 4 markets, total_live_notional $710,
+no errors, no kill switch. The remaining ~15 markets will come online over
+next 5-10 farmer cycles (~5 minutes).
+
+Rollback path (one-liner, ~10 seconds):
+```
+sudo sed -i 's|simple_oversight.py --loop|oversight_agent.py --loop|' \
+  /etc/systemd/system/polymarket-oversight.service && \
+sudo systemctl daemon-reload && sudo systemctl restart polymarket-oversight
+```
+
+Backup of original unit at:
+`/etc/systemd/system/polymarket-oversight.service.bak.pre-B-prime`
+
+Validation point: next daily payout at ~00:20 UTC 2026-05-26.
+
+### D5 — Wallet scale-up COMPLETE 2026-05-25
+
+Operator topped wallet to $1222.93 (verified via live CLOB probe). Architecture
+ceiling unlocked from $1-4/day (at $226) to $8-35/day projected (at $1.5k tier).
+SimpleAllocator's filter+sizing constants tuned to this new scale.
+
+### D2 (legacy) — Trial budget bump 0.25 → 0.75
+
+Effective on Helsinki earlier in session. Now superseded by SimpleAllocator
+which doesn't use the trial-budget mechanism. The config_overrides.json entry
+is harmless (SimpleAllocator ignores it).
