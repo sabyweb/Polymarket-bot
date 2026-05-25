@@ -333,11 +333,15 @@ class SimpleAllocator:
             sources_used[src] += 1
 
         # ── Filter ──
+        # NOTE: /rewards/markets/current does NOT include yes_token_id /
+        # no_token_id fields. They live in /markets/{cid}. The farmer's
+        # reward_farmer.py:970-987 has a CLOB fallback that fetches token_ids
+        # if missing from the alloc — so we do NOT filter on yes_tid/no_tid
+        # here. Doing so would zero out every market.
         eligible = [
             m for m in candidates
             if m.daily_rate >= MIN_DAILY_RATE_USD
             and m.expected_daily_reward >= MIN_EXPECTED_PER_MARKET
-            and m.yes_tid and m.no_tid
         ]
 
         # ── Rank by expected reward ──
