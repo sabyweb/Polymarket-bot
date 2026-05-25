@@ -254,12 +254,31 @@ class OrderLifecycle:
                     continue
 
                 if slot.order_id not in open_ids:
+                    # FX-054 instrumentation: trace every fill-detection branch
+                    # so we can diagnose why 8 of 9 fills went missing from the
+                    # DB on 2026-05-25. Observability only — no control flow change.
+                    log.info(
+                        f"[FILL_DETECT_TRACE] cid={cid[:12]} side={side} "
+                        f"order_id={slot.order_id[:16]} step=missing_from_open_ids"
+                    )
                     try:
                         status = self.client.get_order(slot.order_id)
                         order_status = status.get("status", "UNKNOWN")
                         matched = float(status.get("size_matched", 0))
+                        log.info(
+                            f"[FILL_DETECT_TRACE] cid={cid[:12]} side={side} "
+                            f"order_id={slot.order_id[:16]} step=sdk_resp "
+                            f"status={order_status} matched={matched:.2f}"
+                        )
                     except Exception as e:
-                        log.debug(f"BUY order status check failed {slot.order_id[:16]}: {e}")
+                        # FX-054: this exception path is the prime suspect for
+                        # the 8 missing fills — get_order timeouts during burst
+                        # silently route every fill into UNKNOWN with matched=0.
+                        log.warning(
+                            f"[FILL_DETECT_TRACE] cid={cid[:12]} side={side} "
+                            f"order_id={slot.order_id[:16]} step=sdk_exception "
+                            f"err={type(e).__name__}: {e}"
+                        )
                         order_status = "UNKNOWN"
                         matched = 0
 
@@ -274,7 +293,14 @@ class OrderLifecycle:
                         # defense — fail-open on probe error preserves SDK
                         # value so legitimate fills aren't lost to network
                         # blips.
+                        pre_phantom_matched = matched
                         matched = self._check_buy_phantom_fill(ms, side, matched)
+                        if matched != pre_phantom_matched:
+                            log.info(
+                                f"[FILL_DETECT_TRACE] cid={cid[:12]} side={side} "
+                                f"step=phantom_adjusted pre={pre_phantom_matched:.2f} "
+                                f"post={matched:.2f}"
+                            )
                     if matched > 0 and order_status in ("MATCHED", "CANCELLED"):
                         fill_type = "FULL" if matched >= slot.shares - 0.5 else "PARTIAL"
                         # API returns token-specific CLOB price; convert to
@@ -293,14 +319,29 @@ class OrderLifecycle:
                                 f"(order {order_status}) | {ms.question[:30]}"
                             )
                         self.handle_fill(ms, side, slot, actual_shares=matched, actual_price=actual_price)
+                        log.info(
+                            f"[FILL_DETECT_TRACE] cid={cid[:12]} side={side} "
+                            f"step=fill_recorded shares={matched:.2f} "
+                            f"fill_type={fill_type} actual_price={actual_price:.4f}"
+                        )
                         ms.unknown_count[side] = 0
                     elif matched <= 0 and order_status in ("MATCHED", "CANCELLED"):
                         # FX-037: phantom check zeroed the fill (full phantom).
                         # SDK said size_matched > 0 but on-chain delta was 0.
                         # Treat as no-fill — clear the slot below, do not record.
+                        log.warning(
+                            f"[FILL_DETECT_TRACE] cid={cid[:12]} side={side} "
+                            f"step=phantom_zeroed status={order_status} "
+                            f"(SDK said matched > 0, on-chain delta = 0; no DB write)"
+                        )
                         ms.unknown_count[side] = 0
                     elif order_status == "UNKNOWN":
                         ms.unknown_count[side] = ms.unknown_count.get(side, 0) + 1
+                        log.info(
+                            f"[FILL_DETECT_TRACE] cid={cid[:12]} side={side} "
+                            f"step=unknown_status count={ms.unknown_count[side]}/"
+                            f"{cfg('RF_UNKNOWN_RETRY_THRESHOLD')}"
+                        )
                         if ms.unknown_count[side] >= cfg("RF_UNKNOWN_RETRY_THRESHOLD"):
                             log.warning(f"BUY order stuck UNKNOWN {cfg('RF_UNKNOWN_RETRY_THRESHOLD')}x, clearing | {ms.question[:30]}")
                             # Reconcile: check exchange balance to detect silent fills
@@ -355,6 +396,14 @@ class OrderLifecycle:
             _pos_usd = _yes_cost + _no_cost
         except Exception:
             pass
+        # FX-054 instrumentation: bracket the DB write so we can spot crashes /
+        # exceptions that orphan a fill (logged → not written, or written →
+        # not logged). [FILL_WRITE] attempting must always be followed by
+        # [FILL_WRITE] succeeded; an orphaned `attempting` is the smoking gun.
+        log.info(
+            f"[FILL_WRITE] cid={cid[:12]} side={side} shares={filled_shares:.2f} "
+            f"price={fill_price:.4f} step=attempting"
+        )
         self.db.log_fill(
             condition_id=cid, question=ms.question,
             side=side, fill_type="FULL",
@@ -365,6 +414,10 @@ class OrderLifecycle:
             order_age_secs=_order_age,
             position_usd_after=_pos_usd,
             reward_rate_hr=ms.daily_rate / 24.0 if ms.daily_rate > 0 else 0,
+        )
+        log.info(
+            f"[FILL_WRITE] cid={cid[:12]} side={side} shares={filled_shares:.2f} "
+            f"step=succeeded"
         )
 
         alert_fill(
