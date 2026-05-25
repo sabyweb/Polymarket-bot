@@ -318,7 +318,11 @@ class OrderLifecycle:
                                 f"PARTIAL fill {side.upper()} {matched:.0f}/{slot.shares:.0f}sh "
                                 f"(order {order_status}) | {ms.question[:30]}"
                             )
-                        self.handle_fill(ms, side, slot, actual_shares=matched, actual_price=actual_price)
+                        self.handle_fill(
+                            ms, side, slot,
+                            actual_shares=matched, actual_price=actual_price,
+                            fill_type=fill_type,
+                        )
                         log.info(
                             f"[FILL_DETECT_TRACE] cid={cid[:12]} side={side} "
                             f"step=fill_recorded shares={matched:.2f} "
@@ -367,8 +371,16 @@ class OrderLifecycle:
                     self._check_stale_order(ms, side, slot)
 
     def handle_fill(self, ms: MarketState, side: str, slot: OrderSlot,
-                    actual_shares: float = 0, actual_price: float = 0.0):
-        """Process a detected fill: record, then merge or dump."""
+                    actual_shares: float = 0, actual_price: float = 0.0,
+                    fill_type: str = "FULL"):
+        """Process a detected fill: record, then merge or dump.
+
+        FX-039: ``fill_type`` is threaded through from the caller (detect_fills
+        and _check_stale_order both compute it) so the ``fills`` DB row carries
+        the correct PARTIAL/FULL label. Defaults to "FULL" for the
+        _reconcile_after_unknown caller which has no SDK-reported matched
+        size to distinguish.
+        """
         from alerts import alert_fill
         from dump_manager import DumpManager
 
@@ -406,7 +418,7 @@ class OrderLifecycle:
         )
         self.db.log_fill(
             condition_id=cid, question=ms.question,
-            side=side, fill_type="FULL",
+            side=side, fill_type=fill_type,
             shares=filled_shares, price=fill_price,
             clob_cost=clob_cost, usd_value=filled_shares * clob_cost,
             midpoint=ms.midpoint,
@@ -420,11 +432,17 @@ class OrderLifecycle:
             f"step=succeeded"
         )
 
+        # FX-039 follow-up: alerts.py's PARTIAL branch formats remaining_shares
+        # unconditionally and crashes on None. Pre-FX-039 the hardcoded
+        # fill_type='FULL' masked this latent bug. Pass the remainder explicitly
+        # so partial-fill alerts work.
+        remaining_shares = max(0.0, slot.shares - filled_shares)
         alert_fill(
-            fill_type="FULL", side=side.upper(),
+            fill_type=fill_type, side=side.upper(),
             price=clob_cost, filled_shares=filled_shares,
             filled_usd=filled_shares * clob_cost,
             market_question=ms.question,
+            remaining_shares=remaining_shares,
         )
 
         ms.last_fill_price[side] = fill_price
@@ -959,7 +977,11 @@ class OrderLifecycle:
             self.db.delete_active_order(slot.order_id)
 
             # Record the fill
-            self.handle_fill(ms, side, slot, actual_shares=matched, actual_price=actual_price)
+            self.handle_fill(
+                ms, side, slot,
+                actual_shares=matched, actual_price=actual_price,
+                fill_type=fill_type,
+            )
             ms.unknown_count[side] = 0
             slot.order_id = None
 
