@@ -61,6 +61,15 @@ MIN_PER_MARKET_USD = 10.0          # minimum per-market notional (venue min_size
 DEPLOY_RATIO = 0.95                # fraction of wallet deployable
 COLD_START_Q_SHARE = 0.005         # 0.5% prior — matches bot historical median band
 
+# FX-056: Extreme-price filter. Markets with midpoint < 0.10 or > 0.90
+# produce wide effective spreads on dump. The 2026-05-25 fill on
+# 0x46c09232 (NO at $0.08, dumped at $0.07) took 13.3% slippage vs
+# 1-2% on mid-priced markets. Polymarket's reward formula doesn't
+# discount these — they often have HIGH daily_rate that attracts the
+# scorer — but the per-fill cost negates the per-cycle reward.
+EXTREME_PRICE_LOW = 0.10
+EXTREME_PRICE_HIGH = 0.90
+
 # Kill switch thresholds — these replace SafetyController's 14 invariants
 KILL_LOSS_FRAC = 0.10              # halt on 24h realized loss > 10% of wallet
 KILL_DRAWDOWN_FRAC = 0.15          # halt on 15% drawdown from peak wallet
@@ -209,6 +218,23 @@ class SimpleAllocator:
             page = data.get("data", []) if isinstance(data, dict) else data
             for m in page:
                 try:
+                    # FX-056: try to extract a midpoint hint from the API
+                    # response so the downstream extreme-price filter has
+                    # real data. The /rewards/markets/current schema doesn't
+                    # guarantee a `tokens` field — when absent we fall back
+                    # to the dataclass default 0.5 (no filter applied for
+                    # that market). Same field shape used by market_discovery
+                    # and reward_farmer when consuming /markets/{cid}.
+                    midpoint_hint = 0.5
+                    tokens = m.get("tokens", []) or []
+                    if isinstance(tokens, list) and len(tokens) >= 1:
+                        try:
+                            p = float(tokens[0].get("price", 0.5))
+                            if 0 < p < 1:
+                                midpoint_hint = p
+                        except (TypeError, ValueError):
+                            pass
+
                     markets.append(
                         CandidateMarket(
                             condition_id=m["condition_id"],
@@ -217,6 +243,7 @@ class SimpleAllocator:
                             daily_rate=float(m.get("native_daily_rate", m.get("total_daily_rate", 0)) or 0),
                             max_spread=float(m.get("rewards_max_spread", 4.5) or 4.5),
                             min_size=int(m.get("rewards_min_size", 20) or 20),
+                            midpoint_guess=midpoint_hint,
                         )
                     )
                 except (KeyError, ValueError, TypeError) as e:
@@ -342,6 +369,12 @@ class SimpleAllocator:
             m for m in candidates
             if m.daily_rate >= MIN_DAILY_RATE_USD
             and m.expected_daily_reward >= MIN_EXPECTED_PER_MARKET
+            # FX-056: skip extreme-price markets (midpoint < 0.10 or > 0.90)
+            # where dump slippage routinely exceeds per-cycle reward. Markets
+            # without a price hint pass through (midpoint_guess default 0.5)
+            # so this is fail-open — a follow-up filter at farmer-side book
+            # fetch time will catch any that slip through.
+            and EXTREME_PRICE_LOW <= m.midpoint_guess <= EXTREME_PRICE_HIGH
         ]
 
         # ── Rank by expected reward ──

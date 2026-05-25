@@ -400,3 +400,129 @@ def test_C15_cumulative_ratios_skip_low_samples_and_poisoned():
     assert "0xPOI" not in ratios   # skipped: poisoned ratio
 
     os.unlink(db_path)
+
+
+# ── FX-056 extreme-price filter contracts ──
+
+def test_C16_extreme_low_midpoint_filtered():
+    """C16: markets with midpoint < EXTREME_PRICE_LOW (0.10) are filtered out.
+
+    The 2026-05-25 fill on 0x46c09232 (midpoint ~$0.08) took 13.3% slippage
+    on dump — net negative even with the market's high daily_rate. FX-056
+    excludes these structurally.
+    """
+    from simple_allocator import EXTREME_PRICE_LOW
+    a = _make_allocator()
+    a.fetch_current_q_shares = lambda: {}
+    a.load_cumulative_ratios = lambda: {"0xCHEAP": 0.05}
+
+    cheap = _make_candidate("0xCHEAP", daily_rate=500)
+    cheap.midpoint_guess = EXTREME_PRICE_LOW - 0.01  # below floor
+    result = a.compute(
+        wallet_usd=200, wallet_peak_usd=200, wallet_24h_ago_usd=200,
+        realized_loss_24h=0, markets=[cheap],
+    )
+    deploy_cids = {m.condition_id for m in result.deploys}
+    assert "0xCHEAP" not in deploy_cids
+
+
+def test_C17_extreme_high_midpoint_filtered():
+    """C17: markets with midpoint > EXTREME_PRICE_HIGH (0.90) are filtered out."""
+    from simple_allocator import EXTREME_PRICE_HIGH
+    a = _make_allocator()
+    a.fetch_current_q_shares = lambda: {}
+    a.load_cumulative_ratios = lambda: {"0xPRICEY": 0.05}
+
+    pricey = _make_candidate("0xPRICEY", daily_rate=500)
+    pricey.midpoint_guess = EXTREME_PRICE_HIGH + 0.01  # above ceiling
+    result = a.compute(
+        wallet_usd=200, wallet_peak_usd=200, wallet_24h_ago_usd=200,
+        realized_loss_24h=0, markets=[pricey],
+    )
+    deploy_cids = {m.condition_id for m in result.deploys}
+    assert "0xPRICEY" not in deploy_cids
+
+
+def test_C18_mid_priced_market_passes_filter():
+    """C18: markets in [EXTREME_PRICE_LOW, EXTREME_PRICE_HIGH] are kept.
+
+    Also confirms the default midpoint_guess (0.5) — used when the API
+    didn't return a tokens-array price hint — passes through fail-open.
+    """
+    a = _make_allocator()
+    a.fetch_current_q_shares = lambda: {}
+    a.load_cumulative_ratios = lambda: {"0xMID": 0.05, "0xDEFAULT": 0.05}
+
+    mid = _make_candidate("0xMID", daily_rate=500)
+    mid.midpoint_guess = 0.50  # explicit mid
+
+    default_mp = _make_candidate("0xDEFAULT", daily_rate=500)
+    # midpoint_guess left at dataclass default (0.5) — represents "unknown"
+
+    result = a.compute(
+        wallet_usd=2000, wallet_peak_usd=2000, wallet_24h_ago_usd=2000,
+        realized_loss_24h=0, markets=[mid, default_mp],
+    )
+    deploy_cids = {m.condition_id for m in result.deploys}
+    assert "0xMID" in deploy_cids
+    assert "0xDEFAULT" in deploy_cids  # fail-open contract
+
+
+def test_C19_fetch_reward_markets_extracts_tokens_price():
+    """C19: when /rewards/markets/current includes a tokens array with a
+    price field, fetch_reward_markets populates midpoint_guess so the
+    FX-056 filter can act on real data."""
+    routes = {
+        "/rewards/markets/current": SimpleNamespace(
+            status_code=200,
+            text="",
+            json=lambda: {
+                "data": [
+                    {
+                        "condition_id": "0xWITHPRICE",
+                        "yes_token_id": "yes_tok",
+                        "no_token_id": "no_tok",
+                        "native_daily_rate": 50.0,
+                        "rewards_max_spread": 4.5,
+                        "rewards_min_size": 20,
+                        "tokens": [{"price": 0.07, "outcome": "Yes"}],
+                    }
+                ],
+                "next_cursor": "LTE=",
+            },
+        ),
+    }
+    a = _make_allocator(http_stub=_stub_http(routes))
+    markets = a.fetch_reward_markets()
+    assert len(markets) == 1
+    assert markets[0].condition_id == "0xWITHPRICE"
+    assert markets[0].midpoint_guess == pytest.approx(0.07)
+
+
+def test_C20_fetch_reward_markets_defaults_midpoint_when_tokens_absent():
+    """C20: when the API response has no tokens array (or no price),
+    midpoint_guess stays at the dataclass default 0.5 — the fail-open
+    path that lets FX-056 filter passes unrecognized markets through
+    rather than blackholing them."""
+    routes = {
+        "/rewards/markets/current": SimpleNamespace(
+            status_code=200,
+            text="",
+            json=lambda: {
+                "data": [
+                    {
+                        "condition_id": "0xNOPRICE",
+                        "native_daily_rate": 50.0,
+                        "rewards_max_spread": 4.5,
+                        "rewards_min_size": 20,
+                        # no tokens field
+                    }
+                ],
+                "next_cursor": "LTE=",
+            },
+        ),
+    }
+    a = _make_allocator(http_stub=_stub_http(routes))
+    markets = a.fetch_reward_markets()
+    assert len(markets) == 1
+    assert markets[0].midpoint_guess == 0.5
