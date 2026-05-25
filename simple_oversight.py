@@ -181,6 +181,27 @@ def run_once(
     realized_loss = get_realized_loss_24h(db_path)
     wallet_24h_ago = get_wallet_24h_ago(db_path)
 
+    # 3a. FX-055: re-wire FX-049 wallet-invariant reconciliation that was
+    # dropped in the 2026-05-25 simple_oversight swap. Mirrors the
+    # oversight_agent.run_once() integration. Compares bot-DB cash flows
+    # (fills + unwinds + data-api rewards) against on-chain wallet delta;
+    # emits [CRITICAL] WALLET_DESYNC if drift > RF_WALLET_DESYNC_THRESHOLD_USD.
+    # Fail-open: any exception is logged + cycle continues (the reconciler
+    # is observational, never gates allocation).
+    try:
+        from oversight.wallet_reconciliation import reconcile_wallet_invariant
+        from database import get_db
+        from config import cfg
+        _db = get_db()
+        reconcile_wallet_invariant(
+            _db,
+            actual_wallet_now=float(wallet),
+            funder=allocator.funder,
+            threshold_usd=float(cfg("RF_WALLET_DESYNC_THRESHOLD_USD")),
+        )
+    except Exception as e:
+        log.warning(f"[WALLET_RECONCILE] reconciliation pass failed (fail-open): {e}")
+
     # 4. Allocate
     result = allocator.compute(
         wallet_usd=wallet,
