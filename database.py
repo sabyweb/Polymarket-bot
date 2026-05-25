@@ -390,6 +390,65 @@ CREATE TABLE IF NOT EXISTS calibration_model_state (
     metrics_json  TEXT NOT NULL DEFAULT '{}',
     feature_names TEXT NOT NULL DEFAULT '[]'
 );
+
+-- FX-051: Per-market rolling ROI snapshots (Ground Rule 3 foundation).
+-- One row per (condition_id, window). Upserted on every oversight cycle by
+-- MarketROITracker.tick(). Consumed by DecisionPolicy + SimpleAllocator's
+-- excluded_cids filter.
+CREATE TABLE IF NOT EXISTS market_roi (
+    condition_id          TEXT NOT NULL,
+    window                TEXT NOT NULL,           -- '1h' | '24h' | '7d'
+    window_end_ts         REAL NOT NULL,
+    reward_earned         REAL NOT NULL DEFAULT 0, -- best-effort from API/cache
+    fill_loss             REAL NOT NULL DEFAULT 0, -- SUM(-pnl) from unwinds, pnl<0
+    capital_committed_avg REAL NOT NULL DEFAULT 0, -- time-weighted in window
+    roi                   REAL NOT NULL DEFAULT 0,
+    fill_count            INTEGER NOT NULL DEFAULT 0,
+    fill_rate_per_hour    REAL NOT NULL DEFAULT 0,
+    samples               INTEGER NOT NULL DEFAULT 0,
+    last_updated          REAL NOT NULL,
+    PRIMARY KEY (condition_id, window)
+);
+CREATE INDEX IF NOT EXISTS idx_market_roi_window ON market_roi(window);
+CREATE INDEX IF NOT EXISTS idx_market_roi_updated ON market_roi(last_updated);
+
+-- FX-051: Per-cycle capital allocation snapshots. One row per (cycle, deploy).
+-- Time-integrated by the tracker to compute capital_committed_avg.
+-- Pruned to last ~14 days by MarketROITracker.prune_old_snapshots().
+CREATE TABLE IF NOT EXISTS capital_committed_snapshots (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts              REAL NOT NULL,
+    condition_id    TEXT NOT NULL,
+    est_capital_cost REAL NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_ccs_cid_ts ON capital_committed_snapshots(condition_id, ts);
+CREATE INDEX IF NOT EXISTS idx_ccs_ts ON capital_committed_snapshots(ts);
+
+-- FX-051: Per-market cooldown state. DecisionPolicy inserts a row when a
+-- market's recent ROI breaches the cooldown threshold; the row is removed
+-- (or just ignored once `cooldown_until` passes) on reactivation.
+CREATE TABLE IF NOT EXISTS market_cooldowns (
+    condition_id        TEXT PRIMARY KEY,
+    cooled_at           REAL NOT NULL,
+    cooldown_until      REAL NOT NULL,
+    reason              TEXT NOT NULL,
+    roi_at_cooldown     REAL NOT NULL DEFAULT 0,
+    fill_loss_at_cooldown REAL NOT NULL DEFAULT 0,
+    samples_at_cooldown INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_market_cooldowns_until ON market_cooldowns(cooldown_until);
+
+-- FX-051: Daily reward cache. /rewards/user/markets API returns per-market
+-- per-date reward totals; we cache to avoid refetching within one cycle.
+-- Keyed by (date, condition_id); date is UTC YYYY-MM-DD.
+CREATE TABLE IF NOT EXISTS daily_reward_cache (
+    date            TEXT NOT NULL,
+    condition_id    TEXT NOT NULL,
+    reward_earned   REAL NOT NULL DEFAULT 0,
+    fetched_at      REAL NOT NULL,
+    PRIMARY KEY (date, condition_id)
+);
+CREATE INDEX IF NOT EXISTS idx_drc_date ON daily_reward_cache(date);
 """
 
 

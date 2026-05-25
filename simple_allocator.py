@@ -320,6 +320,7 @@ class SimpleAllocator:
         wallet_24h_ago_usd: Optional[float],
         realized_loss_24h: float,
         markets: Optional[list[CandidateMarket]] = None,
+        excluded_cids: Optional[set[str]] = None,
     ) -> AllocationResult:
         """Main allocation entry point.
 
@@ -329,10 +330,14 @@ class SimpleAllocator:
             wallet_24h_ago_usd: wallet 24h ago (or None if unknown)
             realized_loss_24h: sum of negative pnl from unwinds in last 24h (positive USD)
             markets: optional override (for testing); if None, fetches from Polymarket
+            excluded_cids: FX-051 cooldown filter — set of condition_ids the
+              DecisionPolicy has put on cooldown after recent losses. Pass
+              `None` (or empty set) when the ROI tracker isn't running.
 
         Returns AllocationResult with deploys, avoids, and kill signal.
         """
         sources_used = {"api": 0, "cumulative": 0, "cold_start": 0}
+        excluded = excluded_cids or set()
 
         # ── Kill switch check FIRST ──
         kill, reason = self.check_kill_switch(
@@ -375,6 +380,11 @@ class SimpleAllocator:
             # so this is fail-open — a follow-up filter at farmer-side book
             # fetch time will catch any that slip through.
             and EXTREME_PRICE_LOW <= m.midpoint_guess <= EXTREME_PRICE_HIGH
+            # FX-051: skip markets in cooldown after recent losses (set passed
+            # in from DecisionPolicy.get_excluded_cids()). Empty set passes
+            # everything through, so the allocator stays usable when the ROI
+            # tracker isn't wired up.
+            and m.condition_id not in excluded
         ]
 
         # ── Rank by expected reward ──

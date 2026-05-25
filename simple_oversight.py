@@ -202,13 +202,55 @@ def run_once(
     except Exception as e:
         log.warning(f"[WALLET_RECONCILE] reconciliation pass failed (fail-open): {e}")
 
+    # 3b. FX-051 / Ground Rule 3: tick the per-market ROI tracker and let the
+    # DecisionPolicy update cooldowns. The policy returns a set of
+    # condition_ids that the allocator must exclude this cycle. Fail-open:
+    # any exception logs and the allocator gets an empty exclusion set
+    # (i.e., behaves exactly as pre-FX-051).
+    excluded_cids: set[str] = set()
+    tracker = None
+    try:
+        from market_roi_tracker import MarketROITracker
+        from decision_policy import DecisionPolicy
+        tracker = MarketROITracker(
+            db_path=db_path,
+            funder=allocator.funder,
+            api_key=allocator.api_key,
+            api_secret=allocator.api_secret,
+            api_passphrase=allocator.api_passphrase,
+            wallet_address=allocator.wallet_address,
+            # Re-use the allocator's HTTP + clock injections so tests that
+            # stub the allocator's network also stub the tracker's. In
+            # production both default to requests.get / time.time.
+            _http=getattr(allocator, "_http", None),
+            _now=getattr(allocator, "_now", None),
+        )
+        tracker.tick()
+        tracker.prune_old_snapshots()
+        policy = DecisionPolicy(db_path=db_path, tracker=tracker)
+        policy.evaluate()
+        excluded_cids = policy.get_excluded_cids()
+    except Exception as e:
+        log.warning(f"[LEARN] tracker/policy pass failed (fail-open): {e}")
+
     # 4. Allocate
     result = allocator.compute(
         wallet_usd=wallet,
         wallet_peak_usd=peak,
         wallet_24h_ago_usd=wallet_24h_ago,
         realized_loss_24h=realized_loss,
+        excluded_cids=excluded_cids,
     )
+
+    # 4a. FX-051: record per-market est_capital_cost rows so future ROI ticks
+    # can compute time-weighted capital_committed_avg. Fail-quiet — the
+    # tracker is observational; if this write fails the next cycle's ROI
+    # numbers are slightly stale but the bot keeps running.
+    if tracker is not None:
+        try:
+            tracker.snapshot_capital(result)
+        except Exception as e:
+            log.debug(f"[LEARN] snapshot_capital skipped (fail-quiet): {e}")
 
     # 5. Write alloc file
     allocator.write_allocation_json(result, output_path=output_path)

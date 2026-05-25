@@ -526,3 +526,64 @@ def test_C20_fetch_reward_markets_defaults_midpoint_when_tokens_absent():
     markets = a.fetch_reward_markets()
     assert len(markets) == 1
     assert markets[0].midpoint_guess == 0.5
+
+
+# ── FX-051 cooldown filter contracts ──
+
+def test_C21_excluded_cids_removed_from_eligible():
+    """C21: markets in excluded_cids are filtered before ranking — they
+    do not appear in result.deploys regardless of how high their score is.
+
+    This is the FX-051 cooldown integration point: DecisionPolicy.get_excluded_cids()
+    returns the set of cids the allocator must exclude this cycle.
+    """
+    a = _make_allocator()
+    a.fetch_current_q_shares = lambda: {}
+    a.load_cumulative_ratios = lambda: {"0xCOOLED": 0.10, "0xHOT": 0.10}
+
+    # Both should clear all the other filters
+    cooled = _make_candidate("0xCOOLED", daily_rate=1000)  # high reward
+    hot = _make_candidate("0xHOT", daily_rate=100)         # lower reward
+    result = a.compute(
+        wallet_usd=2000, wallet_peak_usd=2000, wallet_24h_ago_usd=2000,
+        realized_loss_24h=0, markets=[cooled, hot],
+        excluded_cids={"0xCOOLED"},
+    )
+    deploy_cids = {m.condition_id for m in result.deploys}
+    assert "0xCOOLED" not in deploy_cids
+    assert "0xHOT" in deploy_cids
+
+
+def test_C22_empty_excluded_cids_is_passthrough():
+    """C22: when excluded_cids is None or empty, the allocator behaves
+    identically to pre-FX-051 — no filter applied."""
+    a = _make_allocator()
+    a.fetch_current_q_shares = lambda: {}
+    a.load_cumulative_ratios = lambda: {"0xOK": 0.05}
+    cand = _make_candidate("0xOK", daily_rate=500)
+
+    r_none = a.compute(
+        wallet_usd=500, wallet_peak_usd=500, wallet_24h_ago_usd=500,
+        realized_loss_24h=0, markets=[cand], excluded_cids=None,
+    )
+    r_empty = a.compute(
+        wallet_usd=500, wallet_peak_usd=500, wallet_24h_ago_usd=500,
+        realized_loss_24h=0, markets=[cand], excluded_cids=set(),
+    )
+    assert {m.condition_id for m in r_none.deploys} == {"0xOK"}
+    assert {m.condition_id for m in r_empty.deploys} == {"0xOK"}
+
+
+def test_C23_excluded_cids_param_omitted_works():
+    """C23: existing callers that don't pass excluded_cids still work
+    (backwards-compat contract — Phase 1 callers pre-FX-051)."""
+    a = _make_allocator()
+    a.fetch_current_q_shares = lambda: {}
+    a.load_cumulative_ratios = lambda: {"0xLEGACY": 0.05}
+    cand = _make_candidate("0xLEGACY", daily_rate=500)
+    # No excluded_cids kwarg
+    result = a.compute(
+        wallet_usd=500, wallet_peak_usd=500, wallet_24h_ago_usd=500,
+        realized_loss_24h=0, markets=[cand],
+    )
+    assert {m.condition_id for m in result.deploys} == {"0xLEGACY"}

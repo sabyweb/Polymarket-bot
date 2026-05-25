@@ -290,6 +290,64 @@ def test_O10_run_once_emits_capital_source_log(caplog):
     os.unlink(db)
 
 
+def test_O12_run_once_excludes_cooled_markets_from_deploys():
+    """O12: FX-051 integration — if a market is in market_cooldowns with
+    cooldown_until > now, run_once must NOT deploy on it even when the
+    allocator candidate set includes it.
+
+    This locks in the simple_oversight ↔ tracker ↔ policy ↔ allocator
+    wiring end-to-end. If any link in that chain breaks, this fails.
+    """
+    db = _make_temp_db()
+    allocator = _make_allocator(db)
+    # Need the FX-051 tables to exist; _make_temp_db only creates the
+    # legacy 3 tables. BotDatabase() init creates all tables idempotently.
+    from database import BotDatabase
+    BotDatabase(db)
+
+    # Seed an active cooldown for 0xCOOLED
+    now = 1700000000.0
+    until = now + 3600.0
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "INSERT INTO market_cooldowns VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("0xCOOLED", now - 100, until, "test_seed", -0.10, 5.0, 5),
+    )
+    conn.commit()
+    conn.close()
+
+    # Stub allocator.compute to verify excluded_cids was passed
+    captured_excluded = []
+    real_compute = allocator.compute
+    def captured_compute(*args, **kwargs):
+        captured_excluded.append(set(kwargs.get("excluded_cids") or set()))
+        return AllocationResult(
+            deploys=[], avoids=[], total_capital=1000,
+            capital_deployed=0, expected_total_reward=0,
+            kill_switch=False, kill_reason="",
+            sources_used={"api": 0, "cumulative": 0, "cold_start": 0},
+        )
+    allocator.compute = captured_compute
+
+    out_path = tempfile.mktemp(suffix=".json")
+    # Patch wallet probe + freeze allocator's clock to match the seeded cooldown
+    with patch.object(so, "get_live_wallet_usd", return_value=1000.0):
+        # Make the policy's "now" align with the test clock by patching
+        # the tracker's _now via the allocator hand-off. Easiest: also
+        # patch time.time module-wide.
+        with patch("decision_policy.time.time", return_value=now):
+            with patch("market_roi_tracker.time.time", return_value=now):
+                so.run_once(allocator, db, out_path, signer_key="k", api_creds=None)
+
+    assert len(captured_excluded) == 1, "allocator.compute should be called once"
+    assert "0xCOOLED" in captured_excluded[0], (
+        f"expected 0xCOOLED in excluded_cids, got {captured_excluded[0]}"
+    )
+
+    os.unlink(out_path)
+    os.unlink(db)
+
+
 def test_O11_run_once_no_capital_on_wallet_fetch_failure():
     """O11: if live wallet fetch raises, return no_capital and DO NOT overwrite alloc.
 
