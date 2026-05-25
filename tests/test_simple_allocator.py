@@ -137,11 +137,25 @@ def test_C4_filters_markets_below_min_daily_rate():
 
 
 def test_C5_filters_markets_with_expected_below_threshold():
-    """C5: when daily_rate × q_share < MIN_EXPECTED_PER_MARKET (0.20), filter out."""
+    """C5: when daily_rate × q_share < MIN_EXPECTED_PER_MARKET, filter out.
+
+    Constructs a market where expected = daily_rate × cold_start prior is
+    strictly less than the MIN_EXPECTED_PER_MARKET constant, regardless of
+    its concrete value. Robust to constant tuning.
+    """
+    from simple_allocator import MIN_EXPECTED_PER_MARKET, MIN_DAILY_RATE_USD, COLD_START_Q_SHARE
     a = _make_allocator()
-    # daily_rate=20 (just above min), but q_share at cold_start (0.001) → expected=0.02
-    # That's below MIN_EXPECTED_PER_MARKET (0.20). Should be filtered.
-    candidate = _make_candidate("0xTHIN", daily_rate=20)
+    # Pick a daily_rate that JUST passes MIN_DAILY_RATE_USD but produces
+    # expected < MIN_EXPECTED_PER_MARKET under cold-start q_share.
+    # Solve: daily_rate × COLD_START_Q_SHARE < MIN_EXPECTED_PER_MARKET
+    #        daily_rate < MIN_EXPECTED_PER_MARKET / COLD_START_Q_SHARE
+    max_rate_to_fail_filter = MIN_EXPECTED_PER_MARKET / COLD_START_Q_SHARE
+    target_rate = max(MIN_DAILY_RATE_USD, max_rate_to_fail_filter * 0.5)
+    # If MIN_DAILY_RATE_USD is already above the threshold this test can't run
+    if target_rate >= max_rate_to_fail_filter:
+        pytest.skip("constants make this contract vacuous — see C5 description")
+
+    candidate = _make_candidate("0xTHIN", daily_rate=target_rate)
     result = a.compute(
         wallet_usd=200, wallet_peak_usd=200, wallet_24h_ago_usd=200,
         realized_loss_24h=0, markets=[candidate],

@@ -41,15 +41,25 @@ import requests
 log = logging.getLogger("simple_allocator")
 
 
-# ── Configuration (hot-reloadable via config_overrides.json if integrated) ──
+# ── Configuration (tuned against $1.2k wallet, real Polymarket q_share) ──
+#
+# Aggregate strategy: Polymarket's $1/day threshold is per-USER not per-market.
+# We deploy on many markets at modest expected reward each, summing to clear
+# the threshold. Per-market filter set deliberately low.
+#
+# Calibrated from agent-4's competitive analysis:
+#   - Bot historical median q_share: ~0.074%
+#   - At $1.2k wallet with larger orders, expected ~0.3-1.0% (model-projected)
+#   - $1.2k × DEPLOY_RATIO = $1140 budget
+#   - 20 markets × $60 cap = $1200 max utilization
 
-MIN_DAILY_RATE_USD = 20.0          # filter markets below this daily reward rate
-MIN_EXPECTED_PER_MARKET = 0.20     # filter markets where expected_reward < $0.20/day
+MIN_DAILY_RATE_USD = 10.0          # market floor — below this not worth a slot
+MIN_EXPECTED_PER_MARKET = 0.01     # 1¢/day floor — aggregate-strategy permissive
 MAX_DEPLOYED_MARKETS = 20          # hard cap on simultaneous deploys
-MAX_PER_MARKET_USD = 30.0          # per-market exposure cap
-MIN_PER_MARKET_USD = 10.0          # minimum per-market notional
+MAX_PER_MARKET_USD = 60.0          # per-market exposure cap (~5% of $1.2k wallet)
+MIN_PER_MARKET_USD = 10.0          # minimum per-market notional (venue min_size dependent)
 DEPLOY_RATIO = 0.95                # fraction of wallet deployable
-COLD_START_Q_SHARE = 0.001         # 0.1% conservative prior for unseen markets
+COLD_START_Q_SHARE = 0.005         # 0.5% prior — matches bot historical median band
 
 # Kill switch thresholds — these replace SafetyController's 14 invariants
 KILL_LOSS_FRAC = 0.10              # halt on 24h realized loss > 10% of wallet
