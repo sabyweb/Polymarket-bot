@@ -505,6 +505,17 @@ class BotDatabase:
             ("fills", "order_age_secs", "REAL NOT NULL DEFAULT 0"),
             ("fills", "position_usd_after", "REAL NOT NULL DEFAULT 0"),
             ("fills", "reward_rate_hr", "REAL NOT NULL DEFAULT 0"),
+            # FX-054: fill provenance + idempotency. order_id is the CLOB
+            # order that produced this fill (empty for reconcile-after-
+            # unknown / drift-sweep fills where no specific order is known).
+            # fill_event_id is a caller-supplied dedup key — same value
+            # across retries of the same logical fill so INSERT OR IGNORE
+            # collapses them into one row. Empty string means "no dedup"
+            # (legacy callers + tests that don't care). The unique partial
+            # index below enforces dedup only on non-empty values so
+            # multiple legacy '' rows stay legal.
+            ("fills", "order_id", "TEXT NOT NULL DEFAULT ''"),
+            ("fills", "fill_event_id", "TEXT NOT NULL DEFAULT ''"),
             # unwinds: hold duration, fill type, reward earned during hold
             ("unwinds", "hold_duration_secs", "REAL NOT NULL DEFAULT 0"),
             ("unwinds", "unwind_type", "TEXT NOT NULL DEFAULT ''"),
@@ -533,6 +544,17 @@ class BotDatabase:
             except Exception as e:
                 log.warning(f"Migration {table}.{col}: {e}")
 
+        # FX-054: partial unique index on fill_event_id. Enforces idempotency
+        # ONLY for non-empty event ids so legacy '' rows and tests that
+        # don't supply an event id remain insertable.
+        try:
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_fills_event_id "
+                "ON fills(fill_event_id) WHERE fill_event_id != ''"
+            )
+        except Exception as e:
+            log.warning(f"Migration fills idx_fills_event_id: {e}")
+
     # ── Logging Methods ───────────────────────────────────────────────────────
 
     def log_fill(
@@ -542,24 +564,63 @@ class BotDatabase:
         midpoint: float = 0.0, slippage: float = 0.0,
         order_age_secs: float = 0.0, position_usd_after: float = 0.0,
         reward_rate_hr: float = 0.0,
-    ) -> None:
-        """Record a BUY fill with context for iteration analysis."""
+        order_id: str = "",
+        fill_event_id: str = "",
+    ) -> bool:
+        """Record a BUY fill with context for iteration analysis.
+
+        FX-054: idempotent + truthful return value.
+          • Pass a non-empty ``fill_event_id`` to dedup retries. INSERT OR
+            IGNORE relies on the partial unique index `idx_fills_event_id`
+            (`fill_event_id != ''`). Repeated calls with the same id
+            return ``False`` (collision = no-op) on the second+ try.
+          • Pass an empty ``fill_event_id`` (default) to keep pre-FX-054
+            append-only semantics — used by tests + legacy migration data.
+          • Exceptions are no longer swallowed at debug. Any error from
+            the DB layer surfaces as ``log.warning`` AND returns ``False``
+            so the caller can react (re-queue, alert, kill switch). The
+            pre-FX-054 behaviour silently dropped fills on lock
+            contention / schema mismatch / disk pressure with no signal
+            other than `[FILL_WRITE] succeeded` lying.
+
+        Returns:
+            True on successful INSERT (one row added).
+            False on idempotent collision OR DB error.
+            Callers that distinguish "collision (safe)" from "error
+            (unsafe)" should check the DB row count themselves.
+        """
+        # FX-054: defensive coercion of None → '' for the NOT NULL TEXT
+        # columns. INSERT OR IGNORE silently swallows ALL constraint
+        # violations (including NOT NULL), so a None value here would
+        # disappear with no signal — exactly the silent-failure surface
+        # this fix is designed to close. Caller bugs (e.g., drift sweep
+        # passing slot.order_id when slot.order_id was cleared upstream)
+        # are surfaced as empty-string rows in the DB rather than missing
+        # rows.
+        order_id = order_id if order_id is not None else ""
+        fill_event_id = fill_event_id if fill_event_id is not None else ""
         try:
             conn = self._get_conn()
-            conn.execute(
-                "INSERT INTO fills (ts, condition_id, question, side, "
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO fills (ts, condition_id, question, side, "
                 "fill_type, shares, price, clob_cost, usd_value, "
                 "midpoint, slippage, order_age_secs, position_usd_after, "
-                "reward_rate_hr) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "reward_rate_hr, order_id, fill_event_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (time.time(), condition_id, question, side,
                  fill_type, shares, price, clob_cost, usd_value,
                  midpoint, slippage, order_age_secs, position_usd_after,
-                 reward_rate_hr),
+                 reward_rate_hr, order_id, fill_event_id),
             )
             conn.commit()
+            return cur.rowcount > 0
         except Exception as e:
-            log.debug(f"DB log_fill error: {e}")
+            log.warning(
+                f"[FILL_WRITE] DB log_fill error: cid={condition_id[:12]} "
+                f"side={side} shares={shares:.2f} event_id={fill_event_id[:32]} "
+                f"err={type(e).__name__}: {e}"
+            )
+            return False
 
     def log_unwind(
         self, condition_id: str, question: str, side: str,

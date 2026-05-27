@@ -19,6 +19,24 @@ def BATCH_SIZE(): return cfg("RF_BATCH_SIZE")
 def TARGET_QUEUE_AHEAD_USD(): return cfg("RF_TARGET_QUEUE_AHEAD_USD")
 def DUMP_DEPTH_SAFETY_FACTOR(): return cfg("RF_DUMP_DEPTH_SAFETY_FACTOR")
 
+# FX-054 constants
+#
+# On Polygon the SDK reports `size_matched > 0` BEFORE the CTF transfer
+# block confirms. The phantom-check's on-chain balance probe runs
+# immediately, so during fast bursts it can read stale 0-balance and
+# zero a legitimate fill. The lag tolerance lets the phantom check
+# stay fail-OPEN for the first window after `slot.placed_at` —
+# beyond that the FX-037 phantom defence resumes.
+FILL_BALANCE_LAG_TOLERANCE_SEC = 60.0
+
+# Drift-sweep dedup bucket. The post-detect catch-up sweep keys its
+# `fill_event_id` on `(cid, side, int(now / DRIFT_DEDUP_BUCKET_SEC))`
+# so repeated drift detections in the same bucket collapse to one row.
+# 5 min × 30 s farmer cycle = ~10 consecutive cycles share the same key
+# — wide enough to cover any single fill that lingers across cycles
+# without losing distinct fills that arrive in different buckets.
+DRIFT_DEDUP_BUCKET_SEC = 300.0
+
 
 def _queue_aware_edge(
     side: str,
@@ -241,8 +259,111 @@ class OrderLifecycle:
             log.warning(f"Cancel FAILED {order_id[:16]} ({reason}): {e}")
             return False
 
+    def _reconcile_balance_drift(self, ms: MarketState, side: str) -> bool:
+        """FX-054 drift catch-up sweep.
+
+        Compares on-chain CTF balance against the position-store's tracked
+        shares. If the bot's tracked count is short by ≥ 1 share, records
+        a synthetic catch-up fill so the ``fills`` table stays consistent
+        with reality, even when the primary detect-fills path lost a fill
+        (silent DB error, swallowed phantom, cycle-skip during network
+        timeout, fill arriving while we were processing dump-side fills).
+
+        Idempotency: ``fill_event_id`` is bucketed on
+        ``(cid, side, int(now / DRIFT_DEDUP_BUCKET_SEC))`` so multiple
+        drift detections inside a 5-min bucket collapse to one row via
+        the partial unique index. A fresh fill in the next bucket gets
+        a new key and a new row.
+
+        Returns True if a catch-up row was written, False otherwise (no
+        drift, RPC failure, or duplicate within bucket).
+        """
+        try:
+            from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
+            tid = ms.yes_tid if side == "yes" else ms.no_tid
+            bal = self.client.get_balance_allowance(
+                BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=tid)
+            )
+            on_chain = float(bal.get("balance", 0)) / 1e6
+        except Exception as e:
+            log.debug(
+                f"[RECONCILE_DRIFT] cid={ms.cid[:12]} side={side} "
+                f"step=balance_probe_failed err={type(e).__name__}: {e}"
+            )
+            return False
+
+        tracked = self.positions.get_shares(ms.cid, side)
+        drift = on_chain - tracked
+        if drift < 1.0:
+            return False
+
+        # Drift detected — the bot has at least 1 share more on-chain than
+        # in its position store. Almost certainly a fill the primary path
+        # missed; catch it up.
+        now = time.time()
+        bucket = int(now / DRIFT_DEDUP_BUCKET_SEC)
+        event_id = f"drift:{ms.cid}:{side}:{bucket}"
+        log.warning(
+            f"[RECONCILE_DRIFT] cid={ms.cid[:12]} side={side} "
+            f"on_chain={on_chain:.2f} tracked={tracked:.2f} drift={drift:.2f} "
+            f"step=catching_up event_id={event_id[:48]}"
+        )
+        # Use the current slot's price if available, otherwise the market's
+        # midpoint as a best-effort proxy. The catch-up fill records what
+        # the bot just discovered; price accuracy on the catch-up row is
+        # secondary to the row existing at all.
+        slot = ms.orders.get(side)
+        if slot and slot.price > 0:
+            fill_price = slot.price
+        elif ms.midpoint > 0:
+            fill_price = ms.midpoint
+        else:
+            fill_price = 0.5  # last-resort placeholder
+        # Synthesize a slot for handle_fill's signature requirements.
+        # placed_at = now so the order_age log enrichment doesn't underflow.
+        synthetic_slot = slot if slot else OrderSlot(
+            order_id="", price=fill_price, shares=int(drift), placed_at=now,
+        )
+        # FX-054: slot.order_id is typically None here — the primary path
+        # cleared it after deciding phantom_zeroed (the case this sweep
+        # rescues). Coalesce to '' so we don't pass None into the
+        # ``fills.order_id`` TEXT NOT NULL column (INSERT OR IGNORE
+        # would silently drop the row on constraint violation).
+        oid = (slot.order_id if slot and slot.order_id else "")
+        self.handle_fill(
+            ms, side, synthetic_slot,
+            actual_shares=drift, actual_price=fill_price,
+            fill_type="FULL",
+            order_id=oid,
+            fill_event_id=event_id,
+        )
+        return True
+
     def detect_fills(self, open_ids: set):
-        """Step 3: Detect BUY order fills from exchange state."""
+        """Step 3: Detect BUY order fills from exchange state.
+
+        FX-054: at the end of the per-market loop, for any market that
+        had a fill processed THIS cycle (or whose slot was JUST cleared
+        by the loop), runs a drift-catchup sweep. This is the third line
+        of defence against missed fills — orthogonal to the primary
+        SDK-status path (root cause B: phantom-check zero) and the
+        UNKNOWN-retry path (root cause from network timeouts during
+        bursts). Together with the idempotent ``log_fill`` writes
+        (root cause A: silent DB failures), invariant
+        ``fills_count >= on_chain_BUY_count`` holds across all three
+        attack surfaces.
+        """
+        # Track markets where an order disappeared this cycle so the
+        # end-of-cycle drift sweep knows what to probe. Subtracted from
+        # this is `primary_handled` — pairs where the primary path
+        # already called handle_fill (positions store has been updated;
+        # drift sweep would double-count). The drift sweep therefore
+        # only fires on (cid, side) pairs whose order disappeared
+        # without a primary handle_fill — i.e., phantom_zeroed branch
+        # AND UNKNOWN-with-no-surplus branch — exactly the gap classes
+        # FX-054 is designed to close.
+        cids_processed: set[tuple[str, str]] = set()
+        primary_handled: set[tuple[str, str]] = set()
         for cid, ms in list(self.markets.items()):
             for side in ["yes", "no"]:
                 slot = ms.orders[side]
@@ -254,9 +375,17 @@ class OrderLifecycle:
                     continue
 
                 if slot.order_id not in open_ids:
+                    # FX-054: any time the order disappears from the
+                    # exchange's open-list, mark this (cid, side) for the
+                    # end-of-cycle drift sweep — regardless of which
+                    # detection branch we end up in. This catches the
+                    # case where the SDK path silently dropped the fill
+                    # (root causes A or B) or returned UNKNOWN without
+                    # the unknown_count threshold tripping yet.
+                    cids_processed.add((cid, side))
                     # FX-054 instrumentation: trace every fill-detection branch
                     # so we can diagnose why 8 of 9 fills went missing from the
-                    # DB on 2026-05-25. Observability only — no control flow change.
+                    # DB on 2026-05-25.
                     log.info(
                         f"[FILL_DETECT_TRACE] cid={cid[:12]} side={side} "
                         f"order_id={slot.order_id[:16]} step=missing_from_open_ids"
@@ -292,9 +421,12 @@ class OrderLifecycle:
                         # dump_manager.py:60-87) on the BUY side. Symmetric
                         # defense — fail-open on probe error preserves SDK
                         # value so legitimate fills aren't lost to network
-                        # blips.
+                        # blips. FX-054: now passes ``slot`` so the phantom
+                        # check can apply balance-lag tolerance for orders
+                        # placed within the last 60s (avoids zeroing legit
+                        # fills before the CTF transfer confirms).
                         pre_phantom_matched = matched
-                        matched = self._check_buy_phantom_fill(ms, side, matched)
+                        matched = self._check_buy_phantom_fill(ms, side, matched, slot=slot)
                         if matched != pre_phantom_matched:
                             log.info(
                                 f"[FILL_DETECT_TRACE] cid={cid[:12]} side={side} "
@@ -318,11 +450,23 @@ class OrderLifecycle:
                                 f"PARTIAL fill {side.upper()} {matched:.0f}/{slot.shares:.0f}sh "
                                 f"(order {order_status}) | {ms.question[:30]}"
                             )
+                        # FX-054: dedup key derives from order_id + matched
+                        # quantity so re-detection of the same logical fill
+                        # is collapsed by the DB partial unique index, but a
+                        # subsequent partial-fill increment on the same order
+                        # writes a distinct row.
+                        event_id = f"sdk:{slot.order_id}:{int(matched)}"
                         self.handle_fill(
                             ms, side, slot,
                             actual_shares=matched, actual_price=actual_price,
                             fill_type=fill_type,
+                            order_id=slot.order_id,
+                            fill_event_id=event_id,
                         )
+                        # FX-054: primary path took it — drift sweep skipped
+                        # for this (cid, side) to avoid double-counting against
+                        # the now-updated positions store.
+                        primary_handled.add((cid, side))
                         log.info(
                             f"[FILL_DETECT_TRACE] cid={cid[:12]} side={side} "
                             f"step=fill_recorded shares={matched:.2f} "
@@ -349,7 +493,10 @@ class OrderLifecycle:
                         if ms.unknown_count[side] >= cfg("RF_UNKNOWN_RETRY_THRESHOLD"):
                             log.warning(f"BUY order stuck UNKNOWN {cfg('RF_UNKNOWN_RETRY_THRESHOLD')}x, clearing | {ms.question[:30]}")
                             # Reconcile: check exchange balance to detect silent fills
-                            self._reconcile_after_unknown(ms, side, slot)
+                            if self._reconcile_after_unknown(ms, side, slot):
+                                # FX-054: surplus found → handle_fill called →
+                                # mark primary-handled so drift sweep skips it.
+                                primary_handled.add((cid, side))
                             self.db.delete_active_order(slot.order_id)
                             slot.order_id = None
                             ms.unknown_count[side] = 0
@@ -370,9 +517,36 @@ class OrderLifecycle:
                     # untracked and the slot stays occupied at a stale price.
                     self._check_stale_order(ms, side, slot)
 
+        # FX-054 drift catch-up sweep. Targeted at the (cid, side) pairs
+        # whose order disappeared this cycle BUT didn't go through the
+        # primary handle_fill path — i.e., phantom_zeroed and
+        # UNKNOWN-with-no-surplus. For each, compare on-chain CTF
+        # balance against tracked shares; if on-chain leads tracked by
+        # ≥ 1 share, the bot missed a fill and we write a catch-up row
+        # with a 5-minute-bucketed event_id (partial unique index
+        # collapses repeated detections).
+        #
+        # Bounded API cost: 1 RPC per missed-detection observation per
+        # cycle, never per market. In production at <1 fill/day target
+        # rate this is typically 0 RPC/cycle on healthy operation; only
+        # fires when the primary path silently failed.
+        for cid, side in cids_processed - primary_handled:
+            ms = self.markets.get(cid)
+            if ms is None:
+                continue
+            try:
+                self._reconcile_balance_drift(ms, side)
+            except Exception as e:
+                log.warning(
+                    f"[RECONCILE_DRIFT] cid={cid[:12]} side={side} "
+                    f"step=sweep_exception err={type(e).__name__}: {e}"
+                )
+
     def handle_fill(self, ms: MarketState, side: str, slot: OrderSlot,
                     actual_shares: float = 0, actual_price: float = 0.0,
-                    fill_type: str = "FULL"):
+                    fill_type: str = "FULL",
+                    order_id: str = "",
+                    fill_event_id: str = ""):
         """Process a detected fill: record, then merge or dump.
 
         FX-039: ``fill_type`` is threaded through from the caller (detect_fills
@@ -380,6 +554,19 @@ class OrderLifecycle:
         the correct PARTIAL/FULL label. Defaults to "FULL" for the
         _reconcile_after_unknown caller which has no SDK-reported matched
         size to distinguish.
+
+        FX-054: ``order_id`` + ``fill_event_id`` flow through to
+        ``db.log_fill`` for idempotent persistence. Callers should supply
+        a stable ``fill_event_id`` per logical fill so retries (network
+        timeout retry, drift-sweep catch-up) collapse to one row via
+        the partial unique index. Missing event_id (legacy callers /
+        tests) keeps append-only semantics.
+
+        Now also checks the DB write result and emits an honest
+        ``[FILL_WRITE]`` log line: ``succeeded`` only on actual insert,
+        ``duplicate`` on idempotent collision, ``FAILED`` on error. The
+        old behaviour logged ``succeeded`` unconditionally — masking the
+        DB exception path that swallowed errors at debug level.
         """
         from alerts import alert_fill
         from dump_manager import DumpManager
@@ -408,15 +595,18 @@ class OrderLifecycle:
             _pos_usd = _yes_cost + _no_cost
         except Exception:
             pass
-        # FX-054 instrumentation: bracket the DB write so we can spot crashes /
-        # exceptions that orphan a fill (logged → not written, or written →
-        # not logged). [FILL_WRITE] attempting must always be followed by
-        # [FILL_WRITE] succeeded; an orphaned `attempting` is the smoking gun.
+        # FX-054 instrumentation + idempotency check.
+        # [FILL_WRITE] attempting must always be followed by EXACTLY ONE of
+        # [FILL_WRITE] succeeded / duplicate / FAILED. The smoking gun for
+        # the 2026-05-25 incident would have been many `attempting` rows
+        # followed by FAILED — invisible in the pre-FX-054 code because
+        # log_fill swallowed exceptions at debug level + always logged
+        # `succeeded`.
         log.info(
             f"[FILL_WRITE] cid={cid[:12]} side={side} shares={filled_shares:.2f} "
-            f"price={fill_price:.4f} step=attempting"
+            f"price={fill_price:.4f} step=attempting event_id={fill_event_id[:32]}"
         )
-        self.db.log_fill(
+        inserted = self.db.log_fill(
             condition_id=cid, question=ms.question,
             side=side, fill_type=fill_type,
             shares=filled_shares, price=fill_price,
@@ -426,11 +616,44 @@ class OrderLifecycle:
             order_age_secs=_order_age,
             position_usd_after=_pos_usd,
             reward_rate_hr=ms.daily_rate / 24.0 if ms.daily_rate > 0 else 0,
+            order_id=order_id,
+            fill_event_id=fill_event_id,
         )
-        log.info(
-            f"[FILL_WRITE] cid={cid[:12]} side={side} shares={filled_shares:.2f} "
-            f"step=succeeded"
-        )
+        if inserted:
+            log.info(
+                f"[FILL_WRITE] cid={cid[:12]} side={side} shares={filled_shares:.2f} "
+                f"step=succeeded"
+            )
+        elif fill_event_id:
+            # FX-054: distinguish idempotent collision (safe, expected on
+            # retry) from genuine DB error. We can tell by re-querying for
+            # the event id; presence ⇒ duplicate, absence ⇒ error.
+            try:
+                row = self.db._get_conn().execute(  # noqa: SLF001
+                    "SELECT 1 FROM fills WHERE fill_event_id = ? LIMIT 1",
+                    (fill_event_id,),
+                ).fetchone()
+            except Exception:
+                row = None
+            if row:
+                log.info(
+                    f"[FILL_WRITE] cid={cid[:12]} side={side} shares={filled_shares:.2f} "
+                    f"step=duplicate event_id={fill_event_id[:32]}"
+                )
+            else:
+                log.error(
+                    f"[FILL_WRITE] cid={cid[:12]} side={side} shares={filled_shares:.2f} "
+                    f"step=FAILED event_id={fill_event_id[:32]} "
+                    f"(log_fill returned False AND row absent — DB write actually failed)"
+                )
+        else:
+            # No event_id supplied (legacy caller). Can't disambiguate
+            # collision vs error; surface as FAILED because the legacy
+            # append-only contract treats False as "did not insert".
+            log.error(
+                f"[FILL_WRITE] cid={cid[:12]} side={side} shares={filled_shares:.2f} "
+                f"step=FAILED (no event_id; log_fill returned False)"
+            )
 
         # FX-039 follow-up: alerts.py's PARTIAL branch formats remaining_shares
         # unconditionally and crashes on None. Pre-FX-039 the hardcoded
@@ -852,27 +1075,37 @@ class OrderLifecycle:
             return False, "fill_rate_breaker"
         return True, ""
 
-    def _check_buy_phantom_fill(self, ms: MarketState, side: str, matched: float) -> float:
+    def _check_buy_phantom_fill(
+        self, ms: MarketState, side: str, matched: float,
+        slot: OrderSlot | None = None,
+    ) -> float:
         """FX-037: BUY-side phantom-fill defense.
 
         After the SDK reports a BUY fill, verify the on-chain CTF balance
         actually increased by the expected amount. The V2 SDK has been
         observed (2026-05-19, Iran NO) to over-report ``size_matched`` for
-        orders that only partially delivered on-chain. Trusting the SDK
-        value writes an inflated row to the ``fills`` table which biases
-        SafetyController I7 hourly_loss and can trigger the kill switch on
-        phantom damage.
+        orders that only partially delivered on-chain.
+
+        FX-054: balance-lag tolerance. On Polygon, CTF transfers confirm
+        ~2–5s after the SDK reports a match (sometimes longer when the bot's
+        RPC endpoint serves stale state). The pre-FX-054 phantom check
+        zeroed legitimate fills during this window — strongly suspected as
+        one root cause of the 2026-05-25 8-of-9-lost-fills incident.
+        When ``slot`` is provided and the order is younger than
+        ``FILL_BALANCE_LAG_TOLERANCE_SEC`` from ``placed_at``, treat
+        ``on_chain_delta=0`` as "balance hasn't confirmed yet" and fail
+        OPEN (return SDK matched). Past the tolerance window, the FX-037
+        defence resumes — a true phantom won't update the balance even
+        after 60s.
 
         Returns the corrected fill quantity (≤ ``matched``). On API failure
         we fail OPEN with a warning — preserving the SDK value avoids
-        losing legitimate fills during transient network issues. Worst case
-        on fail-open: we record a phantom; orphan-scan + reconciliation
-        will surface the discrepancy next cycle. Worst case if we fail-
-        closed: a real fill is dropped and the position diverges silently
-        — strictly worse.
+        losing legitimate fills during transient network issues.
 
         Symmetric with ``DumpManager.check_dump_fills`` lines 60-87
-        (SELL-side phantom defense shipped in v5.1.9 / FX-007).
+        (SELL-side phantom defense shipped in v5.1.9 / FX-007). The slot
+        parameter is keyword-defaulted to ``None`` so pre-FX-054 callers
+        (e.g., the stale-order path before refactor) keep working.
         """
         if matched <= 0:
             return matched
@@ -886,6 +1119,20 @@ class OrderLifecycle:
             pre_fill_tracked = self.positions.get_shares(ms.cid, side)
             actual_delta = max(0.0, on_chain - pre_fill_tracked)
             if actual_delta < matched - 0.5:
+                # FX-054: balance-lag window check before declaring phantom.
+                elapsed = (
+                    time.time() - slot.placed_at
+                    if slot is not None and slot.placed_at > 0 else 1e9
+                )
+                if actual_delta == 0 and elapsed < FILL_BALANCE_LAG_TOLERANCE_SEC:
+                    log.warning(
+                        f"[FILL_DETECT_TRACE] cid={ms.cid[:12]} side={side} "
+                        f"step=phantom_lag_tolerated matched={matched:.0f} "
+                        f"on_chain_delta=0 elapsed={elapsed:.0f}s<"
+                        f"{FILL_BALANCE_LAG_TOLERANCE_SEC:.0f}s "
+                        f"(CTF transfer likely still confirming, trusting SDK)"
+                    )
+                    return matched
                 log.critical(
                     f"PHANTOM FILL: SDK size_matched={matched:.0f}sh but on-chain "
                     f"delta only {actual_delta:.0f}sh (pre_tracked={pre_fill_tracked:.0f}, "
@@ -900,12 +1147,17 @@ class OrderLifecycle:
             )
             return matched
 
-    def _reconcile_after_unknown(self, ms: MarketState, side: str, slot: OrderSlot):
+    def _reconcile_after_unknown(self, ms: MarketState, side: str, slot: OrderSlot) -> bool:
         """Check exchange balance when clearing an UNKNOWN order.
 
         If the order silently filled, the exchange will have more shares than
         we're tracking. Detect this and record the fill so position tracking
         stays in sync.
+
+        FX-054: returns True iff handle_fill was called (surplus >= 1.0 sh).
+        Caller uses this to mark (cid, side) as primary-handled so the
+        end-of-cycle drift sweep skips the redundant catch-up. False
+        means the bot either found no surplus OR the RPC failed.
         """
         try:
             from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
@@ -921,11 +1173,24 @@ class OrderLifecycle:
                     f"UNKNOWN reconcile: exchange has {actual:.0f} but tracking {tracked:.0f} "
                     f"({surplus:.0f} surplus) — recording as fill | {ms.question[:30]}"
                 )
-                self.handle_fill(ms, side, slot, actual_shares=surplus, actual_price=slot.price)
+                # FX-054: stamp a stable event_id keyed on
+                # (cid, side, order_id) so retries of the same UNKNOWN
+                # path collapse to one row via the partial unique index.
+                # order_id may still be non-empty here even though the
+                # SDK was unreachable — slot.order_id stays set until
+                # the caller clears it after this method returns.
+                ev = f"reconcile_unknown:{slot.order_id or ms.cid}:{side}"
+                self.handle_fill(
+                    ms, side, slot,
+                    actual_shares=surplus, actual_price=slot.price,
+                    order_id=slot.order_id, fill_event_id=ev,
+                )
+                return True
             else:
                 log.info(f"UNKNOWN reconcile: no surplus (exchange={actual:.0f} tracked={tracked:.0f}) | {ms.question[:30]}")
         except Exception as e:
             log.warning(f"UNKNOWN reconcile balance check failed {side} {ms.question[:25]}: {e}")
+        return False
 
     def _check_stale_order(self, ms: MarketState, side: str, slot: OrderSlot):
         """Force-check an order still in open_ids for partial fills.
@@ -977,10 +1242,17 @@ class OrderLifecycle:
             self.db.delete_active_order(slot.order_id)
 
             # Record the fill
+            # FX-054: stale-check path uses an event_id keyed on the order
+            # and the matched quantity, identical shape to the SDK-detect
+            # path. If a fill is observed by BOTH paths (rare; could happen
+            # if a partial fill grows between cycles) only the first
+            # write succeeds — the second collapses to `step=duplicate`.
+            ev = f"stale:{slot.order_id}:{int(matched)}"
             self.handle_fill(
                 ms, side, slot,
                 actual_shares=matched, actual_price=actual_price,
                 fill_type=fill_type,
+                order_id=slot.order_id, fill_event_id=ev,
             )
             ms.unknown_count[side] = 0
             slot.order_id = None

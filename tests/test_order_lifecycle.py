@@ -544,13 +544,27 @@ class TestDetectFillsPhantomIntegration(unittest.TestCase):
     """FX-037: end-to-end integration — detect_fills must apply the phantom
     check before invoking handle_fill, and route a zeroed result through
     the clean-slot path without recording a fill.
+
+    FX-054 note: ``slot.placed_at`` is set 120s in the past so the new
+    balance-lag tolerance window (60s default) does NOT trip and the
+    phantom check fires the original FX-037 way. Separate audit tests
+    in tests/test_audit_fill_detection.py cover the new lag-tolerance
+    branch.
+
+    FX-054 note 2: ``positions.get_shares`` is wired to bump after
+    ``record_fill`` is called so the end-of-cycle drift sweep sees a
+    consistent tracked-vs-on-chain pair and doesn't double-count.
+    Without the wiring the mock returns 0 forever, drift sweep would
+    see on_chain > tracked and emit a redundant catch-up call.
     """
 
     def setUp(self):
         self.ms = _make_ms(cid="cid_int", yes_tid="ytid", no_tid="ntid")
-        # Pre-populate a known NO BUY slot we'll claim "filled"
+        # FX-054: placed_at well outside the 60s balance-lag tolerance so the
+        # phantom check fires per FX-037 contract.
         self.ms.orders["no"] = OrderSlot(
-            order_id="OID_PHANTOM_001", price=0.53, shares=158, placed_at=time.time()
+            order_id="OID_PHANTOM_001", price=0.53, shares=158,
+            placed_at=time.time() - 120,
         )
         self.ol = _make_lifecycle(ms=self.ms)
         self.ol.positions.get_shares = MagicMock(return_value=0)
@@ -562,9 +576,15 @@ class TestDetectFillsPhantomIntegration(unittest.TestCase):
         self.ol.client.get_balance_allowance = MagicMock(
             return_value={"balance": str(int(38 * 1e6))}
         )
-        # Replace handle_fill with a recording mock so we can assert what
-        # quantity actually reached the DB-writing path.
-        self.ol.handle_fill = MagicMock()
+
+        # Replace handle_fill with a recording mock that ALSO bumps the
+        # positions mock — so the drift sweep sees on_chain == tracked
+        # post-primary and doesn't double-count.
+        def _record_and_track(*args, **kwargs):
+            shares = kwargs.get("actual_shares", 0)
+            current = self.ol.positions.get_shares.return_value
+            self.ol.positions.get_shares.return_value = current + shares
+        self.ol.handle_fill = MagicMock(side_effect=_record_and_track)
 
     def test_detect_fills_records_on_chain_truth_not_sdk_inflation(self):
         """The 2026-05-19 Iran NO regression: SDK says 158, chain says 38.
@@ -581,7 +601,10 @@ class TestDetectFillsPhantomIntegration(unittest.TestCase):
                          "FX-037: recorded fill must reflect on-chain delta, not SDK report")
 
     def test_detect_fills_skips_record_on_full_phantom(self):
-        """If on-chain delta is 0, no fill is recorded. Slot still cleared."""
+        """If on-chain delta is 0 (and the order is older than the FX-054
+        60s balance-lag tolerance), no fill is recorded. Slot still cleared.
+        The drift sweep also reads on_chain=0, so no catch-up either.
+        """
         # On-chain delta = 0 (full phantom)
         self.ol.client.get_balance_allowance.return_value = {"balance": "0"}
         self.ol.detect_fills(open_ids=set())
