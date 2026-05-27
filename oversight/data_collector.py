@@ -18,6 +18,22 @@ log = logging.getLogger("oversight.collector")
 
 _REWARD_MARKETS_CACHE_TTL = 2 * 3600  # 2h — stale cache is better than no data
 
+# FX-045: windowed presence-gate thresholds. The presence gate fires when
+# we have ≥ MIN_SAMPLES windowed scoring observations AND the scoring_ratio
+# (fraction of cycles our orders were in-zone) is below GATE. In that case
+# q_share is forced to 0 regardless of cumulative history — we are
+# confidently NOT earning on this market right now, so cumulative is stale.
+#
+# Tuning rationale:
+#   GATE=0.10  — below 10% in-zone presence over the 4h window is "rarely
+#                scoring". Healthy markets sit at 1.0 (always scoring) so
+#                the gate is generous; only fires on real degradation.
+#   MIN_SAMPLES=3 — same gate the pre-FX-045 Priority-1-as-magnitude path
+#                used. Below 3 samples the windowed signal is too noisy
+#                to trust either as magnitude OR as gate.
+RF_WINDOWED_PRESENCE_GATE = 0.10
+RF_WINDOWED_PRESENCE_MIN_SAMPLES = 3
+
 
 def _connect_db(db_path: str, timeout: int = 10) -> sqlite3.Connection:
     """Open a SQLite connection with WAL mode and retry on lock.
@@ -908,12 +924,13 @@ def query_reward_stats(db_path: str) -> dict[str, dict]:
         if rows is None:
             return {}
         result = {}
-        windowed_used = 0
+        windowed_used = 0  # FX-045: kept for log-line compat; always 0 post-fix
         cumulative_capped = 0
         stale_decayed = 0
         stale_excluded = 0
         prior_used = 0
         poisoned_skipped = 0
+        presence_gated = 0  # FX-045: count of markets forced to q_share=0 by windowed gate
         for r in rows:
             d = json.loads(r["data"])
             cid = d["condition_id"]
@@ -954,23 +971,43 @@ def query_reward_stats(db_path: str) -> dict[str, dict]:
                 q_share = 0.0
                 stale_decayed += 1
             else:
-                # Priority 1: windowed scoring data from Phase 0
+                # FX-045: Priority 1 demoted from MAGNITUDE estimator to
+                # PRESENCE gate. The pre-FX-045 formula `min(ratio × 0.5, 0.5)`
+                # mapped "fraction of cycles we were in-zone" onto
+                # "fraction of reward pool we'll get" — two unrelated
+                # quantities. For a well-positioned bot scoring 100% of
+                # the time, scoring_ratio=1.0 → q_share=0.5 (the max),
+                # regardless of total queue depth. Live probe 2026-05-23
+                # confirmed 1500× over-estimate vs the cumulative ratio
+                # measurement. The over-estimate fed I6 as est_d, which
+                # blocked CALIBRATED state structurally (G3 friend-rollout
+                # gate). FX-045 fix: use windowed as a SAFETY OVERRIDE
+                # only (if we're not scoring at all, force q_share=0 to
+                # invalidate stale cumulative), then fall through to
+                # cumulative (Priority 2, a real measurement) for
+                # magnitude.
                 ws = windowed.get(cid)
-                if ws and ws["samples"] >= 3:
-                    q_share = min(ws["scoring_ratio"] * 0.5, 0.5)
-                    windowed_used += 1
+                presence_gated_now = False
+                if (ws and ws["samples"] >= RF_WINDOWED_PRESENCE_MIN_SAMPLES
+                        and ws["scoring_ratio"] < RF_WINDOWED_PRESENCE_GATE):
+                    # Presence gate: windowed signal says we are rarely
+                    # in-zone right now → cumulative history is stale →
+                    # force q_share=0. No fallthrough to cumulative or
+                    # prior — we are confidently NOT earning right now.
+                    q_share = 0.0
+                    presence_gated += 1
+                    presence_gated_now = True
                 elif total_market_q > 0 and d.get("q_score_samples", 0) > 0:
-                    # Priority 2: cumulative from reward_tracker, with
-                    # poisoned-row guard.
+                    # Priority 2 (was Priority 2 pre-FX-045): cumulative
+                    # from reward_tracker, with poisoned-row guard.
                     raw_cumulative = d["total_q_score"] / total_market_q
                     if raw_cumulative > RF_POISONED_Q_SHARE_THRESHOLD:
                         # Legacy poisoned row (see memory file:
                         # project_market_q_fallback_bug.md). Cumulative totals
                         # are contaminated by q_share=1.0 saturation from the
                         # pre-Option-B max(market_q, our_q) fallback. Treat as
-                        # cold-start so Priority 1 (windowed) can take over
-                        # once samples accumulate; self-heals when dilution
-                        # drops the ratio under the threshold.
+                        # cold-start; self-heals when dilution drops the
+                        # ratio under the threshold.
                         q_share = RF_NEW_MARKET_Q_SHARE_PRIOR
                         poisoned_skipped += 1
                     else:
@@ -979,7 +1016,7 @@ def query_reward_stats(db_path: str) -> dict[str, dict]:
                             q_share = 0.5
                             cumulative_capped += 1
                 elif on_book < 2.0 and d.get("q_score_samples", 0) == 0:
-                    # Priority 3: cold-start prior.
+                    # Priority 3 (was Priority 3 pre-FX-045): cold-start prior.
                     # Markets with no posting history (< 2h on book, zero scoring
                     # samples) get a conservative prior instead of 0.0. This
                     # escapes the cold-start trap where score=0 would classify
@@ -1009,10 +1046,12 @@ def query_reward_stats(db_path: str) -> dict[str, dict]:
                 "total_market_q": total_market_q,
                 "q_score_samples": d.get("q_score_samples", 0),  # FX-040: graduates from trial sizing when samples ≥ RF_TRIAL_SCORING_SAMPLES
             }
-        if windowed_used or stale_decayed or stale_excluded or prior_used or poisoned_skipped:
+        if (windowed_used or stale_decayed or stale_excluded or prior_used
+                or poisoned_skipped or presence_gated):
             log.info(
-                f"Q-share: {windowed_used} windowed, {cumulative_capped} cumulative capped, "
+                f"Q-share: {cumulative_capped} cumulative capped, "
                 f"{prior_used} cold-start prior, {poisoned_skipped} poisoned skipped, "
+                f"{presence_gated} presence-gated (FX-045), "
                 f"{stale_decayed} decayed (>6h), {stale_excluded} excluded (>24h)"
             )
         return result
