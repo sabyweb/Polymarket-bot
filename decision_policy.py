@@ -43,16 +43,28 @@ log = logging.getLogger("decision_policy")
 # Calibrated for $1.2k wallet operating per ground_rules.md targets:
 #   - daily ROI floor: 0.5% (rewards − losses) / wallet
 #   - per-market fill rate: < 1/day
+#   - per-market notional under overcommit: $10–$50 (wallet / target_market_count)
 #
 # Cooldown threshold of -5% is intentionally permissive — we don't want to
-# cool down a market for a single noisy fill that will average out. The
-# samples gate (≥3 fills) prevents single-event over-reaction.
+# cool down a market for a single noisy fill that will average out.
+#
+# FX-057 (audit response to FX-051): the original v1 thresholds
+# (ABS_LOSS=$2.00, MIN_SAMPLES=3) left two gaps the adversarial audit
+# tests in test_audit_cooldown_logic.py exercised:
+#   1. Sample-gate of 3 is structurally unreachable inside a 24h window
+#      when fill-rate is <1/day (the operating target). So roi-trigger
+#      was effectively dead.
+#   2. Fast-path of $2 missed slow-bleed markets producing $1–$1.99 of
+#      losses per fill, indefinitely.
+# Both retuned: sample gate → 1 (consistent with <1 fill/day target);
+# fast-path → $1 (≈2–5% of per-market notional under overcommit).
 
 ROI_COOLDOWN_THRESHOLD = -0.05         # 24h ROI < -5% triggers cooldown
-ROI_COOLDOWN_MIN_SAMPLES = 3           # require ≥3 fills before trusting the signal
-ABS_LOSS_FAST_COOLDOWN_USD = 2.0       # OR if fill_loss > $2 in 24h (bypasses sample gate;
-                                       # the 2026-05-25 0x46c09232 incident was $2.13 from a
-                                       # single fill — cool immediately, don't wait for 3)
+ROI_COOLDOWN_MIN_SAMPLES = 1           # FX-057: was 3; ≥1 fill is enough confidence
+                                       # at <1 fill/day target rate
+ABS_LOSS_FAST_COOLDOWN_USD = 1.0       # FX-057: was $2; lowered to catch the slow-bleed
+                                       # band ($1–$1.99 single-fill losses). Calibrated
+                                       # against per-market notional of $10–$50.
 COOLDOWN_PERIOD_SEC = 86400.0          # 24h cooldown duration
 FILL_RATE_WARNING_PER_HOUR = 1.0       # > 1/hr is suspicious; warn (no auto-action in v1)
 GLOBAL_LOSS_WARNING_RATIO = 0.5        # if total_loss > 0.5 × total_reward → warn
@@ -98,19 +110,44 @@ class DecisionPolicy:
 
     # ── Per-market evaluation ──
 
+    def _is_roi_bad(self, roi: MarketROISnapshot) -> tuple[bool, str]:
+        """Return (bad, reason_string) given a fresh ROI snapshot.
+
+        Single source of truth for the cooldown triggers — used both on the
+        first-cool path and on the FX-057 expired-but-still-bad re-cool path.
+        """
+        roi_bad = (
+            roi.roi < self.roi_threshold and roi.samples >= self.roi_min_samples
+        )
+        loss_fast = roi.fill_loss >= self.abs_loss_fast_threshold
+        if not (roi_bad or loss_fast):
+            return False, ""
+        bits: list[str] = []
+        if roi_bad:
+            bits.append(
+                f"roi_24h={roi.roi:+.4f}<{self.roi_threshold:+.4f}"
+                f" samples={roi.samples}≥{self.roi_min_samples}"
+            )
+        if loss_fast:
+            bits.append(
+                f"fill_loss_24h=${roi.fill_loss:.2f}>=${self.abs_loss_fast_threshold:.2f}"
+            )
+        return True, " | ".join(bits)
+
     def evaluate_market(self, cid: str) -> MarketDecision:
         """Look at this market's 24h ROI + current cooldown state, decide what to do.
 
         Decision matrix:
-            cooled-down + not expired  → 'still_cooled'  (skip, don't requery ROI)
-            cooled-down + expired      → 'reactivate'    (delete cooldown row, allow)
-            not cooled + ROI bad       → 'cool_down'     (insert cooldown row, exclude)
-            not cooled + ROI ok/unseen → 'allow'
+            cooled-down + not expired              → 'still_cooled'
+            cooled-down + expired + ROI still bad  → 'cool_down'   (FX-057 re-cool)
+            cooled-down + expired + ROI healthy    → 'reactivate'  (delete + allow)
+            not cooled + ROI bad                   → 'cool_down'
+            not cooled + ROI ok/unseen             → 'allow'
 
         ROI is "bad" when EITHER:
           (a) roi_24h < roi_threshold AND samples_24h ≥ roi_min_samples, OR
-          (b) fill_loss_24h ≥ abs_loss_fast_threshold (single-event fast path —
-              don't wait for 3 fills to cool a market that already lost $2)
+          (b) fill_loss_24h ≥ abs_loss_fast_threshold (single-event fast path)
+        See `_is_roi_bad` for the shared trigger evaluator.
         """
         now = self._now()
         existing = self._load_cooldown(cid)
@@ -123,7 +160,11 @@ class DecisionPolicy:
                     cooldown_until=until_ts,
                     roi_24h=roi_at, fill_loss_24h=loss_at, samples_24h=samp_at,
                 )
-            # Expired — remove + decide based on fresh ROI
+            # Expired — remove the old row, then decide based on fresh ROI.
+            # FX-057: if the fresh ROI is STILL bad, re-cool immediately
+            # rather than reactivating for one farmer cycle and re-cooling
+            # next oversight cycle (the original v1 behaviour leaked one
+            # cycle of avoidable fills per expiry on every persistent loser).
             self._delete_cooldown(cid)
             roi_now = self.tracker.get_roi(cid, "24h")
             if roi_now is None:
@@ -131,6 +172,17 @@ class DecisionPolicy:
                     condition_id=cid, action="reactivate",
                     reason="cooldown expired, no fresh ROI yet",
                     cooldown_until=None,
+                )
+            still_bad, bad_reason = self._is_roi_bad(roi_now)
+            if still_bad:
+                until = now + self.cooldown_period_sec
+                full_reason = f"expired+still_bad: {bad_reason}"
+                self._insert_cooldown(cid, now, until, full_reason, roi_now)
+                return MarketDecision(
+                    condition_id=cid, action="cool_down",
+                    reason=full_reason, cooldown_until=until,
+                    roi_24h=roi_now.roi, fill_loss_24h=roi_now.fill_loss,
+                    samples_24h=roi_now.samples,
                 )
             return MarketDecision(
                 condition_id=cid, action="reactivate",
@@ -147,23 +199,9 @@ class DecisionPolicy:
                 reason="no ROI snapshot yet",
             )
 
-        roi_bad = (
-            roi.roi < self.roi_threshold and roi.samples >= self.roi_min_samples
-        )
-        loss_fast = roi.fill_loss >= self.abs_loss_fast_threshold
-        if roi_bad or loss_fast:
+        bad, reason = self._is_roi_bad(roi)
+        if bad:
             until = now + self.cooldown_period_sec
-            reason_bits = []
-            if roi_bad:
-                reason_bits.append(
-                    f"roi_24h={roi.roi:+.4f}<{self.roi_threshold:+.4f}"
-                    f" samples={roi.samples}≥{self.roi_min_samples}"
-                )
-            if loss_fast:
-                reason_bits.append(
-                    f"fill_loss_24h=${roi.fill_loss:.2f}>=${self.abs_loss_fast_threshold:.2f}"
-                )
-            reason = " | ".join(reason_bits)
             self._insert_cooldown(cid, now, until, reason, roi)
             return MarketDecision(
                 condition_id=cid, action="cool_down",

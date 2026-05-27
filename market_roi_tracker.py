@@ -75,6 +75,13 @@ USER_MARKETS_PATH = "/rewards/user/markets"
 _FRESH_TODAY_SEC = 1500.0  # 25 min — within one oversight cycle
 _FRESH_PAST_SEC = 86400.0 * 7  # past days: refresh once per week
 
+# FX-057: minimum capital_committed_avg required to compute a meaningful
+# ROI. Below this, the (reward - loss) / capital ratio becomes wildly
+# unstable; we treat it as "no signal" (roi=0). DecisionPolicy's triggers
+# read `fill_loss` directly so cooldown decisions are unaffected when
+# this guard fires.
+CAPITAL_AVG_MIN_FOR_ROI = 0.10  # USD
+
 
 @dataclass
 class MarketROISnapshot:
@@ -352,9 +359,20 @@ class MarketROITracker:
     ) -> float:
         """Time-weighted avg of est_capital_cost in [since_ts, until_ts].
 
-        Each snapshot row at ts_i is weighted by min(next_ts - ts_i, until_ts - ts_i),
-        clamped to [0, window]. If we have N snapshots, integrate the step
-        function and divide by window length.
+        Algorithm:
+          1. Fetch in-window snapshots (ts ≥ since_ts AND ts ≤ until_ts).
+          2. FX-057: also fetch the latest snapshot BEFORE the window. This
+             value reflects the capital that was committed at window_start
+             but never re-stamped. Without this lookback, a 1h window with
+             a single snapshot at minute 59 yields capital_avg ≈ $0.83
+             instead of $50 — the pre-snapshot interval was unattributed.
+          3. The "initial value" for the segment from since_ts to the first
+             in-window snapshot is:
+               • the pre-window snapshot's capital if one exists, else
+               • the first in-window snapshot's capital (extrapolated back),
+               • else 0.0 (nothing known).
+          4. Integrate the step function across the window and divide by
+             window length.
         """
         rows = conn.execute(
             "SELECT ts, est_capital_cost FROM capital_committed_snapshots "
@@ -362,20 +380,45 @@ class MarketROITracker:
             "ORDER BY ts ASC",
             (cid, since_ts, until_ts),
         ).fetchall()
-        if not rows:
+
+        # FX-057: look back before the window for the most recent prior
+        # snapshot. This captures capital committed at window_start that
+        # wasn't re-stamped inside the window.
+        prior = conn.execute(
+            "SELECT est_capital_cost FROM capital_committed_snapshots "
+            "WHERE condition_id = ? AND ts < ? "
+            "ORDER BY ts DESC LIMIT 1",
+            (cid, since_ts),
+        ).fetchone()
+
+        if not rows and not prior:
             return 0.0
-        # Append a virtual end-of-window row so the last real row's weight
-        # is the remaining window time.
-        rows = list(rows) + [(until_ts, 0.0)]
-        total_capital_time = 0.0
-        for i in range(len(rows) - 1):
-            ts_i, cap_i = rows[i]
-            ts_next = rows[i + 1][0]
-            dwell = max(0.0, ts_next - ts_i)
-            total_capital_time += cap_i * dwell
+        if not rows:
+            # Only a prior snapshot exists; assume it held for the whole window.
+            return float(prior[0])
+
+        # Pick the initial value: prior snapshot if present, else extrapolate
+        # the first in-window snapshot backwards. The extrapolation can
+        # over-count for genuinely new positions, but only for the small
+        # window-start-to-first-snapshot interval and only on the very first
+        # cycle a market is observed; on later cycles `prior` is populated.
+        initial_capital = float(prior[0]) if prior else float(rows[0][1])
+
         window_len = until_ts - since_ts
         if window_len <= 0:
             return 0.0
+
+        # Integrate. First segment: from since_ts to rows[0].ts at
+        # initial_capital. Subsequent segments: each row's capital held until
+        # the next row's ts. Final segment: from rows[-1].ts to until_ts at
+        # rows[-1].capital (handled by virtual zero-capital sentinel).
+        total_capital_time = initial_capital * max(0.0, rows[0][0] - since_ts)
+        rows_with_end = list(rows) + [(until_ts, 0.0)]
+        for i in range(len(rows_with_end) - 1):
+            ts_i, cap_i = rows_with_end[i]
+            ts_next = rows_with_end[i + 1][0]
+            dwell = max(0.0, ts_next - ts_i)
+            total_capital_time += cap_i * dwell
         return total_capital_time / window_len
 
     # ── Active-market discovery ──
@@ -454,8 +497,17 @@ class MarketROITracker:
                         reward_earned = self._read_reward_for_window(
                             cid, window_name, now
                         )
-                        denom = max(capital_avg, 0.01)
-                        roi = (reward_earned - fill_loss) / denom
+                        # FX-057: when capital data is absent (no allocator
+                        # cycle has stamped this market yet, or the alloc
+                        # output didn't include it), `capital_avg` is ~0.
+                        # The previous `max(capital_avg, 0.01)` floor caused
+                        # ROI to inflate by 100× — a $1 loss reported as
+                        # roi=-100, polluting [LEARN] telemetry and
+                        # operator triage. Treat as "no signal" instead.
+                        if capital_avg < CAPITAL_AVG_MIN_FOR_ROI:
+                            roi = 0.0
+                        else:
+                            roi = (reward_earned - fill_loss) / capital_avg
                         fill_rate = fill_count / (window_secs / 3600.0)
 
                         conn.execute(

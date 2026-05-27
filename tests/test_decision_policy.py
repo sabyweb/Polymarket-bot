@@ -117,13 +117,17 @@ def test_P2_bad_roi_with_enough_samples_triggers_cooldown():
 # ── P3: sample-gate respect ──
 
 def test_P3_bad_roi_with_too_few_samples_no_cooldown():
+    """FX-057 retuned sample gate to 1 (was 3). Test now asserts the new
+    edge: samples=0 (zero observations) → no cool even if the ROI row
+    looks bad (which it shouldn't, given samples=0, but defend the gate).
+    """
     db = _make_db()
     _, policy, st = _make_tracker_and_policy(db)
     _insert_roi_row(
         db, "0xUNLUCKY", "24h",
         roi=-0.50,  # way below threshold
-        fill_loss=0.1,  # well below abs-fast threshold
-        samples=ROI_COOLDOWN_MIN_SAMPLES - 1,  # not enough confidence
+        fill_loss=0.1,  # below abs-fast threshold ($1.00 post-FX-057)
+        samples=ROI_COOLDOWN_MIN_SAMPLES - 1,  # samples=0, below the gate
         now=st["now"],
     )
     ev = policy.evaluate()
