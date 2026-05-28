@@ -68,6 +68,7 @@ def MIN_EXPECTED_PER_MARKET(): return cfg("RF_OVERCOMMIT_MIN_EXPECTED_PER_MARKET
 def MAX_DEPLOYED_MARKETS(): return cfg("RF_OVERCOMMIT_MAX_DEPLOYED_MARKETS")
 def PER_MARKET_BUFFER_FRAC(): return cfg("RF_OVERCOMMIT_PER_MARKET_BUFFER_FRAC")
 def EXPECTED_FILL_COST_FRAC(): return cfg("RF_OVERCOMMIT_EXPECTED_FILL_COST_FRAC")
+def Q_SHARE_CONSERVATIVE_FACTOR(): return cfg("RF_OVERCOMMIT_Q_SHARE_CONSERVATIVE_FACTOR")
 COLD_START_Q_SHARE = 0.005         # 0.5% prior — matches bot historical median band
 
 # FX-056: Extreme-price filter. Markets with midpoint < 0.10 or > 0.90
@@ -384,8 +385,19 @@ class SimpleAllocator:
         api_shares = self.fetch_current_q_shares()
         cumulative = self.load_cumulative_ratios()
 
+        # FX-046 conservative margin (P3): API q_share is Polymarket's own
+        # measurement (ground truth, no margin). Cumulative + cold-start are
+        # heuristics that the FX-046 investigation showed under-predict by
+        # 24-94×. Default conservative factor is 1.0 (no-op — accept the
+        # uncertainty and let FX-051 cooldowns catch losers). Operators
+        # concerned about over-deployment can set RF_OVERCOMMIT_Q_SHARE_CONSERVATIVE_FACTOR
+        # below 1.0 to bias non-API expected_reward down → EV gate tightens.
+        conservative_factor = Q_SHARE_CONSERVATIVE_FACTOR()
         for m in candidates:
             q, src = self.estimate_q_share(m.condition_id, api_shares, cumulative)
+            # Apply conservative factor ONLY to non-API sources
+            if src != "api":
+                q = q * conservative_factor
             m.expected_q_share = q
             m.expected_daily_reward = m.daily_rate * q
             m.q_share_source = src
