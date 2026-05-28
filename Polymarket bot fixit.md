@@ -135,6 +135,7 @@ Codified during the 2026-05-19 → 2026-05-21 cascade-recovery sequence. The can
 | ~~**FX-039**~~ | ~~**`handle_fill` hardcodes `fill_type='FULL'`** in DB write at `order_lifecycle.py:269`, regardless of whether actual match was partial.~~ ✅ SHIPPED in commit `9164f1f` (2026-05-26). `fill_type` is now a `handle_fill` parameter threaded through from the three call sites (`detect_fills`, `_check_stale_order`, `_reconcile_after_unknown`). The fix surfaced and closed a latent crash in `alerts.py:322` where the PARTIAL alert branch formatted `remaining_shares` unconditionally — pre-FX-039 the hardcode masked this dead code path. See §4 detail. | Low → CLOSED | Fixed (`9164f1f`) | `[BUG]` |
 | FX-033 | Oversight allocator doesn't consult `unliquidatable_markets` table — proposes deploys the farmer silently skips | Low | Open | `[ARCH]` `[TEST]` |
 | FX-034 | `_reprobe_unliquidatable` never un-marks cids even when subsequent book fetches return HTTP 200 | Low | Open | `[BUG]` |
+| **FX-062** | **P5 Stage B runbook criteria (`deploys ≥ 50`, `overcommit_ratio` 3-8×) are structurally unreachable in dry mode** — they depend on API + cumulative q_share feedback that only flows back when orders are placed. First Helsinki shadow run (2026-05-28 08:37 UTC) holds at `deploys=31-32, ratio=2.14-2.42×` across 3 cycles while bot is otherwise perfectly clean. Operator following the runbook strictly would misread shadow success as failure. Proposed fix: split runbook criteria into "shadow-applicable" vs "live-only-verifiable" buckets. | Low | Open | `[DOC]` `[OPS]` |
 
 (FX-001 through FX-036, plus FX-040 and FX-041, have been shipped — see §4. FX-027 was accepted as designed architectural risk — see §5. FX-044 was investigated 2026-05-23 and found to be misdiagnosed in the original entry; superseded by the new FX-045 / FX-046 / FX-047 chain that addresses the actual root cause.)
 
@@ -844,6 +845,72 @@ Codified during the 2026-05-19 → 2026-05-21 cascade-recovery sequence. The can
 - **Related:** FX-007, FX-028 (introduced the re-probe), FX-032.
 - **Hardening Phase:** Post-roadmap follow-up.
 - **History:** —
+
+---
+
+### FX-062 — P5 Stage B runbook criteria assume live-mode q_share feedback; unreachable in dry shadow
+
+- **Severity:** Low (operational doc accuracy; misleading shadow-validation criteria)
+- **Status:** Open
+- **Tags:** `[DOC]` `[OPS]`
+- **Opened:** 2026-05-28 (surfaced during first P5 Stage B shadow execution on Helsinki)
+- **Principle that surfaced it:** P4 (production cycles > tests) — first real shadow run exposed the criterion-vs-architecture mismatch within 70 min of restart.
+- **Symptom:** `docs/runbooks/9_of_10_p5_p7_operator_runbook.md` Stage B specifies two data-dependent pass criteria:
+  > - `[OVERCOMMIT_ALLOC]` log emitted every oversight cycle (~30min) with `deploys >= 50` once eligible market discovery has run.
+  > - `overcommit_ratio` in `[OVERCOMMIT_ALLOC]` log lands in the 3.0× – 8.0× band.
+
+  In actual shadow operation (Helsinki, 2026-05-28 08:37 UTC, observed across 3 consecutive oversight cycles at 08:37 / 09:07 / 09:37):
+  ```
+  [OVERCOMMIT_ALLOC] eligible=2362-2379 positive_ev=31-32 deploys=31-32
+    notional_total=$2574-2904 wallet=$1201.76 overcommit_ratio=2.14×-2.42×
+    p10_global_reward_low=True
+  ```
+  - `deploys` held steady at 31-32 (not ≥50)
+  - `overcommit_ratio` held steady at 2.14×-2.42× (below 3.0×)
+  - Bot otherwise perfectly clean: zero CRITICAL/FATAL/Traceback, services stable for 1h+, self-correction loop firing correctly (`p10_global_reward_low` detecting `total_reward_24h=$0 < $4` target and halving MIN floors per FX-060's design).
+- **Root cause:** Both quantitative criteria depend on q_share data that structurally cannot flow back in dry mode:
+  1. **API q_share** (`SimpleAllocator.fetch_current_q_shares` → `GET /rewards/user/percentages`) only returns data for markets where the bot has held positions. Dry mode never places orders → never holds positions → API source permanently empty (`api=0` observed every cycle).
+  2. **Cumulative q_share** (`reward_market_stats` table, populated by `reward_tracker.record_cycle`) only grows the per-market q_score totals when `has_yes_order || has_no_order` is True. Dry mode → both always False → table never grows beyond what previous live runs left. Helsinki currently has 12 cumulative entries (stale from pre-kill-switch ops, observed as `cumulative=12` every cycle).
+  3. **Cold-start prior** (`RF_NEW_MARKET_Q_SHARE_PRIOR = 0.10`) applies to the remaining ~6121 markets (observed `cold_start=6121-6135`). The EV gate (`daily_rate × q_share > cost_per_market × EXPECTED_FILL_COST_FRAC`) then filters this pool to ~32 markets — the conservatism is intentional under Ground Rule 1+3.
+
+  In LIVE mode the 32 deployed markets would populate API + cumulative sources within hours, marginal markets near the EV boundary would re-qualify on better data, and equilibrium would settle near or above the runbook's 50. **In DRY mode the count is structurally capped near 32 by the EV gate operating purely on the cold-start prior.**
+- **Why it matters:**
+  - An operator following the runbook strictly would interpret the actual shadow numbers as a Stage B failure and either (a) reset the 48h clock unnecessarily, (b) escalate to engineering for a non-existent bug, or (c) tune cfg knobs (`EXPECTED_FILL_COST_FRAC`, `NEW_MARKET_Q_SHARE_PRIOR`, `MIN_DAILY_RATE_USD`) to hit an artificial target — which would compromise the live-mode safety posture those knobs encode.
+  - Lost confidence in the runbook erodes the change-management discipline that P5 itself demands. The runbook is the contract; the contract should match reality.
+  - Friend-rollout (Phase 10) inherits the same problem at scale — each new operator hits the same false-fail on first shadow run.
+- **Proposed fix (runbook edit, ~30 LOC in `docs/runbooks/9_of_10_p5_p7_operator_runbook.md`):** Split Stage B pass criteria into "shadow-applicable" vs "live-only-verifiable" buckets:
+
+  **Shadow-applicable (Stage B must hold continuously ≥48h):**
+  - Zero `[CRITICAL]` / `[FATAL]` / `Traceback` log lines (existing — keep)
+  - `[OVERCOMMIT_ALLOC]` emitted every oversight cycle (~30 min), regardless of `deploys` count
+  - `[SIMPLE_ALLOC]` `kill_switch: False` every cycle (existing — keep)
+  - Farmer cycle duration < 30s (existing — keep)
+  - Wallet reconciliation post-baseline-rebase shows `divergence ≤ $0.50` on cycle ≥ 2 (NEW — catches FX-049 regressions like the one that prompted FX-055)
+  - No service crashes / restarts (existing — keep)
+  - DB migrations applied: 5 new FX-051 + FX-061 tables present (NEW — catches schema-migration regressions)
+
+  **Live-verifiable (move to Stage C pre-cutover or Stage C first-hour checks):**
+  - `deploys ≥ 50` (requires API q_share feedback — only available after live placement)
+  - `overcommit_ratio` in 3-8× band (requires deploys ≥ 50 + cumulative q_share growth)
+  - At least one fill+dump with slippage ≤ 3% (already covered by P6 / G4 — explicit cross-ref)
+
+  Add a "What NOT to worry about in dry mode" subsection citing the dry-mode structural reason (this entry as the canonical reference) so future operators don't chase the same ghost.
+- **Acceptance criterion:** Runbook diff merged to main; next operator's Stage B execution doesn't flag the dry-mode 32-deploy / 2-3× ratio as a failure, doesn't reset the 48h clock for those reasons, and doesn't tune cfg knobs aimed at hitting the live-target numbers. Operator can complete Stage B in ≤48h elapsed without engineering escalation on the q_share-dependent criteria.
+- **Risk profile:**
+  - **Reversibility (P2):** trivial — pure doc revert.
+  - **Single-axis (P3):** one logical change — refining criterion semantics for dry-vs-live applicability. Doesn't touch any code.
+  - **Risk if proposed split is too permissive:** operator interprets shadow as more permissive than intended, misses a real issue that the original strict criteria would have caught. Mitigation: keep the structural-failure criteria (CRITICAL/FATAL/Traceback/kill-switch/cycle duration/crashes) — those still catch real issues; only the data-dependent quantitative criteria move to Stage C.
+  - **Could it be a code fix instead?** Theoretical alternative: have `simple_oversight` write synthetic scoring_snapshots in dry mode from the allocator's emitted plan. Rejected because (a) `simple_oversight` and `SimpleAllocator` don't read `scoring_snapshots` (only legacy `oversight_agent` path does — would be dead writes), (b) it would fake q_share data that doesn't reflect reality, defeating the purpose of shadow validation, (c) doc edit is strictly cheaper and clearer.
+- **Related:**
+  - `docs/runbooks/9_of_10_p5_p7_operator_runbook.md` — Stage B section (the file edited)
+  - Architecture doc §4.19 — defines dry/shadow/live execution mode semantics
+  - FX-051 — `reward_market_stats` writer is gated on placed orders (root cause #2)
+  - FX-046 — accepted-risk entry on q_share formula uncertainty; FX-062 is the runbook-side parallel
+  - FX-060 — `p10_global_reward_low` trigger correctly fires during shadow but doesn't widen enough to hit ≥50 alone
+  - ground_rules.md Rule 1 + 3 — cold-start conservatism is by design; the runbook target should respect that
+- **Hardening Phase:** Phase 10 (friend rollout / operational doc accuracy). Ships independently of P5/P7 live execution — operator can update the runbook before, during, or after the 48h shadow window without affecting bot behavior.
+- **History:**
+  - 2026-05-28 09:47 UTC — Surfaced during first P5 Stage B shadow execution on Helsinki. Three oversight cycles at deploys=31-32, ratio=2.14-2.42×. Investigation traced to dry-mode structural absence of API + cumulative q_share data sources (writer paths in `reward_farmer.py` + `reward_tracker.record_cycle` both gated on `has_yes_order || has_no_order`). Confirmed `simple_oversight` and `SimpleAllocator` do not read `scoring_snapshots` — only legacy `oversight_agent` does — so no code-side seeding mechanism exists or makes sense.
 
 ---
 
