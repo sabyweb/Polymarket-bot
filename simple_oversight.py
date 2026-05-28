@@ -208,6 +208,8 @@ def run_once(
     # any exception logs and the allocator gets an empty exclusion set
     # (i.e., behaves exactly as pre-FX-051).
     excluded_cids: set[str] = set()
+    size_reduction_cids: set[str] = set()
+    global_tighten: bool = False
     tracker = None
     try:
         from market_roi_tracker import MarketROITracker
@@ -228,18 +230,27 @@ def run_once(
         tracker.tick()
         tracker.prune_old_snapshots()
         policy = DecisionPolicy(db_path=db_path, tracker=tracker)
-        policy.evaluate()
+        # P4 of 9/10 plan: evaluate() returns richer dict — extract the new
+        # behavior-change outputs (size_reduction_cids per-market, global_tighten
+        # globally) alongside the cooldown set.
+        eval_out = policy.evaluate()
         excluded_cids = policy.get_excluded_cids()
+        size_reduction_cids = eval_out.get("size_reduction_cids", set())
+        global_tighten = eval_out.get("global_tighten", False)
     except Exception as e:
         log.warning(f"[LEARN] tracker/policy pass failed (fail-open): {e}")
 
     # 4. Allocate
+    # P4: pass the new behavior-change inputs. Allocator halves shares_per_side
+    # for cids in size_reduction_cids; raises filter floors when global_tighten=True.
     result = allocator.compute(
         wallet_usd=wallet,
         wallet_peak_usd=peak,
         wallet_24h_ago_usd=wallet_24h_ago,
         realized_loss_24h=realized_loss,
         excluded_cids=excluded_cids,
+        size_reduction_cids=size_reduction_cids,
+        global_tighten=global_tighten,
     )
 
     # 4a. FX-051: record per-market est_capital_cost rows so future ROI ticks

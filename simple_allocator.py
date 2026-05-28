@@ -349,6 +349,8 @@ class SimpleAllocator:
         realized_loss_24h: float,
         markets: Optional[list[CandidateMarket]] = None,
         excluded_cids: Optional[set[str]] = None,
+        size_reduction_cids: Optional[set[str]] = None,
+        global_tighten: bool = False,
     ) -> AllocationResult:
         """Main allocation entry point.
 
@@ -361,11 +363,22 @@ class SimpleAllocator:
             excluded_cids: FX-051 cooldown filter — set of condition_ids the
               DecisionPolicy has put on cooldown after recent losses. Pass
               `None` (or empty set) when the ROI tracker isn't running.
+            size_reduction_cids: P4 of 9/10 plan — Ground Rule 3 trigger #3.
+              Set of cids whose fill_rate > target (>1/hr default). For these
+              markets, target_shares is halved this cycle to stay on the
+              market with smaller exposure rather than cooling entirely.
+              Pass `None` (or empty set) when the trigger isn't running.
+            global_tighten: P4 of 9/10 plan — Ground Rule 3 trigger #5.
+              When True (global loss > rewards detected), allocator raises
+              the MIN_DAILY_RATE_USD floor 2× AND applies a global 0.5×
+              size multiplier — biases toward fewer, safer deploys until
+              the rolling metric recovers. Default False (no tightening).
 
         Returns AllocationResult with deploys, avoids, and kill signal.
         """
         sources_used = {"api": 0, "cumulative": 0, "cold_start": 0}
         excluded = excluded_cids or set()
+        size_reduction = size_reduction_cids or set()
 
         # ── Kill switch check FIRST ──
         kill, reason = self.check_kill_switch(
@@ -409,7 +422,11 @@ class SimpleAllocator:
         # reward_farmer.py:970-987 has a CLOB fallback that fetches token_ids
         # if missing from the alloc — so we do NOT filter on yes_tid/no_tid
         # here. Doing so would zero out every market.
-        min_rate = MIN_DAILY_RATE_USD()
+        # P4 Trigger #5: under global_tighten, raise MIN_DAILY_RATE_USD floor
+        # 2× to skip the long tail of low-reward markets. Symmetric with the
+        # global_size_factor below — both effects accumulate to bias toward
+        # fewer, safer deploys until the global loss/reward ratio recovers.
+        min_rate = MIN_DAILY_RATE_USD() * (2.0 if global_tighten else 1.0)
         min_expected = MIN_EXPECTED_PER_MARKET()
         eligible = [
             m for m in candidates
@@ -467,6 +484,20 @@ class SimpleAllocator:
             # Compute shares from target capital
             cost_per_share = max(0.10, min(m.midpoint_guess, 1.0 - m.midpoint_guess) * 2.0)
             target_shares = max(m.min_size, int(cost_per_market / cost_per_share))
+
+            # P4 Trigger #3: per-market size reduction for high fill_rate markets.
+            # Halve target_shares (clamped at min_size for venue eligibility).
+            # AND global_tighten (Trigger #5): apply 0.5× to ALL deploys this
+            # cycle. Both effects compose multiplicatively when both fire.
+            size_multiplier = 1.0
+            if m.condition_id in size_reduction:
+                size_multiplier *= 0.5
+            if global_tighten:
+                size_multiplier *= 0.5
+            if size_multiplier < 1.0:
+                target_shares = max(m.min_size, int(target_shares * size_multiplier))
+                cost_per_market = target_shares * cost_per_share
+
             m.target_shares = target_shares
             m.target_capital = round(cost_per_market, 2)
 
@@ -485,7 +516,9 @@ class SimpleAllocator:
             f"deploys={len(deploys)} avoids={len(avoids)} "
             f"notional_total=${used:.2f} wallet=${wallet_usd:.2f} "
             f"overcommit_ratio={notional_overcommit_ratio:.2f}× "
-            f"(target band 3-8× per Ground Rule 2)"
+            f"(target band 3-8× per Ground Rule 2) "
+            f"p4_size_reduction_cids={len(size_reduction)} "
+            f"p4_global_tighten={global_tighten}"
         )
 
         return AllocationResult(

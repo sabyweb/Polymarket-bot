@@ -224,12 +224,22 @@ class DecisionPolicy:
         OR an active cooldown row. Emit summary + structured log.
 
         Returns dict with:
-          newly_cooled  : list of cids that just entered cooldown
-          still_cooled  : list of cids in active cooldown (not changed)
-          reactivated   : list of cids that just exited cooldown
-          allowed       : list of cids with ROI snapshot but no cooldown
-          global_summary: from tracker.get_global_summary("24h")
-          warnings      : list of structured warning strings
+          newly_cooled         : list of cids that just entered cooldown
+          still_cooled         : list of cids in active cooldown (not changed)
+          reactivated          : list of cids that just exited cooldown
+          allowed              : list of cids with ROI snapshot but no cooldown
+          global_summary       : from tracker.get_global_summary("24h")
+          warnings             : list of structured warning strings
+
+          P4 of 9/10 plan — new behavior-change outputs (ground_rules §3
+          triggers 3 + 5 wired to actual action, not just logs):
+
+          size_reduction_cids  : set of cids where fill_rate > target by Y×
+                                (allocator halves shares_per_side for these)
+          global_tighten       : bool — if True, allocator raises filter
+                                floors this cycle (global loss > rewards
+                                pattern detected; bias toward fewer / safer
+                                deploys until the rolling metric recovers)
         """
         cids = set()
         for snap in self.tracker.get_all_for_window("24h"):
@@ -243,6 +253,11 @@ class DecisionPolicy:
             "reactivated": [],
             "allowed": [],
             "warnings": [],
+            # P4: per-cycle behavior-change outputs (no DB persistence —
+            # recomputed each cycle from raw signals so transient anomalies
+            # self-resolve at the next evaluation without manual cleanup).
+            "size_reduction_cids": set(),
+            "global_tighten": False,
         }
         for cid in sorted(cids):
             d = self.evaluate_market(cid)
@@ -254,13 +269,24 @@ class DecisionPolicy:
                 out["reactivated"].append(cid)
             else:
                 out["allowed"].append(cid)
-            # Fill-rate warning (no auto-action)
+            # P4 — Trigger #3 (per-market fill_rate). Ground rules §3:
+            # "Per-market fill_rate > target by Y× → reduce per-market size
+            # OR cool". Cooling is the FX-051 path (ROI-driven). This path
+            # handles the rate-driven response: when fill_rate exceeds the
+            # warning threshold but ROI is fine, reduce per-market size so
+            # we stay on the market with smaller exposure. Auto-action
+            # (was just a warn log pre-P4).
             if d.samples_24h and (d.samples_24h / 24.0) > self.fill_rate_warn_per_hour:
                 out["warnings"].append(
                     f"high_fill_rate cid={cid[:12]} fills_24h={d.samples_24h}"
                 )
+                # Only mark for size reduction if the market is NOT already
+                # cooled (cooling is the stronger response — no need to
+                # also reduce size on a market we're skipping entirely).
+                if d.action not in ("cool_down", "still_cooled"):
+                    out["size_reduction_cids"].add(cid)
 
-        # Global summary + global warnings
+        # Global summary + global warnings + P4 trigger #5
         global_summary = self.tracker.get_global_summary("24h")
         out["global_summary"] = global_summary
         tr = global_summary.get("total_reward", 0.0)
@@ -269,6 +295,20 @@ class DecisionPolicy:
             out["warnings"].append(
                 f"global_loss_ratio loss=${tl:.2f} > {self.global_loss_warn_ratio:.0%}×reward=${tr:.2f}"
             )
+            # P4 — Trigger #5 (global loss > rewards). Ground rules §3:
+            # "Global 24h loss > rewards → tighten filters; reduce per-market
+            # exposure". Auto-action: signal allocator to raise the
+            # MIN_DAILY_RATE_USD floor (skip lower-reward markets) and
+            # apply size reduction globally. Allocator reads `global_tighten`
+            # and applies a conservative-mode multiplier this cycle.
+            out["global_tighten"] = True
+        # Also tighten when loss exists but reward is 0 (worse-than-warn-ratio
+        # case where we can't even compute the ratio). Bias toward safe.
+        elif tl > 0 and tr == 0:
+            out["warnings"].append(
+                f"global_loss_no_reward loss=${tl:.2f} reward=$0 (tightening)"
+            )
+            out["global_tighten"] = True
 
         # Structured log line per ground_rules.md
         log.info(
