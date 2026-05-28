@@ -38,27 +38,36 @@ from typing import Optional
 
 import requests
 
+from config import cfg
+
 log = logging.getLogger("simple_allocator")
 
 
-# ── Configuration (tuned against $1.2k wallet, real Polymarket q_share) ──
+# ── Configuration ──
 #
-# Aggregate strategy: Polymarket's $1/day threshold is per-USER not per-market.
-# We deploy on many markets at modest expected reward each, summing to clear
-# the threshold. Per-market filter set deliberately low.
+# P2 of 9/10 plan (FX-052 + FX-053): transform from SimpleAllocator's
+# capped/budget-bound semantics into the OverCommitAllocator per ground
+# rules 1 + 2. Old behavior capped total notional below wallet (Rule 2
+# violation) and capped market count at 20 (Rule 1 violation: 5000+
+# reward markets ignored). New behavior:
+#   - Deploy on EVERY eligible market where expected_reward > expected_fill_cost
+#   - Per-market notional = cost-to-score (min_size × midpoint × 2 + buffer)
+#   - Total notional NOT bounded by allocator — bounded by Polymarket's
+#     collateral-rebalance auto-cancel mechanism (Rule 2 design point: 3-8×
+#     wallet notional from many simultaneous orders, only one fills at a time)
+#   - Target market count 50-200 in steady state; soft sanity cap at 500
+#     prevents runaway from API anomalies (Polymarket lists ~5k markets)
 #
-# Calibrated from agent-4's competitive analysis:
-#   - Bot historical median q_share: ~0.074%
-#   - At $1.2k wallet with larger orders, expected ~0.3-1.0% (model-projected)
-#   - $1.2k × DEPLOY_RATIO = $1140 budget
-#   - 20 markets × $60 cap = $1200 max utilization
-
-MIN_DAILY_RATE_USD = 10.0          # market floor — below this not worth a slot
-MIN_EXPECTED_PER_MARKET = 0.01     # 1¢/day floor — aggregate-strategy permissive
-MAX_DEPLOYED_MARKETS = 20          # hard cap on simultaneous deploys
-MAX_PER_MARKET_USD = 60.0          # per-market exposure cap (~5% of $1.2k wallet)
-MIN_PER_MARKET_USD = 10.0          # minimum per-market notional (venue min_size dependent)
-DEPLOY_RATIO = 0.95                # fraction of wallet deployable
+# Class name "SimpleAllocator" retained for import-site compatibility; the
+# semantics are OverCommitAllocator per FX-052/053. See the OverCommitAllocator
+# docstring on `compute()` for the design.
+#
+# All thresholds cfg-driven for runtime tuning per config_overrides.json.
+def MIN_DAILY_RATE_USD(): return cfg("RF_OVERCOMMIT_MIN_DAILY_RATE_USD")
+def MIN_EXPECTED_PER_MARKET(): return cfg("RF_OVERCOMMIT_MIN_EXPECTED_PER_MARKET")
+def MAX_DEPLOYED_MARKETS(): return cfg("RF_OVERCOMMIT_MAX_DEPLOYED_MARKETS")
+def PER_MARKET_BUFFER_FRAC(): return cfg("RF_OVERCOMMIT_PER_MARKET_BUFFER_FRAC")
+def EXPECTED_FILL_COST_FRAC(): return cfg("RF_OVERCOMMIT_EXPECTED_FILL_COST_FRAC")
 COLD_START_Q_SHARE = 0.005         # 0.5% prior — matches bot historical median band
 
 # FX-056: Extreme-price filter. Markets with midpoint < 0.10 or > 0.90
@@ -303,15 +312,33 @@ class SimpleAllocator:
     def _est_cost_per_market(self, m: CandidateMarket) -> float:
         """Estimate USD cost for full deploy (both sides) at min_size.
 
-        cost ≈ min_size × cost_per_share × 2_sides
-        cost_per_share at midpoint 0.5 = 0.5 × 2 = 1.0 (sum); use midpoint guess.
-        Conservative: use 0.5 unless we know better.
+        FX-052: this is the COST-TO-SCORE under overcommit operation.
+        cost ≈ min_size × cost_per_share × 2_sides × (1 + buffer)
+        Per ground rules Rule 1, each market is sized to the MINIMUM that
+        earns rewards (typically min_size shares), not the maximum that fits
+        the budget. Buffer covers tick rounding + price drift.
         """
-        # Both sides each cost ~midpoint per share; total ≈ 2 × midpoint × shares
-        # but the actual cost is min(midpoint, 1-midpoint) for buying each side
-        # Most reward markets sit near 0.5; if midpoint_guess=0.5, cost ~= 1.0 × shares
+        # Both sides each cost ~midpoint per share; total ≈ 2 × midpoint × shares.
+        # Use min(midpoint, 1-midpoint) for the per-side BUY cost.
         cost_per_share = max(0.10, min(m.midpoint_guess, 1.0 - m.midpoint_guess) * 2.0)
-        return m.min_size * cost_per_share
+        base_cost = m.min_size * cost_per_share
+        return base_cost * (1.0 + PER_MARKET_BUFFER_FRAC())
+
+    def _estimate_fill_cost(self, m: CandidateMarket, position_notional: float) -> float:
+        """FX-052/053: expected USD cost incurred IF the market fills today.
+
+        Cost = position_notional × slippage_assumption. The slippage assumption
+        is cfg-driven (default 2% per FX-056 extreme-price filter narrowing
+        the population to mid-priced markets where slippage is ~1-3%). This
+        is used to filter markets where (expected_reward_per_day × q_share)
+        does not clear the per-fill cost — i.e., negative-EV deploys per
+        ground rules Rule 1.
+
+        Conservative: assumes 1 fill per day (the rate-limit target). At
+        higher actual fill rates the per-market ROI drops; FX-051's
+        per-market cooldown catches that.
+        """
+        return position_notional * EXPECTED_FILL_COST_FRAC()
 
     def compute(
         self,
@@ -364,16 +391,18 @@ class SimpleAllocator:
             m.q_share_source = src
             sources_used[src] += 1
 
-        # ── Filter ──
+        # ── Filter (FX-052/053 OverCommitAllocator) ──
         # NOTE: /rewards/markets/current does NOT include yes_token_id /
         # no_token_id fields. They live in /markets/{cid}. The farmer's
         # reward_farmer.py:970-987 has a CLOB fallback that fetches token_ids
         # if missing from the alloc — so we do NOT filter on yes_tid/no_tid
         # here. Doing so would zero out every market.
+        min_rate = MIN_DAILY_RATE_USD()
+        min_expected = MIN_EXPECTED_PER_MARKET()
         eligible = [
             m for m in candidates
-            if m.daily_rate >= MIN_DAILY_RATE_USD
-            and m.expected_daily_reward >= MIN_EXPECTED_PER_MARKET
+            if m.daily_rate >= min_rate
+            and m.expected_daily_reward >= min_expected
             # FX-056: skip extreme-price markets (midpoint < 0.10 or > 0.90)
             # where dump slippage routinely exceeds per-cycle reward. Markets
             # without a price hint pass through (midpoint_guess default 0.5)
@@ -390,22 +419,38 @@ class SimpleAllocator:
         # ── Rank by expected reward ──
         eligible.sort(key=lambda x: -x.expected_daily_reward)
 
-        # ── Budget allocation ──
-        budget = wallet_usd * DEPLOY_RATIO
+        # ── OverCommit allocation (FX-052/053) ──
+        # No total-notional budget — Polymarket's collateral-rebalance auto-
+        # cancel mechanism handles overcommit per Ground Rule 2 (3-8× wallet
+        # notional is the design point). Per-market cost is cost-to-score
+        # (min_size × midpoint × 2 + buffer), NOT capped by a wallet
+        # fraction. Each market deploys iff its expected_reward clears
+        # expected_fill_cost (positive-EV gate per Ground Rule 1 + 3).
+        max_deploys = MAX_DEPLOYED_MARKETS()  # SOFT sanity cap (default 500)
         deploys: list[CandidateMarket] = []
         avoids: list[CandidateMarket] = []
         used = 0.0
+        positive_ev_count = 0
         for m in eligible:
-            if len(deploys) >= MAX_DEPLOYED_MARKETS:
+            if len(deploys) >= max_deploys:
+                # Soft cap hit — extremely rare in practice (5k market pool
+                # × eligibility filters typically yields 100-500 markets).
+                # Logged via the SIMPLE_ALLOC telemetry line; operator can
+                # raise RF_OVERCOMMIT_MAX_DEPLOYED_MARKETS if needed.
                 avoids.append(m)
                 continue
 
-            # Size to per-market cap
-            cost_per_market = max(MIN_PER_MARKET_USD,
-                                  min(MAX_PER_MARKET_USD, self._est_cost_per_market(m)))
-            if used + cost_per_market > budget:
+            cost_per_market = self._est_cost_per_market(m)
+            expected_fill_cost = self._estimate_fill_cost(m, cost_per_market)
+            # Positive-EV gate: only deploy if expected reward clears fill cost.
+            # m.expected_daily_reward is already in $/day; comparing against
+            # per-fill cost assumes ≤1 fill per day per market (the operating
+            # target per ground_rules.md; FX-051's fill-rate trigger catches
+            # markets that exceed it).
+            if m.expected_daily_reward < expected_fill_cost:
                 avoids.append(m)
                 continue
+            positive_ev_count += 1
 
             # Compute shares from target capital
             cost_per_share = max(0.10, min(m.midpoint_guess, 1.0 - m.midpoint_guess) * 2.0)
@@ -421,6 +466,15 @@ class SimpleAllocator:
         avoids.extend(non_eligible)
 
         expected_total = sum(m.expected_daily_reward for m in deploys)
+        notional_overcommit_ratio = (used / wallet_usd) if wallet_usd > 0 else 0.0
+
+        log.info(
+            f"[OVERCOMMIT_ALLOC] eligible={len(eligible)} positive_ev={positive_ev_count} "
+            f"deploys={len(deploys)} avoids={len(avoids)} "
+            f"notional_total=${used:.2f} wallet=${wallet_usd:.2f} "
+            f"overcommit_ratio={notional_overcommit_ratio:.2f}× "
+            f"(target band 3-8× per Ground Rule 2)"
+        )
 
         return AllocationResult(
             deploys=deploys, avoids=avoids,
@@ -515,8 +569,18 @@ class SimpleAllocator:
                 "_total_capital": round(result.total_capital, 2),
             })
 
+        # FX-052/053: overcommit ratio telemetry for monitoring. Ground
+        # Rule 2 target band is 3-8× wallet notional. Persistently outside
+        # the band indicates either (low end) the eligibility / EV filters
+        # are too aggressive, or (high end) the soft sanity cap on market
+        # count is binding (RF_OVERCOMMIT_MAX_DEPLOYED_MARKETS).
+        overcommit_ratio = (
+            result.capital_deployed / result.total_capital
+            if result.total_capital > 0 else 0.0
+        )
+
         payload = {
-            "version": "simple-1.1",  # FX-043: metadata _total_capital stamp
+            "version": "simple-1.2",  # FX-052/053: OverCommitAllocator metadata
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()),
             "num_deploy": len(result.deploys),
             "num_avoid": len(result.avoids),
@@ -532,6 +596,9 @@ class SimpleAllocator:
             # underscore prefix matches the per-row field name so the
             # reader can use either source.
             "_total_capital": round(result.total_capital, 2),
+            # FX-052/053: monitoring fields for the overcommit operating point.
+            "_notional_overcommit_ratio": round(overcommit_ratio, 3),
+            "_target_market_count_band": [50, 200],
             "expected_total_reward": result.expected_total_reward,
             "kill_switch": result.kill_switch,
             "kill_reason": result.kill_reason,

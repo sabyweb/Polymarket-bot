@@ -10,9 +10,11 @@ Contracts under test (R6):
 - C4: markets below MIN_DAILY_RATE_USD are filtered out
 - C5: markets below MIN_EXPECTED_PER_MARKET filtered out
 - C6: deploys ranked by expected_daily_reward descending
-- C7: MAX_DEPLOYED_MARKETS hard cap enforced
-- C8: per-market budget capped at MAX_PER_MARKET_USD
-- C9: total capital budget = wallet × DEPLOY_RATIO; over-budget markets routed to avoid
+- C7: SOFT sanity cap MAX_DEPLOYED_MARKETS (default 500) — was hard 20-cap pre-P2
+- C8: per-market notional = cost-to-score (min_size × midpoint × 2 × (1+buffer)) — NOT wallet-fraction capped (P2 / FX-052)
+- C9: total notional can exceed wallet — overcommit by design (P2 / FX-052 / Ground Rule 2)
+- C16 (P2): positive-EV gate filters markets where expected_reward < expected_fill_cost
+- C17 (P2): alloc.json metadata includes _notional_overcommit_ratio + _target_market_count_band
 - C10: kill switch fires when 24h loss > KILL_LOSS_FRAC
 - C11: kill switch fires when drawdown > KILL_DRAWDOWN_FRAC
 - C12: kill switch returns empty deploys (no work done if killed)
@@ -38,10 +40,7 @@ from simple_allocator import (
     CandidateMarket,
     AllocationResult,
     COLD_START_Q_SHARE,
-    MAX_DEPLOYED_MARKETS,
-    MAX_PER_MARKET_USD,
-    MIN_PER_MARKET_USD,
-    DEPLOY_RATIO,
+    MAX_DEPLOYED_MARKETS,  # P2: now a cfg-driven SOFT sanity cap (default 500)
     KILL_LOSS_FRAC,
     KILL_DRAWDOWN_FRAC,
 )
@@ -145,12 +144,15 @@ def test_C5_filters_markets_with_expected_below_threshold():
     """
     from simple_allocator import MIN_EXPECTED_PER_MARKET, MIN_DAILY_RATE_USD, COLD_START_Q_SHARE
     a = _make_allocator()
+    # P2: thresholds are now cfg-driven (callables). Resolve to values.
+    min_expected = MIN_EXPECTED_PER_MARKET()
+    min_rate = MIN_DAILY_RATE_USD()
     # Pick a daily_rate that JUST passes MIN_DAILY_RATE_USD but produces
     # expected < MIN_EXPECTED_PER_MARKET under cold-start q_share.
     # Solve: daily_rate × COLD_START_Q_SHARE < MIN_EXPECTED_PER_MARKET
     #        daily_rate < MIN_EXPECTED_PER_MARKET / COLD_START_Q_SHARE
-    max_rate_to_fail_filter = MIN_EXPECTED_PER_MARKET / COLD_START_Q_SHARE
-    target_rate = max(MIN_DAILY_RATE_USD, max_rate_to_fail_filter * 0.5)
+    max_rate_to_fail_filter = min_expected / COLD_START_Q_SHARE
+    target_rate = max(min_rate, max_rate_to_fail_filter * 0.5)
     # If MIN_DAILY_RATE_USD is already above the threshold this test can't run
     if target_rate >= max_rate_to_fail_filter:
         pytest.skip("constants make this contract vacuous — see C5 description")
@@ -189,11 +191,15 @@ def test_C6_deploys_ranked_by_expected_daily_reward():
     assert result.deploys[0].condition_id == candidates[-1].condition_id
 
 
-def test_C7_hard_cap_on_max_deployed_markets():
-    """C7: MAX_DEPLOYED_MARKETS is a hard ceiling, regardless of budget."""
+def test_C7_soft_sanity_cap_on_max_deployed_markets():
+    """C7 (P2): MAX_DEPLOYED_MARKETS is a SOFT sanity cap (default 500),
+    not the design constraint. The design point per Ground Rule 1 is 50-200
+    markets in steady state — the 500 cap exists only to bound runaway from
+    API anomalies (Polymarket lists ~5k markets). Pre-P2 this was a hard 20.
+    """
     a = _make_allocator()
     a.fetch_current_q_shares = lambda: {}
-    # Give all markets the same large q_share so they all pass the expected-reward filter
+    # 50 eligible markets all clear the EV gate
     a.load_cumulative_ratios = lambda: {f"0x{i:04d}aaa": 0.05 for i in range(50)}
 
     candidates = [_make_candidate(f"0x{i:04d}aaa", daily_rate=100) for i in range(50)]
@@ -201,38 +207,116 @@ def test_C7_hard_cap_on_max_deployed_markets():
         wallet_usd=10_000, wallet_peak_usd=10_000, wallet_24h_ago_usd=10_000,
         realized_loss_24h=0, markets=candidates,
     )
-    assert len(result.deploys) <= MAX_DEPLOYED_MARKETS
+    # Pre-P2 this would have been ≤20. Post-P2 sanity cap is 500 (default),
+    # so all 50 eligible markets should deploy.
+    assert len(result.deploys) == 50, (
+        f"all 50 EV-positive markets should deploy under OverCommit semantics; "
+        f"got {len(result.deploys)}"
+    )
+    # And confirm the soft cap is well above the actual deploy count
+    assert MAX_DEPLOYED_MARKETS() >= 200, (
+        f"MAX_DEPLOYED_MARKETS soft cap ({MAX_DEPLOYED_MARKETS()}) must permit "
+        f"Ground Rule 1 target band (50-200)"
+    )
 
 
-def test_C8_per_market_capital_capped():
-    """C8: no deploy gets more than MAX_PER_MARKET_USD."""
+def test_C8_per_market_notional_is_cost_to_score_not_wallet_fraction():
+    """C8 (P2 / FX-052): per-market notional = min_size × midpoint × 2 × (1+buffer).
+    NOT bounded by a wallet fraction. Pre-P2 was capped at MAX_PER_MARKET_USD=$60.
+    """
     a = _make_allocator()
     a.fetch_current_q_shares = lambda: {}
     a.load_cumulative_ratios = lambda: {"0xBIG": 0.10}
 
-    # Large min_size that would naturally exceed MAX_PER_MARKET_USD
+    # min_size=200, midpoint=0.5 → cost-to-score = 200 × 1.0 × 1.10 = $220
     candidate = _make_candidate("0xBIG", daily_rate=1000, min_size=200)
     result = a.compute(
         wallet_usd=5000, wallet_peak_usd=5000, wallet_24h_ago_usd=5000,
         realized_loss_24h=0, markets=[candidate],
     )
-    if result.deploys:
-        assert result.deploys[0].target_capital <= MAX_PER_MARKET_USD + 0.01
+    assert len(result.deploys) == 1, "high-EV market must deploy"
+    target = result.deploys[0].target_capital
+    # Expected: 200 × min(0.5, 0.5) × 2 × (1 + 0.10) = 200 × 1.0 × 1.10 = $220
+    assert 190.0 < target < 250.0, (
+        f"per-market notional should reflect cost-to-score (~$220 for min_size=200), "
+        f"NOT capped at $60 wallet fraction; got ${target:.2f}"
+    )
 
 
-def test_C9_budget_caps_total_at_deploy_ratio_of_wallet():
-    """C9: total capital deployed ≤ wallet × DEPLOY_RATIO."""
+def test_C9_total_notional_can_exceed_wallet_overcommit_by_design():
+    """C9 (P2 / FX-052 / Ground Rule 2): total notional can exceed wallet.
+
+    100 markets × ~$22 cost-to-score (min_size=20, midpoint=0.5, buffer=10%)
+    = $2200 on a $500 wallet (4.4× overcommit). Pre-P2 this would have been
+    capped at wallet × 0.95 = $475 (Rule 2 violation).
+    """
     a = _make_allocator()
     a.fetch_current_q_shares = lambda: {}
-    a.load_cumulative_ratios = lambda: {f"0x{i:04d}aaa": 0.05 for i in range(50)}
+    # 100 markets all positive-EV
+    a.load_cumulative_ratios = lambda: {f"0x{i:04d}aaa": 0.10 for i in range(100)}
 
-    candidates = [_make_candidate(f"0x{i:04d}aaa", daily_rate=200) for i in range(50)]
-    wallet = 200
+    candidates = [_make_candidate(f"0x{i:04d}aaa", daily_rate=500) for i in range(100)]
+    wallet = 500  # $500 wallet — small enough that 100 markets × $22 overcommits clearly
     result = a.compute(
         wallet_usd=wallet, wallet_peak_usd=wallet, wallet_24h_ago_usd=wallet,
         realized_loss_24h=0, markets=candidates,
     )
-    assert result.capital_deployed <= wallet * DEPLOY_RATIO + 0.5  # small float tolerance
+    overcommit_ratio = result.capital_deployed / wallet
+    # Per Ground Rule 2: 3-8× design point. 100 markets × $22 ≈ $2200 / $500 = 4.4×.
+    assert overcommit_ratio > 3.0, (
+        f"overcommit operation must push total notional into 3-8× wallet band; "
+        f"got {overcommit_ratio:.2f}× (${result.capital_deployed:.2f} / ${wallet:.2f})"
+    )
+    assert len(result.deploys) == 100, (
+        f"all 100 EV-positive markets must deploy under OverCommit semantics; "
+        f"got {len(result.deploys)}"
+    )
+
+
+def test_C16_positive_ev_gate_filters_negative_ev_markets():
+    """C16 (P2 / FX-052): markets where expected_reward < expected_fill_cost
+    are routed to avoid. Keeps deploys positive-EV per Ground Rules 1 + 3.
+    """
+    a = _make_allocator()
+    # daily_rate=10, q_share=0.001 → expected_reward = $0.01/day
+    # cost-to-score = 50 × 1.0 × 1.10 = $55. expected_fill_cost = 55 × 0.02 = $1.10
+    # $0.01/day < $1.10/fill → negative EV → must be avoided
+    a.fetch_current_q_shares = lambda: {}
+    a.load_cumulative_ratios = lambda: {"0xLOW": 0.001}
+
+    low_ev = _make_candidate("0xLOW", daily_rate=10)
+    result = a.compute(
+        wallet_usd=1000, wallet_peak_usd=1000, wallet_24h_ago_usd=1000,
+        realized_loss_24h=0, markets=[low_ev],
+    )
+    assert len(result.deploys) == 0, (
+        f"negative-EV market must be filtered (expected_reward $0.01/day < "
+        f"expected_fill_cost ~$1.10/fill); got {len(result.deploys)} deploys"
+    )
+    assert "0xLOW" in [m.condition_id for m in result.avoids]
+
+
+def test_C17_alloc_json_metadata_includes_overcommit_fields():
+    """C17 (P2): write_allocation_json stamps _notional_overcommit_ratio
+    and _target_market_count_band in top-level metadata for monitoring.
+    """
+    a = _make_allocator()
+    a.fetch_current_q_shares = lambda: {}
+    a.load_cumulative_ratios = lambda: {"0xA": 0.05}
+    candidates = [_make_candidate("0xA", daily_rate=200)]
+    result = a.compute(
+        wallet_usd=1000, wallet_peak_usd=1000, wallet_24h_ago_usd=1000,
+        realized_loss_24h=0, markets=candidates,
+    )
+    tmp = tempfile.mktemp(suffix=".json")
+    a.write_allocation_json(result, output_path=tmp)
+    with open(tmp) as f:
+        data = json.load(f)
+    assert "_notional_overcommit_ratio" in data
+    assert "_target_market_count_band" in data
+    assert data["_target_market_count_band"] == [50, 200]
+    assert data["version"] == "simple-1.2"
+    os.unlink(tmp)
 
 
 # ── Kill switch contracts ──
