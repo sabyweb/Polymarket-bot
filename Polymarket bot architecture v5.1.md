@@ -4,6 +4,82 @@
 
 ---
 
+**v6.1 scope (2026-05-28).** v6.0 SHIPPED. 8 commits to `main` over 2026-05-26 → 2026-05-28 closing all code-level deliverables of the 9-phase 9/10 plan. Bot remains halted on Helsinki; ready for staged rebring-up per operator runbook at `docs/runbooks/9_of_10_p5_p7_operator_runbook.md`.
+
+**Session ledger:**
+
+| Commit | Phase | FX | What |
+|---|---|---|---|
+| `5bbded1` | P1 | FX-058 + FX-043 | Farmer kill-threshold retune (2.0/2.5 → 5.0/8.0 cfg-driven) + rapid-growth kill (5× over 5 min) + `_total_capital` top-level metadata stamp closes silent fail-open on 0-deploy cycles |
+| `45a7fc3` | P2 | FX-052 + FX-053 | OverCommitAllocator — dropped `DEPLOY_RATIO=0.95`, `MAX_PER_MARKET_USD=$60`, `MAX_DEPLOYED_MARKETS=20` (Rule-1+2 violations). Per-market notional = cost-to-score (`min_size × midpoint × 2 × 1.10`). Target band 50-200 markets, 3-8× wallet notional. New EV gate filters `expected_reward × q_share < expected_fill_cost`. Soft sanity cap at 500. |
+| `bc8d169` | P3 | FX-046 | Formal acceptance (moved to §5 Won't Fix / Accepted Risk) — research agent confirmed all 3 candidate formulas under-predict by 24-94× and no clean code change disambiguates. Conservative-margin cfg knob `RF_OVERCOMMIT_Q_SHARE_CONSERVATIVE_FACTOR=1.0` lets operators tune at runtime. |
+| `b1d7ddd` | P4 | FX-059 | 2 new self-correction triggers wired (was 2/6, now 4/6): #3 per-market fill_rate → reduce shares; #5 global loss > rewards → tighten filters + halve sizing. |
+| `c68186b` | — | — | Operator runbook for P5/P6/P7 live phases (`docs/runbooks/9_of_10_p5_p7_operator_runbook.md`). |
+| `c2358df` | P8 | — | Chaos engineering — 11 attack vectors (API failures, RPC outage, config corruption, stale alloc, adversarial alloc data, clock skew, schema drift). 0 new FX entries opened; all absorbed by P1-P4 defensive work. |
+| `7f17e1b` | P9 | — | Honest audit after operator pushback. 11 integration adversarial tests (cumulative P1+P2+P3+P4 interaction). 1 pre-existing failure surfaced (`test_simulation::test_over_aggressive_contracts_capital` — confirmed predates session in legacy `LearningController`, not my changes). |
+| `ac5da22` | P10+P11 | FX-060 + FX-061 | Final 2 self-correction triggers wired (now 6/6): #4 global reward < target → expand filters; #6 API q_share divergence > 2× → distrust + recalibrate. New DB table `q_share_recalibration_events`. Ground Rule 3's "no code that runs but isn't read" violation closed. |
+
+**Architecture changes summary (vs v6.0 plan):**
+
+A → ✅ shipped (FX-052+053): OverCommitAllocator. `SimpleAllocator` class name retained for import-site compat; semantics transformed.
+B → ✅ shipped pre-session (FX-051, commit `e4f2ee3`): `market_roi_tracker` with rolling 1h/24h/7d windows.
+C → ✅ shipped pre-session (FX-051) + this session (P4 + P10 + P11): `decision_policy.evaluate()` returns 5 behavior-change outputs (`excluded_cids`, `size_reduction_cids`, `global_tighten`, `global_reward_low`, `q_share_distrust_cids`).
+D → ✅ shipped pre-session (FX-054, commit `e478dc8`): 3-axis fill-detection fix (idempotent log_fill + balance-lag tolerance + drift catch-up sweep).
+E → ✅ shipped pre-session (FX-055): wallet_reconciliation re-wired in simple_oversight.
+F → ⚠️ partial — LossModel + Bandit not resurrected; per-market loss feedback achieved via FX-051's cooldown loop directly (simpler architecture).
+G → ✅ shipped (FX-058): kill switch retune to acceleration-based detection (5× notional growth over 5 min) instead of absolute threshold.
+H → ✅ shipped (FX-058): notional ratios 2.0/2.5 → 5.0/8.0 cfg-driven.
+
+**Test verification:**
+- 318 tests pass across P1-P11 + adjacent suites. Zero regressions.
+- 1 pre-existing failure (`test_over_aggressive_contracts_capital`) in legacy `LearningController` (oversight_agent path, not current `simple_oversight`). Not caused by v6.x changes.
+- 15 new P10+P11 adversarial tests (`tests/test_p10_p11_full_self_learning.py`); 11 integration tests (`tests/test_p9_integration_audit.py`); 11 chaos tests (`tests/test_p8_chaos_engineering.py`); + 13 P4 + 7 P3 + 20 P2 + 17 P1 = **94 new tests this session.**
+
+**New DB tables (introduced this session + retained from prior):**
+
+| Table | Source | Purpose |
+|---|---|---|
+| `market_roi` | FX-051 | Per-market rolling 1h/24h/7d snapshots (PK: cid + window) |
+| `capital_committed_snapshots` | FX-051 | Time-weighted capital integration source for ROI calc |
+| `market_cooldowns` | FX-051 | Active cooldown rows (cid → cooldown_until) |
+| `daily_reward_cache` | FX-051 | `/rewards/user/markets?date=X` API cache |
+| `q_share_recalibration_events` | FX-061 (P11) | Audit trail of API-vs-cumulative divergence events |
+
+**New cfg knobs (all hot-reloadable via `config_overrides.json`):**
+
+| Knob | Default | Purpose |
+|---|---|---|
+| `RF_MAX_NOTIONAL_RATIO` | 5.0 | FX-058 soft notional cap |
+| `RF_HARD_NOTIONAL_RATIO` | 8.0 | FX-058 hard notional cap |
+| `RF_RAPID_GROWTH_KILL_RATIO` | 5.0 | FX-058 acceleration-based kill threshold |
+| `RF_RAPID_GROWTH_WINDOW_SEC` | 300.0 | FX-058 lookback window |
+| `RF_OVERCOMMIT_MIN_DAILY_RATE_USD` | 10.0 | FX-052/053 market eligibility floor |
+| `RF_OVERCOMMIT_MIN_EXPECTED_PER_MARKET` | 0.01 | FX-052/053 per-market reward floor |
+| `RF_OVERCOMMIT_MAX_DEPLOYED_MARKETS` | 500 | FX-052/053 soft sanity cap (not design target) |
+| `RF_OVERCOMMIT_PER_MARKET_BUFFER_FRAC` | 0.10 | FX-052 cost-to-score buffer |
+| `RF_OVERCOMMIT_EXPECTED_FILL_COST_FRAC` | 0.02 | FX-052/053 EV gate slippage assumption |
+| `RF_OVERCOMMIT_Q_SHARE_CONSERVATIVE_FACTOR` | 1.0 | FX-046 (P3) runtime conservative multiplier for non-API q_share |
+| `RF_GLOBAL_REWARD_TARGET_24H_USD` | 4.0 | FX-060 (P10) trigger #4 threshold (80% of $5/day floor) |
+| `RF_QSHARE_DIVERGENCE_RATIO` | 2.0 | FX-061 (P11) trigger #6 threshold (matches ground_rules.md "diverges > 2×") |
+
+**Alloc.json schema bump: v1.0 → v1.2.** Adds top-level `_total_capital` metadata stamp (FX-043) + `_notional_overcommit_ratio` + `_target_market_count_band=[50,200]`.
+
+**9/10 plan gate status:**
+
+| Gate | Status |
+|---|---|
+| G-A FX-052+053 OverCommitAllocator | ✅ MET (P2) |
+| G-B 4+ self-correction triggers wired | ✅ MET (P4+P10+P11 = 6/6 now) |
+| G-D FX-046 resolved or formally accepted | ✅ MET (P3 → §5) |
+| G-C FX-054 verified in production | ⏳ requires live op (P6) |
+| G-E G1 7-day clean run | ⏳ requires live op (P7) |
+
+**Honest rating: 7.5/10 today.** Code-level mechanisms complete. The 1.5-point gap to 9/10 is empirical validation pending live Helsinki operation.
+
+**Operator action to advance to 9/10:** execute `docs/runbooks/9_of_10_p5_p7_operator_runbook.md` (shadow ≥48h → live cutover at full wallet → P6 fill-burst verify → P7 G1 7-day continuous clean).
+
+---
+
 **v6.0 scope (2026-05-26).** GROUND RULES established. The companion file
 `ground_rules.md` in the repo is now the **immutable contract** for every
 architectural decision. Three rules:
