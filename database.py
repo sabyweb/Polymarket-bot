@@ -449,6 +449,34 @@ CREATE TABLE IF NOT EXISTS daily_reward_cache (
     PRIMARY KEY (date, condition_id)
 );
 CREATE INDEX IF NOT EXISTS idx_drc_date ON daily_reward_cache(date);
+
+-- FX-061 (P11 of 9/10 plan): q_share recalibration events. When the API
+-- q_share for a held market diverges from the cumulative DB ratio by
+-- more than RF_QSHARE_DIVERGENCE_RATIO, decision_policy inserts a row
+-- here for audit trail. Allocator reads recent events (last 24h) and
+-- adds the cid to its `q_share_distrust_cids` set so non-API q_share
+-- estimates for that cid get an extra 0.5× factor.
+--
+-- This implements the ground_rules.md §3 trigger #6 action: "Update
+-- bot's per-market q_share to API value; recalibrate scoring". The
+-- API-value-update part is already automatic via Priority 0 in
+-- estimate_q_share. This table operationalizes the "recalibrate scoring"
+-- part — when API and cumulative disagree, we trust API while held
+-- AND remember to distrust cumulative for that cid going forward.
+--
+-- One row per detection event (not per cid). cid appears multiple times
+-- if divergence persists across cycles. Pruned to last 7 days by
+-- tracker.prune_old_snapshots() (same retention as capital snapshots).
+CREATE TABLE IF NOT EXISTS q_share_recalibration_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts              REAL NOT NULL,
+    condition_id    TEXT NOT NULL,
+    api_q_share     REAL NOT NULL,
+    cumulative_q_share REAL NOT NULL,
+    divergence_ratio REAL NOT NULL  -- max/min(api, cumul); always >= 1.0
+);
+CREATE INDEX IF NOT EXISTS idx_qsre_cid_ts ON q_share_recalibration_events(condition_id, ts);
+CREATE INDEX IF NOT EXISTS idx_qsre_ts ON q_share_recalibration_events(ts);
 """
 
 

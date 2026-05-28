@@ -210,7 +210,10 @@ def run_once(
     excluded_cids: set[str] = set()
     size_reduction_cids: set[str] = set()
     global_tighten: bool = False
+    global_reward_low: bool = False
+    q_share_distrust_cids: set[str] = set()
     tracker = None
+    policy = None
     try:
         from market_roi_tracker import MarketROITracker
         from decision_policy import DecisionPolicy
@@ -233,16 +236,50 @@ def run_once(
         # P4 of 9/10 plan: evaluate() returns richer dict — extract the new
         # behavior-change outputs (size_reduction_cids per-market, global_tighten
         # globally) alongside the cooldown set.
+        # P10/P11 additions: global_reward_low + q_share_distrust_cids.
         eval_out = policy.evaluate()
         excluded_cids = policy.get_excluded_cids()
         size_reduction_cids = eval_out.get("size_reduction_cids", set())
         global_tighten = eval_out.get("global_tighten", False)
+        global_reward_low = eval_out.get("global_reward_low", False)
+        q_share_distrust_cids = eval_out.get("q_share_distrust_cids", set())
     except Exception as e:
         log.warning(f"[LEARN] tracker/policy pass failed (fail-open): {e}")
 
+    # P11 of 9/10 plan: q_share divergence detection requires comparing
+    # API q_share vs cumulative DB ratio. Both sources live on the
+    # allocator (fetch_current_q_shares + load_cumulative_ratios). We pull
+    # them here and feed each cid pair to policy.record_qshare_divergence,
+    # which inserts a row in q_share_recalibration_events on breach.
+    # Next cycle's policy.evaluate will pick up the new event via
+    # _detect_qshare_divergence and add the cid to q_share_distrust_cids.
+    #
+    # Fail-quiet: any failure in this block skips detection this cycle;
+    # next cycle retries. Wrapped in its own try/except so a fetch error
+    # doesn't pollute the main allocation path.
+    if policy is not None:
+        try:
+            api_shares = allocator.fetch_current_q_shares()
+            cumul = allocator.load_cumulative_ratios()
+            breaches = 0
+            for cid, api_q in api_shares.items():
+                if cid in cumul:
+                    if policy.record_qshare_divergence(cid, api_q, cumul[cid]):
+                        breaches += 1
+            if breaches > 0:
+                log.warning(
+                    f"[LEARN_DIVERGENCE] cycle_summary: {breaches} cids "
+                    f"with q_share divergence > 2× recorded"
+                )
+        except Exception as e:
+            log.debug(f"[LEARN_DIVERGENCE] detection pass skipped: {e}")
+
     # 4. Allocate
-    # P4: pass the new behavior-change inputs. Allocator halves shares_per_side
-    # for cids in size_reduction_cids; raises filter floors when global_tighten=True.
+    # P4 / P10 / P11: pass the new behavior-change inputs.
+    # - size_reduction_cids: halve shares for these (fill_rate too high)
+    # - global_tighten: raise floors + halve sizing (loss > rewards)
+    # - global_reward_low: lower floors (under-deployment)
+    # - q_share_distrust_cids: apply 0.5× to non-API q_share for these
     result = allocator.compute(
         wallet_usd=wallet,
         wallet_peak_usd=peak,
@@ -251,6 +288,8 @@ def run_once(
         excluded_cids=excluded_cids,
         size_reduction_cids=size_reduction_cids,
         global_tighten=global_tighten,
+        global_reward_low=global_reward_low,
+        q_share_distrust_cids=q_share_distrust_cids,
     )
 
     # 4a. FX-051: record per-market est_capital_cost rows so future ROI ticks

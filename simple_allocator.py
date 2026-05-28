@@ -351,6 +351,8 @@ class SimpleAllocator:
         excluded_cids: Optional[set[str]] = None,
         size_reduction_cids: Optional[set[str]] = None,
         global_tighten: bool = False,
+        global_reward_low: bool = False,
+        q_share_distrust_cids: Optional[set[str]] = None,
     ) -> AllocationResult:
         """Main allocation entry point.
 
@@ -379,6 +381,7 @@ class SimpleAllocator:
         sources_used = {"api": 0, "cumulative": 0, "cold_start": 0}
         excluded = excluded_cids or set()
         size_reduction = size_reduction_cids or set()
+        q_distrust = q_share_distrust_cids or set()
 
         # ── Kill switch check FIRST ──
         kill, reason = self.check_kill_switch(
@@ -405,12 +408,25 @@ class SimpleAllocator:
         # uncertainty and let FX-051 cooldowns catch losers). Operators
         # concerned about over-deployment can set RF_OVERCOMMIT_Q_SHARE_CONSERVATIVE_FACTOR
         # below 1.0 to bias non-API expected_reward down → EV gate tightens.
+        # FX-061 (P11): for cids in `q_distrust` (recent API-vs-cumulative
+        # divergence > 2×), apply an ADDITIONAL 0.5× factor to non-API
+        # q_share. Compounds multiplicatively with the global conservative
+        # factor if both are < 1.0. Implements ground_rules.md §3 trigger
+        # #6 action "recalibrate scoring": when bot's heuristic disagrees
+        # with Polymarket's truth, distrust the heuristic for that cid.
         conservative_factor = Q_SHARE_CONSERVATIVE_FACTOR()
+        distrust_factor = 0.5
         for m in candidates:
             q, src = self.estimate_q_share(m.condition_id, api_shares, cumulative)
             # Apply conservative factor ONLY to non-API sources
             if src != "api":
                 q = q * conservative_factor
+                # P11: per-cid distrust factor (only meaningful when allocator
+                # falls back to non-API source for a cid we KNOW has API/cumul
+                # disagreement). If API IS available for this cid right now,
+                # this branch never executes (src=="api" above).
+                if m.condition_id in q_distrust:
+                    q = q * distrust_factor
             m.expected_q_share = q
             m.expected_daily_reward = m.daily_rate * q
             m.q_share_source = src
@@ -426,8 +442,21 @@ class SimpleAllocator:
         # 2× to skip the long tail of low-reward markets. Symmetric with the
         # global_size_factor below — both effects accumulate to bias toward
         # fewer, safer deploys until the global loss/reward ratio recovers.
-        min_rate = MIN_DAILY_RATE_USD() * (2.0 if global_tighten else 1.0)
-        min_expected = MIN_EXPECTED_PER_MARKET()
+        # P10 Trigger #4 (FX-060): under global_reward_low (rewards under
+        # target, NOT losing), HALVE both floors to widen the candidate set
+        # per ground_rules.md "expand market count, lower per-market
+        # expected-reward floor". Mutually exclusive with global_tighten
+        # (decision_policy ensures only one fires). Applies only when
+        # actually under target — default no-op.
+        rate_multiplier = 1.0
+        expected_multiplier = 1.0
+        if global_tighten:
+            rate_multiplier = 2.0
+        elif global_reward_low:
+            rate_multiplier = 0.5
+            expected_multiplier = 0.5
+        min_rate = MIN_DAILY_RATE_USD() * rate_multiplier
+        min_expected = MIN_EXPECTED_PER_MARKET() * expected_multiplier
         eligible = [
             m for m in candidates
             if m.daily_rate >= min_rate
@@ -518,7 +547,9 @@ class SimpleAllocator:
             f"overcommit_ratio={notional_overcommit_ratio:.2f}× "
             f"(target band 3-8× per Ground Rule 2) "
             f"p4_size_reduction_cids={len(size_reduction)} "
-            f"p4_global_tighten={global_tighten}"
+            f"p4_global_tighten={global_tighten} "
+            f"p10_global_reward_low={global_reward_low} "
+            f"p11_q_distrust_cids={len(q_distrust)}"
         )
 
         return AllocationResult(

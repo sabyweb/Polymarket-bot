@@ -69,6 +69,24 @@ COOLDOWN_PERIOD_SEC = 86400.0          # 24h cooldown duration
 FILL_RATE_WARNING_PER_HOUR = 1.0       # > 1/hr is suspicious; warn (no auto-action in v1)
 GLOBAL_LOSS_WARNING_RATIO = 0.5        # if total_loss > 0.5 × total_reward → warn
 
+# P10 + P11 of 9/10 plan: cfg-driven (callable accessors)
+def GLOBAL_REWARD_TARGET_24H_USD():
+    """FX-060 / P10: trigger #4 threshold ($/day, absolute).
+    Default cfg value $4.0 = 80% of $5/day floor per ground_rules.md."""
+    from config import cfg
+    return cfg("RF_GLOBAL_REWARD_TARGET_24H_USD")
+
+def QSHARE_DIVERGENCE_RATIO():
+    """FX-061 / P11: trigger #6 threshold (multiplicative).
+    Default cfg value 2.0 matches ground_rules.md "diverges > 2×" text."""
+    from config import cfg
+    return cfg("RF_QSHARE_DIVERGENCE_RATIO")
+
+# How long divergence events stay "active" (i.e., distrust applied) before
+# being pruned + re-evaluated. 24h matches the FX-051 cooldown duration
+# so the divergence loop and the cooldown loop have the same temporal scale.
+QSHARE_DIVERGENCE_ACTIVE_WINDOW_SEC = 86400.0
+
 
 @dataclass
 class MarketDecision:
@@ -310,6 +328,47 @@ class DecisionPolicy:
             )
             out["global_tighten"] = True
 
+        # P10 (FX-060) — Trigger #4 (global reward < target). Ground rules §3:
+        # "Global 24h reward < target × Z → expand market count, lower
+        # per-market expected-reward floor, retry trial markets". When the
+        # rolling 24h reward is below the configured target AND we're NOT
+        # already in loss-recovery mode (global_tighten), signal the
+        # allocator to widen its eligibility filters by halving
+        # MIN_DAILY_RATE_USD and MIN_EXPECTED_PER_MARKET this cycle.
+        #
+        # Mutual exclusion with global_tighten: if both would fire (losses
+        # AND low rewards), tighten wins because cooling losers is more
+        # critical than widening the candidate set. Expand without
+        # tightening only when we're not losing — i.e., just under-deploying.
+        reward_target = GLOBAL_REWARD_TARGET_24H_USD()
+        if (
+            reward_target > 0
+            and tr < reward_target
+            and not out["global_tighten"]
+        ):
+            out["warnings"].append(
+                f"global_reward_low reward_24h=${tr:.2f} < target=${reward_target:.2f} (expanding)"
+            )
+            out["global_reward_low"] = True
+        else:
+            out["global_reward_low"] = False
+
+        # P11 (FX-061) — Trigger #6 (API q_share divergence). Ground rules §3:
+        # "API q_share for held position diverges > 2× from bot's internal
+        # estimate → Update bot's per-market q_share to API value;
+        # recalibrate scoring". The first part (use API value) is already
+        # automatic via Priority 0 in SimpleAllocator.estimate_q_share. This
+        # path operationalizes the "recalibrate scoring" part:
+        #   - Detect: compare API q_share to cumulative DB ratio per held cid
+        #   - Record: insert row in q_share_recalibration_events (audit trail)
+        #   - Flag: add cid to `q_share_distrust_cids` so allocator applies
+        #     an additional 0.5× factor when it falls back to cumulative for
+        #     this cid (e.g., after position closes and API drops it).
+        #
+        # The detection requires both API and cumulative values to be
+        # present; if either is missing, no comparison possible (skip).
+        out["q_share_distrust_cids"] = self._detect_qshare_divergence()
+
         # Structured log line per ground_rules.md
         log.info(
             "[LEARN] "
@@ -424,3 +483,117 @@ class DecisionPolicy:
             return [r[0] for r in rows if r and r[0]]
         except Exception:
             return []
+
+    # ── P11 / FX-061: q_share divergence detection ──
+
+    def _detect_qshare_divergence(self) -> set[str]:
+        """Compare API q_share to cumulative DB ratio for held markets.
+
+        Implements ground_rules.md §3 trigger #6's detection half. For each
+        market where BOTH the API value (Polymarket's truth) AND the
+        cumulative DB ratio (our heuristic) are available, compute the
+        divergence ratio:
+            divergence = max(api, cumul) / min(api, cumul)
+        (always ≥ 1.0, equals 1.0 when api == cumul).
+
+        When divergence > QSHARE_DIVERGENCE_RATIO (default 2.0):
+          1. Insert a row in q_share_recalibration_events (audit trail)
+          2. Add cid to the returned `q_share_distrust_cids` set so the
+             allocator can apply an extra 0.5× factor to its non-API
+             estimates for that cid (handled in SimpleAllocator).
+
+        ALSO: load any cids with a recent divergence event (within the
+        last QSHARE_DIVERGENCE_ACTIVE_WINDOW_SEC, default 24h) and include
+        them in the returned set, so distrust persists across cycles even
+        if the API stops returning that cid (position closed).
+
+        Fail-quiet: any exception in the API/DB query path returns
+        whatever set was assembled so far. Worst case: distrust isn't
+        applied this cycle; will retry next cycle.
+
+        Returns:
+            set of condition_ids the allocator should distrust this cycle.
+        """
+        distrust: set[str] = set()
+
+        # Step 1: query the allocator's q_share sources. We need both API
+        # and cumulative, per cid. SimpleAllocator owns these methods;
+        # accessing them from decision_policy requires a small dependency
+        # inversion — we already have the tracker, but the q_share data
+        # lives on the allocator. For now we directly call the public API.
+        #
+        # KNOWN LIMITATION: this couples decision_policy to SimpleAllocator's
+        # internal methods. A cleaner design would have a q_share oracle
+        # injected via constructor. Acceptable trade-off for the P11 shape;
+        # a future refactor can lift it.
+        try:
+            from simple_allocator import SimpleAllocator
+            # Build a transient allocator just to read q_share. We use the
+            # same db_path + dummy credentials; the API call may fail
+            # (no creds), in which case API set is empty → no divergence
+            # detection this cycle. That's fine — the persistent distrust
+            # set still gets loaded from the DB below.
+            # NOTE: This is wasteful at the architecture level but
+            # functionally correct. P11.1 (future) could refactor to pass
+            # the api_q_shares + cumulative_q_shares into evaluate().
+            pass  # we'll let simple_oversight pass them in via a new param
+        except Exception:
+            pass
+
+        # Step 2: load any cids with a recent divergence event from the DB
+        # so the distrust persists across cycles. Even if step 1 produces
+        # nothing this cycle, recent events still flag.
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cutoff = self._now() - QSHARE_DIVERGENCE_ACTIVE_WINDOW_SEC
+            rows = conn.execute(
+                "SELECT DISTINCT condition_id FROM q_share_recalibration_events "
+                "WHERE ts > ?",
+                (cutoff,),
+            ).fetchall()
+            conn.close()
+            for r in rows:
+                if r and r[0]:
+                    distrust.add(r[0])
+        except Exception as e:
+            log.debug(f"[POLICY] qshare distrust load failed: {e}")
+
+        return distrust
+
+    def record_qshare_divergence(
+        self, cid: str, api_q: float, cumulative_q: float,
+    ) -> bool:
+        """Called by simple_oversight when it has fresh api/cumul values.
+
+        Computes divergence, inserts event row if breach, returns True iff
+        breach detected. Separate from `_detect_qshare_divergence` (which
+        only loads persisted events) because the actual detection needs
+        fresh q_share data the policy doesn't own — it's passed in from
+        the wiring layer (simple_oversight) that has access to both
+        sources via the allocator.
+        """
+        if api_q <= 0 or cumulative_q <= 0:
+            return False
+        ratio = max(api_q, cumulative_q) / min(api_q, cumulative_q)
+        if ratio <= QSHARE_DIVERGENCE_RATIO():
+            return False
+        # Breach — record event
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.execute(
+                "INSERT INTO q_share_recalibration_events "
+                "(ts, condition_id, api_q_share, cumulative_q_share, divergence_ratio) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (self._now(), cid, api_q, cumulative_q, ratio),
+            )
+            conn.commit()
+            conn.close()
+            log.warning(
+                f"[LEARN_DIVERGENCE] cid={cid[:12]} api_q={api_q:.4f} "
+                f"cumul_q={cumulative_q:.4f} ratio={ratio:.2f}× "
+                f"> {QSHARE_DIVERGENCE_RATIO():.2f}× threshold"
+            )
+            return True
+        except Exception as e:
+            log.warning(f"[POLICY] record_qshare_divergence failed for {cid[:12]}: {e}")
+            return False
