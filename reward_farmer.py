@@ -60,9 +60,19 @@ def PLACEMENT_TICKS_INSIDE(): return cfg("RF_PLACEMENT_TICKS_INSIDE")
 # unaware of them (correct layering: allocation decides intent, farmer
 # enforces execution-time safety). Fail-open on missing data so a DB hiccup
 # can never halt trading — only the explicit kill-switch triggers halt.
-MAX_NOTIONAL_RATIO = 2.0                 # soft: block new placements above this
-HARD_NOTIONAL_RATIO = 2.5                # hard: actively cancel lowest-priority
-                                         # orders until ratio ≤ MAX_NOTIONAL_RATIO
+#
+# FX-058 (P1 of 9/10 plan): the four notional thresholds below are now
+# cfg()-driven so they can be retuned without code redeploy. The legacy
+# hardcoded values (MAX_NOTIONAL_RATIO=2.0, HARD_NOTIONAL_RATIO=2.5) were
+# Rule-2 violations — capped below the 3-8× overcommit design point and
+# would have tripped on the FX-052/053 OverCommitAllocator's intended
+# operating regime. Replaced with raised cfg defaults (5.0 soft / 8.0
+# hard) + a NEW acceleration-based rapid-growth kill that catches
+# anomalous bursts without false-firing on healthy overcommit.
+def MAX_NOTIONAL_RATIO(): return cfg("RF_MAX_NOTIONAL_RATIO")
+def HARD_NOTIONAL_RATIO(): return cfg("RF_HARD_NOTIONAL_RATIO")
+def RAPID_GROWTH_KILL_RATIO(): return cfg("RF_RAPID_GROWTH_KILL_RATIO")
+def RAPID_GROWTH_WINDOW_SEC(): return cfg("RF_RAPID_GROWTH_WINDOW_SEC")
 CLUSTER_NOTIONAL_LIMIT_FRAC = 0.5        # soft+hard: block new placements AND
                                          # actively cancel once a cluster exceeds
                                          # 0.5·total_capital (§4.1 of spec — the
@@ -216,6 +226,14 @@ class RewardFarmer:
         # the hard threshold. Unknown (signal missing) leaves the
         # counter unchanged so a DB hiccup doesn't mask a real breach.
         self._consecutive_hard_notional_breach_cycles: int = 0
+        # FX-058: rolling samples of (ts, notional_ratio) over the
+        # RAPID_GROWTH_WINDOW_SEC window. Used by
+        # _guardrail_rapid_notional_growth to detect anomalous bursts
+        # that the loose static thresholds (5×/8×) intentionally permit.
+        # deque with no maxlen — eviction is time-based, capped by the
+        # 30 s cycle interval × 300 s window = ~10 entries in steady state.
+        from collections import deque
+        self._notional_ratio_samples: deque[tuple[float, float]] = deque()
 
         # Cycle-scope observability counters. Reset at the top of each
         # run_cycle; emitted in [CYCLE_SUMMARY] at every run_cycle exit.
@@ -1174,10 +1192,22 @@ class RewardFarmer:
     # and (b) activating the kill switch — both gated inside run_cycle.
 
     def _guardrail_total_capital_from_alloc(self) -> float | None:
-        """Read `_total_capital` stamp from the first deploy row of the
-        current allocation JSON. None when file is missing / stale /
-        unstamped — farmer falls open (skips capital-fraction checks)
-        and emits a [GUARDRAIL_WARNING] so the gap is visible."""
+        """Read `_total_capital` from the current allocation JSON.
+
+        FX-043 resolution order (lifts the silent fail-open on 0-deploy
+        cycles observed 2026-05-21 19:50-19:54 UTC):
+          1. Top-level metadata `_total_capital` (preferred; FX-043 stamp
+             added in simple-1.1 alloc-file version).
+          2. First DEPLOY row's `_total_capital` (legacy; pre-FX-043).
+          3. First AVOID row's `_total_capital` (further fallback;
+             SimpleAllocator stamps it on every row).
+          4. None — warns + farmer falls open.
+
+        Net effect: any cycle whose allocator successfully ran (even with
+        0 deploys) carries a usable capital signal for all wallet-fraction
+        guardrails. Only a genuinely missing/corrupted alloc file falls
+        open now.
+        """
         alloc_path = os.path.join(
             os.path.dirname(__file__) or ".", "market_allocations.json",
         )
@@ -1190,15 +1220,29 @@ class RewardFarmer:
                 return None
             with open(alloc_path) as f:
                 data = json.load(f)
+            # FX-043 step 1: prefer top-level metadata stamp
+            tc = data.get("_total_capital")
+            if tc is not None:
+                return float(tc)
+            # FX-043 step 2-3: fall back to any row's stamp (deploy first,
+            # then avoid). Iterating once is O(N) but N is small (≤200).
+            deploy_tc = None
+            avoid_tc = None
             for m in data.get("markets", []):
-                if m.get("action") != "deploy":
+                row_tc = m.get("_total_capital")
+                if row_tc is None:
                     continue
-                tc = m.get("_total_capital")
-                if tc is not None:
-                    return float(tc)
+                if m.get("action") == "deploy" and deploy_tc is None:
+                    deploy_tc = float(row_tc)
+                elif m.get("action") == "avoid" and avoid_tc is None:
+                    avoid_tc = float(row_tc)
+            if deploy_tc is not None:
+                return deploy_tc
+            if avoid_tc is not None:
+                return avoid_tc
             log.warning(
                 "[GUARDRAIL_WARNING] missing_signal=total_capital "
-                "(no deploy row with _total_capital stamp)"
+                "(no top-level or row-level _total_capital stamp in alloc)"
             )
         except Exception as e:
             log.warning(
@@ -1336,6 +1380,55 @@ class RewardFarmer:
             return None, short_count, base_count
         return short_count / expected_short, short_count, base_count
 
+    def _guardrail_rapid_notional_growth(
+        self, notional_ratio: float | None,
+    ) -> tuple[bool, float | None]:
+        """FX-058: detect a rapid burst in notional_ratio across the
+        RAPID_GROWTH_WINDOW_SEC lookback.
+
+        Returns (kill, observed_multiplier). kill=True when:
+          (a) RAPID_GROWTH_KILL_RATIO > 0  (i.e., not disabled)
+          (b) we have at least 2 samples in the window
+          (c) max_in_window / min_in_window > RAPID_GROWTH_KILL_RATIO
+
+        The acceleration-based check is the load-bearing kill protection
+        under the OverCommitAllocator (FX-052/053). The static thresholds
+        (MAX/HARD_NOTIONAL_RATIO 5/8) intentionally permit healthy
+        overcommit; this catches the misconfigured-allocator scenario
+        (e.g., deploying 10× normal) while permitting normal 3-8× operation.
+
+        Fail-open semantics:
+          - kill_disabled (kill_ratio <= 0) → never kills
+          - missing signal (notional_ratio is None) → leaves deque
+            unchanged so a DB hiccup can't reset the burst-detection
+            window AND can't trigger a false kill
+        """
+        kill_ratio = RAPID_GROWTH_KILL_RATIO()
+        if kill_ratio is None or kill_ratio <= 0:
+            return False, None
+        if notional_ratio is None:
+            return False, None
+        now = time.time()
+        window = RAPID_GROWTH_WINDOW_SEC()
+        self._notional_ratio_samples.append((now, float(notional_ratio)))
+        # Evict samples older than the window.
+        cutoff = now - window
+        while (
+            self._notional_ratio_samples
+            and self._notional_ratio_samples[0][0] < cutoff
+        ):
+            self._notional_ratio_samples.popleft()
+        if len(self._notional_ratio_samples) < 2:
+            return False, None
+        vals = [v for _, v in self._notional_ratio_samples]
+        lo = min(vals)
+        hi = max(vals)
+        # Avoid div-by-zero on the cold-start "first sample is zero" case
+        if lo <= 0.0001:
+            lo = 0.0001
+        observed = hi / lo
+        return observed > kill_ratio, observed
+
     def _guardrail_check_and_log(self) -> dict:
         """Compute all guardrail signals, emit a structured telemetry
         line, and return a decision struct for run_cycle to act on.
@@ -1368,7 +1461,7 @@ class RewardFarmer:
         # so a DB hiccup can't mask nor reset a real breach.
         if notional_ratio is None:
             pass  # no signal — leave counter as-is
-        elif notional_ratio > HARD_NOTIONAL_RATIO:
+        elif notional_ratio > HARD_NOTIONAL_RATIO():
             self._consecutive_hard_notional_breach_cycles += 1
         else:
             self._consecutive_hard_notional_breach_cycles = 0
@@ -1399,10 +1492,23 @@ class RewardFarmer:
                 f"fill_rate_ratio={fill_ratio:.2f} > {FILL_RATE_SPIKE_FACTOR}× "
                 f"(short={short_fills}, baseline={base_fills})"
             )
+        # FX-058: rapid-growth (acceleration) kill. Catches anomalous bursts
+        # like a misconfigured allocator deploying 10× normal. Loose static
+        # thresholds (MAX 5×, HARD 8×) intentionally permit healthy
+        # overcommit; this check is the load-bearing kill protection.
+        rapid_kill, rapid_mult = self._guardrail_rapid_notional_growth(
+            notional_ratio
+        )
+        if rapid_kill:
+            kill_reasons.append(
+                f"notional_ratio_burst={rapid_mult:.2f}× over "
+                f"{RAPID_GROWTH_WINDOW_SEC():.0f}s > "
+                f"{RAPID_GROWTH_KILL_RATIO():.2f}× kill threshold"
+            )
 
         notional_block = (
             notional_ratio is not None
-            and notional_ratio > MAX_NOTIONAL_RATIO
+            and notional_ratio > MAX_NOTIONAL_RATIO()
         )
         blocked_clusters: set[int] = set()
         if total_capital is not None and total_capital > 0:
@@ -1589,14 +1695,16 @@ class RewardFarmer:
         stops as soon as the running total drops under the soft cap."""
         if total_capital is None or total_capital <= 0:
             return 0
-        hard_usd = HARD_NOTIONAL_RATIO * total_capital
-        soft_usd = MAX_NOTIONAL_RATIO * total_capital
+        hard_ratio = HARD_NOTIONAL_RATIO()
+        soft_ratio = MAX_NOTIONAL_RATIO()
+        hard_usd = hard_ratio * total_capital
+        soft_usd = soft_ratio * total_capital
         if total_live_notional <= hard_usd:
             return 0
         log.error(
             f"[GUARDRAIL] HARD notional breach: "
-            f"${total_live_notional:.2f} > {HARD_NOTIONAL_RATIO}·T=${hard_usd:.2f} "
-            f"— cancelling to ≤ {MAX_NOTIONAL_RATIO}·T=${soft_usd:.2f}"
+            f"${total_live_notional:.2f} > {hard_ratio}·T=${hard_usd:.2f} "
+            f"— cancelling to ≤ {soft_ratio}·T=${soft_usd:.2f}"
         )
         cancelled = 0
         running = total_live_notional
@@ -2037,7 +2145,7 @@ class RewardFarmer:
         elif guard["notional_block"]:
             if self.cycle_count % 10 == 0:
                 log.warning(
-                    f"[GUARDRAIL] notional_ratio > {MAX_NOTIONAL_RATIO} — "
+                    f"[GUARDRAIL] notional_ratio > {MAX_NOTIONAL_RATIO()} — "
                     f"blocking ALL new placements this cycle"
                 )
         elif action == "pause":

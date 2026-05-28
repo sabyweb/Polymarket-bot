@@ -516,12 +516,22 @@ class SimpleAllocator:
             })
 
         payload = {
-            "version": "simple-1.0",
+            "version": "simple-1.1",  # FX-043: metadata _total_capital stamp
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()),
             "num_deploy": len(result.deploys),
             "num_avoid": len(result.avoids),
             "total_capital_deployed": result.capital_deployed,
             "total_capital": round(result.total_capital, 2),
+            # FX-043: top-level metadata stamp so the farmer's
+            # `_guardrail_total_capital_from_alloc` reader has a value
+            # even on 0-deploy cycles (when no deploy row exists to
+            # carry the per-row _total_capital stamp). Pre-FX-043 the
+            # reader returned None on 0-deploy cycles → notional/cluster/
+            # 24h-loss/CF guardrails ALL silently failed-open for the
+            # duration. Observed 2026-05-21 19:50-19:54 UTC. The
+            # underscore prefix matches the per-row field name so the
+            # reader can use either source.
+            "_total_capital": round(result.total_capital, 2),
             "expected_total_reward": result.expected_total_reward,
             "kill_switch": result.kill_switch,
             "kill_reason": result.kill_reason,
