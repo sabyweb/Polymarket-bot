@@ -833,3 +833,148 @@ The Helsinki server's running processes are unaffected; no `git pull` + restart 
 - Known-fixed-bugs changelog added
 
 ---
+
+
+---
+
+## Historical Appendix: Retired components (v4.0 era)
+
+(Moved 2026-05-28 from `Polymarket bot architecture v5.1.md` §10.3.
+Describes components removed in the v4.0 simplification: Bandit
+Thompson sampling, LearningController EMA stack, β-η control system,
+LossModel per-share prediction. Kept for archaeology; not relevant
+to understanding the current simple_oversight + OverCommitAllocator
+architecture.)
+
+### 10.3 Known limitations (v5.1.14)
+
+**v5.1.4 blocker resolved in v5.1.5:**
+- ~~Polymarket geoblocks US IPs at the CLOB API.~~ — Resolved by Ashburn → Helsinki migration. Verified against the live geoblock docs page (2026-05-15): **Helsinki (`hel1`, Finland)** is allowed; Germany locations (`fsn1`, `nbg1`) and US locations (`ash`, `hil`) are blocked; Singapore (`sin`) is close-only (cannot open new orders, only close existing). §11.4 was updated to reflect the verified list. First LIVE cutover from Helsinki on 2026-05-15 04:03 UTC successfully placed orders (no 403).
+
+**v5.1.5 blocker resolved in same session:**
+- ~~SafetyController I9 deadlock on fresh-DB bootstrap.~~ — Surfaced during the first LIVE cutover from the fresh-DB Helsinki server. Closed by `dd67f97`. See §10.2 B10 + Amendments in v5.1.5.
+
+**Currently no known blockers.** Open issues are tracked in `Polymarket bot fixit.md` (the companion fixit doc) with stable `FX-NNN` IDs.
+
+**v5.1.4-vintage operational items resolved in v5.1.6:**
+- ~~**`numpy` not in `requirements.txt`.** Transitive dep via `streamlit` (in `pyproject.toml`) on local Mac; missing on headless server install. Manually `pip install numpy` is in §11.8.~~ — Resolved by `987a844` (FX-018). `requirements.txt` now declares `numpy>=2.0`. §11.8's "CRITICAL: numpy is NOT in requirements.txt" warning has been replaced with a note that the previous line (`pip install -r requirements.txt`) handles it.
+- ~~**Stale `polymarket-bot.service` in repo root.**~~ — Resolved by `3f50441` (FX-017). The legacy unit referenced `/opt/polymarket-bot/` and ran `main.py`; not deployed anywhere. Its `KillSignal=SIGINT` + `TimeoutStopSec=30` directives were copied into the canonical §11.11 unit blocks by Phase 5 (`91bae99`, FX-014).
+
+**New operational items in v5.1.4 (not blockers, carried forward):**
+- **`_p_fill` unstamped on legacy allocator rows.** Profit engine stamps it (`profit/allocator.py:372`); legacy doesn't. Result: `expected_capital_sum = 0` → `expected_util = 0` → β rule converges to upper clamp 0.95 under EMA. Mitigated by `GATE_ACTIVE_CYCLES = 2000` SHADOW soak (Phase 3b). Permanent fix: mirror the profit-engine stamping in `oversight/allocation_writer.compute_allocations`, or retire the legacy path entirely once calibrator readiness is achieved.
+- **`GATE_ACTIVE_CYCLES = 2000` is temporary.** Inline TODO in `profit/learning.py:66` marks revert-to-50 once LIVE observation confirms sane β trajectory.
+- ~~**`check_wallet.py` 400 error on conditional asset query.** Cosmetic. The on-chain collateral balance shown below the error is read via web3 and is correct. Bot's runtime balance fetch (different code path) is correct.~~ — Resolved in v5.1.14 (FX-019). The dead `AssetType.CONDITIONAL` call without a `token_id` was removed; the diagnostic now starts cleanly.
+- **Production farmer's `get_orders` log message wasn't renamed.** Method call updated to `get_open_orders` (B9 fix) but the log message inside the except block still reads `"get_orders failed: …"` — deliberately preserved for log-grep continuity with the historical corpus. Update at next major version if appropriate.
+
+**New behavioural observations from Phase D:**
+- **SafetyController + DRY chicken-and-egg.** In DRY mode, `_save_usdc_balance` is gated behind `if not self.dry_run` at `reward_farmer.py:2093`. `portfolio_snapshots` never gets a fresh row. SafetyController reads stale/missing snapshots → state stays in `DATA_UNAVAILABLE`. `STATE_PERMISSIONS[DATA_UNAVAILABLE]["trials"] = False` blocks all trial markets. On a fresh-DB server, every market is a trial. **Result: 0 deploys in DRY soak on a fresh server.** This is correct behaviour, not a bug. Exit path: first LIVE cycle writes `portfolio_snapshots`, SafetyController advances out of the I3/I4 portfolio-value constraints. Local Mac escapes this because its DB has historical `reward_market_stats` from prior runs (some markets are no longer "trial"). Documented in §11.12 so operators don't misinterpret the 0-deploy state.
+  - **v5.1.5 finding** — this exit path is *incomplete*. Writing `portfolio_snapshots` clears I3 and I4 but does NOT clear I9 (`data_freshness`), which is queried separately against `scoring_snapshots`. Until v5.1.5's I9 patch, the LIVE bootstrap was permanently stuck on I9 even though portfolio_value was now known. See §10.2 B10. The v5.1.5 fix means the bot now genuinely exits `DATA_UNAVAILABLE` once both portfolio_snapshots and the cold-start I9 check are clean.
+
+**New behavioural observations from v5.1.20 (40h post-FX-041 production analysis, 2026-05-22):**
+
+- **CF smoothing is asymmetric to the upside.** The `_smooth_correction_factor` circuit-breaker (per §4.4) bypasses EMA on the LOW side (`raw < 0.01` → bypass; `raw < 0.05 AND prev_smoothed > 0.2` → fast-adapt α=0.7), but has NO equivalent fast-attenuation on the HIGH side. A single-cycle raw spike (e.g., when `est_d` collapses transiently because the alloc list briefly went 0-deploy) propagates fully into smoothed CF and takes 5-10 cycles to decay. Observed 2026-05-21 20:22 UTC: raw 9.63, smoothed peaked 3.145 (above the CALIBRATED upper bound 3.0). No invariants fired during the spike (only the CF lower-band invariants I5/I5b would react), but it's a noise vector worth knowing about for any future invariant added on the CF upper side.
+
+- **Polymarket CLOB `/markets/{cid}` endpoint is unreliable for "is this market resolved" decisions.** Verified empirically on 2026-05-22: the endpoint returned HTTP 404 for `0x0ed3f07970b272e0d8b50c0ce62b51e26a4dcdb13bee92feca0f0c11ed6cc6c0` while the SAME market was actively scoring + accepting orders + being tracked by `/rewards/markets/current`. **Lesson: don't conclude market resolution from a single endpoint's 404.** Multi-endpoint verification pattern:
+  - `/rewards/markets/current` — more authoritative for reward-listing (if cid present → market is in reward pool)
+  - Order book endpoint via `client.get_order_book(token_id)` — if non-empty bids/asks → market is live
+  - `client.get_open_orders()` showing our own orders on the cid → market accepts orders
+  - `client.create_and_post_order` succeeds → market accepts orders for real
+  
+  Use ≥2 of these before concluding resolution. The bot's internal `unliquidatable_markets` table (FX-007) gates on a different signal (canonical 400 from create_and_post_order) and is the trusted production signal for "this market is dead". The metadata endpoint is informational only.
+
+- **Morning UTC-boundary I6 spike** (`fixit.md::FX-044`). At 00:00 UTC each day, Polymarket's daily payout resets the "actual_daily" measurement to the new day's partial accumulation, while "estimated_daily" stays at full-day rate. I6 (`est_actual_ratio`) jumps from healthy ~5-8× to ~25-30× within 30 min → SafetyController demotes to SEVERELY_MISCALIBRATED → trial markets blocked for 6-8h until act_d catches up. Verified across the 2026-05-22 00:00 UTC boundary on Helsinki. Structural daily friction; doesn't damage anything but constrains operation during peak market activity. Friend rollout G3 gate ("CALIBRATED ≥24h") is unreachable until this ships.
+
+- **`_total_capital` stamp can disappear during 0-deploy alloc moments** (`fixit.md::FX-043`). Phase 2 (`d2612e6`) added the stamp to deploy rows, but the loop only stamps EXISTING rows. When the allocator routes everything to "avoid" momentarily (market-list refresh, deploy demotion), there are no deploy rows → no stamp → `_guardrail_total_capital_from_alloc` returns None → fail-open guardrails (notional + cluster + 24h-loss kill-switch). Observed once for ~5 min on 2026-05-21 19:50-19:54 UTC; no damage but invariant violation. Proposed fix: stamp on alloc metadata + portfolio_snapshots fallback.
+
+**New behavioural observations from v5.1.5 (Helsinki bootstrap):**
+- ~~**Counter / DB inconsistency on placement failures** (`fixit.md::FX-004`). `[CYCLE_SUMMARY] orders_placed: N` increments at the point `place_orders_for_market` is called, not after API confirms success.~~ — Resolved in v5.1.8 (`e7fc3d2`). The wrapped function now returns `int` and the gated wrapper accumulates the value; `[CYCLE_SUMMARY] orders_placed` matches `SELECT COUNT(*) FROM orders_placed` for every cycle. See §10.2 B13.
+- ~~**Orphan-scan creates persistent failing dumps for resolved markets** (`fixit.md::FX-007`).~~ — Resolved in v5.1.9 (`7d8d38d`). Closes the entire FX-005/006/007/008/009/028 family. See §10.2 B14 + the v5.1.9 amendment block at top of doc.
+- ~~**Capital-sizing race on cold start** (`fixit.md::FX-013`).~~ — Resolved in v5.1.10 (`d4d1541`). Closes the entire FX-010/011/013/024/025 family. See §10.2 B15 + the v5.1.10 amendment block at top of doc.
+- **No dedicated SafetyController test coverage** (`fixit.md::FX-016`). The bootstrap deadlock that v5.1.5 fixes would have been caught by any unit test exercising `_query_data_freshness` with an empty `scoring_snapshots` table. No such test existed at v5.1.5. v5.1.7's Phase 1 release seeds the new `tests/test_safety_controller.py` with 17 focused tests around the cold-start helper + I3 + BOOTSTRAP, but the broader build-out covering all 14 invariants and the full state machine is still scheduled for Hardening Phase 6.
+
+**Phase 1 (v5.1.7) closes (bootstrap completion):**
+- ~~**I3 drawdown deadlock on fresh-DB bootstrap** (`fixit.md::FX-002`).~~ — Resolved by `dc78ba0`. I3 now skips on genuine cold start (`_is_genuine_cold_start()`).
+- ~~**No `BOOTSTRAP` state for first-time-ever cold start** (`fixit.md::FX-003`).~~ — Resolved by `541108b`. New state with `max_markets=10, capital_pct=0.30, trials=True`.
+- ~~**Cold-start defaults to MILDLY_MISCALIBRATED, not conservative** (`fixit.md::FX-012`).~~ — Resolved by `541108b`. `_load_state` now routes through `_cold_start_or(MILDLY)`.
+
+**Phase 2 (v5.1.8) closes (counter consistency):**
+- ~~**`[CYCLE_SUMMARY] orders_placed` counted attempts, not API-confirmed placements** (`fixit.md::FX-004`).~~ — Resolved by `e7fc3d2`. `place_orders_for_market` returns `int` (0/1/2); the gated wrapper accumulates the return value. Counter now matches `SELECT COUNT(*) FROM orders_placed` exactly. See §10.2 B13.
+
+**Phase 8 / 9 (v5.1.14) closes (hardening roadmap closure):**
+- ~~**`check_wallet.py` 400 error on conditional asset query** (`fixit.md::FX-019`).~~ — Resolved in v5.1.14 closure commit `38fc63c`. The dead `AssetType.CONDITIONAL` call (no token_id) was removed; diagnostic now starts cleanly with only the COLLATERAL pUSD balance + on-chain allowance checks the operator actually needs. See §10.2 B20.
+- **Process-boundary lag** (`fixit.md::FX-027`) — **accepted as designed architectural risk** in v5.1.14. The 30-min agent / 30-s farmer cadence is intentional (§2 + §4.21.6). The actually time-critical safety responses live on the farmer's 30-s cadence: runtime guardrails (§4.18 — notional cap, cluster cap, kill switch on 24h-loss / CF / fill-rate spike), order placement/cancellation gates, Phase-C pause/kill hook. The agent's 30-min cadence affects allocation **revisions**, not allocation **enforcement** (the filter runs at write-time and the farmer enforces every 30 s). Mitigations already in place: Phase 4 wallet-first capital flow closes the "stale capital number" exploit; Phase 3 dump-state lifecycle closes the "agent doesn't know orderbook is dead" exploit; Phase 1 BOOTSTRAP cold-start ladder closes the "fresh-DB SafetyController stuck in DATA_UNAVAILABLE" exploit; Phase 6 part 2's FX-030 fix tightens UNSAFE recovery so even the agent's lag can't cut the documented 5-cycle minimum. Decision recorded in `fixit.md::§5`. Reopens if a specific pathological scenario emerges that the farmer-side guardrails can't bound.
+
+**Phase 6 (v5.1.12 + v5.1.13) closes (test coverage + CI):**
+- ~~**No CI: tests don't run automatically on push** (`fixit.md::FX-026`).~~ — Resolved in v5.1.12 (`a580bdb`). GitHub Actions workflow `.github/workflows/test.yml` runs the fast-tier suite on every push to `main` + every PR; first green run `26046878949` in 7m17s. See §10.2 B17.
+- ~~**No dedicated SafetyController test coverage** (`fixit.md::FX-016`).~~ — Resolved in v5.1.13 (`4aff918` + `f3630c9`). 17 → 152 tests; coverage 58% → 94% on `oversight/safety_controller.py`. All 14 invariants + state machine ladder + `filter_allocations` + persistence + helpers + alert files now pinned.
+- ~~**`filter_allocations` per-market $200 cap can be overshot** (`fixit.md::FX-029`).~~ — Resolved in v5.1.13 (`1c4ae7e`, audit-surfaced). Both scaling decision and post-cap value now derive from the internal formula. See §10.2 B18.
+- ~~**`_handle_upgrade` UNSAFE→MILDLY fast path bypasses documented 3-cycle cap** (`fixit.md::FX-030`).~~ — Resolved in v5.1.13 (`1c4ae7e`, audit-surfaced). `_handle_upgrade` no-ops on UNSAFE; slow auto-recovery in `evaluate_state` is the SOLE UNSAFE exit. See §10.2 B19.
+
+**Phase 5 (v5.1.11) closes (operational hardening):**
+- ~~**systemd units lack `KillSignal=SIGINT` + `TimeoutStopSec`** (`fixit.md::FX-014`).~~ — Resolved by `91bae99`. §11.11 unit blocks updated; operator re-tees on the server. Forward-compatible with the unit blocks NOT updated, thanks to FX-015.
+- ~~**No signal handler for graceful shutdown in bot processes** (`fixit.md::FX-015`).~~ — Resolved by `91bae99`. SIGTERM handler in `reward_farmer.run()`; `_shutdown_cleanup` uses V2 batch `cancel_orders` (1 API call replaces 240); OL.cancel_order honours `force=True`; rate-limiter covers V2 method names; structured `[SHUTDOWN]` log channel. See §10.2 B16.
+
+**Phase 4 (v5.1.10) closes (capital flow correctness):**
+- ~~**Capital-sizing race: `$1500` fallback active up to 30 min on cold start** (`fixit.md::FX-013`).~~ — Resolved by `d4d1541`. Farmer cycle-1 write + agent `--capital` default None. See §10.2 B15.
+- ~~**`--capital` CLI default `1500.0` should be `None`** (`fixit.md::FX-025`).~~ — Subsumed by FX-013.
+- ~~**`CAPITAL_FLOOR_USD` is absolute `$50`, not wallet-scaled** (`fixit.md::FX-010`).~~ — Resolved by `d4d1541`. New `SafetyController._capital_floor` helper; I4 uses `max($50, max(peak, portfolio, exchange) * 0.10)`. $50 minimum preserved for operational floor.
+- ~~**`RF_MAX_TOTAL_EXPOSURE` / `RF_MAX_COST_PER_MARKET` defined but unused** (`fixit.md::FX-011`).~~ — Resolved by `d4d1541`. Both constants + their accessors deleted; the v5.0 runtime guardrails own this responsibility.
+- ~~**Inconsistent capital-source logging** (`fixit.md::FX-024`).~~ — Resolved by `d4d1541`. Per-cycle `[CAPITAL_SOURCE] source={usdc_db|flag|none}` line.
+
+**Phase 3 (v5.1.9) closes (dump-state lifecycle):**
+- ~~**Orphan-dump 400-spam from on-chain CTF positions on resolved markets** (`fixit.md::FX-007`).~~ — Resolved by `7d8d38d`. New `unliquidatable_markets` DB table + gates at every order path. Tamilaga spam closes on next Helsinki `git pull + restart`. See §10.2 B14.
+- ~~**`book_failures` doesn't increment on order-placement failures** (`fixit.md::FX-005`).~~ — Subsumed by FX-007. OL marks unliquidatable on canonical 400; the gate filters the cid on subsequent cycles.
+- ~~**Dead-market cleanup orphans `dump_states` rows** (`fixit.md::FX-006`).~~ — Resolved by `7d8d38d`. Cleanup loop now cascades to `delete_dump_state` + `mark_unliquidatable`.
+- ~~**`dump_states` reload on restart re-creates failing dumps** (`fixit.md::FX-008`).~~ — Subsumed by FX-007. `_restore_dump_states` gates each row on `is_unliquidatable`.
+- ~~**`dump_state` row saved BEFORE the SELL is posted** (`fixit.md::FX-009`).~~ — Subsumed by FX-007. Save ordering preserved (retry semantics); exception handler distinguishes definitive failure (cleans up) from transient (preserves state).
+- ~~**No re-probe mechanism for unliquidatable markets** (`fixit.md::FX-028`).~~ — Resolved by `7d8d38d`. `_reprobe_unliquidatable` runs every 30 min loop sweep; per-cid 6h staleness gating; un-marks cids whose orderbook returns.
+
+**Phase C oversight stage promotion sequence** (operator-driven, not automatic):
+- Stage 1 (current default): all signals computed + logged, no actions. `_SHADOW_ONLY=True`, `_PAUSE_ENABLED=False`, `_KILL_ENABLED=False`.
+- Stage 2 candidate flip: after ≥200 LIVE cycles with no `[OVERSIGHT_SHADOW] triggered=True` lines from healthy regime, flip `_SHADOW_ONLY=False` AND `_PAUSE_ENABLED=True`. Promotion gates from §4.21.7: no false positives, triggers fire BEFORE corresponding hard guardrail, no flapping.
+- Stage 3 candidate flip: after ≥200 LIVE cycles at Stage 2 with same gates clean, flip `_KILL_ENABLED=True`. cf_trajectory acts as kill.
+- Each flag flip is a single-line commit and easy to revert.
+
+**Closed in v4.0 by deletion (Patches 6–13 removed):**
+- ~~avg_overcommit_active < 1.5 (V3.1 INV3)~~ — concept retired; v4.0 has no overcommit factor.
+- ~~deploy_ratio < 0.85 (V3.1 INV5 / V4 INV5)~~ — concept retired; v4.0 targets `expected_util`, not notional deploy ratio. Replaced with V5 INV5_new (coverage_ratio).
+- ~~marginal-efficiency gate rejecting too many candidates (Patch 13 V4 finding)~~ — gate deleted.
+- ~~Patch 9 / Patch 10 composition friction~~ — both layers deleted.
+- ~~Patch 13 hysteresis dead-band suppressing legitimate moves~~ — hysteresis retained for `capital_scale`, but the dead-band now applies only to `capital_scale`, not to any allocator-side mechanism.
+- ~~Legacy `oscillation_lock` DB column from Patch-13 interim draft~~ — still in schema for compat; remains silently ignored.
+
+**Newly closed in v4.0:**
+- ~~λ1 / λ2 control system has no leverage on allocation~~ — proven algebraically (§4.16.1 / §4.16.2) and deleted. Replaced with (β, η); β has non-cancelling linear leverage on absolute scale in any regime, η has non-cancelling leverage on relative allocation under any non-uniform market.
+- ~~`expected_capital ≈ 0` in sim bootstrap because FillModel is untrained~~ — `simulation/bootstrap_calibrator.py` substitutes a deterministic, bounded, state-dependent `p_fill ∈ [0.02, 0.15]` while `fill_model.is_ready() == False`. Production calibrator untouched.
+- ~~allocator couples reward reconstruction through EV~~ — `CalibrationPredictions.raw_reward_per_day` added; allocator reads reward directly.
+
+**Newly closed in v5.1.1 (shadow stage 1):**
+- ~~`oversight_agent.evaluate(guard)` not implemented~~ — function now exists in shadow form; computes 6 trigger signals (§4.21.7) over a 30-snapshot ring buffer; returns `{"action": "continue", "reason": "shadow"}` unconditionally. Behaviour byte-identical to pre-shadow; only observable change is the per-cycle `[OVERSIGHT] reason=shadow` log line + new `[OVERSIGHT_SHADOW]` channel emitted only on triggers/missing-data.
+- ~~Per-cycle `reason=not_implemented` log line~~ — replaced by `reason=shadow` (truthful representation; no downstream consumers depended on `not_implemented`, verified by repo-wide grep).
+
+**Newly closed in v5.1:**
+- ~~No structured oversight evaluation hook in the farmer~~ — `b8d84bd` added the hook; `2706953` made it deterministic with `hasattr` gate, latency tracking (`OVERSIGHT_LATENCY_WARN_MS = 50`), strict `{action, reason}` validation, per-cycle `[OVERSIGHT]` audit log, kill-reason propagation. See §4.21.
+- ~~`[OVERSIGHT_WARNING] evaluation failed` log spam (~2880/day) when `oversight_agent.evaluate` is absent~~ — closed by the `hasattr` gate at `2706953`. Stayed silent under v5.1; fully obsolete now that the function exists in v5.1.1.
+
+**Newly closed in v5.0:**
+- ~~V5 INV5_new (coverage) passes only in `under_deployed`~~ — Step-3b cap-aware shaping (`5611d54`) resolves the cluster-cap × min-floor artefact directly inside the allocator. INV5_new: 1/6 → 6/6 PASS (coverage 0.50–0.98 across all scenarios).
+- ~~V5 INV7 fails in `over_aggressive` + `regime_shift_3phase`~~ — `capital_scale` stability filters (`741d35c`, bounded-rate + flip suppression) collapse `max_flip_rate_100` from 7–9 to 0–1. INV7: 4/6 → 6/6 PASS.
+- ~~V5 INV3_new unreachable in 5/6 scenarios because the raw-util metric is bounded by the bootstrap p_fill clamp~~ — INV3 rewritten (`707ca50`) as cap-normalised `capital_util / feasible_capital_fraction ≥ 0.70`. Metric is now scenario-independent and evaluates control-loop quality instead of cap-policy geometry. INV3_new: 0/6 → 6/6 PASS.
+- ~~No runtime execution-time safety layer~~ — v5.0 ships the `reward_farmer.py` guardrail stack (`414354a` + `2e72606`): soft notional + cluster blocks, hard enforcement with multi-cancel cap, kill-switch on {daily_loss, CF, fill-rate spike}, persistent-breach detector, structured `[GUARDRAIL]` telemetry, fail-open visibility.
+- ~~Binary dry-run flag with no intermediate~~ — v5.0 three-mode gate (`7ab514d`): DRY_RUN → SHADOW → LIVE with staged promotion path.
+- ~~Unstructured log output~~ — v5.0 emits `[CYCLE_SUMMARY]` / `[ROLLING_STATS]` / `[GUARDRAIL]` / `[CRITICAL]` / `[GUARDRAIL_WARNING]` / `[DRY_RUN]` / `[SHADOW]` as machine-parseable JSON.
+
+**Still open (v5.1.1):**
+- **Shadow evaluator running but not promoted to live control.** `evaluate(guard)` exists and triggers logs at `[OVERSIGHT_SHADOW]`, but `_SHADOW_ONLY = True` so all six signals resolve to `continue`. Activation ladder in §4.21.7: stage 2 = pause-kind signals (A–D, F), stage 3 = kill-kind signal E (cf_trajectory). Each promotion requires evidence from a 200–500 cycle shadow run (no false positives, triggers fire before guardrails, no flapping).
+- **Per-cycle `[OVERSIGHT] reason=shadow` line** (~2880/day at 30 s cadence) — same volume as the pre-shadow `reason=not_implemented` line. Not a bug; truthful representation of the function's intentional non-operative state.
+- **Deprecated `lambda_1`, `lambda_2` fields still on `LearningState`.** Retained as frozen compatibility fields solely because `simulation/engine.py` and `simulation/invariants.py` reference them. A future sim-side migration can remove them.
+- **Gamma-routed sports markets still unprotected by Phase 1** (field not exposed by Gamma API).
+- **Learning-loop Rule A low-fill high-loss edge case** (§6.7) — unchanged from v3.x. Rule A requires `fill_rate > threshold` to contract; a low-fill high-loss regime is invisible to it.
+- **`profit_efficiency` not used by the learning loop** (only `reward_efficiency`) — unchanged.
+- **Stop-loss events not distinguished** from normal unwinds in the learning signal — unchanged.
+- **No per-market CF; still global** — unchanged. Reward-global / loss-local asymmetry preserved by design.
+- **`profit/refill.py` pure helpers still not wired** into `reward_farmer.py` / `order_lifecycle.py` — fill-triggered cancellation + re-allocation still runs on the 30 s cycle cadence (deferred from v3.x; not touched in v4.0 or v5.0).
+- **`capital_util > 1.0` in some V5 scenarios** is notional overcommit (Σ C > T) — allowed on Polymarket since orders cancel on first fill, but the allocator's Step-7 rescale only caps `Σ(p·C) ≤ 0.95·T`, not `Σ C`. Consistent with `project_capital_overcommit` memory; revisit if over-fill risk becomes a production concern.
+- **Repo structure**: flat `.py` files should eventually move into `src/` package layout. Deferred until the bot is stable in production (`project_repo_structure` memory).
+- **Post-shaping V5 re-audit produced one edge case**: `over_aggressive` `expected_util` dropped from 0.029 (pre-shaping raw util) to 0.018 (post-shaping raw util) because shaping's top-k selection sometimes leaves survivors that don't scale above min_capital under the cluster cap. The cap-normalised INV3 correctly records this as `normalized_util ≈ 1.45` (still well above 0.70 threshold), but the raw-util regression is worth monitoring in production; it signals that shaping is conservative for that topology.
+
