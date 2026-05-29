@@ -220,6 +220,15 @@ class RewardFarmer:
         self._kill_switch_active: bool = False
         self._kill_switch_reason: str = ""
         self._kill_switch_triggered_at: float = 0.0
+        # FX-068: oversight-side kill switch, captured from
+        # market_allocations.json by _load_allocations and honored as a
+        # real farmer halt (cancel-all + sticky) in run_cycle. Pre-FX-068
+        # the farmer only read action=="deploy" rows and never read the
+        # alloc's kill_switch field, so an oversight kill degraded to an
+        # empty deploy list (stop new orders) without cancelling existing
+        # exposure or engaging the sticky halt.
+        self._alloc_kill_switch: bool = False
+        self._alloc_kill_reason: str = ""
         # Persistent-breach tracker (spec §5.1): consecutive cycles
         # where notional_ratio > HARD_NOTIONAL_RATIO. Incremented in
         # _guardrail_check_and_log; reset when ratio drops back under
@@ -955,6 +964,14 @@ class RewardFarmer:
                 if age > timedelta(hours=cfg("RF_ALLOCATION_TTL_HOURS")):
                     log.debug("Allocation file stale — skipping")
                     return None
+            # FX-068: honor the oversight-side kill switch. simple_allocator
+            # writes kill_switch=True (+ deploys=[]) when check_kill_switch
+            # fires (24h loss > 10% wallet, or 15% drawdown). The alloc is
+            # fresh here (past the TTL gate above). Capture it so run_cycle
+            # can act on it; without this the empty-deploy `return None`
+            # below silently drops the kill.
+            self._alloc_kill_switch = bool(data.get("kill_switch"))
+            self._alloc_kill_reason = str(data.get("kill_reason", ""))[:200]
             deploy = [m for m in data.get("markets", []) if m.get("action") == "deploy"]
             if not deploy:
                 return None
@@ -1982,6 +1999,18 @@ class RewardFarmer:
                     f"[GUARDRAIL] kill switch ACTIVE: "
                     f"{self._kill_switch_reason} — skipping cycle"
                 )
+            self._emit_cycle_telemetry()
+            return
+
+        # FX-068: oversight-side kill switch (from market_allocations.json).
+        # _load_allocations captures simple_allocator's kill_switch flag into
+        # self._alloc_kill_switch on every fresh alloc load (the `run` loop
+        # calls _check_allocation_update before run_cycle). Honor it as a REAL
+        # halt — cancel-all + sticky — not just an empty deploy list. Guard on
+        # not-already-active so it fires once, then the short-circuit above
+        # owns every subsequent cycle. kill switch cancels fire in any mode.
+        if self._alloc_kill_switch and not self._kill_switch_active:
+            self._activate_kill_switch(reason="oversight:" + self._alloc_kill_reason)
             self._emit_cycle_telemetry()
             return
 
