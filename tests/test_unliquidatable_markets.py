@@ -524,6 +524,63 @@ class TestSyncExchangePositionsGate(unittest.TestCase):
         self.assertEqual(["cid_alive"], registered)
 
 
+class TestSyncExchangePositionsDumpGuard(unittest.TestCase):
+    """FX-070: the stale-position cleanup in _sync_exchange_positions must NOT
+    remove a position that is actively being dumped. The old guard checked
+    hasattr(dump_mgr, 'dump_states') — an attribute DumpManager never has — so
+    it was always False and a mid-dump position could be stranded (losing its
+    loss-accounting trail). The real signal is ms.dump_state / ms.dump_orders."""
+
+    def _run_sync(self, stub):
+        from reward_farmer import RewardFarmer
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = []  # empty exchange → every DB pos is "stale"
+        with patch("config.FUNDER", "0xFUNDER"):
+            with patch("requests.get", return_value=resp):
+                RewardFarmer._sync_exchange_positions(stub)
+
+    def test_does_not_remove_actively_dumping_position(self):
+        stub = _make_farmer_stub()
+        stub.positions = MagicMock()
+        stub.positions.get_all_positions.return_value = {
+            "cid_dumping": {"yes_shares": 100.0, "no_shares": 0.0,
+                            "question": "Dumping market?"},
+        }
+        ms = _make_ms(cid="cid_dumping")
+        ms.dump_state["yes"] = {"shares": 100, "started_at": time.time(),
+                                "fill_price": 0.5, "tid": "ytid"}
+        stub.markets["cid_dumping"] = ms
+        self._run_sync(stub)
+        stub.positions.remove_market.assert_not_called()
+
+    def test_removes_stale_position_not_dumping(self):
+        stub = _make_farmer_stub()
+        stub.positions = MagicMock()
+        stub.positions.get_all_positions.return_value = {
+            "cid_stale": {"yes_shares": 100.0, "no_shares": 0.0,
+                          "question": "Resolved market?"},
+        }
+        stub.markets["cid_stale"] = _make_ms(cid="cid_stale")  # empty dump_state
+        self._run_sync(stub)
+        stub.positions.remove_market.assert_called_once_with("cid_stale")
+
+    def test_dumping_via_dump_orders_only_is_protected(self):
+        # Transient reprice window: dump_state cleared but a resting dump SELL
+        # order still exists — must still count as dumping.
+        stub = _make_farmer_stub()
+        stub.positions = MagicMock()
+        stub.positions.get_all_positions.return_value = {
+            "cid_reprice": {"yes_shares": 0.0, "no_shares": 100.0,
+                            "question": "Repricing dump?"},
+        }
+        ms = _make_ms(cid="cid_reprice")
+        ms.dump_orders["no"] = "OID_LIVE"
+        stub.markets["cid_reprice"] = ms
+        self._run_sync(stub)
+        stub.positions.remove_market.assert_not_called()
+
+
 class TestReprobeTokenIdFallback(unittest.TestCase):
     """FX-028: when a re-probe candidate isn't in self.markets, the method
     falls back to a CLOB market lookup for token_ids. If that fallback

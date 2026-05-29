@@ -235,6 +235,20 @@ def reconcile_wallet_invariant(
             f"unwinds_delta=${unwinds_delta:.4f} (in) "
             f"rewards_delta=${rewards_delta:.4f} (in)"
         )
+        # FX-074: page the operator via the existing Discord alert channel.
+        # OBSERVATIONAL ONLY — this does NOT halt or gate allocation; it just
+        # turns the [CRITICAL] log above into a real external alert. Fail-open:
+        # an alert-send failure must never crash oversight or block trading.
+        try:
+            from alerts import alert_wallet_desync
+            alert_wallet_desync(
+                divergence=divergence,
+                threshold_usd=threshold_usd,
+                actual_wallet=actual_wallet_now,
+                expected_wallet=expected_wallet,
+            )
+        except Exception as e:
+            log.warning(f"[WALLET_RECONCILE] desync alert send failed (fail-open): {e}")
     else:
         status = "ok"
         log.info(

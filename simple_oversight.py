@@ -164,6 +164,17 @@ def run_once(
     logged but the bot continues on the previous alloc file (farmer is resilient
     to stale alloc — has RF_ALLOCATION_TTL_HOURS guard).
     """
+    # FX-063: Hot-reload config_overrides.json if it changed, so the
+    # SimpleAllocator's cfg()-driven knobs (e.g.
+    # RF_OVERCOMMIT_EXPECTED_FILL_COST_FRAC) take effect without restarting the
+    # oversight process. The farmer and bot already reload every cycle
+    # (reward_farmer.py / bot.py); oversight was the only long-running
+    # entrypoint that never did, so allocator knobs froze at process start.
+    # Cheap mtime-guarded no-op when the file is unchanged; fail-open by design
+    # (check_and_reload swallows its own errors and returns 0).
+    from config import BotConfig
+    BotConfig.instance().check_and_reload()
+
     # 1. Wallet probe
     try:
         wallet = get_live_wallet_usd(allocator.funder, signer_key, api_creds)

@@ -36,5 +36,12 @@ class MarketState:
     agent_shares: float = 0
     agent_approved: bool = False
     fill_times: dict = field(default_factory=lambda: {"yes": [], "no": []})
+    # FX-069: kill-switch fill history. SEPARATE from fill_times (which
+    # can_place prunes to the 180s RF_FILL_BREAKER_WINDOW). This flat list of
+    # unix timestamps is appended on the real fill-record path (handle_fill)
+    # and pruned only to the 6h kill baseline (RF_KILL_FILL_HISTORY_SECS), so
+    # the fill-rate spike kill can see slow bleed instead of degenerating to
+    # ">=5 fills/180s".
+    kill_fill_times: list = field(default_factory=list)
     end_date_iso: str = ""
     book_failures: int = 0  # consecutive get_merged_book failures (404/timeout)

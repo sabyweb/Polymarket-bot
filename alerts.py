@@ -462,6 +462,54 @@ def alert_merge_needed(
     _write_alert("MERGE", msg)
 
 
+def alert_wallet_desync(
+    divergence: float,
+    threshold_usd: float,
+    actual_wallet: float,
+    expected_wallet: float,
+) -> None:
+    """Page the operator on a [CRITICAL] WALLET_DESYNC breach (FX-074).
+
+    The FX-049 reconciler is OBSERVATIONAL — it never halts or gates
+    allocation. This helper turns its [CRITICAL] log into a real external
+    alert (Discord) so a desync pages, not just logs. Reuses the existing
+    _send_discord channel; never raises (Discord send is best-effort).
+
+    Args:
+        divergence: actual_wallet − expected_wallet (signed USD).
+        threshold_usd: the breached tolerance.
+        actual_wallet: live on-chain pUSD balance this cycle.
+        expected_wallet: bot-DB-derived expected balance this cycle.
+    """
+    embed = {
+        "title": "WALLET DESYNC — On-chain vs Bot-DB Divergence",
+        "description": (
+            f"Reconciler divergence **${divergence:+.4f}** exceeds threshold "
+            f"**${threshold_usd:.4f}**.\n\n"
+            f"**Actual wallet:** ${actual_wallet:.4f}\n"
+            f"**Expected wallet:** ${expected_wallet:.4f}\n\n"
+            f"Observational alert — trading is NOT halted. Investigate: "
+            f"missed fill, phantom unwind, external wallet activity, or "
+            f"Polymarket reporting lag."
+        ),
+        "color": 0xFF0000,  # Red — urgent
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+    _send_discord(
+        f"**WALLET DESYNC** — divergence ${divergence:+.4f} "
+        f"(threshold ${threshold_usd:.4f})",
+        embed,
+    )
+
+    msg = (
+        f"WALLET_DESYNC | divergence=${divergence:+.4f} "
+        f"threshold=${threshold_usd:.4f} | "
+        f"actual=${actual_wallet:.4f} expected=${expected_wallet:.4f}"
+    )
+    log.critical(msg)
+    _write_alert("WALLET_DESYNC", msg)
+
+
 def alert_heartbeat_failure(last_success_secs_ago: float) -> None:
     """Send a Discord alert when no cycle has completed recently.
 

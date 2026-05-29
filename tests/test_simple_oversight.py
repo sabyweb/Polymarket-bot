@@ -376,3 +376,68 @@ def test_O11_run_once_no_capital_on_wallet_fetch_failure():
 
     os.unlink(out_path)
     os.unlink(db)
+
+
+# ── FX-063: oversight hot-reloads config each cycle ──
+
+def test_O13_run_once_hot_reloads_config():
+    """O13 (FX-063): run_once must hot-reload config every cycle so the
+    SimpleAllocator's cfg()-driven knobs (e.g. RF_OVERCOMMIT_EXPECTED_FILL_COST_FRAC)
+    don't freeze at oversight-process start. reward_farmer + bot already do this;
+    oversight was the only long-running entrypoint that didn't.
+    """
+    db = _make_temp_db()
+    allocator = _make_allocator(db)
+    allocator.compute = MagicMock(return_value=AllocationResult(
+        deploys=[], avoids=[], total_capital=1000, capital_deployed=0,
+        expected_total_reward=0, kill_switch=False, kill_reason="",
+        sources_used={"api": 0, "cumulative": 0, "cold_start": 0},
+    ))
+
+    out_path = tempfile.mktemp(suffix=".json")
+    import config
+    # Patch the method (not the class) so cfg() keeps using the real singleton.
+    with patch.object(config.BotConfig, "check_and_reload") as m_reload:
+        with patch.object(so, "get_live_wallet_usd", return_value=1000.0):
+            so.run_once(allocator, db, out_path, signer_key="k", api_creds=None)
+
+    assert m_reload.called, (
+        "check_and_reload() not called in run_once — oversight knobs would "
+        "freeze at process start (FX-063)"
+    )
+
+    os.unlink(out_path)
+    os.unlink(db)
+
+
+def test_O14_run_once_reloads_before_compute():
+    """O14 (FX-063): the reload must run BEFORE allocator.compute() so a knob
+    edited in config_overrides.json takes effect THIS cycle, not next."""
+    db = _make_temp_db()
+    allocator = _make_allocator(db)
+
+    order: list[str] = []
+
+    def _compute(*args, **kwargs):
+        order.append("compute")
+        return AllocationResult(
+            deploys=[], avoids=[], total_capital=1000, capital_deployed=0,
+            expected_total_reward=0, kill_switch=False, kill_reason="",
+            sources_used={"api": 0, "cumulative": 0, "cold_start": 0},
+        )
+    allocator.compute = _compute
+
+    out_path = tempfile.mktemp(suffix=".json")
+    import config
+    with patch.object(config.BotConfig, "check_and_reload",
+                      side_effect=lambda: order.append("reload")):
+        with patch.object(so, "get_live_wallet_usd", return_value=1000.0):
+            so.run_once(allocator, db, out_path, signer_key="k", api_creds=None)
+
+    assert "reload" in order and "compute" in order, f"order={order}"
+    assert order.index("reload") < order.index("compute"), (
+        f"reload must precede compute so refreshed knobs apply this cycle; order={order}"
+    )
+
+    os.unlink(out_path)
+    os.unlink(db)

@@ -24,11 +24,28 @@ C6: Reward-fetch returns 0 with ok=True (no events) → reconciliation
 import os
 import sys
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from oversight.wallet_reconciliation import reconcile_wallet_invariant
+
+
+@pytest.fixture(autouse=True)
+def _mock_discord_send(monkeypatch):
+    """FX-074: neutralize the real Discord POST for every test in this module.
+
+    After FX-074 a desync fires ``alert_wallet_desync`` -> ``alerts._send_discord``,
+    and ``.env`` carries a live ``DISCORD_WEBHOOK_URL`` (captured into alerts at
+    import via ``from config import DISCORD_WEBHOOK_URL``). Without this, the
+    existing desync-path tests would each POST to the operator's Discord.
+    Patching ``alerts._send_discord`` is the correct interception point.
+    """
+    import alerts
+    monkeypatch.setattr(alerts, "_send_discord", lambda *a, **k: None)
+    yield
 
 
 class _FakeDB:
@@ -292,6 +309,91 @@ class TestReconcileWithRewards(unittest.TestCase):
                 _fetch_rewards_fn=fetch, _now_fn=_frozen_now(1779603600.0),
             )
         self.assertEqual(result["status"], "desync")
+
+
+class TestReconcileFX074ExternalAlert(unittest.TestCase):
+    """FX-074: a [CRITICAL] WALLET_DESYNC now PAGES via the external alert
+    channel (alert_wallet_desync), while staying OBSERVATIONAL — it never
+    halts or gates allocation. These lock the alert to the desync branch only
+    and prove the wiring is fail-open (an alert-send failure must not crash
+    the reconciler or block trading).
+    """
+
+    def _seed_baseline(self, db, wallet, ts=1779600000.0):
+        db.history.append({
+            "ts": ts, "actual_wallet": wallet, "expected_wallet": wallet,
+            "divergence": 0.0, "status": "baseline",
+            "baseline_ts": ts, "baseline_wallet": wallet,
+        })
+
+    def test_desync_fires_external_alert(self):
+        db = _FakeDB(fills_delta=0.0, unwinds_delta=0.0)
+        self._seed_baseline(db, 227.43)
+        fetch = MagicMock(return_value=(0.0, True))
+        with patch("alerts.alert_wallet_desync") as m_alert:
+            result = reconcile_wallet_invariant(
+                db, actual_wallet_now=237.43, funder="0xFAKE",  # +$10 desync
+                threshold_usd=0.50,
+                _fetch_rewards_fn=fetch, _now_fn=_frozen_now(1779603600.0),
+            )
+        self.assertEqual(result["status"], "desync")
+        m_alert.assert_called_once()
+        kwargs = m_alert.call_args.kwargs
+        self.assertAlmostEqual(kwargs["divergence"], 10.0, places=4)
+        self.assertEqual(kwargs["threshold_usd"], 0.50)
+        self.assertAlmostEqual(kwargs["actual_wallet"], 237.43, places=4)
+
+    def test_ok_does_not_fire_external_alert(self):
+        db = _FakeDB(fills_delta=10.0, unwinds_delta=10.0)  # net 0 expected
+        self._seed_baseline(db, 200.0)
+        fetch = MagicMock(return_value=(0.0, True))
+        with patch("alerts.alert_wallet_desync") as m_alert:
+            result = reconcile_wallet_invariant(
+                db, actual_wallet_now=200.0, funder="0xFAKE",
+                threshold_usd=0.50,
+                _fetch_rewards_fn=fetch, _now_fn=_frozen_now(1779603600.0),
+            )
+        self.assertEqual(result["status"], "ok")
+        m_alert.assert_not_called()
+
+    def test_fail_open_does_not_fire_external_alert(self):
+        # reward fetch failed → fail_open branch precedes the desync check;
+        # even a large wallet jump must NOT page (could be unseen rewards).
+        db = _FakeDB(fills_delta=0.0, unwinds_delta=0.0)
+        self._seed_baseline(db, 200.0)
+        fetch = MagicMock(return_value=(0.0, False))
+        with patch("alerts.alert_wallet_desync") as m_alert:
+            result = reconcile_wallet_invariant(
+                db, actual_wallet_now=999.0, funder="0xFAKE",
+                threshold_usd=0.50,
+                _fetch_rewards_fn=fetch, _now_fn=_frozen_now(1779603600.0),
+            )
+        self.assertEqual(result["status"], "fail_open")
+        m_alert.assert_not_called()
+
+    def test_alert_send_failure_does_not_crash_reconciler(self):
+        # The alert is wrapped in a fail-open try/except: a Discord/alert
+        # failure must not propagate and must NOT skip the DB row write.
+        db = _FakeDB(fills_delta=0.0, unwinds_delta=0.0)
+        self._seed_baseline(db, 227.43)
+        fetch = MagicMock(return_value=(0.0, True))
+        with patch("alerts.alert_wallet_desync",
+                   side_effect=RuntimeError("discord down")):
+            with self.assertLogs(
+                "oversight.wallet_reconciliation", level="WARNING"
+            ) as cap:
+                result = reconcile_wallet_invariant(
+                    db, actual_wallet_now=237.43, funder="0xFAKE",
+                    threshold_usd=0.50,
+                    _fetch_rewards_fn=fetch, _now_fn=_frozen_now(1779603600.0),
+                )
+        self.assertEqual(result["status"], "desync")
+        # Row still written AFTER the failed alert (insert runs post-branch).
+        self.assertEqual(db.history[-1]["status"], "desync")
+        self.assertTrue(
+            any("desync alert send failed" in line for line in cap.output),
+            f"Expected fail-open warning, got: {cap.output}",
+        )
 
 
 if __name__ == "__main__":

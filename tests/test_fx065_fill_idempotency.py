@@ -34,6 +34,7 @@ def _make_ms(cid="0xabc"):
     ms.daily_rate = 100.0
     ms.last_fill_price = {"yes": 0.0, "no": 0.0}
     ms.fill_times = {"yes": [], "no": []}
+    ms.kill_fill_times = []  # FX-069: mirror the real MarketState field
     return ms
 
 

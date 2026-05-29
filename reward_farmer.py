@@ -799,10 +799,16 @@ class RewardFarmer:
                     continue
                 # Position is in DB but not on exchange — check if it's being
                 # actively dumped before removing
-                is_dumping = (
-                    cid in self.dump_mgr.dump_states
-                    if hasattr(self.dump_mgr, "dump_states")
-                    else False
+                # FX-070: DumpManager has no `dump_states` attribute — the
+                # active-dump signal lives on the per-market MarketState as
+                # ms.dump_state[side] / ms.dump_orders[side]. The old hasattr()
+                # guard was therefore always False, so a position mid-dump could
+                # be removed here (stranding it + losing its loss-accounting
+                # trail). Check the real in-memory state instead.
+                ms = self.markets.get(cid)
+                is_dumping = bool(ms) and any(
+                    ms.dump_state[side] or ms.dump_orders[side]
+                    for side in ("yes", "no")
                 )
                 if is_dumping:
                     continue
@@ -1392,14 +1398,16 @@ class RewardFarmer:
         short_count = 0
         base_count = 0
         for ms in self.markets.values():
-            ft = ms.fill_times if isinstance(ms.fill_times, dict) else {}
-            for side in ("yes", "no"):
-                times = ft.get(side) or []
-                for t in times:
-                    if t >= base_cutoff:
-                        base_count += 1
-                        if t >= short_cutoff:
-                            short_count += 1
+            # FX-069: read the kill-switch history (pruned only to the 6h
+            # baseline), NOT ms.fill_times — can_place prunes fill_times to a
+            # 180s window, which previously starved this baseline and blinded
+            # the spike kill to slow bleed.
+            times = ms.kill_fill_times if isinstance(ms.kill_fill_times, list) else []
+            for t in times:
+                if t >= base_cutoff:
+                    base_count += 1
+                    if t >= short_cutoff:
+                        short_count += 1
         if base_count < MIN_FILL_BASELINE:
             log.warning(
                 f"[GUARDRAIL_WARNING] missing_signal=fill_rate "

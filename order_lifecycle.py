@@ -685,7 +685,17 @@ class OrderLifecycle:
         )
 
         ms.last_fill_price[side] = fill_price
-        ms.fill_times[side].append(time.time())
+        _fill_ts = time.time()
+        ms.fill_times[side].append(_fill_ts)
+        # FX-069: also record into the kill-switch history (separate from the
+        # 180s can_place breaker buffer) and prune it to the 6h kill baseline
+        # so the fill-rate spike kill can detect slow bleed. can_place's 180s
+        # prune intentionally does NOT touch this list.
+        ms.kill_fill_times.append(_fill_ts)
+        _kill_hist_window = cfg("RF_KILL_FILL_HISTORY_SECS")
+        ms.kill_fill_times = [
+            t for t in ms.kill_fill_times if _fill_ts - t < _kill_hist_window
+        ]
 
         yes_shares = self.positions.get_shares(cid, "yes")
         no_shares = self.positions.get_shares(cid, "no")
