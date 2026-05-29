@@ -4,6 +4,30 @@
 
 ---
 
+**v6.2 scope (2026-05-29).** P5 Stage B (shadow) brought up on Helsinki + pre-Stage-C live-fill hardening. The bot is **no longer "halted"** — it runs `--mode dry` (shadow) on Helsinki against live Polymarket data, placing zero orders. Repo HEAD `d060801`.
+
+**Session ledger (2026-05-29):**
+
+| Commit | FX | What |
+|---|---|---|
+| (ops) | — | Helsinki `git pull` `0fafa1b` → `3bb6137`, `--mode dry`, both services restarted. Shadow run started 2026-05-29 08:37 UTC. DB migrations applied on first run (`market_roi`, `capital_committed_snapshots`, `market_cooldowns`, `daily_reward_cache`, `q_share_recalibration_events`; `fills.order_id` + `fill_event_id`). |
+| `d76876e`, `6647995` | FX-062 | Stage B runbook pass-criteria (`deploys ≥ 50`, ratio 3-8×) are q_share-feedback-dependent → not reachable at the default EV cfg in dry mode. Documented + A/B'd. |
+| (cfg, not committed) | — | A/B: hot-reload `RF_OVERCOMMIT_EXPECTED_FILL_COST_FRAC` 0.02 → 0.01 (operator kept 0.01). **Finding: the EV gate is the binding constraint on deploy count, not the rate floor.** 0.02→0.01 moved deploys 29 → ~125 and `overcommit_ratio` ~1.85× → ~5-8×. **Required an oversight process RESTART** to take effect (FX-063: oversight never hot-reloads cfg). Also confirmed the live-path cold-start q_share is `0.005`, NOT the documented `0.10` (see §4.10). |
+| `38a7709` | FX-063…FX-077 | Pre-Stage-C live-fill readiness audit (6 parallel agents tracing fill → dump → accounting → learning → safety). 15 findings, each verified against code with file:line. None exercised in dry mode; all activate at live cutover. |
+| `c44e8f0` | FX-068 | **CRITICAL:** oversight kill switch now actually halts the farmer (the farmer read only `action=="deploy"` rows and ignored the alloc `kill_switch` field). |
+| `4686b6b` | FX-065 | **CRITICAL:** no positions double-count on a duplicate `handle_fill` (`record_fill` guarded by the `fills` idempotency key). |
+| `8851416` | FX-067 | **CRITICAL:** `log_unwind` truthful + idempotent (mirrors FX-054) — a realized loss can't silently vanish from the kill math. |
+| `6d2b57c` + `c606e78` | FX-066 | **CRITICAL:** unknown-cost dump never recorded as profit (Tier 1 floor) + cost basis reconstructed at orphan registration from `fills` (Tier 2). |
+| `d060801` | — | Fixit tracker: CRITICAL set marked CLOSED. |
+
+**Deployment state:** FX-065/066/067/068 are in `main` but **NOT deployed to Helsinki** — they are live-only behaviors (dry mode never fills), so the shadow run continues undisturbed on the pre-fix code and the CRITICAL set lands at the Stage C `git pull`. The Stage B 48h clock is unaffected by these commits (they went to `main`, not the running bot). A single oversight restart at 04:22 UTC (to apply the A/B cfg) was logged as a planned cfg-test action.
+
+**Open before Stage C live cutover** (see `Polymarket bot fixit.md` §2 + the FX-063…077 umbrella entry): HIGH set — FX-063 (oversight hot-reload), FX-069 (fill-rate kill defeated by the 180s `fill_times` prune), FX-071 (no dump-time slippage cap), FX-072 (drift sweep misses fast buy→dump). MEDIUM set — FX-073 (**notional headroom: the live shadow ratio is hitting 7.5-7.9× at the 0.01 EV setting, near the 8.0× hard cap — argues for right-sizing the EV gate to ~0.015 rather than raising the caps**), FX-074 (WALLET_DESYNC halt-vs-observe — operator decision), FX-076 (`global_reward_low` pulls a non-binding lever → inert), FX-064/070/075/077.
+
+**Honest rating: still 7.5/10.** The empirical gates (G-C fill-burst verify, G-E 7-day clean) remain unmet — they require live operation. The CRITICAL live-fill safety holes are now closed at the code level, which is necessary for a *safe* Stage C but does not by itself advance the 9/10 gates.
+
+---
+
 **v6.1 scope (2026-05-28).** v6.0 SHIPPED. 8 commits to `main` over 2026-05-26 → 2026-05-28 closing all code-level deliverables of the 9-phase 9/10 plan. Bot remains halted on Helsinki; ready for staged rebring-up per operator runbook at `docs/runbooks/9_of_10_p5_p7_operator_runbook.md`.
 
 **Session ledger:**
@@ -574,7 +598,9 @@ New markets (never posted on) used to get `q_share = 0`, producing `score = 0`, 
 
 **Cold-start prior** (`RF_NEW_MARKET_Q_SHARE_PRIOR = 0.10`)
 
-Applied in three places:
+> **⚠ FX-064 (2026-05-29): this section describes the LEGACY `oversight_agent` / `data_collector` path only.** The current production path (`simple_oversight` → `SimpleAllocator`) does **not** use `RF_NEW_MARKET_Q_SHARE_PRIOR` — it uses a hardcoded module constant `COLD_START_Q_SHARE = 0.005` (`simple_allocator.py:72`), 20× lower and **not cfg-tunable**. The A/B on 2026-05-29 confirmed 0.005 empirically: at the default EV setting (`EXPECTED_FILL_COST_FRAC=0.02`) a cold-start market needs `daily_rate ≥ ~$88/day` to clear the EV gate, and the observed minimum deploy `daily_rate` was exactly 88.0. The legacy 0.10 below applies only if `oversight_agent.py` is restored as the planner.
+
+Applied in three places (LEGACY path):
 
 1. `data_collector.query_reward_stats` Priority 3 — when `on_book < 2.0 AND q_score_samples == 0`
 2. `data_collector.collect_all` discovery branch — for CLOB-discovered markets not yet in `reward_market_stats`
