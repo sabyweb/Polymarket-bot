@@ -388,6 +388,31 @@ class DumpManager:
                 sell_price = round(state["fill_price"] - decay_ticks * tick, 4)
                 sell_price = max(0.01, sell_price)
 
+            # FX-071: dump-time slippage floor. Both pricing branches above
+            # converge here. The aggressive-decay branch walks sell_price below
+            # the fill price with no floor, so an extreme/illiquid market gets an
+            # unbounded-loss forced SELL (the 2026-05-25 13.3% class). Floor the
+            # SELL so a single dump never crystallizes more than
+            # RF_DUMP_MAX_SLIPPAGE_FRAC below the cost basis (state["fill_price"],
+            # CLOB terms). The order then rests at the bounded-loss price; if the
+            # book never reaches it, RF_DUMP_ABANDON_MINS holds the position
+            # rather than dumping into a loss bigger than the reward (Rule 3).
+            # Only applies when the cost basis is known (fill_price>0; orphan /
+            # startup positions with avg_price=0 are handled by FX-066 Tier 1 +
+            # FX-074 paging). Disabled when frac<=0 or >=1.
+            _dump_max_slip = cfg("RF_DUMP_MAX_SLIPPAGE_FRAC")
+            _cost_basis = state.get("fill_price", 0) or 0
+            if 0 < _dump_max_slip < 1.0 and _cost_basis > 0:
+                _slip_floor = round(_cost_basis * (1.0 - _dump_max_slip), 4)
+                if sell_price < _slip_floor:
+                    log.info(
+                        f"DUMP SLIPPAGE FLOOR {side.upper()}: {sell_price:.4f} -> "
+                        f"{_slip_floor:.4f} (cost {_cost_basis:.4f}, cap "
+                        f"{_dump_max_slip*100:.0f}%) — bounded-loss rest, "
+                        f"abandon-timer holds if unfilled | {ms.question[:30]}"
+                    )
+                    sell_price = _slip_floor
+
             # Cancel existing dump order if any (repricing)
             if ms.dump_orders[side]:
                 old_oid = ms.dump_orders[side]

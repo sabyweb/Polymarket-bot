@@ -278,5 +278,76 @@ class TestDumpManagerTakerFee(unittest.TestCase):
                                msg="Sanity check: post-fee pnl should match real loss magnitude")
 
 
+class TestDumpSlippageFloor(unittest.TestCase):
+    """FX-071: dump_position floors the SELL price so a single dump never
+    crystallizes more than RF_DUMP_MAX_SLIPPAGE_FRAC below the cost basis.
+    The aggressive-decay branch previously walked the price down with no floor
+    (the 2026-05-25 13.3% class: $0.08->$0.07)."""
+
+    def _cfg(self, max_slip):
+        def cfg_side_effect(name):
+            return {
+                "RF_DUMP_ABANDON_MINS": 30.0,
+                "RF_DUMP_AGGRESSIVE_MINS": 5.0,
+                "RF_DUMP_PASSIVE_REPRICE_MINS": 5.0,
+                "RF_DUMP_MAX_SLIPPAGE_FRAC": max_slip,
+                "RF_UNKNOWN_RETRY_THRESHOLD": 2,
+            }.get(name, 0)
+        return cfg_side_effect
+
+    def _dm_and_ms(self, started_min_ago, cost=0.50):
+        positions = MagicMock()
+        dm = DumpManager(client=MagicMock(), db=MagicMock(), positions=positions,
+                         cancel_fn=MagicMock(), dry_run=False)
+        dm.db.is_unliquidatable.return_value = False
+        dm.client.get_balance_allowance.return_value = {"balance": 50_000_000}  # 50 sh
+        dm.client.create_and_post_order.return_value = {"orderID": "oid_new"}
+        ms = _make_ms_with_dump(tick_size=0.01)
+        ms.dump_state["yes"] = {
+            "fill_price": cost, "started_at": time.time() - started_min_ago * 60,
+            "shares": 50, "tid": "ytid_fee",
+        }
+        ms.dump_orders["yes"] = None  # no existing order to cancel
+        return dm, ms
+
+    def _posted_price(self, dm):
+        args = dm.client.create_and_post_order.call_args
+        self.assertIsNotNone(args, "create_and_post_order was not called")
+        return args.args[0].price
+
+    @patch("dump_manager.cfg")
+    def test_aggressive_decay_floored_at_cap(self, mock_cfg):
+        """3.5m in → decay_ticks=4 → 0.50-0.04=0.46 < floor 0.475 → floored."""
+        mock_cfg.side_effect = self._cfg(0.05)
+        dm, ms = self._dm_and_ms(started_min_ago=3.5, cost=0.50)
+        dm.dump_position(ms, "yes", 50)
+        self.assertAlmostEqual(self._posted_price(dm), 0.475, places=4)
+
+    @patch("dump_manager.cfg")
+    def test_within_cap_not_floored(self, mock_cfg):
+        """1.5m in → decay_ticks=2 → 0.50-0.02=0.48 >= floor 0.475 → unchanged."""
+        mock_cfg.side_effect = self._cfg(0.05)
+        dm, ms = self._dm_and_ms(started_min_ago=1.5, cost=0.50)
+        dm.dump_position(ms, "yes", 50)
+        self.assertAlmostEqual(self._posted_price(dm), 0.48, places=4)
+
+    @patch("dump_manager.cfg")
+    def test_floor_disabled_reverts_to_pre_fx071(self, mock_cfg):
+        """frac=0 → no floor → decayed 0.46 posted (byte-equivalent to pre-FX-071)."""
+        mock_cfg.side_effect = self._cfg(0.0)
+        dm, ms = self._dm_and_ms(started_min_ago=3.5, cost=0.50)
+        dm.dump_position(ms, "yes", 50)
+        self.assertAlmostEqual(self._posted_price(dm), 0.46, places=4)
+
+    @patch("dump_manager.cfg")
+    def test_unknown_cost_basis_not_floored(self, mock_cfg):
+        """fill_price=0 (orphan/startup, cost unknown) → no floor; falls through
+        to FX-066 Tier 1 + FX-074 paging. Decay from 0 clamps to 0.01."""
+        mock_cfg.side_effect = self._cfg(0.05)
+        dm, ms = self._dm_and_ms(started_min_ago=3.5, cost=0.0)
+        dm.dump_position(ms, "yes", 50)
+        self.assertAlmostEqual(self._posted_price(dm), 0.01, places=4)
+
+
 if __name__ == "__main__":
     unittest.main()

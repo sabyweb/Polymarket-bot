@@ -266,6 +266,7 @@ RF_DUMP_AGGRESSIVE_MINS: float = 5.0        # Duration of aggressive dump decay 
 RF_DUMP_PASSIVE_REPRICE_MINS: float = 5.0   # Reprice interval in passive dump mode
 RF_DUMP_ABANDON_MINS: float = 30.0          # Hard timeout: give up on dump
 RF_DUMP_EXIT_DEPTH_BUFFER: float = 0.02     # Max price buffer for exit depth check
+RF_DUMP_MAX_SLIPPAGE_FRAC: float = 0.05     # FX-071: dump-time slippage floor. dump_position's aggressive-decay branch walks the SELL price below the fill/cost price with NO floor, so an illiquid/extreme-price market realizes an unbounded loss on the forced dump (the 2026-05-25 13.3% class: $0.08->$0.07). The dump SELL is floored to cost*(1-this), so a single dump never crystallizes more than this fraction below the cost basis (state["fill_price"], CLOB terms). If the book won't meet the floor the order rests until RF_DUMP_ABANDON_MINS holds the position (not dumped at a loss bigger than the reward — Ground Rule 3). Only applies when the cost basis is known (avg_price>0; orphan/startup positions with price 0 fall through to FX-066 Tier 1 + FX-074 paging). Set >=1.0 or 0 to disable.
 RF_UNKNOWN_RETRY_THRESHOLD: int = 2         # Retries before clearing UNKNOWN status order (was 5, reduced)
 RF_DUMP_MAX_FAILURES: int = 3               # Dump failures before blocking placement
 RF_UNLIQUIDATABLE_REPROBE_SECS: float = 6 * 3600  # FX-028: re-probe each unliquidatable market every ~6h via get_merged_book
