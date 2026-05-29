@@ -695,6 +695,39 @@ class BotDatabase:
             log.debug(f"fill_event_exists error: {e}")
             return False
 
+    def fills_vwap(self, condition_id: str, side: str) -> tuple[float, float]:
+        """FX-066 Tier 2: reconstruct (total_shares, VWAP) for a cid/side from
+        the fills table. ``fills.price`` is stored YES-equivalent (see the fills
+        schema), so the VWAP is directly usable as PositionStore ``avg_price``.
+
+        Used to set the cost basis when registering an orphan / recovered
+        position from on-chain balance. ``set_shares`` otherwise leaves
+        ``avg_price=0`` → ``get_avg_price=0`` → ``vwap_cost=0`` at dump time
+        (the FX-066 loss-as-profit bug, Tier-1-floored but magnitude-blind)
+        AND ``get_position()=0`` → the position is invisible to the farmer's
+        notional guardrails.
+
+        Returns (0.0, 0.0) when there are no fills (a true orphan with no local
+        record — cost basis genuinely unknown, so the caller leaves avg_price
+        unset and the Tier 1 floor handles the dump) or on any DB error.
+        """
+        try:
+            conn = self._get_conn()
+            row = conn.execute(
+                "SELECT COALESCE(SUM(shares), 0), "
+                "       COALESCE(SUM(shares * price), 0) "
+                "FROM fills WHERE condition_id = ? AND side = ?",
+                (condition_id, side),
+            ).fetchone()
+            total_shares = float(row[0]) if row else 0.0
+            sum_shares_price = float(row[1]) if row else 0.0
+            if total_shares <= 0:
+                return 0.0, 0.0
+            return total_shares, round(sum_shares_price / total_shares, 6)
+        except Exception as e:
+            log.debug(f"fills_vwap error: {e}")
+            return 0.0, 0.0
+
     def log_unwind(
         self, condition_id: str, question: str, side: str,
         shares: float, sell_price: float, usd_value: float,

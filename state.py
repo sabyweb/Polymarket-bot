@@ -606,8 +606,19 @@ class PositionStore:
             log.info(f"Position side reset | {question[:40]} | {side.upper()} zeroed")
             self._save()
 
-    def set_shares(self, condition_id: str, side: str, shares: float) -> None:
+    def set_shares(self, condition_id: str, side: str, shares: float,
+                   avg_price: "float | None" = None) -> None:
         """Set share count to match exchange reality.
+
+        FX-066 Tier 2: optional ``avg_price`` sets the cost basis when
+        registering a position recovered from on-chain balance. Without it an
+        orphan is registered with ``avg_price=0`` → ``get_avg_price=0`` →
+        ``vwap_cost=0`` at dump time (loss recorded as profit) AND
+        ``get_position()=0`` (invisible to notional guardrails). Pass the
+        fills-reconstructed VWAP (``db.fills_vwap``) so every downstream
+        consumer sees a real cost basis. ``None`` (default) preserves the
+        existing ``avg_price`` — used by share-only corrections on
+        already-tracked positions, which must not clobber a live VWAP.
 
         Thread-safe: acquires self._lock for the duration.
         """
@@ -617,10 +628,14 @@ class PositionStore:
                 return
             old_shares = sp.shares
             sp.correct_to_exchange(shares)
+            cost_note = ""
+            if avg_price is not None and avg_price > 0:
+                sp.avg_price = round(float(avg_price), 6)
+                cost_note = f" (cost basis set avg_price={sp.avg_price:.4f})"
             question = self._markets[condition_id]["question"]
             log.info(
                 f"Position corrected | {question[:40]} | {side.upper()} "
-                f"{old_shares:.2f} -> {shares:.2f} shares"
+                f"{old_shares:.2f} -> {shares:.2f} shares{cost_note}"
             )
             self._save()
 

@@ -630,9 +630,20 @@ class RewardFarmer:
                 q = question or f"orphan-{cid[:12]}"
                 self.positions.register_market(cid, q)
                 for side, actual in orphan_sides.items():
-                    self.positions.set_shares(cid, side, actual)
+                    # FX-066 Tier 2: reconstruct cost basis from the fills the
+                    # orphan scan already keyed on (this scan only considers
+                    # cids with fills in the last 7d, reward_farmer.py:565), so
+                    # the registered position has a real avg_price instead of 0.
+                    # Fixes dump pnl (Tier 1 only floored it), per-market ROI,
+                    # AND notional-guardrail visibility at the source.
+                    _fs, _vwap = self.db.fills_vwap(cid, side)
+                    self.positions.set_shares(
+                        cid, side, actual,
+                        avg_price=_vwap if _vwap > 0 else None,
+                    )
                     log.warning(
-                        f"ORPHAN FOUND: {side.upper()} {actual:.0f}sh on exchange | "
+                        f"ORPHAN FOUND: {side.upper()} {actual:.0f}sh on exchange "
+                        f"(cost basis {'reconstructed' if _vwap > 0 else 'UNKNOWN — Tier 1 floor at dump'}) | "
                         f"{q[:50]}"
                     )
                     orphans_found += 1
@@ -748,7 +759,15 @@ class RewardFarmer:
                 q = question or f"orphan-{cid[:12]}"
                 self.positions.register_market(cid, q)
                 for side, info in sides.items():
-                    self.positions.set_shares(cid, side, info["shares"])
+                    # FX-066 Tier 2: reconstruct cost basis from fills if any
+                    # exist. This (data-api) path can find true orphans with NO
+                    # local fills (prior deployment) → fills_vwap returns 0 →
+                    # avg_price left unset → Tier 1 floor handles the dump.
+                    _fs, _vwap = self.db.fills_vwap(cid, side)
+                    self.positions.set_shares(
+                        cid, side, info["shares"],
+                        avg_price=_vwap if _vwap > 0 else None,
+                    )
                     log.warning(
                         f"EXCHANGE SYNC: found {side.upper()} {info['shares']:.1f}sh "
                         f"not tracked | {q[:50]}"
