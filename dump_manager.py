@@ -104,7 +104,30 @@ class DumpManager:
 
                         from price import to_clob
                         avg_p = self.positions.get_avg_price(ms.cid, side)
-                        vwap_cost = actual_matched * to_clob(avg_p, side) if avg_p > 0 else 0
+                        if avg_p > 0:
+                            vwap_cost = actual_matched * to_clob(avg_p, side)
+                        else:
+                            # FX-066 Tier 1 (safety floor): cost basis unknown —
+                            # the position was registered from on-chain balance via
+                            # set_shares (orphan / startup recovery) with NO price, so
+                            # get_avg_price returns 0. Pre-fix vwap_cost=0 → pnl =
+                            # usd_value − 0 = +sell_revenue, i.e. a real loss recorded
+                            # as PROFIT (pnl>0) → excluded from the kill switch's
+                            # SUM(pnl WHERE pnl<0) → the loss is invisible to the kill.
+                            # We cannot know the true buy price here (that is FX-066
+                            # Tier 2 — reconstruct avg_price at orphan registration —
+                            # and FX-074 — wallet reconciler), but we MUST never record
+                            # an unknown-cost dump as a profit. Floor vwap_cost to the
+                            # gross (pre-fee) proceeds so pnl = sell_revenue − gross =
+                            # −fee ≤ 0: visible to the kill as a (small) loss, never a
+                            # phantom profit that could mask real losses in aggregate.
+                            vwap_cost = gross_revenue
+                            log.warning(
+                                f"[UNWIND_COST] cid={ms.cid[:12]} side={side} "
+                                f"cost_basis_unknown avg_price=0 — flooring vwap_cost to "
+                                f"gross ${gross_revenue:.2f} so pnl<=0 (FX-066 Tier 1; "
+                                f"true magnitude needs Tier 2 / FX-074)"
+                            )
 
                         log.info(
                             f"DUMP CONFIRMED {side.upper()} {actual_matched:.0f}sh @ {actual_price:.4f} | "
