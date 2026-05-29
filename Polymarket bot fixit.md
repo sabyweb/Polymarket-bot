@@ -135,7 +135,7 @@ Codified during the 2026-05-19 → 2026-05-21 cascade-recovery sequence. The can
 | ~~**FX-039**~~ | ~~**`handle_fill` hardcodes `fill_type='FULL'`** in DB write at `order_lifecycle.py:269`, regardless of whether actual match was partial.~~ ✅ SHIPPED in commit `9164f1f` (2026-05-26). `fill_type` is now a `handle_fill` parameter threaded through from the three call sites (`detect_fills`, `_check_stale_order`, `_reconcile_after_unknown`). The fix surfaced and closed a latent crash in `alerts.py:322` where the PARTIAL alert branch formatted `remaining_shares` unconditionally — pre-FX-039 the hardcode masked this dead code path. See §4 detail. | Low → CLOSED | Fixed (`9164f1f`) | `[BUG]` |
 | FX-033 | Oversight allocator doesn't consult `unliquidatable_markets` table — proposes deploys the farmer silently skips | Low | Open | `[ARCH]` `[TEST]` |
 | FX-034 | `_reprobe_unliquidatable` never un-marks cids even when subsequent book fetches return HTTP 200 | Low | Open | `[BUG]` |
-| **FX-062** | **P5 Stage B runbook criteria (`deploys ≥ 50`, `overcommit_ratio` 3-8×) are structurally unreachable in dry mode** — they depend on API + cumulative q_share feedback that only flows back when orders are placed. First Helsinki shadow run (2026-05-28 08:37 UTC) holds at `deploys=31-32, ratio=2.14-2.42×` across 3 cycles while bot is otherwise perfectly clean. Operator following the runbook strictly would misread shadow success as failure. Proposed fix: split runbook criteria into "shadow-applicable" vs "live-only-verifiable" buckets. | Low | Open | `[DOC]` `[OPS]` |
+| **FX-062** | **P5 Stage B runbook criteria (`deploys ≥ 50`, `overcommit_ratio` 3-8×) are rarely sustained in dry mode** — they depend on API + cumulative q_share feedback that only flows back when orders are placed. **First Helsinki shadow run (2026-05-28 08:37 UTC → 2026-05-29 03:38 UTC, 19h, 39 oversight cycles):** `deploys` range 23-34 (mean ~29), `overcommit_ratio` range 0.98×-4.46× (mean ~1.85×), 3-8× band hit on 3 of 39 cycles (~8%, driven by transient entry of high-`min_size` markets). `deploys ≥ 50` never observed. Otherwise perfectly clean — zero CRITICAL/FATAL/Traceback/kill. Operator following the runbook strictly would misread shadow success as failure ~92% of cycles. Proposed fix: split runbook criteria into "shadow-applicable" vs "live-only-verifiable" buckets. | Low | Open | `[DOC]` `[OPS]` |
 
 (FX-001 through FX-036, plus FX-040 and FX-041, have been shipped — see §4. FX-027 was accepted as designed architectural risk — see §5. FX-044 was investigated 2026-05-23 and found to be misdiagnosed in the original entry; superseded by the new FX-045 / FX-046 / FX-047 chain that addresses the actual root cause.)
 
@@ -859,21 +859,21 @@ Codified during the 2026-05-19 → 2026-05-21 cascade-recovery sequence. The can
   > - `[OVERCOMMIT_ALLOC]` log emitted every oversight cycle (~30min) with `deploys >= 50` once eligible market discovery has run.
   > - `overcommit_ratio` in `[OVERCOMMIT_ALLOC]` log lands in the 3.0× – 8.0× band.
 
-  In actual shadow operation (Helsinki, 2026-05-28 08:37 UTC, observed across 3 consecutive oversight cycles at 08:37 / 09:07 / 09:37):
-  ```
-  [OVERCOMMIT_ALLOC] eligible=2362-2379 positive_ev=31-32 deploys=31-32
-    notional_total=$2574-2904 wallet=$1201.76 overcommit_ratio=2.14×-2.42×
-    p10_global_reward_low=True
-  ```
-  - `deploys` held steady at 31-32 (not ≥50)
-  - `overcommit_ratio` held steady at 2.14×-2.42× (below 3.0×)
-  - Bot otherwise perfectly clean: zero CRITICAL/FATAL/Traceback, services stable for 1h+, self-correction loop firing correctly (`p10_global_reward_low` detecting `total_reward_24h=$0 < $4` target and halving MIN floors per FX-060's design).
+  In actual shadow operation (Helsinki, 2026-05-28 08:37 UTC → 2026-05-29 03:38 UTC, 19h continuous, **39 oversight cycles observed**):
+  - **`deploys` range 23-34**, mean ~29 (never ≥50)
+  - **`overcommit_ratio` range 0.98×-4.46×**, mean ~1.85× (target 3-8× band hit on 3 of 39 cycles = ~8%)
+  - **`eligible` range 2271-2399** (stable ~2300, modest Polymarket market churn)
+  - **`positive_ev` range 23-34** (matches deploys; soft cap of 500 never approached)
+  - **`notional_total` range $1177-$5357** (high variance driven by which markets are in the pool — high-`min_size` markets dominate when present)
+  - Bot otherwise perfectly clean across the 19h: zero CRITICAL/FATAL/Traceback, services on original PIDs, no kill switch, no WALLET_DESYNC after the documented startup baseline rebase, no LEARN_COOLDOWN/REACTIVATE/DIVERGENCE events. Self-correction loop firing correctly (`p10_global_reward_low=True` on every cycle — `total_reward_24h=$0` < $4 target, halving MIN floors per FX-060).
+
+  **The 3 cycles that DID hit the band** (2026-05-29 01:07 / 01:38 / 02:08 UTC, ratios 4.40× / 4.40× / 4.46×) were driven by 1-2 high-`min_size` markets transiently entering the eligible set — `notional_total` jumped from $2090 → $5291 between cycles 33→34 with the SAME deploy count of 34. When those markets aged out (cycle 37 at 02:38), ratio collapsed back to 2.61×. The band CAN be entered, just not held stably.
 - **Root cause:** Both quantitative criteria depend on q_share data that structurally cannot flow back in dry mode:
   1. **API q_share** (`SimpleAllocator.fetch_current_q_shares` → `GET /rewards/user/percentages`) only returns data for markets where the bot has held positions. Dry mode never places orders → never holds positions → API source permanently empty (`api=0` observed every cycle).
   2. **Cumulative q_share** (`reward_market_stats` table, populated by `reward_tracker.record_cycle`) only grows the per-market q_score totals when `has_yes_order || has_no_order` is True. Dry mode → both always False → table never grows beyond what previous live runs left. Helsinki currently has 12 cumulative entries (stale from pre-kill-switch ops, observed as `cumulative=12` every cycle).
   3. **Cold-start prior** (`RF_NEW_MARKET_Q_SHARE_PRIOR = 0.10`) applies to the remaining ~6121 markets (observed `cold_start=6121-6135`). The EV gate (`daily_rate × q_share > cost_per_market × EXPECTED_FILL_COST_FRAC`) then filters this pool to ~32 markets — the conservatism is intentional under Ground Rule 1+3.
 
-  In LIVE mode the 32 deployed markets would populate API + cumulative sources within hours, marginal markets near the EV boundary would re-qualify on better data, and equilibrium would settle near or above the runbook's 50. **In DRY mode the count is structurally capped near 32 by the EV gate operating purely on the cold-start prior.**
+  In LIVE mode the 23-34 deployed markets would populate API + cumulative sources within hours, marginal markets near the EV boundary would re-qualify on better data, and equilibrium could plausibly settle near or above the runbook's 50. **In DRY mode the count is structurally biased low (mean ~29) by the EV gate operating purely on the cold-start prior** — the gate CAN occasionally let ratio spike into 3-8× when high-`min_size` markets enter, but cannot sustain it (~8% hit rate observed).
 - **Why it matters:**
   - An operator following the runbook strictly would interpret the actual shadow numbers as a Stage B failure and either (a) reset the 48h clock unnecessarily, (b) escalate to engineering for a non-existent bug, or (c) tune cfg knobs (`EXPECTED_FILL_COST_FRAC`, `NEW_MARKET_Q_SHARE_PRIOR`, `MIN_DAILY_RATE_USD`) to hit an artificial target — which would compromise the live-mode safety posture those knobs encode.
   - Lost confidence in the runbook erodes the change-management discipline that P5 itself demands. The runbook is the contract; the contract should match reality.
@@ -911,6 +911,7 @@ Codified during the 2026-05-19 → 2026-05-21 cascade-recovery sequence. The can
 - **Hardening Phase:** Phase 10 (friend rollout / operational doc accuracy). Ships independently of P5/P7 live execution — operator can update the runbook before, during, or after the 48h shadow window without affecting bot behavior.
 - **History:**
   - 2026-05-28 09:47 UTC — Surfaced during first P5 Stage B shadow execution on Helsinki. Three oversight cycles at deploys=31-32, ratio=2.14-2.42×. Investigation traced to dry-mode structural absence of API + cumulative q_share data sources (writer paths in `reward_farmer.py` + `reward_tracker.record_cycle` both gated on `has_yes_order || has_no_order`). Confirmed `simple_oversight` and `SimpleAllocator` do not read `scoring_snapshots` — only legacy `oversight_agent` does — so no code-side seeding mechanism exists or makes sense.
+  - 2026-05-29 03:47 UTC — Amended entry after 19h / 39 cycles of empirical data. Original "structurally unreachable" framing softened to "rarely sustained": observed `overcommit_ratio` 0.98×-4.46×, mean ~1.85×, 3-8× band hit 3 of 39 cycles (~8%) driven by transient high-`min_size` market entry (notional jumped $2090→$5291 cycle 33→34 with same deploy count). `deploys ≥ 50` never observed (range 23-34, mean ~29). Otherwise zero CRITICAL/FATAL/kill/divergence across the 19h. Proposed shadow A/B experiment opened: hot-reload `RF_OVERCOMMIT_EXPECTED_FILL_COST_FRAC: 0.02 → 0.01` at 03:54 UTC to test whether the EV gate is the binding constraint on deploys count in dry mode. Results in next History append after ≥2 cycle observation.
 
 ---
 
