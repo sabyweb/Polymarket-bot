@@ -137,6 +137,15 @@ class DumpManager:
                         )
 
                         self.positions.record_unwind(ms.cid, side, actual_matched)
+                        # FX-072 gate 3: mark that THIS cycle recorded an
+                        # unwind for (cid, side) so the end-of-cycle drift
+                        # sweep does NOT also add the drained dump shares back
+                        # (tracked was correctly reduced here — adding back
+                        # would fabricate a phantom catch-up). hasattr guard
+                        # keeps old-namespace test stubs / MarketState mocks
+                        # without the field working.
+                        if hasattr(ms, "fx072_unwound_this_cycle"):
+                            ms.fx072_unwound_this_cycle[side] = True
                         # FX-067: key the unwind by the dump order id so a
                         # restart between this write and the dump-state clear
                         # below can't double-log the loss; check the truthful

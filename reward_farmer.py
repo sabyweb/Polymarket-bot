@@ -2054,6 +2054,13 @@ class RewardFarmer:
                 return
             open_ids = {o["id"] for o in exchange_orders}
 
+        # FX-072: snapshot outstanding dumps BEFORE check_dump_fills so the
+        # end-of-cycle drift sweep can recover a real concurrent BUY that a
+        # dump drain masked (tracked overstates when an on-chain drain happens
+        # without its unwind being recorded this cycle). Free/in-memory, no RPC.
+        # Same OrderLifecycle instance that runs detect_fills below (Step 3).
+        self.order_lifecycle.capture_pre_cycle_dumps()
+
         # Step 2: Check dump SELL orders
         self.dump_mgr.check_dump_fills(self.markets, open_ids)
 

@@ -608,5 +608,220 @@ class TestFD_D_InvariantsUnderStackedFailures(unittest.TestCase):
                          "drift sweep must rescue the zeroed fill via on-chain truth")
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# FD-E — Dump-masked concurrent BUY fill (FX-072)
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class TestFD_E_DumpMaskedFill(unittest.TestCase):
+    """FX-072: in a fast BUY->dump burst (the 2026-05-25 shape), a dump SELL
+    fills on-chain (drains D shares) but check_dump_fills records the unwind a
+    LATER cycle (or its phantom check mis-fires because a concurrent BUY
+    replenished the balance, so it SKIPS record_unwind). In that window
+    `tracked` overstates holdings by D, so detect_fills' phantom check zeroes
+    the real concurrent BUY and the raw (on_chain - tracked) drift sweep also
+    fails to recover it → the fill is LOST.
+
+    The fix adds the drained dump shares back to on_chain in the drift sweep
+    under 3 gates (CAPTURED / DRAINED / NOT-UNWOUND).
+    """
+
+    def test_FD_E1_leak_recovered_with_addback(self):
+        """HEADLINE. A dump (SELL1, 50sh) drained on-chain but its unwind was
+        NOT recorded this cycle; a concurrent real BUY (ORD2, 50sh) also filled
+        on-chain. tracked overstates by the dump's 50 → phantom check zeroes
+        ORD2 → raw drift = on_chain(50) - tracked(50) = 0 < 1 → lost.
+
+        With the 3-gate add-back, on_chain is restored to 50+50=100, drift = 50,
+        and the masked BUY is recovered as exactly 1 fill row.
+
+        PRE-FIX _count_fills == 0 (the fill is lost; verified on the pristine
+        worktree before the code change). POST-FIX _count_fills == 1.
+        """
+        ms = _make_ms()
+        # The real concurrent BUY that fills on-chain during the dump-drain window.
+        ms.orders["yes"] = OrderSlot(
+            order_id="ORD2", price=0.5, shares=50,
+            placed_at=time.time() - 600,  # past the FILL_BALANCE_LAG_TOLERANCE window
+        )
+        ol, db = _make_real_db_lifecycle(ms)
+        # tracked overstates by the drained dump (50sh) for the whole cycle:
+        # the on-chain drain happened but the unwind was not recorded, so the
+        # position store still reflects the pre-drain count.
+        ol.positions.get_shares = MagicMock(return_value=50)
+        # 50sh on-chain = the concurrent real fill (dump already drained its 50).
+        ol.client.get_order = MagicMock(
+            return_value={"status": "MATCHED", "size_matched": 50, "price": 0.5}
+        )
+        ol.client.get_balance_allowance = MagicMock(
+            return_value={"balance": str(int(50 * 1e6))}
+        )
+        # Gate state: dump captured at cycle top, NOT unwound this cycle.
+        ms.fx072_pre_cycle_dump["yes"] = (50.0, "SELL1")
+        ms.fx072_unwound_this_cycle["yes"] = False
+
+        # SELL1 not in open_ids => the dump drained (gate 2 holds).
+        ol.detect_fills(open_ids=set())
+
+        self.assertEqual(
+            1, _count_fills(db, ms.cid),
+            "FX-072: the dump-masked concurrent BUY must be recovered "
+            "(pre-fix this was 0 — the fill was lost)",
+        )
+
+    def test_FD_E2_clean_dump_no_false_catchup(self):
+        """Gate 3 (NOT-UNWOUND) fails. A dump (SELL1, 50sh) was captured AND
+        its unwind WAS recorded this cycle, so tracked was correctly reduced to
+        0 and on-chain is 0. A separate (cid, yes) BUY order disappeared and
+        phantom-zeroed, so the sweep runs — but the add-back must be SUPPRESSED
+        (else we fabricate a 50-sh catch-up that never happened on-chain)."""
+        ms = _make_ms()
+        ms.orders["yes"] = OrderSlot(
+            order_id="ORD2", price=0.5, shares=50,
+            placed_at=time.time() - 600,
+        )
+        ol, db = _make_real_db_lifecycle(ms)
+        ol.positions.get_shares = MagicMock(return_value=0)  # unwind recorded → tracked=0
+        ol.client.get_order = MagicMock(
+            return_value={"status": "MATCHED", "size_matched": 50, "price": 0.5}
+        )
+        ol.client.get_balance_allowance = MagicMock(
+            return_value={"balance": "0"}  # nothing on-chain — clean dump
+        )
+        ms.fx072_pre_cycle_dump["yes"] = (50.0, "SELL1")
+        ms.fx072_unwound_this_cycle["yes"] = True  # GATE 3 fails
+
+        ol.detect_fills(open_ids=set())
+
+        self.assertEqual(
+            0, _count_fills(db, ms.cid),
+            "FX-072: a clean recorded-then-dumped position must NOT trigger "
+            "a fabricated catch-up (gate 3)",
+        )
+
+    def test_FD_E3_resting_dump_no_false_positive(self):
+        """Gate 2 (DRAINED) fails. The dump SELL1 is still RESTING on the book
+        (passed in open_ids), so it did NOT drain. An SDK over-report (FX-037
+        shape) zeroes the BUY, the sweep runs, but the add-back must be
+        suppressed because the dump is still live → no false positive."""
+        ms = _make_ms()
+        ms.orders["yes"] = OrderSlot(
+            order_id="ORD2", price=0.5, shares=50,
+            placed_at=time.time() - 600,
+        )
+        ol, db = _make_real_db_lifecycle(ms)
+        ol.positions.get_shares = MagicMock(return_value=50)  # tracked=50, on-chain=50
+        # SDK over-reports a 50sh match with no real fill (FX-037 over-count).
+        ol.client.get_order = MagicMock(
+            return_value={"status": "MATCHED", "size_matched": 50, "price": 0.5}
+        )
+        ol.client.get_balance_allowance = MagicMock(
+            return_value={"balance": str(int(50 * 1e6))}
+        )
+        ms.fx072_pre_cycle_dump["yes"] = (50.0, "SELL1")
+        ms.fx072_unwound_this_cycle["yes"] = False
+
+        # SELL1 IS in open_ids => dump still resting => gate 2 fails.
+        ol.detect_fills(open_ids={"SELL1"})
+
+        self.assertEqual(
+            0, _count_fills(db, ms.cid),
+            "FX-072: a still-resting dump must NOT trigger an add-back "
+            "(gate 2) — FX-037 over-count defense preserved",
+        )
+
+    def test_FD_E4_no_dump_unchanged(self):
+        """Gate 1 (CAPTURED) absent. No dump was outstanding (cap is None), so
+        the sweep behaves exactly as FX-054 did: a genuine on-chain surplus
+        (50 > tracked 0) still records exactly 1 catch-up row. Raw behavior
+        must be unchanged when FX-072 doesn't apply."""
+        ms = _make_ms()
+        ms.orders["yes"] = OrderSlot(
+            order_id="ORD_DRIFT", price=0.5, shares=50,
+            placed_at=time.time() - 600,
+        )
+        ol, db = _make_real_db_lifecycle(ms)
+        # Phantom check sees 0 (zeroes the fill) → drift sweep sees the real 50.
+        ol.client.get_order = MagicMock(
+            return_value={"status": "MATCHED", "size_matched": 50, "price": 0.5}
+        )
+        ol.client.get_balance_allowance = MagicMock(side_effect=[
+            {"balance": "0"},
+            {"balance": str(int(50 * 1e6))},
+        ])
+        _wire_position_tracking(ol)
+        # No fx072_pre_cycle_dump set → stays at the default {"yes": None, ...}.
+        self.assertIsNone(ms.fx072_pre_cycle_dump["yes"])
+
+        ol.detect_fills(open_ids=set())
+
+        self.assertEqual(
+            1, _count_fills(db, ms.cid),
+            "FX-072: with no captured dump, the raw FX-054 drift catch-up "
+            "behavior must be unchanged (1 row)",
+        )
+
+    def test_FD_E5_capture_method_populates_and_clears(self):
+        """capture_pre_cycle_dumps() snapshots (shares, dump_order_id) for a
+        resting dump and resets the unwound flag for the new cycle."""
+        ms = _make_ms()
+        ol, _ = _make_real_db_lifecycle(ms)
+        ms.dump_orders["yes"] = "SELL1"
+        ms.dump_state["yes"] = {"shares": 50}
+        # Pre-seed the unwound flag True to prove capture resets it.
+        ms.fx072_unwound_this_cycle["yes"] = True
+
+        ol.capture_pre_cycle_dumps()
+
+        self.assertEqual((50.0, "SELL1"), ms.fx072_pre_cycle_dump["yes"])
+        self.assertIs(False, ms.fx072_unwound_this_cycle["yes"])
+        # A side with no dump captures None.
+        self.assertIsNone(ms.fx072_pre_cycle_dump["no"])
+
+    def test_FD_E6_addback_routes_through_fx065_idempotency(self):
+        """The FX-072 catch-up still routes through handle_fill with the
+        bucketed drift:{cid}:{side}:{bucket} event_id, so FX-065's
+        fill_event_exists guard collapses a repeat in the same bucket to one
+        row. Run the E1 recovery twice in the same DRIFT_DEDUP_BUCKET_SEC
+        bucket (re-arming the capture each time) → exactly 1 row total."""
+        ms = _make_ms()
+        ms.orders["yes"] = OrderSlot(
+            order_id="ORD2", price=0.5, shares=50,
+            placed_at=time.time() - 600,
+        )
+        ol, db = _make_real_db_lifecycle(ms)
+        ol.positions.get_shares = MagicMock(return_value=50)
+        ol.client.get_order = MagicMock(
+            return_value={"status": "MATCHED", "size_matched": 50, "price": 0.5}
+        )
+        ol.client.get_balance_allowance = MagicMock(
+            return_value={"balance": str(int(50 * 1e6))}
+        )
+
+        # Cycle 1: arm the capture, recover the masked fill.
+        ms.fx072_pre_cycle_dump["yes"] = (50.0, "SELL1")
+        ms.fx072_unwound_this_cycle["yes"] = False
+        ol.detect_fills(open_ids=set())
+        n1 = _count_fills(db, ms.cid)
+
+        # Cycle 2 (same 5-min bucket): the end-of-cycle clear nulled the
+        # capture, so re-arm it and re-run. Same event_id => FX-065 collapses.
+        ms.orders["yes"] = OrderSlot(
+            order_id="ORD2", price=0.5, shares=50,
+            placed_at=time.time() - 600,
+        )
+        ms.fx072_pre_cycle_dump["yes"] = (50.0, "SELL1")
+        ms.fx072_unwound_this_cycle["yes"] = False
+        ol.detect_fills(open_ids=set())
+        n2 = _count_fills(db, ms.cid)
+
+        self.assertEqual(1, n1, "cycle 1 must recover exactly 1 row")
+        self.assertEqual(
+            1, n2,
+            "FX-072 + FX-065: the repeat in the same bucket must collapse "
+            "to 1 row (drift:{cid}:{side}:{bucket} event_id is unchanged)",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

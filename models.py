@@ -45,3 +45,14 @@ class MarketState:
     kill_fill_times: list = field(default_factory=list)
     end_date_iso: str = ""
     book_failures: int = 0  # consecutive get_merged_book failures (404/timeout)
+    # FX-072: ephemeral per-cycle dump-mask recovery state. In a fast
+    # BUY->dump burst, a dump SELL can drain on-chain while check_dump_fills
+    # defers/skips the unwind (its phantom check mis-fires when a concurrent
+    # BUY replenished the balance). `tracked` then overstates by the drained
+    # amount, so detect_fills' phantom check zeroes the real concurrent BUY
+    # and the drift sweep's raw (on_chain - tracked) also can't recover it.
+    # capture_pre_cycle_dumps() snapshots the outstanding dump at cycle top
+    # (free/in-memory, no RPC); the drift sweep adds the drained shares back
+    # to on_chain under 3 gates. Both reset every cycle.
+    fx072_pre_cycle_dump: dict = field(default_factory=lambda: {"yes": None, "no": None})  # (shares, dump_order_id) captured at cycle top; consumed by the drift sweep
+    fx072_unwound_this_cycle: dict = field(default_factory=lambda: {"yes": False, "no": False})  # set True by check_dump_fills when it records an unwind this cycle

@@ -259,7 +259,32 @@ class OrderLifecycle:
             log.warning(f"Cancel FAILED {order_id[:16]} ({reason}): {e}")
             return False
 
-    def _reconcile_balance_drift(self, ms: MarketState, side: str) -> bool:
+    def capture_pre_cycle_dumps(self) -> None:
+        """FX-072: snapshot outstanding dumps at the TOP of run_cycle.
+
+        Called by reward_farmer.run_cycle BEFORE check_dump_fills. For each
+        (cid, side) with a resting dump, record (shares, dump_order_id) so the
+        end-of-cycle drift sweep can recover a real concurrent BUY that the
+        phantom check zeroed because a dump drained on-chain without its
+        unwind being recorded the same cycle (the 2026-05-25 burst shape).
+
+        This is FREE — pure in-memory reads of dump_state / dump_orders, NO
+        RPC. It also resets fx072_unwound_this_cycle for the new cycle so
+        gate 3 starts clean; check_dump_fills sets it True when it records an
+        unwind. Both fields are cleared by the drift sweep at end-of-cycle.
+        """
+        for ms in self.markets.values():
+            for side in ("yes", "no"):
+                ms.fx072_unwound_this_cycle[side] = False
+                if ms.dump_orders[side] and ms.dump_state[side]:
+                    ms.fx072_pre_cycle_dump[side] = (
+                        float(ms.dump_state[side].get("shares", 0)),
+                        ms.dump_orders[side],
+                    )
+                else:
+                    ms.fx072_pre_cycle_dump[side] = None
+
+    def _reconcile_balance_drift(self, ms: MarketState, side: str, open_ids: set | None = None) -> bool:
         """FX-054 drift catch-up sweep.
 
         Compares on-chain CTF balance against the position-store's tracked
@@ -291,6 +316,27 @@ class OrderLifecycle:
                 f"step=balance_probe_failed err={type(e).__name__}: {e}"
             )
             return False
+
+        # FX-072: dump-masked-fill add-back. When a dump SELL drained on-chain
+        # this cycle but its unwind was NOT recorded (check_dump_fills deferred
+        # it or mis-fired its phantom check because a concurrent BUY replenished
+        # the balance), `tracked` overstates holdings by the drained amount.
+        # The real concurrent BUY then gets zeroed by the phantom check and the
+        # raw (on_chain - tracked) drift here can't see it either. Add the
+        # drained dump shares back to on_chain so the drift surfaces — but ONLY
+        # under 3 gates so we never fabricate a catch-up:
+        #   GATE 1 CAPTURED  : a dump was outstanding at cycle top (cap != None)
+        #   GATE 2 DRAINED   : that dump order left the book (oid not in open_ids)
+        #   GATE 3 NOT-UNWOUND: check_dump_fills did NOT record the unwind this
+        #                       cycle (else tracked was correctly reduced).
+        cap = getattr(ms, "fx072_pre_cycle_dump", {}).get(side) if hasattr(ms, "fx072_pre_cycle_dump") else None
+        if (cap is not None and open_ids is not None
+                and cap[1] not in open_ids
+                and not getattr(ms, "fx072_unwound_this_cycle", {}).get(side, False)):
+            _drained = float(cap[0])
+            if _drained > 0:
+                log.warning(f"[RECONCILE_DRIFT] cid={ms.cid[:12]} side={side} step=fx072_dump_addback drained={_drained:.2f} on_chain={on_chain:.2f}->{on_chain+_drained:.2f} (dump drained but unwind not recorded this cycle)")
+                on_chain = on_chain + _drained
 
         tracked = self.positions.get_shares(ms.cid, side)
         drift = on_chain - tracked
@@ -535,12 +581,21 @@ class OrderLifecycle:
             if ms is None:
                 continue
             try:
-                self._reconcile_balance_drift(ms, side)
+                # FX-072: pass open_ids so the drift sweep's dump-mask
+                # add-back can apply gate 2 (dump order left the book).
+                self._reconcile_balance_drift(ms, side, open_ids=open_ids)
             except Exception as e:
                 log.warning(
                     f"[RECONCILE_DRIFT] cid={cid[:12]} side={side} "
                     f"step=sweep_exception err={type(e).__name__}: {e}"
                 )
+
+        # FX-072: clear the per-cycle dump capture so a stale snapshot can't
+        # leak an add-back into a later cycle. capture_pre_cycle_dumps()
+        # re-arms it at the top of the next run_cycle.
+        for ms in self.markets.values():
+            if hasattr(ms, "fx072_pre_cycle_dump"):
+                ms.fx072_pre_cycle_dump = {"yes": None, "no": None}
 
     def handle_fill(self, ms: MarketState, side: str, slot: OrderSlot,
                     actual_shares: float = 0, actual_price: float = 0.0,
