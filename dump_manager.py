@@ -114,12 +114,24 @@ class DumpManager:
                         )
 
                         self.positions.record_unwind(ms.cid, side, actual_matched)
-                        self.db.log_unwind(
+                        # FX-067: key the unwind by the dump order id so a
+                        # restart between this write and the dump-state clear
+                        # below can't double-log the loss; check the truthful
+                        # return so a silently-dropped loss row is visible (it
+                        # is the sole input to the 24h-loss kill).
+                        _uw_ok = self.db.log_unwind(
                             condition_id=ms.cid, question=ms.question,
                             side=side, shares=actual_matched,
                             sell_price=actual_price, usd_value=sell_revenue,
                             vwap_cost=vwap_cost,
+                            unwind_event_id=f"unwind:{ms.cid}:{side}:{dump_oid}",
                         )
+                        if not _uw_ok:
+                            log.warning(
+                                f"[UNWIND_WRITE] cid={ms.cid[:12]} side={side} "
+                                f"pnl=${sell_revenue - vwap_cost:+.2f} step=not_inserted "
+                                f"(duplicate or DB error — loss may be missing from kill math)"
+                            )
                         from alerts import alert_unwind
                         alert_unwind(
                             side=side.upper(), price=actual_price,
@@ -223,11 +235,19 @@ class DumpManager:
             log.info(f"MERGE {amount:.0f} pairs | {ms.question[:30]}")
             self.positions.record_unwind(ms.cid, "yes", amount)
             self.positions.record_unwind(ms.cid, "no", amount)
-            self.db.log_unwind(
+            # FX-067: append-only (no event_id) — the phantom-merge balance
+            # check above already prevents a double merge-log — but still
+            # check the truthful return so a dropped merge row is visible.
+            _mg_ok = self.db.log_unwind(
                 condition_id=ms.cid, question=ms.question,
                 side="merge", shares=amount,
                 sell_price=1.0, usd_value=amount,
             )
+            if not _mg_ok:
+                log.warning(
+                    f"[UNWIND_WRITE] cid={ms.cid[:12]} side=merge amount={amount:.0f} "
+                    f"step=not_inserted (DB error — merge unwind row missing)"
+                )
         except Exception as e:
             log.warning(f"Merge failed ({e}) — falling back to dual dump | {ms.question[:30]}")
             for side in ["yes", "no"]:

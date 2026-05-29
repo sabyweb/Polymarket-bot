@@ -548,6 +548,10 @@ class BotDatabase:
             ("unwinds", "hold_duration_secs", "REAL NOT NULL DEFAULT 0"),
             ("unwinds", "unwind_type", "TEXT NOT NULL DEFAULT ''"),
             ("unwinds", "reward_earned_est", "REAL NOT NULL DEFAULT 0"),
+            # FX-067: idempotency key, mirrors fills.fill_event_id (FX-054).
+            # Non-empty value dedups via the partial unique index below;
+            # empty '' keeps append-only semantics for legacy callers.
+            ("unwinds", "unwind_event_id", "TEXT NOT NULL DEFAULT ''"),
             # orders_cancelled: market context
             ("orders_cancelled", "condition_id", "TEXT NOT NULL DEFAULT ''"),
             ("orders_cancelled", "side", "TEXT NOT NULL DEFAULT ''"),
@@ -582,6 +586,17 @@ class BotDatabase:
             )
         except Exception as e:
             log.warning(f"Migration fills idx_fills_event_id: {e}")
+
+        # FX-067: partial unique index on unwind_event_id (mirrors FX-054's
+        # fills index). Enforces idempotency ONLY for non-empty ids so legacy
+        # '' rows + tests stay insertable.
+        try:
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_unwinds_event_id "
+                "ON unwinds(unwind_event_id) WHERE unwind_event_id != ''"
+            )
+        except Exception as e:
+            log.warning(f"Migration unwinds idx_unwinds_event_id: {e}")
 
     # ── Logging Methods ───────────────────────────────────────────────────────
 
@@ -686,23 +701,51 @@ class BotDatabase:
         vwap_cost: float = 0.0,
         hold_duration_secs: float = 0.0, unwind_type: str = "",
         reward_earned_est: float = 0.0,
-    ) -> None:
-        """Record a SELL (unwind) fill with hold context."""
+        unwind_event_id: str = "",
+    ) -> bool:
+        """Record a SELL (unwind) fill with hold context.
+
+        FX-067: idempotent + truthful return value, mirroring FX-054's
+        log_fill hardening. The realized loss/profit recorded here is the
+        ONLY input to the 24h-realized-loss kill switch (both the farmer's
+        and the oversight's), so a silently-dropped row blinds the kill.
+          • Pass a non-empty ``unwind_event_id`` to dedup re-processing of
+            the same dump across cycles / a restart between record and the
+            dump-state clear. INSERT OR IGNORE relies on the partial unique
+            index ``idx_unwinds_event_id`` (``unwind_event_id != ''``).
+          • Empty ``unwind_event_id`` (default) keeps pre-FX-067 append-only
+            semantics.
+          • Exceptions are no longer swallowed at debug — any DB error
+            surfaces as ``log.warning`` so a missed loss row is visible
+            (pre-FX-067 it was a silent debug line, exactly the 2026-05-25
+            "8 SELLs on-chain, 1 unwinds row" failure mode).
+
+        Returns:
+            True on successful INSERT (one row added).
+            False on idempotent collision OR DB error.
+        """
+        unwind_event_id = unwind_event_id if unwind_event_id is not None else ""
         pnl = usd_value - vwap_cost
         try:
             conn = self._get_conn()
-            conn.execute(
-                "INSERT INTO unwinds (ts, condition_id, question, side, "
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO unwinds (ts, condition_id, question, side, "
                 "shares, sell_price, usd_value, vwap_cost, pnl, "
-                "hold_duration_secs, unwind_type, reward_earned_est) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "hold_duration_secs, unwind_type, reward_earned_est, unwind_event_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (time.time(), condition_id, question, side,
                  shares, sell_price, usd_value, vwap_cost, pnl,
-                 hold_duration_secs, unwind_type, reward_earned_est),
+                 hold_duration_secs, unwind_type, reward_earned_est, unwind_event_id),
             )
             conn.commit()
+            return cur.rowcount > 0
         except Exception as e:
-            log.debug(f"DB log_unwind error: {e}")
+            log.warning(
+                f"[UNWIND_WRITE] DB log_unwind error: cid={condition_id[:12]} "
+                f"side={side} shares={shares:.2f} pnl=${pnl:+.2f} "
+                f"event_id={unwind_event_id[:32]} err={type(e).__name__}: {e}"
+            )
+            return False
 
     def log_order_placed(
         self, condition_id: str, side: str, price: float,
