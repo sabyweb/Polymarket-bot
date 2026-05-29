@@ -650,6 +650,36 @@ class BotDatabase:
             )
             return False
 
+    def fill_event_exists(self, fill_event_id: str) -> bool:
+        """FX-065: True iff a fills row with this (non-empty) event_id exists.
+
+        Used by ``OrderLifecycle.handle_fill`` to guard ``PositionStore.record_fill``
+        with the SAME idempotency key the ``fills`` table uses. Pre-FX-065,
+        ``record_fill`` ran before AND outside the ``log_fill`` INSERT-OR-IGNORE
+        boundary, so a re-handled fill (network retry, SDK-detect then
+        stale-check on a grown partial, drift-sweep overlap) collapsed to one
+        ``fills`` row (correct) but added the shares to PositionStore a SECOND
+        time → inflated position + corrupted VWAP → fed the dump cost-basis
+        (FX-066) and the kill-switch loss math.
+
+        Empty/None event_id ⇒ False (legacy append-only callers can't dedup).
+        Any DB error ⇒ False (fail toward recording — a missed dedup
+        double-counts, but failing closed here would DROP a real fill, which
+        is strictly worse for loss accounting).
+        """
+        if not fill_event_id:
+            return False
+        try:
+            conn = self._get_conn()
+            row = conn.execute(
+                "SELECT 1 FROM fills WHERE fill_event_id = ? LIMIT 1",
+                (fill_event_id,),
+            ).fetchone()
+            return row is not None
+        except Exception as e:
+            log.debug(f"fill_event_exists error: {e}")
+            return False
+
     def log_unwind(
         self, condition_id: str, question: str, side: str,
         shares: float, sell_price: float, usd_value: float,

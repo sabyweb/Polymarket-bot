@@ -580,7 +580,23 @@ class OrderLifecycle:
             f"{ms.question[:35]}"
         )
 
-        self.positions.record_fill(cid, side, filled_shares, fill_price, question=ms.question)
+        # FX-065: guard the positions update with the fills idempotency key.
+        # The fills-table write (log_fill below) is already idempotent via
+        # INSERT OR IGNORE on fill_event_id, but PositionStore.record_fill was
+        # NOT — so a re-handled fill (network retry, SDK-detect then
+        # stale-check on a grown partial, drift-sweep overlap) double-counted
+        # shares and corrupted VWAP, which then fed the dump cost-basis
+        # (FX-066) and the kill-switch loss math. Only the positions mutation
+        # is guarded; the [FILL_WRITE] instrumentation + dump re-attempt below
+        # run unchanged (dump_position is balance-clamped, so re-attempting a
+        # dump on an already-recorded fill is a no-op / harmless).
+        if fill_event_id and self.db.fill_event_exists(fill_event_id):
+            log.info(
+                f"[FILL_WRITE] cid={cid[:12]} side={side} shares={filled_shares:.2f} "
+                f"step=positions_skip_duplicate event_id={fill_event_id[:32]} (FX-065)"
+            )
+        else:
+            self.positions.record_fill(cid, side, filled_shares, fill_price, question=ms.question)
 
         from price import to_clob
         clob_cost = to_clob(fill_price, side)
