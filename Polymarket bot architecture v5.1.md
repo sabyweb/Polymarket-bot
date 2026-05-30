@@ -114,9 +114,9 @@ sections below if you need to understand WHAT the system does today.
 ---
 
 
-## Current Production State (v6.3 — pre-Stage-C HIGH set shipped; bot in P5 Stage B shadow on Helsinki)
+## Current Production State (v6.4 — pre-Stage-C HIGH set shipped; bot in P5 Stage B shadow on Helsinki)
 
-Updated 2026-05-28. Rows where I'm uncertain about a fact are marked **(unverified)** rather than guessed; operator can confirm against Helsinki on next access.
+Updated 2026-05-28. Rows where I'm uncertain about a fact are marked **(unverified)** rather than guessed; operator can confirm against Helsinki on next access. **v6.4 doc change:** legacy/rollback component sections (former §4.12 Bandit, §4.14 SafetyController, §4.15 β/η Continuous Allocator, §4.16 β/η Control System, §4.17 Patch-6–13 stack) consolidated into a single §4.14b; full detail preserved in git @ `c074446`.
 
 | Layer | State | Location |
 |---|---|---|
@@ -656,422 +656,45 @@ market_allocations.json ("game_start_time" key)
 **Schema**
 `market_expiry_cache` now has columns `(condition_id, end_date_iso, game_start_time, fetched_at)`. Migration in `database.py:_migrate_enrichment_columns` adds the column idempotently.
 
-### 4.12 Bandit Layer
+### 4.12 Bandit Layer → see §4.14b
 
-**Method**
-Thompson sampling with Beta(α, β) per-market posteriors.
-
-**Inputs**
-24h realised per-market PnL updates the posteriors each cycle.
-
-**Effect**
-Produces a multiplier per market applied to RAS during allocation ranking. Boosts markets that have been quietly profitable; penalises ones that have been quietly losing.
-
-**Constraints**
-- Cannot override an `EV ≤ 0` rejection
-- Cannot rescue a market that has been filtered out upstream
-- Deterministic seed: `hash(int(time.time()))`
+> Consolidated. `profit/bandit.py` (Thompson-sampling per-market RAS multiplier) is **legacy / rollback-only** and no longer read by any allocator; summary in **§4.14b**, full method/constraints in git @ `c074446`.
 
 ### 4.13 Learning Loop
 
-`profit/learning.py` — the behavioural feedback layer.
-
-**Mode gate** (`LearningGate`) — unchanged from earlier versions.
-| Mode | Conditions | Effect |
-|---|---|---|
-| OFF | Insufficient data (fills < 100, pairs < 50, reward_days < 3, valid_cycles < 50) | No effect on allocation |
-| SHADOW | Thresholds crossed but not yet stable | Metrics computed and logged; applied_state always neutral |
-| ACTIVE | Mature data with stable telemetry | Computed state flows to allocator / calibrator |
-
-**Live control scalars (v4.0)** — four variables, each with a different destination and update rule.
-
-| Scalar | Range | Destination | EMA α | Update signal |
-|---|---|---|---:|---|
-| `capital_scale` | 0.30 – 1.20 | multiplier on `total_capital` applied by `oversight_agent` BEFORE the allocator call | 0.20 | Rules A/B/D/E + Patch-3 expansion + Patch-11 oscillation damping + Patch-13 hysteresis (all retained from v3.x) |
-| `reward_trust` | 0.50 – 1.00 | `CalibrationManager.reward_trust` in the PART-6 reward pipeline | 0.20 | Rule C on reward_error + mean-reversion toward 1.0 per cycle |
-| `β` (beta) | 0.10 – 0.95 | Step-3 scale factor in allocator (§4.15) | 0.03 | `β · (1 + K_BETA · (TARGET_UTIL − expected_util))`, `K_BETA = 0.5`, `TARGET_UTIL = 0.75` |
-| `η` (eta) | 0.00 – 4.00 | concentration exponent on `w_i` (§4.15) | 0.03 | `η + K_ETA · (TARGET_COVERAGE − coverage_ratio)`, `K_ETA = 1.0`, `TARGET_COVERAGE = 0.5` |
-
-**Deprecated compat fields** (retained to avoid `AttributeError` in `simulation/engine.py` and `simulation/invariants.py`, which still reference them):
-- `aggressiveness`, `risk_multiplier` — deleted as control levers earlier; removed from the dataclass entirely.
-- `λ1`, `λ2` — deleted as control levers in v4.0; retained as frozen-at-default dataclass fields (`1.0`, `0.5`). No rule updates them; the allocator does not read them. See §4.16.2 for why they're dead — they cancel algebraically in the allocator's scale step.
-
-**Rules (v4.0 surviving set)**
-- Rule A/B/D/E (capital_scale): original Patch-2/3 behaviour, now only updating `capital_scale` (the aggressiveness/risk_multiplier branches were deleted along with the scalars).
-- Rule C (reward_trust): `reward_error < 0.7` → `TRUST_DOWN = 0.90`; `reward_error ∈ [0.9, 1.1]` → `TRUST_UP = 1.02`. Mean-reverts toward 1.0 at 2% per cycle.
-- β rule, η rule (new in v4.0, spec §6): see §4.16.4 for the full form.
-
-**Patch-11 oscillation damping + Patch-13 hysteresis** (capital_scale): retained verbatim. The same `_detect_oscillation` signal is now also reused by the β/η stability guard (§4.16.4) to halve their α when capital_scale oscillates.
-
-**v5.0 capital_scale stability filters** (new at `741d35c`): two additive filters run **after every pre-existing rule** (A/B/D/E + Patch-11 damping + EMA + CLAMP_CAP + Patch-13 hysteresis) inside `update_state`. Neither touches the upstream rule surface.
-
-1. **Bounded-rate step** (`MAX_CAPITAL_SCALE_STEP = 0.07`):
-    ```
-    step_delta = new_cap_final − prev.capital_scale
-    step_delta = max(-MAX_CAPITAL_SCALE_STEP, min(MAX_CAPITAL_SCALE_STEP, step_delta))
-    new_cap_final = prev.capital_scale + step_delta
-    ```
-    Bounds preserved by construction — both `prev.capital_scale` and pre-clamp `new_cap_final` are already within `CLAMP_CAP = (0.30, 1.20)`. No-op in the current sim (per-cycle |Δ| ≤ 0.025 observed) but available for higher-swing regimes.
-
-2. **Small-amplitude flip suppression**:
-    ```
-    delta = new_cap_final − prev.capital_scale
-    prev_delta = last nonzero delta walking prev.capital_history backward
-    if prev_delta is not None
-       and (delta · prev_delta) < 0                                    # direction flip
-       and |delta| < CAPITAL_CHANGE_MIN_STEP                           # small current
-       and |prev_delta| < CAPITAL_CHANGE_MIN_STEP:                     # small prior
-        new_cap_final = prev.capital_scale                             # revert
-    ```
-    Targets the ~0.01–0.025 amplitude direction churn that slipped past Patch-13's dead-band (Patch-13's dead-band is gated to same-direction deltas only — opposite-sign small deltas pass through). Large reversals (|delta| ≥ `MIN_STEP = 0.05`) and same-direction moves are unaffected.
-
-**V5 INV7 result**: 4/6 → **6/6 PASS** after flip suppression. `over_aggressive` `max_flip_rate_100`: 7–9 → 0–1; `regime_shift_3phase`: 6–9 → 0. `expected_util` + `coverage_ratio` are byte-identical to the pre-filter run — the suppressed oscillation was too small-amplitude to perturb any downstream metric. See §10.4.
-
-**Frontier memory** (Patch 5): unchanged. Per-regime `(best_reward, best_capital_scale)` dict, keyed by `(round(fill_rate_1h, 1), round(reward_efficiency, 3))`.
-
-**Known blind spots** (v4.0):
-- No direct PnL signal (reward_efficiency is reward-only).
-- Stop-loss events are invisible to the loop.
-- Rule A requires `fill_rate > threshold` — still misses the low-fill high-loss edge case (§6.7).
-- β's leverage is architecturally zero under cluster-cap × min-floor binding (see §4.16.5 cap interaction): when every `C_i` is overwritten to `min_capital`, no upstream signal survives.
-- η's leverage requires market heterogeneity in `p·L`; in exactly-uniform markets it is zero by symmetry (§4.16.2).
-
-### 4.14 Safety Controller
-
-`oversight/safety_controller.py` — the final override layer. Runs AFTER the allocator, mutating the allocation list based on state.
-
-**States** (7 total, v5.1.7)
-
-| State | max_markets | capital_pct | trials | Other |
-|---|---:|---:|---|---|
-| CALIBRATED | 60 | 100% | yes | — |
-| MILDLY_MISCALIBRATED | 40 | 70% | yes | — |
-| BOOTSTRAP | 10 | 30% | yes | cold-start ease-in; once-only initial state |
-| SEVERELY_MISCALIBRATED | 20 | 40% | no | — |
-| DEGRADED | 10 | 20% | no | — |
-| DATA_UNAVAILABLE | 5 | 10% | no | — |
-| UNSAFE | 3 | 5% | no | probe mode + min_size only |
-
-BOOTSTRAP (added v5.1.7, `541108b`) is entered only on a genuine cold start (`_is_genuine_cold_start()` → True iff lifetime `orders_placed == 0` AND lifetime `fills == 0`). It allows trials because every market on a fresh DB is a trial (`confidence='low' AND fill_count==0`); the conservative-first goal is achieved through the 10-market / 30%-capital caps, not by suppressing trials. Exit to MILDLY_MISCALIBRATED happens on EITHER `lifetime_fills >= BOOTSTRAP_FILL_EXIT (10)` (fast path) OR `_bootstrap_clean_cycles >= UPGRADE_FROM_BOOTSTRAP (3)` (slow path for markets-are-dry scenarios). BOOTSTRAP is once-only: recoveries from any downgrade climb straight back to MILDLY through the existing upgrade ladder, never re-enter BOOTSTRAP.
-
-**Invariants** (14 total; all checked each cycle)
-
-| # | Name | Priority | Threshold |
-|---|---|---|---|
-| I1 | daily_loss | CRITICAL | > $150 / 24h |
-| I2 | slow_bleed_7d | CRITICAL | > $500 / 7d |
-| I3 | drawdown | CRITICAL | > 15% from peak |
-| I4 | capital_floor | CRITICAL | balance < $50 |
-| I5 | cf_drift | HIGH | CF < 0.005 / 0.02 / 0.03 |
-| I5b | cf_corroborated | CRITICAL | I5 + est/actual > 15× + losses > $50 |
-| I6 | est_actual_ratio | HIGH | > 50× / 15× |
-| I7 | hourly_loss | HIGH | > $30 / $60 |
-| I8 | capital_at_risk | HIGH | > 80% / 90% |
-| I9 | data_freshness | MEDIUM | > 30 min warn, > 2h critical |
-| I10 | data_completeness | MEDIUM | < 80% warn, < 50% critical |
-| I11 | loss_reward_ratio | HIGH | > 1.5× / 2.0× |
-| I12 | clob_rate_drop | MEDIUM | > 30% drop |
-| I13 | fill_storm | LOW | ≥ 1 burst/hour — applies 20% capital haircut |
-| I14 | cf_at_floor | LOW | ≥ 3 cycles — applies 10% capital haircut |
-
-**Transitions**
-- Downgrades are immediate on invariant violation
-- Upgrades require clean conditions for `UPGRADE_STEP = 2` consecutive cycles (single-step improvement) or `UPGRADE_TO_CALIBRATED = 3` cycles (full recovery to CALIBRATED)
-- BOOTSTRAP exit: ≥ `BOOTSTRAP_FILL_EXIT = 10` lifetime fills (fast path) OR ≥ `UPGRADE_FROM_BOOTSTRAP = 3` clean cycles (slow path). Target is always MILDLY_MISCALIBRATED. Counter is `_bootstrap_clean_cycles`, reset by `_transition`.
-- UNSAFE auto-demotion: after `UNSAFE_RECOVERY_CYCLES = 3` cycles without any CRITICAL-UNSAFE violation, target caps at DEGRADED
-
-**Bootstrap cold-start chain**
-On a genuinely fresh DB, three invariants used to demote state to DATA_UNAVAILABLE despite the bot having nothing to compare against:
-- I9 (`data_freshness`) — empty `scoring_snapshots`. Closed in v5.1.5 (`dd67f97`) via `_query_data_freshness` returning `0.0` instead of `None` when `_is_genuine_cold_start()` is True.
-- I3 (`drawdown`) — zero `total_portfolio_value` and zero `exchange_balance`. Closed in v5.1.7 (`dc78ba0`) via the same `_is_genuine_cold_start()` gate — the violation is skipped (logged at INFO once per cycle) on a genuine cold start.
-- Cold-start state default — was `MILDLY_MISCALIBRATED` (70% capital, trials). Closed in v5.1.7 (`541108b`) via the new `BOOTSTRAP` state and `_cold_start_or(MILDLY)` helper in `_load_state`.
-
-All three branches collapse to one helper `_is_genuine_cold_start()` which returns True iff lifetime `orders_placed == 0` AND lifetime `fills == 0`. Once the bot has either placed an order or observed a fill in this DB's lifetime, all three branches revert to their pre-fix behaviour — the warm-DB code paths are byte-identical to v5.1.4.
-
-**Critical limitation**
-The SafetyController can only **restrict** allocations. It cannot convert an `avoid` to a `deploy`. If the allocator has already emitted "all avoid" due to CF collapse, the controller has nothing to modify — the system is silently dead. See §6.1.
-
-### 4.15 Unified Continuous Allocator (v4.0)
-
-> **⚠ This section describes the LEGACY profit/allocator.py β/η continuous allocator, which is NOT the current production allocator.** Production is `SimpleAllocator` (`simple_allocator.py`) per the Current Production State table above; `profit/allocator.py` is a rollback-only path, not maintained against v6.x.
-
-**Replaces Patches 6–13 in their entirety.** The Patch-era stack (overcommit, target-driven greedy, forced-exposure, marginal-efficiency gate, exposure saturation, hysteresis inside the allocator path) has been deleted. What runs today is a ~320-line `profit/allocator.py` implementing a single continuous formula plus a safety-caps post-step. The prior stack is preserved for historical reference in §10.3 "Closed in v4.0 by deletion" and in prior-version snapshots of this doc (v3.3 kept the full Patch-6-through-13 subsections; v4.0 replaces them).
-
-#### 4.15.1 Inputs per market
-
-From `calibrator.get_predictions(...)`:
-
-| Input | Source | Notes |
-|---|---|---|
-| `R_i` | `predictions.raw_reward_per_day` | Clean reward term; includes safety bias, model confidence, and `reward_trust`. NOT reconstructed from EV. Field added to `CalibrationPredictions` in v4.0. |
-| `p_i` | `max(1e-4, predictions.p_fill_24h)` | Fill probability, floored at 1e-4 to keep downstream divisions well-defined. |
-| `L_i` | `predictions.e_loss_given_fill` | Expected USD loss per fill. |
-| `cpb_i` | `2 · max(0.10, (1 − 2·spread_i) / 2)` | Cost per share (both sides). Matches `oversight/allocation_writer._est_market_cost`. |
-
-From the caller (`oversight_agent` or sim runner):
-
-| Input | Source |
-|---|---|
-| `total_capital` | `available_capital · learning_state.capital_scale` — `capital_scale` applied upstream, not inside the allocator. |
-| `β`, `η` | `learning_state.beta`, `learning_state.eta` — see §4.16. Default `β = 0.75`, `η = 0.0` when `learning_state=None`. |
-
-#### 4.15.2 The formula (strict order — do not reorder)
-
-```
-Step 1 — weights:       w_i = max(1e-6, R_i / (1 + p_i · L_i))
-Step 2 — raw alloc:     raw_i = w_i^(1 + η)
-Step 3 — scale:         Z = Σ_k p_k · raw_k
-                        scale = (β · total_capital) / Z
-                        C_i = raw_i · scale
-                        (fallback to equal allocation if Z < 1e-9)
-Step 4 — shares:        capital = max(C_i, cpb_i · min_shares)
-                        shares_i = max(min_shares, int(capital / cpb_i))
-                        est_capital_cost_i = shares_i · cpb_i
-Step 5 — caps:          per-market  → _clip_per_market(allocations, cap)
-                        per-group   → _clip_per_group(allocations, cap)
-                        per-cluster → apply_cluster_caps(...)
-                        (all clip-only; no redistribution of freed capital)
-Step 6 — recompute:     expected_capital = Σ p_i · est_capital_cost_i
-Step 7 — safety ceiling: if expected_capital > 0.95 · total_capital:
-                          rescale every row uniformly
-                        (hard safety, not a control target — β lives in Step 3)
-```
-
-The Step-3 "scale to budget" identity is what makes β a non-cancelling lever: `β` is a linear multiplier on `C_i` regardless of regime. η's leverage comes in via `C_i / C_j = (w_i / w_j)^(1+η)` — zero under exactly-uniform markets (by symmetry), positive first-order leverage under any heterogeneity in `p·L`.
-
-#### 4.15.3 What was deleted
-
-All of the following mechanisms and their observability stamps are gone from v4.0:
-
-- `_compute_overcommit_factor`, `OVERCOMMIT_MIN/MAX/DEFAULT`, `EXPECTED_CAPITAL_BUFFER` (Patch 7).
-- `_enforce_expected_capital` (Patch 7). The 0.95 ceiling survives as the Step 7 safety rescale — same numeric target, separate code path.
-- `_enforce_capital_conservation` (pre-Patch-7 two-sided budget rebalance). No under-budget redistribution.
-- `_force_overcommit_allocation`, `target_notional` greedy fill (Patch 11 / Patch 13 Part 1+2).
-- Marginal-efficiency gate `ev / (p·size) < 0.7 × baseline` (Patch 13 Part 1).
-- Forced-exposure block `deploy_ratio < 0.85 → promote avoids` (Patch 10).
-- Relaxed EV gate + `_low_ev_override` flag (Patch 10).
-- Exposure-priority weight `final_score × 1.3` (Patch 10).
-- Hard profit-guard override in ACTIVE (Patch 10).
-- Patch 6 objective blend `0.7 × RAS + 0.3 × normalized raw_ev`.
-- Patch 6 deployment boost `DEPLOYMENT_BOOST = 1.05`.
-- Patch 6 / Patch 9 min-markets guards (`PATCH6_MIN_MARKETS = 5`, `MIN_MARKETS_ACTIVE_FLOOR = 15`).
-- Patch 9 `MARKET_EXPANSION_FACTOR = 1.5`, `MIN_SIZE_REDUCTION_FACTOR = 0.5`.
-- Patch 4 efficiency penalty `final_score × 0.9 if reward_efficiency < baseline` (Patch 13 Part 4).
-- `_compute_efficiency_scale` (Fix 6 sqrt damping).
-- `_redistribute_cluster_savings` (Fix 3).
-- `_risk_adjusted_score` (FIX 1 + FIX 14).
-- `_efficiency_quintiles` / `_efficiency_multiplier` (FIX 4).
-- `_compute_exploration_pct` (PART 4 dynamic exploration budget).
-- Bandit multiplier in the scoring path. The `profit/bandit.py` module + `bandit_state` DB table remain in place but are no longer read by the allocator (may be reintroduced later as an R-side modifier).
-- All Patch-era observability stamps on allocation rows: `_overcommit_factor`, `_forced_target_alloc`, `_forced_exposure`, `_low_ev_override`, `_saturation_applied`, `_target_notional`, `_saturation_scale`, `_target_market_count`, `_per_market_scale`, `_exposure_boost`, `_expansion_mode`, `_deploy_ratio`, `_target_deploy`, `_ras`, `_bandit`, `_bandit_multiplier`, `_final_score`, `_efficiency_mult`, `_exploration_pct`, `_regime_multiplier`.
+**LIVE learning loop = FX-051 `DecisionPolicy`** (`decision_policy.py`), driven by `market_roi_tracker.py`. This is the only self-learning loop in the production path: the tracker computes rolling 1h/24h/7d ROI snapshots (from `fills` + `unwinds` + `capital_committed_snapshots` + `/rewards/user/markets`) and `policy.evaluate()` emits five behaviour-change outputs consumed by `SimpleAllocator` each `simple_oversight.run_once` cycle — `excluded_cids` (cooldowns), `size_reduction_cids` (P4 fill-rate), `global_tighten` (P4 global loss), `global_reward_low` (P10), `q_share_distrust_cids` (P11). See the Current Production State table and §4.20 telemetry (`[LEARN*]` lines). Wires all 6 ground-rules §3 triggers to behaviour change (was 0/6 pre-FX-051).
 
-#### 4.15.4 Observability stamps (v4.0)
+**Legacy four-scalar loop** (`profit/learning.py` — `capital_scale`, `reward_trust`, `β`, `η`, behind a `LearningGate` OFF/SHADOW/ACTIVE mode gate): **rollback-only, not in the live path.** `simple_oversight` does not read it. The β/η control law is summarised in §4.14b; the surviving `capital_scale` rules (A/B/D/E + Patch-11 damping + Patch-13 hysteresis + v5.0 stability filters), `reward_trust` Rule C mean-reversion, and frontier memory live in `profit/learning.py` but feed only the legacy `oversight_agent` allocator path. Full scalar table, update rules, v5.0 stability filters (`741d35c`), and known blind spots in git @ `c074446`.
 
-Per deploy row, the allocator emits:
+### 4.14 Safety Controller → see §4.14b
 
-| Stamp | Meaning |
-|---|---|
-| `_p_fill` | `max(1e-4, predictions.p_fill_24h)` — the value used in Step 3 and downstream expected-capital computation. |
-| `_reward` | `R_i = predictions.raw_reward_per_day`. |
-| `_expected_loss` | `p_i · L_i`. |
-| `_weight` | `w_i`. |
-| `_raw_alloc` | `raw_i = w_i^(1+η)`. |
-| `_beta`, `_eta` | Control values used this cycle. |
-| `_total_capital` | Allocator's budget input — stamped so `LearningMetrics` can compute `expected_util = Σ(p·C) / total_capital` (v4.0 bridge; allows control-law feedback). |
-| `_expected_capital` | `p_i · est_capital_cost_i`, updated after every cap / rescale step via `_recompute_stamps`. |
-| `_expected_capital_contribution` | Same as `_expected_capital`; retained for consumers that read either name. |
+> Consolidated. The 7-state / 14-invariant `SafetyController` is a **legacy / rollback-only** component; see **§4.14b**. The live path uses only `simple_allocator.check_kill_switch` + the farmer runtime guardrails (§4.18).
 
-#### 4.15.5 Hard guarantees
+### 4.14b Legacy / rollback components (NOT in the live path)
 
-Verified by `tests/test_continuous_allocator.py` (11 tests against the spec's §13 cases):
+The components below live in the repo **only as a rollback path** (activated solely if the operator reverts the systemd `ExecStart` to `oversight_agent.py --loop`). They are **not run in production**, are imported only by the legacy `oversight_agent.py` + `simulation/*`, and are **not maintained against v6.x**. Each is described here at summary depth only; the full formulas, invariant tables, control-law derivations, and observability stamps are preserved in **git @ `c074446`** and in prior-version snapshots of this doc (v3.3 for the Patch-era stack). The **live** allocation/oversight/learning/safety path is: `reward_farmer.py` + `simple_oversight.py::run_once` + `simple_allocator.py::SimpleAllocator` + `decision_policy.py::DecisionPolicy` (FX-051) + the farmer runtime guardrails (§4.18). See the Current Production State table for the authoritative live-vs-legacy map.
 
-- **G1 — Never returns zero deployments while any deploy candidate exists.** Step 4's `max(C_i, cpb_i · min_shares)` floor guarantees at least one positive share count per candidate.
-- **G2 — No binary filtering.** The old EV ≤ 0 gate is gone; every scored-deploy market reaches Step 3.
-- **G3 — Smoothness.** 1% input perturbation on any of `{R_i, p_i, L_i}` produces bounded-ratio output change. Verified at `<10%` relative on reward bumps.
-- **G4 — Determinism.** Same inputs → identical output. No random draws, no wall-clock-dependent code paths.
-- **Caps are clip-only.** Per-market / per-group / per-cluster caps scale down; they never redistribute freed capital back to other rows. This preserves relative allocation shape under cap binding.
+**Bandit Layer** (`profit/bandit.py`, was §4.12). Thompson sampling with Beta(α, β) per-market posteriors updated from 24h realised PnL; produced a per-market multiplier on RAS during allocation ranking. Could not override an `EV ≤ 0` rejection or rescue an upstream-filtered market. **No longer read by any allocator** (removed from the scoring path in v4.0; `bandit_state` table remains). Rollback-only. Full method/constraints in git @ `c074446`.
 
-#### 4.15.6 Sim-only p_fill bootstrap fix
+**Safety Controller** (`oversight/safety_controller.py`, was §4.14). A 7-state machine (CALIBRATED → MILDLY → BOOTSTRAP → SEVERELY → DEGRADED → DATA_UNAVAILABLE → UNSAFE), each state gating `max_markets` / `capital_pct` / trial-mode, driven by 14 invariants (I1–I14: daily/hourly/7d loss, drawdown, capital floor, CF drift + corroboration, est/actual ratio, capital-at-risk, data freshness/completeness, loss-reward ratio, CLOB-rate drop, fill-storm + CF-at-floor haircuts) evaluated each cycle. Ran upstream, restricting (never creating) allocations. **The live path does NOT use this.** Live safety is the minimal `simple_allocator.check_kill_switch` (24h loss > 10% wallet OR drawdown > 15%) plus the farmer runtime guardrails/kill switch (§4.18). Rollback-only; not maintained against v6.x. Full state table, invariant thresholds, transition ladder, and cold-start chain in git @ `c074446`. (Note: §8.2 still lists its constants; treat as legacy reference.)
 
-`simulation/bootstrap_calibrator.py` (v4.0 new) wraps `CalibrationManager` for simulation runs. When `FillModel.is_ready() == False`, substitutes a deterministic
+**Unified Continuous Allocator — β/η** (`profit/allocator.py`, was §4.15). A ~320-line single-formula allocator that replaced the Patch-6–13 stack: per-market weight `w_i = R_i / (1 + p_i·L_i)`, raw alloc `raw_i = w_i^(1+η)`, budget scale `scale = β·T / Σ p_k·raw_k`, then min-shares floor, clip-only per-market/group/cluster caps, and a 0.95·T safety rescale. Included a v5.0 "Step-3b" cap-aware cluster shaping pass and a sim-only `p_fill` bootstrap. **Not the production allocator** — production is `SimpleAllocator` (`simple_allocator.py`), semantics transformed by FX-052/053 to over-commit cost-to-score sizing (see Current Production State + §4.8). Rollback-only; not maintained against v6.x. Full strict-order formula, deletion list, observability stamps, hard guarantees (G1–G6), and Step-3b spec in git @ `c074446`.
 
-```
-p_fill_24h = clamp(
-    0.03 + 0.001·daily_rate + 0.004·q_share_pct,
-    0.02, 0.15)
-```
+**Control System — β/η** (`profit/learning.py`, was §4.16). The closed-loop control law for the continuous allocator's two levers: β (utilisation target, `err_β = 0.75 − expected_util`, gain `K_BETA = 0.5`, bounds [0.10, 0.95]) and η (coverage target, `err_η = 0.5 − coverage_ratio`, gain `K_ETA = 1.0`, bounds [0.00, 4.00]), each EMA-blended (α = 0.03) and halved during `capital_scale` oscillation, fail-closed when signals are missing. Replaced the λ1/λ2 mechanism, which cancels algebraically under uniform markets (the controllability analysis). **Drives only the legacy allocator; the live learning loop is FX-051 `DecisionPolicy` (§4.13).** Rollback-only; not maintained against v6.x. Full update rules, controllability proof, cap-interaction analysis, and empirical validation in git @ `c074446`. (§8.4 still lists its constants; treat as legacy reference.)
 
-with fallback `p = 0.05` when either input is missing. This exists solely because the simulation environment's bootstrap path would otherwise have `p_fill = 0` on every cycle (no book state to feed the production fallback), which makes `expected_capital ≈ 0` and invalidates both V4 and V5 utilisation invariants. The wrapper is a transparent pass-through once the fill model trains.
+**Legacy — Profit Maximization Stack (Patches 6–13)** (was §4.17). The progressive overlay stack (overcommit factor, target-driven greedy fill, forced exposure, marginal-efficiency gate, exposure saturation, in-allocator hysteresis) that the β/η continuous allocator replaced wholesale in v4.0. **Historical only — these mechanisms no longer exist in the codebase.** Full per-patch mechanics in v3.3 of this doc; the explicit deletion list lived in former §4.15.3 (git @ `c074446`). A few primitives survived into `profit/learning.py` (`_detect_oscillation`, `capital_scale` hysteresis + frontier memory, Rules A/B/D/E, `reward_trust` mean-reversion) but none touch any allocator.
 
-Production calibration code is untouched; the wrapper is only instantiated by the sim runners (`run_audit_v4.py`, `run_audit_v5.py`, `simulation/engine.py`).
+### 4.15 Unified Continuous Allocator (v4.0) → see §4.14b
 
-#### 4.15.7 Step-3b cap-aware shaping (v5.0, new)
+> Consolidated. The β/η `profit/allocator.py` continuous allocator is **legacy / rollback-only**; summary in **§4.14b**, full strict-order formula + deletion list + observability stamps + Step-3b shaping in git @ `c074446`. The live allocator is `SimpleAllocator` (§4.8, Current Production State).
 
-**Problem.** §4.16.5 documented a structural gap: when a fill-cluster's proportional per-member budget falls below per-market `min_capital`, Step 5's cluster cap + Step 4's min-shares floor compose to pin every member to `min_capital`, erasing any β/η signal upstream. In the sim this gap collapses 5/6 scenarios into a single flat deployment regardless of control law. In production the same pattern fires whenever several correlated markets share a cluster and per-member share drops below the per-market cost floor.
+### 4.16 Control System — β / η (v4.0) → see §4.14b
 
-**Fix.** A new Step 3b runs **between Step 3 (C_i computed) and Step 4 (min-shares enforcement)**, no changes to raw_i, β, η, or caps:
+> Consolidated. The β/η control law (`profit/learning.py`) and its controllability analysis are **legacy / rollback-only**; summary in **§4.14b**, full update rules + λ1/λ2 cancellation proof + cap-interaction analysis in git @ `c074446`. The live learning loop is FX-051 `DecisionPolicy` (§4.13).
 
-```
-for each fill-cluster C_l in deploy candidates:
-    size            = |members of C_l that are deploy candidates|
-    cap_pct         = OVERSIZED_CLUSTER_PCT if C_l ∈ oversized else max_cluster_pct
-    cluster_budget  = cap_pct · total_capital
-    cluster_per_market = cluster_budget / size
-    cluster_min_capital = max(cpb_i · min_size_i over members)
+### 4.17 Legacy — Profit Maximization Stack (Patches 6–13) → see §4.14b
 
-    if cluster_per_market >= cluster_min_capital:
-        continue           # non-binding — do nothing (preserves behaviour when clusters don't bind)
-
-    # Binding: pre-select top-k survivors, route the rest to avoid.
-    k = max(1, floor(cluster_budget / cluster_min_capital))
-    survivors = top-k by (-raw_alloc_i, condition_id) ascending
-    for d in non-survivors:
-        d.C = 0
-        route d to passthrough_avoids with reason="cluster shaping deselected"
-```
-
-Non-selected candidates are removed from `deploy_candidates` and appended to `passthrough_avoids` as `_to_dict(sm, shares=0, action_override="avoid", reason_override=...)` rows — Step 4 never sees them, so its `max(C, min_capital)` floor can't re-lift them to min_capital. Survivors pass through Step 4 normally.
-
-**Hard guarantees** (verified by passing `tests/test_continuous_allocator.py`):
-
-- G1 **At least one market per cluster receives allocation** — `k ≥ 1`.
-- G2 **Survivors can exceed min_capital after caps** — by construction, `cluster_budget / k ≥ cluster_min_capital`.
-- G3 **Non-selected markets receive zero allocation** — routed to `action="avoid"` before Step 4 floor enforcement.
-- G4 **Non-binding clusters behave identically to pre-shaping** — early `continue` when `cluster_per_market ≥ cluster_min_capital`.
-- G5 **Deterministic** — sort by `(-raw_alloc, condition_id)`; no randomness.
-- G6 **Fail-open** — `build_fill_clusters` exceptions log a warning and skip shaping; the allocator proceeds without shaping rather than halting.
-
-**Edge cases handled** (§7 of the Step-3b spec):
-- `cluster_budget < cluster_min_capital` → `k` clamps to 1 (always keep the top-ranked member).
-- Identical `raw_alloc` values → deterministic tie-break on `condition_id`.
-- Empty cluster (all members non-deploy) → skipped.
-
-**V5 empirical result**: `INV5_new` coverage_ratio 1/6 → **6/6 PASS** after shaping (0.50 – 0.98 across all six scenarios). See §10.4 "Post-shaping" V5 column.
-
----
-
-### 4.16 Control System — β / η (v4.0)
-
-The control-variable redesign that replaces the λ1 / λ2 mechanism. Grounded in the controllability analysis summarised in §4.16.2.
-
-#### 4.16.1 Why λ1 / λ2 failed (summary)
-
-The full derivation is in §4.15.2 of this doc's controllability-analysis lineage. Short form:
-
-**Algebraic cancellation.** Under uniform markets (`p_i·L_i = K`, `R_i = R`), `C_i` simplifies to `0.95·T / Σ p_k` — an expression with no λ1 or λ2 anywhere. The cancellation happens at the scale step: `raw_i` and `Z` both carry `R²/D²`, which factors out identically. Therefore `∂C_i/∂λ1 = ∂C_i/∂λ2 = 0` analytically, not just numerically, in the uniform regime.
-
-**One DOF, not two.** Scaling `(λ1, λ2) → (s·λ1, s·λ2)` leaves every `D_j / D_i` invariant. Relative allocation depends only on `γ = λ2 / λ1` — a single degree of freedom disguised as two.
-
-**Min-floor collapse under caps.** Even in near-uniform regimes where λ1 produces a first-order differential `ΔC_i/C̄ ≈ -2·λ1·ε_i / D̄`, the cluster-cap × min-shares-floor composition in the sim environment pins every `C_i` to exactly `min_capital` (30 correlated markets ÷ $300 oversized-cluster budget = $10/market, below min_capital $27.3). The pre-cap differential doesn't survive into the output.
-
-Both failure modes are independent; either alone is sufficient to make the control inert. Empirically verified by tracing λ2 through 300 sim cycles: λ2 moved from 0.50 → 0.057 under active control, `expected_util` did not move (stayed at 0.033 ± noise).
-
-#### 4.16.2 Controllability under the new formula
-
-Under the continuous allocator's `C_i = raw_i · scale` with `raw_i = w_i^(1+η)` and `scale = β·T / Z`:
-
-- **β enters outside the `raw_i / Z` ratio** as a linear prefactor. `∂C_i / ∂β = C_i / β` in every regime — uniform or heterogeneous, pre-cap or post-cap. β's leverage is structurally preserved unless caps drive every row to min_capital.
-- **η enters through `C_i / C_j = (w_i / w_j)^(1+η)`.** Under uniform markets (`w_i = w_j`), η has zero effect — symmetry forbids differentiation, and no continuous control can beat this. Under heterogeneous markets, `∂ ln(C_i/C_j) / ∂η = ln(w_i / w_j) ≠ 0` whenever the weights differ.
-- **No cancellation between β and η** — they act on orthogonal degrees of freedom (absolute scale vs relative shape). Scaling `(β, η)` by a common factor does not leave the formula invariant the way `(λ1, λ2)` did.
-
-Under near-uniform markets (`p_i·L_i = x̄ + ε_i`, `|ε_i| ≪ x̄`):
-
-```
-ΔC_i / C̄ ≈ −(1 + η) · ε_i / (1 + x̄)
-```
-
-The differential is first-order in ε (not suppressed to higher order), with coefficient `(1+η)/(1+x̄)`. Raising η linearly amplifies the heterogeneity signal — η = 0 reproduces linear-in-w weighting, η = 4 gives 5× amplification. This is the mechanism through which η can push top markets above the min_capital threshold under moderate cap binding.
-
-#### 4.16.3 Control variables
-
-| Variable | Bounds | Default | Destination | EMA α | Gain |
-|---|---|---|---|---:|---:|
-| `β` | [0.10, 0.95] | 0.75 | Step-3 scale (§4.15) | 0.03 | `K_BETA = 0.5` |
-| `η` | [0.00, 4.00] | 0.00 | `raw_i` exponent (§4.15) | 0.03 | `K_ETA = 1.0` |
-
-Both persist via `learning_state` DB columns. Migration is idempotent `ALTER TABLE ADD COLUMN`. Legacy `lambda_1`, `lambda_2` DB columns retained at hardcoded `1.0` / `0.5` (the allocator does not read them; `simulation/engine.py` and `simulation/invariants.py` still import the field names).
-
-#### 4.16.4 Update rules
-
-Inside `LearningController.update_state` (per-cycle, pure function):
-
-```
-# β — utilisation-target feedback
-if expected_util is not None:
-    err_beta    = TARGET_UTIL − expected_util        # TARGET_UTIL = 0.75
-    beta_raw    = prev.beta · (1 + K_BETA · err_beta)
-    beta_target = clamp(beta_raw, 0.10, 0.95)
-
-# η — coverage feedback
-if coverage_ratio is not None:
-    err_eta    = TARGET_COVERAGE − coverage_ratio    # TARGET_COVERAGE = 0.5
-    eta_raw    = prev.eta + K_ETA · err_eta
-    eta_target = clamp(eta_raw, 0.00, 4.00)
-
-# Stability guard — halve both α when capital_scale oscillates
-alpha_beta, alpha_eta = ALPHA_BETA, ALPHA_ETA
-if _detect_oscillation(prev.capital_history):
-    alpha_beta /= 2
-    alpha_eta  /= 2
-
-# EMA blend
-new_beta = (1 − alpha_beta) · prev.beta + alpha_beta · beta_target
-new_eta  = (1 − alpha_eta)  · prev.eta  + alpha_eta  · eta_target
-```
-
-Input signals:
-- `expected_util = Σ(p_i · C_i) / total_capital` — computed by `LearningMetrics.compute_metrics` from the allocation JSON, using the `_total_capital` stamp (v4.0 new) plus the sum of `_expected_capital` stamps.
-- `coverage_ratio = active_markets / total_markets`, where `active = C_i > cpb_i · min_shares` — computed per cycle by the V5 audit tracker or equivalent metrics consumer.
-
-Fail-closed behaviour: if either signal is `None` or non-numeric, the corresponding target is set equal to the prev value, the EMA step becomes a no-op, and the control pass-through. Verified in `tests/test_learning.py::test_beta_eta_passthrough_when_signals_missing`.
-
-#### 4.16.5 Cap interaction
-
-Summary of how the v4.0 cap stack interacts with β and η:
-
-- **β's leverage is preserved whenever at least some markets escape min-floor binding.** When every `C_i` collapses to `min_capital` (pathological cap-bound regime), `Σ p_i · C_i = N · p_avg · min_capital` is independent of β, and β saturates at its ceiling without producing movement.
-- **η's leverage requires `p·L` heterogeneity AND some market escaping min-floor.** Raising η concentrates allocation on the top-weight markets; at high enough η, the top market's post-cluster-cap share exceeds `min_capital`, escaping the floor. `coverage_ratio` rises accordingly. The η feedback loop drives this directly.
-- **Cluster-cap × min-floor is the dominant binding constraint in the current sim.** 30 synthetic markets co-fill identically → one oversized cluster → `$300 / 30 = $10 < min_capital`. No upstream signal survives this composition. Empirically, V5 `expected_util` post-β/η control lands at 0.029–0.054 on five of six scenarios; only `under_deployed` (where `p` is low enough that notional blows past min_floor before caps bind) reaches the 0.5 target band.
-- **Caps themselves are clip-only and symmetric.** They preserve relative allocation under cluster-cap scaling and per-market cap; they only break symmetry under per-group cap (which iterates in allocation order) or when some rows cross a cap while others don't. Under uniform pre-cap shape, symmetric caps produce symmetric post-cap shape — no control signal re-emerges from the cap stack.
-
-#### 4.16.6 Empirical control-law validation
-
-Verified in isolation (`python3 -m` one-shot script against `LearningController.update_state`):
-
-- **Bounds hold** over 2000 stress cycles: β pinned at 0.10 lower bound when driven, η at 4.00 upper bound.
-- **Directions match spec §6.2 / §6.3**: `expected_util < target` ⇒ β ↑; `coverage < target` ⇒ η ↑.
-- **Deterministic** across 3 repeat calls on identical input.
-- **Smooth**: 1% perturbation on `expected_util` → 0.0075% β move (EMA-bounded).
-- **Stability guard exact**: oscillating `capital_history` halves the step (`ratio = 0.500`).
-- **Fail-closed**: `expected_util = None` + `coverage_ratio = None` → β/η unchanged.
-
-End-to-end V5 audit post-β/η integration (6 scenarios × 3 seeds × 500 cycles): overall verdict FAIL, but `expected_util` up 700× vs pre-fix. Per-scenario detail in §10.4. The FAIL is traceable to the cluster-cap × min-floor structural artefact in the sim environment (§4.16.5), not a control-loop malfunction — β and η both move correctly and reach their bounds under sustained error signals.
-
----
-
-### 4.17 Legacy — Profit Maximization Stack (Patches 6, 7, 9, 10, 11, 13)
-
-*Historical only; mechanisms no longer exist in the codebase. Kept as a pointer for anyone reading v3.x commits.*
-
-Patches 6–13 were a progressive stack of overlays that transformed the v2.0 EV-disciplined allocator into an exposure-forcing reward farmer. The full design notes, invocation order, and per-patch mechanics for each layer (Patch 6 objective blend + deployment boost + min-markets guard; Patch 7 overcommit factor + expected-capital enforcement; Patch 9 market expansion + per-market halving; Patch 10 exposure forcing + relaxed EV gate; Patch 11 exposure saturation + oscillation damping; Patch 13 target-driven greedy + hysteresis + efficiency penalty) are preserved in v3.3 of this document.
-
-**Why the stack was removed (v4.0):**
-
-1. V3.1 and V4 audits demonstrated that Patches 6–13 did not close their own design invariants (INV3 / INV5 / INV7) under the audit's six scenarios.
-2. The controllability analysis (§4.16.1, §4.16.2) proved that the underlying `λ1·p·L + λ2` denominator form is **mathematically incapable** of producing cross-market differentiation under uniform markets, regardless of what update rules you attach. The Patch-era mechanisms (overcommit, forced exposure, greedy fill) were all attempts to reintroduce differentiation through side channels, but they either reduced to the same uniform-market degeneracy or produced non-continuous allocation surfaces.
-3. The continuous-allocator + β/η design recovers the ~3–4% near-uniform leverage that existed in the Patch-era stack and makes it controllable by a proper closed-loop feedback rule (§4.16.4). No more multi-layer overlays — one formula, two controls, one safety cap pass.
-
-A subset of v3.x-era infrastructure survives into v4.0:
-
-- Patch 11 `_detect_oscillation` + `_CAPITAL_HISTORY_CACHE` (still used by β/η stability guard and by capital_scale hysteresis).
-- Patch 13 `last_direction` / `direction_lock` hysteresis (still applied post-EMA to `capital_scale`).
-- Patch 4 / Patch 5 frontier memory on `capital_scale` (regime-keyed best-reward dict, unchanged).
-- Rules A/B/D/E for `capital_scale` (with the aggressiveness / risk_multiplier branches stripped).
-- The `reward_trust` mean reversion and Rule C (reward-error feedback).
-
-These live in `profit/learning.py`; none of them touch the allocator.
-
-*Per-patch mechanics (Patch 6 Safe Expansion, Patch 7 overcommit factor + `_enforce_expected_capital`, Patch 9 expansion + per-market halving, Patch 10 forced-exposure + relaxed EV gate, Patch 11 saturation + oscillation damping, Patch 13 target-driven greedy + hysteresis, Audit V4 framework) are documented in full in v3.3 of this document. All of the allocator-side mechanisms listed there were removed in v4.0; see §4.15.3 for the explicit deletion list.*
+> Consolidated. The Patch-6–13 overlay stack no longer exists in the codebase (replaced wholesale by the v4.0 continuous allocator, itself now legacy — §4.14b). Full per-patch mechanics in v3.3 of this doc / git @ `c074446`.
 
 ---
 
