@@ -1526,6 +1526,73 @@ class RewardFarmer:
             )
         return False, ""
 
+    def _guardrail_unrealized_loss(
+        self, total_capital: "float | None",
+    ) -> "tuple[bool, str]":
+        """FX-084 — held-inventory (unrealized) loss kill.
+
+        The other kill limbs only see REALIZED loss (unwinds.pnl<0) and
+        wallet-CASH drawdown (peak vs current balance). Neither catches a
+        marked-down OPEN position or an FX-071 floored-but-unfilled dump that
+        bleeds without ever crystallizing a negative unwind or lowering the cash
+        peak. This limb marks every held leg to the market midpoint and trips
+        the sticky kill when NET unrealized loss exceeds
+        RF_UNREALIZED_LOSS_KILL_FRAC of total_capital.
+
+        Mark per leg (CLOB terms): YES pnl = yes_shares·(mid − yes_avg_price);
+        NO pnl = no_shares·((1 − mid) − no_avg_price). Cost basis from the
+        positions table; midpoint from the live MarketState.
+
+        Fail-open (returns (False, "")) on any missing signal: disabled knob,
+        no/zero total_capital, positions read error, or nothing markable. A leg
+        is skipped (not counted) when its cost basis is unknown (avg_price<=0,
+        e.g. orphan/startup positions handled by FX-066/074) or its market has
+        no fresh/valid midpoint (requires 0 < mid < 1). Net (gains offset
+        losses) so a single noisy mark cannot trip the kill alone.
+        """
+        self._last_unrealized_loss = None
+        frac = cfg("RF_UNREALIZED_LOSS_KILL_FRAC")
+        if not frac or frac <= 0:
+            return False, ""                          # disabled
+        if total_capital is None or total_capital <= 0:
+            return False, ""                          # no denominator → fail-open
+        try:
+            positions = self.db.load_all_positions()
+        except Exception:
+            return False, ""                          # read error → fail-open
+        if not positions:
+            return False, ""
+        net_unrealized = 0.0
+        marked_legs = 0
+        for cid, pos in positions.items():
+            ms = self.markets.get(cid)
+            if ms is None:
+                continue
+            mid = getattr(ms, "midpoint", 0.0) or 0.0
+            if mid <= 0.0 or mid >= 1.0:
+                continue                              # no fresh/valid mark → skip
+            ys = float(pos.get("yes_shares", 0.0) or 0.0)
+            ya = float(pos.get("yes_avg_price", 0.0) or 0.0)
+            ns = float(pos.get("no_shares", 0.0) or 0.0)
+            na = float(pos.get("no_avg_price", 0.0) or 0.0)
+            if ys > 0.0 and ya > 0.0:
+                net_unrealized += ys * (mid - ya)
+                marked_legs += 1
+            if ns > 0.0 and na > 0.0:
+                net_unrealized += ns * ((1.0 - mid) - na)
+                marked_legs += 1
+        if marked_legs == 0:
+            return False, ""                          # nothing markable → fail-open
+        unrealized_loss = -net_unrealized             # positive when underwater
+        self._last_unrealized_loss = unrealized_loss
+        limit = frac * total_capital
+        if unrealized_loss > limit:
+            return True, (
+                f"unrealized_loss=${unrealized_loss:.2f} > {frac:.0%}·T "
+                f"(=${limit:.2f}) across {marked_legs} marked leg(s)"
+            )
+        return False, ""
+
     def _emit_and_check_heartbeat(self) -> None:
         """FX-083: write the farmer's own liveness heartbeat and page if the
         OVERSIGHT peer's heartbeat has gone stale.
@@ -1642,6 +1709,16 @@ class RewardFarmer:
         if silence_kill:
             kill_reasons.append(silence_reason)
 
+        # FX-084: held-inventory (unrealized) loss kill. Catches marked-down
+        # open positions / FX-071 floored-but-unfilled dumps that the
+        # realized-loss and cash-drawdown limbs structurally miss. Fail-open on
+        # any missing signal (sets self._last_unrealized_loss for telemetry).
+        unrealized_kill, unrealized_reason = self._guardrail_unrealized_loss(
+            total_capital
+        )
+        if unrealized_kill:
+            kill_reasons.append(unrealized_reason)
+
         notional_block = (
             notional_ratio is not None
             and notional_ratio > MAX_NOTIONAL_RATIO()
@@ -1679,6 +1756,11 @@ class RewardFarmer:
             ),
             "realized_loss_24h": (
                 round(daily_loss, 2) if daily_loss is not None else None
+            ),
+            "unrealized_loss": (
+                round(self._last_unrealized_loss, 2)
+                if getattr(self, "_last_unrealized_loss", None) is not None
+                else None
             ),
             "cf": round(cf, 6) if cf is not None else None,
             "oversight_silent_secs": (
