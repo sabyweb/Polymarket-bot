@@ -284,5 +284,57 @@ class TestRollbackQuietFX080(unittest.TestCase):
         self.assertFalse(self.db._get_conn().in_transaction)
 
 
+class TestFillStormMarkerPersist(unittest.TestCase):
+    """The cross-market fill-storm breaker writes a __FILL_STORM__ audit row to
+    the fills table (reward_farmer.run_cycle). Pre-fix the call site used a
+    nonexistent self.db.execute_sql() swallowed by a bare except, so the storm
+    HALT still worked but the row was NEVER persisted — no audit trail for the
+    oversight/agent. The typed log_fill_storm_marker writer must actually land
+    the row."""
+
+    def setUp(self):
+        self.db_fd, self.db_path = tempfile.mkstemp(suffix=".db")
+        self.db = BotDatabase(self.db_path)
+
+    def tearDown(self):
+        self.db.close()
+        os.close(self.db_fd)
+        os.unlink(self.db_path)
+
+    def test_marker_row_persists_with_expected_sentinel_values(self):
+        ts = time.time()
+        self.assertTrue(self.db.log_fill_storm_marker(ts))
+        row = self.db._get_conn().execute(
+            "SELECT ts, condition_id, side, fill_type, shares, price, clob_cost, usd_value "
+            "FROM fills WHERE condition_id = '__FILL_STORM__' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(row, "storm marker must be persisted to fills")
+        self.assertAlmostEqual(row["ts"], ts, places=3)
+        self.assertEqual(row["condition_id"], "__FILL_STORM__")
+        self.assertEqual(row["side"], "both")
+        self.assertEqual(row["fill_type"], "STORM_ALERT")
+        # zeros keep the marker out of pnl / share / count aggregations
+        self.assertEqual((row["shares"], row["price"], row["clob_cost"], row["usd_value"]),
+                         (0, 0, 0, 0))
+
+    def test_marker_defaults_ts_when_omitted(self):
+        before = time.time()
+        self.assertTrue(self.db.log_fill_storm_marker())
+        after = time.time()
+        ts = self.db._get_conn().execute(
+            "SELECT ts FROM fills WHERE condition_id='__FILL_STORM__' ORDER BY id DESC LIMIT 1"
+        ).fetchone()["ts"]
+        self.assertGreaterEqual(ts, before)
+        self.assertLessEqual(ts, after + 1)
+
+    def test_marker_does_not_pollute_per_market_fill_count(self):
+        # A real market's per-cid fill count must not see the sentinel row.
+        self.db.log_fill_storm_marker(time.time())
+        n = self.db._get_conn().execute(
+            "SELECT COUNT(*) FROM fills WHERE condition_id = ?", ("0xRealMarket",)
+        ).fetchone()[0]
+        self.assertEqual(n, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

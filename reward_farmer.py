@@ -2095,15 +2095,12 @@ class RewardFarmer:
                 f"FILL STORM DETECTED: {global_recent} fills in {STORM_WINDOW_SECS}s "
                 f"across all markets. Halting new placements for {STORM_HALT_SECS}s."
             )
-            # Log to DB so agent can see it
-            try:
-                self.db.execute_sql(
-                    "INSERT INTO fills (ts, condition_id, side, fill_type, shares, price, clob_cost, usd_value) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (now, "__FILL_STORM__", "both", "STORM_ALERT", 0, 0, 0, 0),
-                )
-            except Exception:
-                pass
+            # Persist a marker row to the fills table so the oversight/agent
+            # and post-incident analysis can see the storm. Typed, truthful
+            # writer (replaces a no-op self.db.execute_sql call that never
+            # existed and was swallowed by a bare except — the storm HALT above
+            # via self._fill_storm_until always worked; the audit row did not).
+            self.db.log_fill_storm_marker(now)
 
         # Step 4: Place orders on priority batch
         market_list = list(self.markets.values())

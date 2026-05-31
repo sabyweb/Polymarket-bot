@@ -683,6 +683,41 @@ class BotDatabase:
             )
             return False
 
+    def log_fill_storm_marker(self, ts: float | None = None) -> bool:
+        """Persist a cross-market fill-storm audit marker into the fills table.
+
+        A sentinel row — condition_id='__FILL_STORM__', side='both',
+        fill_type='STORM_ALERT', zero shares/price/cost/value — recording WHEN
+        the farmer tripped its global fill-storm breaker, so the oversight/agent
+        and post-incident analysis can see it. It is NOT a real fill: the zeros
+        keep it out of pnl/share sums and the sentinel condition_id keeps it out
+        of per-market fill counts.
+
+        Replaces a former ``self.db.execute_sql(<raw INSERT>)`` call site that
+        could never work (BotDatabase has no execute_sql) and was swallowed by a
+        bare ``except: pass`` — so storms halted correctly (via
+        ``self._fill_storm_until``) but left no audit trail. Typed + truthful +
+        rollback-on-failure, matching every other writer (FX-080). The 8-column
+        INSERT is schema-safe: every omitted fills column is NOT NULL DEFAULT.
+
+        Returns True iff the row was written, False on DB error.
+        """
+        try:
+            conn = self._get_conn()
+            conn.execute(
+                "INSERT INTO fills (ts, condition_id, side, fill_type, "
+                "shares, price, clob_cost, usd_value) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (ts if ts is not None else time.time(),
+                 "__FILL_STORM__", "both", "STORM_ALERT", 0, 0, 0, 0),
+            )
+            conn.commit()
+            return True
+        except Exception as e:
+            self._rollback_quiet()
+            log.warning(f"DB log_fill_storm_marker error: {e}")
+            return False
+
     def fill_event_exists(self, fill_event_id: str) -> bool:
         """FX-065: True iff a fills row with this (non-empty) event_id exists.
 
