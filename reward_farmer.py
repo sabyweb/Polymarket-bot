@@ -1473,6 +1473,58 @@ class RewardFarmer:
         observed = hi / lo
         return observed > kill_ratio, observed
 
+    def _guardrail_oversight_silence_drawdown(
+        self, total_live_notional: "float | None",
+    ) -> "tuple[bool, str]":
+        """FX-082 — farmer-side drawdown backstop for oversight silence.
+
+        The 15% drawdown kill normally lives ONLY in the oversight process
+        (simple_allocator.check_kill_switch, written into market_allocations.json).
+        If oversight dies or wedges (FX-080 did exactly this for ~2 days) the
+        alloc file stops being rewritten; the farmer's stale-alloc handling only
+        BLOCKS NEW orders — it does not cancel existing positions or trip any
+        drawdown kill, so live exposure can ride a >15% drawdown unprotected.
+
+        Fires the farmer's own sticky kill when, AND ONLY when, all of:
+          (1) oversight has been silent past RF_OVERSIGHT_SILENCE_KILL_HOURS
+              (alloc-file mtime age via self._alloc_mtime),
+          (2) the farmer holds live notional (something is at risk), and
+          (3) a farmer-computed drawdown (current wallet vs the
+              portfolio_snapshots high-water mark) exceeds
+              RF_FARMER_DRAWDOWN_KILL_FRAC.
+        Gated on silence so it never duplicates/fights the oversight limb while
+        oversight is alive.
+
+        Fail-safe: ANY missing signal (disabled knob, no alloc loaded yet, no
+        exposure, no peak, no current wallet, non-positive peak) returns
+        (False, "") — a healthy bot is never falsely killed (mirrors the
+        missing-signal-leaves-counter-unchanged pattern above).
+        """
+        silence_hours = cfg("RF_OVERSIGHT_SILENCE_KILL_HOURS")
+        if not silence_hours or silence_hours <= 0:
+            return False, ""                       # disabled
+        if not self._alloc_mtime:                  # no alloc ever loaded → no signal
+            return False, ""
+        silent_secs = time.time() - self._alloc_mtime
+        if silent_secs < silence_hours * 3600.0:
+            return False, ""                       # oversight recent → it owns drawdown
+        if not total_live_notional or total_live_notional <= 0:
+            return False, ""                       # nothing at risk
+        peak = self.db.get_wallet_peak_usd()
+        current, _ts = self.db.load_usdc_balance()
+        if peak is None or current is None or peak <= 0:
+            return False, ""                       # missing wallet signal → fail-open
+        drawdown = 1.0 - (current / peak)
+        frac = cfg("RF_FARMER_DRAWDOWN_KILL_FRAC")
+        if drawdown > frac:
+            return True, (
+                f"oversight_silent={silent_secs / 3600.0:.2f}h > {silence_hours}h "
+                f"AND farmer_drawdown={drawdown:.1%} > {frac:.0%} "
+                f"(peak=${peak:.2f}, current=${current:.2f}, "
+                f"live_notional=${total_live_notional:.2f})"
+            )
+        return False, ""
+
     def _guardrail_check_and_log(self) -> dict:
         """Compute all guardrail signals, emit a structured telemetry
         line, and return a decision struct for run_cycle to act on.
@@ -1550,6 +1602,16 @@ class RewardFarmer:
                 f"{RAPID_GROWTH_KILL_RATIO():.2f}× kill threshold"
             )
 
+        # FX-082: farmer-side drawdown backstop when oversight goes silent.
+        # The 15% drawdown kill otherwise lives only in oversight; if oversight
+        # dies/wedges while the farmer holds exposure, this is the only drawdown
+        # protection left. Fail-open on any missing signal.
+        silence_kill, silence_reason = self._guardrail_oversight_silence_drawdown(
+            total_live_notional
+        )
+        if silence_kill:
+            kill_reasons.append(silence_reason)
+
         notional_block = (
             notional_ratio is not None
             and notional_ratio > MAX_NOTIONAL_RATIO()
@@ -1589,6 +1651,10 @@ class RewardFarmer:
                 round(daily_loss, 2) if daily_loss is not None else None
             ),
             "cf": round(cf, 6) if cf is not None else None,
+            "oversight_silent_secs": (
+                round(time.time() - self._alloc_mtime, 1)
+                if self._alloc_mtime else None
+            ),
             "notional_block": notional_block,
             "kill_switch": bool(kill_reasons),
         }

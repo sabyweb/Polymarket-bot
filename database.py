@@ -1294,6 +1294,24 @@ class BotDatabase:
             log.debug(f"DB load_usdc_balance error: {e}")
             return None, 0.0
 
+    def get_wallet_peak_usd(self) -> float | None:
+        """FX-082: wallet high-water mark = MAX(exchange_balance) over all
+        portfolio_snapshots rows (written each oversight cycle; FX-078 fixed the
+        writer). Used by the farmer's oversight-silence drawdown backstop. A
+        stale peak (e.g. oversight down) is still a valid high-water mark — the
+        peak only rises while healthy, and the wallet only falls under drawdown,
+        so 1 - current/peak stays correct (if anything, conservative). Returns
+        None on empty/error so the caller fails OPEN (no false drawdown kill on
+        missing data). Read-only — no transaction to roll back."""
+        try:
+            row = self._get_conn().execute(
+                "SELECT MAX(exchange_balance) FROM portfolio_snapshots"
+            ).fetchone()
+            return float(row[0]) if row and row[0] is not None else None
+        except Exception as e:
+            log.debug(f"DB get_wallet_peak_usd error: {e}")
+            return None
+
     def save_all_reward_stats(self, markets: dict) -> None:
         """Batch UPSERT all market stats as JSON blobs.
 
