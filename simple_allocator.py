@@ -69,7 +69,7 @@ def MAX_DEPLOYED_MARKETS(): return cfg("RF_OVERCOMMIT_MAX_DEPLOYED_MARKETS")
 def PER_MARKET_BUFFER_FRAC(): return cfg("RF_OVERCOMMIT_PER_MARKET_BUFFER_FRAC")
 def EXPECTED_FILL_COST_FRAC(): return cfg("RF_OVERCOMMIT_EXPECTED_FILL_COST_FRAC")
 def Q_SHARE_CONSERVATIVE_FACTOR(): return cfg("RF_OVERCOMMIT_Q_SHARE_CONSERVATIVE_FACTOR")
-COLD_START_Q_SHARE = 0.005         # 0.5% prior — matches bot historical median band
+COLD_START_Q_SHARE = 0.005         # FX-086 (closes FX-064): DEFAULT mirror of the cfg knob RF_COLD_START_Q_SHARE. The live path (estimate_q_share) reads cfg("RF_COLD_START_Q_SHARE") so the prior is runtime-tunable via config_overrides.json (FX-046 says it is 24-94x off and it binds the EV gate). This module constant is retained as the compile-time default + for import-site arithmetic in tests; keep the two values in sync.
 
 # FX-056: Extreme-price filter. Markets with midpoint < 0.10 or > 0.90
 # produce wide effective spreads on dump. The 2026-05-25 fill on
@@ -306,7 +306,9 @@ class SimpleAllocator:
             return api_shares[cid], "api"
         if cid in cumulative:
             return cumulative[cid], "cumulative"
-        return COLD_START_Q_SHARE, "cold_start"
+        # FX-086 (closes FX-064): cfg-driven, runtime-tunable. Defaults to
+        # COLD_START_Q_SHARE (0.005) when no override is set.
+        return cfg("RF_COLD_START_Q_SHARE"), "cold_start"
 
     # ── Allocation logic ──
 

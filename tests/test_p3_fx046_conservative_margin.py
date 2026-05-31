@@ -77,6 +77,7 @@ class TestP3_A_ConservativeFactor(unittest.TestCase):
                 else 500 if k == "RF_OVERCOMMIT_MAX_DEPLOYED_MARKETS"
                 else 0.10 if k == "RF_OVERCOMMIT_PER_MARKET_BUFFER_FRAC"
                 else 0.02 if k == "RF_OVERCOMMIT_EXPECTED_FILL_COST_FRAC"
+                else 0.005 if k == "RF_COLD_START_Q_SHARE"  # FX-086: cold-start is now cfg-driven
                 else 1.0
             )
             result = a.compute(
@@ -102,6 +103,7 @@ class TestP3_A_ConservativeFactor(unittest.TestCase):
                 else 500 if k == "RF_OVERCOMMIT_MAX_DEPLOYED_MARKETS"
                 else 0.10 if k == "RF_OVERCOMMIT_PER_MARKET_BUFFER_FRAC"
                 else 0.02 if k == "RF_OVERCOMMIT_EXPECTED_FILL_COST_FRAC"
+                else 0.005 if k == "RF_COLD_START_Q_SHARE"  # FX-086: cold-start is now cfg-driven
                 else 1.0
             )
             result = a.compute(
@@ -128,6 +130,7 @@ class TestP3_A_ConservativeFactor(unittest.TestCase):
                 else 500 if k == "RF_OVERCOMMIT_MAX_DEPLOYED_MARKETS"
                 else 0.10 if k == "RF_OVERCOMMIT_PER_MARKET_BUFFER_FRAC"
                 else 0.02 if k == "RF_OVERCOMMIT_EXPECTED_FILL_COST_FRAC"
+                else 0.005 if k == "RF_COLD_START_Q_SHARE"  # FX-086: cold-start is now cfg-driven
                 else 1.0
             )
             result = a.compute(

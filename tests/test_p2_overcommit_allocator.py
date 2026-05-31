@@ -41,6 +41,7 @@ from simple_allocator import (
     AllocationResult,
     COLD_START_Q_SHARE,
 )
+from config import cfg as _real_cfg  # FX-086: real cfg for delegating patches
 
 
 # ── Fixtures ──
@@ -380,8 +381,12 @@ class TestAO_F_Adversarial(unittest.TestCase):
         a = _make_allocator()
         a.fetch_current_q_shares = lambda: {}
         a.load_cumulative_ratios = lambda: {}
-        # Force COLD_START_Q_SHARE to 0 to simulate worst case
-        with patch.object(sa, "COLD_START_Q_SHARE", 0.0):
+        # FX-086: cold-start q_share is now the cfg knob RF_COLD_START_Q_SHARE
+        # (was the module constant COLD_START_Q_SHARE). Force it to 0 to simulate
+        # the worst case, delegating all other knob lookups to the real cfg.
+        def _cfg_cold0(key):
+            return 0.0 if key == "RF_COLD_START_Q_SHARE" else _real_cfg(key)
+        with patch.object(sa, "cfg", _cfg_cold0):
             candidates = [_make_candidate("0xQZERO", daily_rate=500)]
             result = a.compute(
                 wallet_usd=1000, wallet_peak_usd=1000, wallet_24h_ago_usd=1000,
