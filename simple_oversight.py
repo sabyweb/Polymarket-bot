@@ -128,17 +128,52 @@ def get_wallet_24h_ago(db_path: str) -> Optional[float]:
 
 
 def write_portfolio_snapshot(db_path: str, balance: float) -> None:
-    """Persist current wallet to portfolio_snapshots for future peak/24h lookups."""
+    """Persist current wallet to portfolio_snapshots for future peak/24h lookups.
+
+    FX-078: the live oversight (simple_oversight) is now the OWNER of this table.
+    Previously portfolio_snapshots was created ONLY by the legacy
+    oversight/safety_controller path, and this INSERT omitted the NOT-NULL
+    ``total_value`` column — so after the 2026-05-25 swap to simple_oversight
+    every call raised IntegrityError (or, on a fresh DB, "no such table"), which
+    was swallowed at debug level. The table silently froze, which disabled the
+    kill switch's drawdown limb (get_wallet_peak_usd reads MAX(exchange_balance)
+    here, so an empty table makes peak==current => drawdown==0 => never trips).
+
+    We now (a) create the canonical 6-column schema if missing (IF NOT EXISTS is
+    a no-op on DBs the legacy path already populated) and (b) write total_value.
+    Oversight only knows the wallet balance, so total_value == exchange_balance.
+    """
+    conn = None
     try:
         conn = sqlite3.connect(db_path)
+        # Canonical schema — mirrors oversight/safety_controller.py so the live
+        # path is self-sufficient and the column set matches existing rows.
         conn.execute(
-            "INSERT INTO portfolio_snapshots (ts, exchange_balance) VALUES (?, ?)",
-            (time.time(), balance),
+            """CREATE TABLE IF NOT EXISTS portfolio_snapshots (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts               REAL NOT NULL,
+                total_value      REAL NOT NULL,
+                exchange_balance REAL NOT NULL DEFAULT 0,
+                locked_capital   REAL NOT NULL DEFAULT 0,
+                peak_value       REAL NOT NULL DEFAULT 0
+            )"""
+        )
+        conn.execute(
+            "INSERT INTO portfolio_snapshots (ts, total_value, exchange_balance) "
+            "VALUES (?, ?, ?)",
+            (time.time(), balance, balance),
         )
         conn.commit()
-        conn.close()
     except Exception as e:
-        log.debug(f"portfolio_snapshot insert skipped: {e}")
+        # Truthful (FX-054 class): a silent failure here disables a kill-switch
+        # input, so surface it at WARNING — never debug.
+        log.warning(f"[PORTFOLIO_SNAPSHOT] write failed: {e}")
+    finally:
+        # FX-078: always close — the pre-fix code put conn.close() AFTER the
+        # throwing execute, so every failed write leaked a connection (and the
+        # held read/write state contributed to the un-checkpointed WAL growth).
+        if conn is not None:
+            conn.close()
 
 
 # ── Per-cycle orchestration ──

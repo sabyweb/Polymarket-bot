@@ -11,6 +11,7 @@ Contracts:
 - O6: get_wallet_24h_ago returns None on no rows in window
 - O7: get_wallet_24h_ago returns balance from row closest to 24h ago
 - O8: write_portfolio_snapshot persists the balance with current timestamp
+- O8b: write_portfolio_snapshot creates the canonical table on a fresh DB (FX-078)
 - O9: run_once writes alloc file even if 0 deploys
 - O10: run_once logs CAPITAL_SOURCE line
 - O11: run_once on wallet fetch failure returns no_capital, no alloc write
@@ -53,9 +54,12 @@ def _make_temp_db():
             unwind_type TEXT NOT NULL DEFAULT 'normal'
         );
         CREATE TABLE portfolio_snapshots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts REAL NOT NULL,
-            exchange_balance REAL NOT NULL
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts               REAL NOT NULL,
+            total_value      REAL NOT NULL,
+            exchange_balance REAL NOT NULL DEFAULT 0,
+            locked_capital   REAL NOT NULL DEFAULT 0,
+            peak_value       REAL NOT NULL DEFAULT 0
         );
         CREATE TABLE reward_market_stats (
             condition_id TEXT PRIMARY KEY,
@@ -144,8 +148,8 @@ def test_O4_wallet_peak_returns_max_of_snapshot_and_current():
     db = _make_temp_db()
     conn = sqlite3.connect(db)
     conn.executemany(
-        "INSERT INTO portfolio_snapshots (ts, exchange_balance) VALUES (?, ?)",
-        [(1, 100), (2, 250), (3, 200)],  # peak = 250
+        "INSERT INTO portfolio_snapshots (ts, total_value, exchange_balance) VALUES (?, ?, ?)",
+        [(1, 100, 100), (2, 250, 250), (3, 200, 200)],  # peak = 250
     )
     conn.commit()
     conn.close()
@@ -184,11 +188,11 @@ def test_O7_wallet_24h_ago_returns_balance_nearest_24h_back():
     now = time.time()
     conn = sqlite3.connect(db)
     conn.executemany(
-        "INSERT INTO portfolio_snapshots (ts, exchange_balance) VALUES (?, ?)",
+        "INSERT INTO portfolio_snapshots (ts, total_value, exchange_balance) VALUES (?, ?, ?)",
         [
-            (now - 86400 + 60, 200.0),    # 60s after target — closest
-            (now - 86400 - 1800, 195.0),  # 30min before target
-            (now - 86400 + 3500, 210.0),  # 58min after target (just inside +1h window)
+            (now - 86400 + 60, 200.0, 200.0),    # 60s after target — closest
+            (now - 86400 - 1800, 195.0, 195.0),  # 30min before target
+            (now - 86400 + 3500, 210.0, 210.0),  # 58min after target (just inside +1h window)
         ],
     )
     conn.commit()
@@ -206,10 +210,10 @@ def test_O7b_wallet_24h_ago_picks_correct_row_with_distant_data():
     now = time.time()
     conn = sqlite3.connect(db)
     conn.executemany(
-        "INSERT INTO portfolio_snapshots (ts, exchange_balance) VALUES (?, ?)",
+        "INSERT INTO portfolio_snapshots (ts, total_value, exchange_balance) VALUES (?, ?, ?)",
         [
-            (now - 86400 - 1800, 195.0),  # 30 min BEFORE target
-            (now - 86400 + 3500, 210.0),  # 58 min AFTER target — further away
+            (now - 86400 - 1800, 195.0, 195.0),  # 30 min BEFORE target
+            (now - 86400 + 3500, 210.0, 210.0),  # 58 min AFTER target — further away
         ],
     )
     conn.commit()
@@ -231,13 +235,36 @@ def test_O8_write_portfolio_snapshot_persists():
 
     conn = sqlite3.connect(db)
     row = conn.execute(
-        "SELECT ts, exchange_balance FROM portfolio_snapshots ORDER BY id DESC LIMIT 1"
+        "SELECT ts, total_value, exchange_balance FROM portfolio_snapshots "
+        "ORDER BY id DESC LIMIT 1"
     ).fetchone()
     conn.close()
 
     assert row is not None
     assert before <= row[0] <= after + 1
-    assert row[1] == 1234.56
+    # FX-078: total_value is NOT NULL in the real (production) schema; the write
+    # must populate it (== exchange_balance for oversight, which only knows the
+    # wallet balance). Pre-fix the INSERT omitted total_value -> IntegrityError
+    # swallowed at debug -> no row, silently freezing the table.
+    assert row[1] == 1234.56  # total_value
+    assert row[2] == 1234.56  # exchange_balance
+    os.unlink(db)
+
+
+def test_O8b_write_portfolio_snapshot_creates_table_when_absent():
+    """O8b (FX-078): the live oversight OWNS portfolio_snapshots. On a fresh DB
+    where the legacy safety_controller never ran, the write must CREATE the
+    canonical table and persist — not silently no-op on a missing table."""
+    db = tempfile.mktemp(suffix=".db")
+    sqlite3.connect(db).close()  # fresh DB, no portfolio_snapshots table
+    so.write_portfolio_snapshot(db, 777.0)
+    conn = sqlite3.connect(db)
+    row = conn.execute(
+        "SELECT total_value, exchange_balance FROM portfolio_snapshots "
+        "ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+    assert row == (777.0, 777.0)
     os.unlink(db)
 
 
