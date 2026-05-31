@@ -510,32 +510,75 @@ def alert_wallet_desync(
     _write_alert("WALLET_DESYNC", msg)
 
 
-def alert_heartbeat_failure(last_success_secs_ago: float) -> None:
-    """Send a Discord alert when no cycle has completed recently.
+def alert_heartbeat_failure(last_success_secs_ago: float, process: str = "bot") -> None:
+    """Send a Discord alert when a process has not cycled recently.
 
-    This catches silent failures — e.g. the bot is running but all API
-    calls return empty data, no markets pass hygiene, etc.
+    This catches silent failures — e.g. the process is running but all API
+    calls return empty data, no markets pass hygiene, or it is fully hung.
 
     Args:
-        last_success_secs_ago: Seconds since the last successful cycle.
+        last_success_secs_ago: Seconds since the process's last heartbeat/cycle.
+        process: Which process is stale (e.g. "farmer", "oversight"). Defaults
+            to "bot" so the legacy single-process caller is unchanged (FX-083).
     """
     minutes = last_success_secs_ago / 60
     embed = {
-        "title": "Heartbeat Missing",
+        "title": f"Heartbeat Missing — {process}",
         "description": (
-            f"No successful trading cycle has completed in "
-            f"**{minutes:.0f} minutes**.\n\n"
-            f"The bot may be stuck, all markets may be failing hygiene, "
-            f"or API calls may be timing out."
+            f"No cycle from **{process}** in **{minutes:.0f} minutes**.\n\n"
+            f"The process may be hung, all markets may be failing hygiene, "
+            f"or API calls may be timing out. Existing positions are NOT being "
+            f"monitored while it is down."
         ),
         "color": 0xFF6600,  # Orange — warning
         "timestamp": datetime.utcnow().isoformat(),
     }
-    _send_discord("**HEARTBEAT ALERT** — bot may be stalled", embed)
+    _send_discord(f"**HEARTBEAT ALERT** — {process} may be stalled", embed)
 
-    msg = f"HEARTBEAT MISSING | No cycle completed in {minutes:.0f} minutes"
+    msg = f"HEARTBEAT MISSING | {process} | no cycle in {minutes:.0f} minutes"
     log.warning(msg)
     _write_alert("HEARTBEAT", msg)
+
+
+# FX-083: cross-process heartbeat staleness paging. Each production process
+# (farmer ~30s, oversight ~30min) writes its own heartbeat to the DB every
+# cycle and checks its PEER's heartbeat via this helper. A hung/dead peer is
+# paged to Discord (deduped). Per-process module state — each process imports
+# its own copy, tracking only the peer(s) it watches, so keys never collide.
+_HB_LAST_ALERT: dict[str, float] = {}
+
+
+def maybe_alert_stale_heartbeat(
+    peer_name: str,
+    last_hb_ts: "float | None",
+    now: float,
+    stale_secs: float,
+    repage_secs: float = 1800.0,
+) -> bool:
+    """Page (deduped) when a peer process heartbeat is stale.
+
+    `last_hb_ts is None` (never written / read error) or `<= 0` is treated as
+    UNKNOWN, not stale → no page. This is the fail-open contract: a fresh
+    deploy where the peer hasn't cycled yet must never false-page.
+
+    Returns True iff a page was emitted this call. Re-pages at most once per
+    `repage_secs` while the peer stays stale; clears the dedup state the moment
+    the peer is healthy again, so the next stall episode pages promptly.
+    """
+    if last_hb_ts is None or last_hb_ts <= 0:
+        return False
+    if not stale_secs or stale_secs <= 0:
+        return False  # disabled
+    age = now - last_hb_ts
+    if age < stale_secs:
+        _HB_LAST_ALERT.pop(peer_name, None)  # healthy → reset dedup
+        return False
+    last = _HB_LAST_ALERT.get(peer_name)
+    if last is not None and (now - last) < repage_secs:
+        return False  # already paged recently — suppress spam
+    _HB_LAST_ALERT[peer_name] = now
+    alert_heartbeat_failure(age, process=peer_name)
+    return True
 
 
 def alert_bot_crash(error: str) -> None:

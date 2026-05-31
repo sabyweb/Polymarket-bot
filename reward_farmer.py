@@ -31,6 +31,7 @@ from models import OrderSlot, MarketState
 from market_discovery import fetch_all_reward_markets, get_merged_book
 from order_lifecycle import OrderLifecycle
 from dump_manager import DumpManager
+import alerts
 # Oversight integration (final safety layer): the farmer calls
 # `oversight_agent.evaluate(guard)` once per cycle, after the guardrail
 # computation and before the placement decision. The contract is
@@ -1525,6 +1526,35 @@ class RewardFarmer:
             )
         return False, ""
 
+    def _emit_and_check_heartbeat(self) -> None:
+        """FX-083: write the farmer's own liveness heartbeat and page if the
+        OVERSIGHT peer's heartbeat has gone stale.
+
+        Heartbeat write is mode-independent — a dry shadow is still a live
+        process whose stall must be detectable. The oversight check fires a
+        Discord page at RF_OVERSIGHT_HEARTBEAT_STALE_SECS (~1h), BEFORE the 2h
+        FX-082 drawdown backstop, so a human is warned before the kill. Fully
+        fail-open: any error here must never break a trading cycle.
+        """
+        try:
+            self.db.record_heartbeat("farmer")
+        except Exception as e:
+            log.debug(f"[HEARTBEAT] farmer record failed (fail-open): {e}")
+        try:
+            ts = self.db.get_heartbeat("oversight")
+            if alerts.maybe_alert_stale_heartbeat(
+                "oversight",
+                ts,
+                time.time(),
+                cfg("RF_OVERSIGHT_HEARTBEAT_STALE_SECS"),
+                cfg("RF_HEARTBEAT_REPAGE_SECS"),
+            ):
+                log.warning(
+                    "[HEARTBEAT] oversight peer heartbeat STALE — Discord paged"
+                )
+        except Exception as e:
+            log.debug(f"[HEARTBEAT] oversight check skipped (fail-open): {e}")
+
     def _guardrail_check_and_log(self) -> dict:
         """Compute all guardrail signals, emit a structured telemetry
         line, and return a decision struct for run_cycle to act on.
@@ -2082,6 +2112,11 @@ class RewardFarmer:
         self._cycle_orders_placed = 0
         self._cycle_orders_cancelled = 0
         self._last_guard = None
+
+        # FX-083: liveness heartbeat + oversight-peer staleness paging. Done at
+        # cycle top, BEFORE the kill-switch short-circuit, so a halted-but-alive
+        # farmer still records liveness and still pages on a dead oversight.
+        self._emit_and_check_heartbeat()
 
         # Kill-switch short-circuit: if a prior cycle tripped the halt,
         # bail out immediately (no fills polled, no placements, no

@@ -30,6 +30,7 @@ from typing import Optional
 from dotenv import load_dotenv
 
 from simple_allocator import SimpleAllocator
+import alerts
 
 logging.basicConfig(
     level=logging.INFO,
@@ -209,6 +210,27 @@ def run_once(
     # (check_and_reload swallows its own errors and returns 0).
     from config import BotConfig
     BotConfig.instance().check_and_reload()
+
+    # FX-083: liveness heartbeat + farmer-peer staleness paging. Written at
+    # cycle top (mode-independent), fully fail-open. A hung/dead farmer is
+    # otherwise invisible to humans — its only heartbeat sender was legacy
+    # bot.py. Pages at RF_FARMER_HEARTBEAT_STALE_SECS (~5min = ~10 missed
+    # 30s farmer cycles).
+    try:
+        from database import get_db
+        from config import cfg as _cfg
+        _hb_db = get_db()
+        _hb_db.record_heartbeat("oversight")
+        if alerts.maybe_alert_stale_heartbeat(
+            "farmer",
+            _hb_db.get_heartbeat("farmer"),
+            time.time(),
+            _cfg("RF_FARMER_HEARTBEAT_STALE_SECS"),
+            _cfg("RF_HEARTBEAT_REPAGE_SECS"),
+        ):
+            log.warning("[HEARTBEAT] farmer peer heartbeat STALE — Discord paged")
+    except Exception as e:
+        log.debug(f"[HEARTBEAT] pass skipped (fail-open): {e}")
 
     # 1. Wallet probe
     try:

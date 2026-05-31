@@ -1294,6 +1294,41 @@ class BotDatabase:
             log.debug(f"DB load_usdc_balance error: {e}")
             return None, 0.0
 
+    def record_heartbeat(self, process: str, ts: "float | None" = None) -> bool:
+        """FX-083: write a liveness heartbeat for `process` (e.g. 'farmer',
+        'oversight') into reward_tracker_state. Called at the top of each cycle,
+        mode-independent (liveness is not gated on trading, so a dry shadow is
+        still monitored). FX-080 rollback on failure; never raises. Returns True
+        on success."""
+        if ts is None:
+            ts = time.time()
+        try:
+            conn = self._get_conn()
+            conn.execute(
+                "INSERT OR REPLACE INTO reward_tracker_state (key, value) "
+                "VALUES (?, ?)", (f"heartbeat:{process}", str(float(ts))),
+            )
+            conn.commit()
+            return True
+        except Exception as e:
+            self._rollback_quiet()
+            log.warning(f"DB record_heartbeat({process}) error: {e}")
+            return False
+
+    def get_heartbeat(self, process: str) -> "float | None":
+        """FX-083: last heartbeat unix-ts for `process`, or None if never
+        written / on error (caller fails OPEN — no false stale-page on missing
+        data). Read-only — no transaction to roll back."""
+        try:
+            row = self._get_conn().execute(
+                "SELECT value FROM reward_tracker_state WHERE key = ?",
+                (f"heartbeat:{process}",),
+            ).fetchone()
+            return float(row["value"]) if row else None
+        except Exception as e:
+            log.debug(f"DB get_heartbeat({process}) error: {e}")
+            return None
+
     def get_wallet_peak_usd(self) -> float | None:
         """FX-082: wallet high-water mark = MAX(exchange_balance) over all
         portfolio_snapshots rows (written each oversight cycle; FX-078 fixed the
