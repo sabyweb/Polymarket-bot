@@ -74,6 +74,7 @@ def MAX_NOTIONAL_RATIO(): return cfg("RF_MAX_NOTIONAL_RATIO")
 def HARD_NOTIONAL_RATIO(): return cfg("RF_HARD_NOTIONAL_RATIO")
 def RAPID_GROWTH_KILL_RATIO(): return cfg("RF_RAPID_GROWTH_KILL_RATIO")
 def RAPID_GROWTH_WINDOW_SEC(): return cfg("RF_RAPID_GROWTH_WINDOW_SEC")
+def RAPID_GROWTH_MIN_BASELINE_RATIO(): return cfg("RF_RAPID_GROWTH_MIN_BASELINE_RATIO")
 CLUSTER_NOTIONAL_LIMIT_FRAC = 0.5        # soft+hard: block new placements AND
                                          # actively cancel once a cluster exceeds
                                          # 0.5·total_capital (§4.1 of spec — the
@@ -1435,6 +1436,11 @@ class RewardFarmer:
           (a) RAPID_GROWTH_KILL_RATIO > 0  (i.e., not disabled)
           (b) we have at least 2 samples in the window
           (c) max_in_window / min_in_window > RAPID_GROWTH_KILL_RATIO
+          (d) FX-087: the window MINIMUM is >= RAPID_GROWTH_MIN_BASELINE_RATIO
+              (an established operating baseline). A ramp UP from ~0 (cold
+              start / post-kill-cancel / a sub-baseline canary) is normal
+              startup, NOT an anomalous burst, and is bounded by the static
+              soft/hard notional caps — so the kill stays disarmed there.
 
         The acceleration-based check is the load-bearing kill protection
         under the OverCommitAllocator (FX-052/053). The static thresholds
@@ -1468,9 +1474,23 @@ class RewardFarmer:
         vals = [v for _, v in self._notional_ratio_samples]
         lo = min(vals)
         hi = max(vals)
-        # Avoid div-by-zero on the cold-start "first sample is zero" case
+        # FX-087: the burst ratio is only meaningful relative to an ESTABLISHED
+        # operating baseline. On cold start (first live placement) or right
+        # after a kill-cancel, the window minimum is ~0, so hi/lo explodes and
+        # FALSELY trips on the very first orders — the canary's opening
+        # placement (0 -> 0.16x) read as a 1578x "burst" and sticky-killed the
+        # farmer; this would fire on EVERY live restart's ramp-up. A ramp UP
+        # from a near-zero baseline is normal startup, not anomalous
+        # acceleration; the dangerous high-exposure case is already bounded by
+        # the static soft/hard notional caps. Only treat growth as a kill-worthy
+        # burst once the window minimum is itself a real operating level.
+        baseline_floor = RAPID_GROWTH_MIN_BASELINE_RATIO()
+        if baseline_floor and baseline_floor > 0 and lo < baseline_floor:
+            return False, None
         if lo <= 0.0001:
-            lo = 0.0001
+            # Baseline guard disabled (<=0) AND a genuine ~0 minimum → the burst
+            # ratio is undefined; never divide by ~0 or false-kill on it.
+            return False, None
         observed = hi / lo
         return observed > kill_ratio, observed
 

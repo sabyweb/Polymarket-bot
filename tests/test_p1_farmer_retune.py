@@ -222,20 +222,22 @@ class TestAT_B_RapidGrowthKill(unittest.TestCase):
         self.assertEqual(prior_len, len(rf._notional_ratio_samples),
                          "missing signal must not append to deque")
 
-    def test_AT_B6_div_zero_guarded_at_lo_near_zero(self):
-        """If the min sample is ~0 (cold start with 0 capital briefly),
-        the division must not blow up. Clamp lo to 0.0001."""
+    def test_AT_B6_cold_start_near_zero_baseline_disarms(self):
+        """FX-087: when the window minimum is ~0 (cold start / right after a
+        kill-cancel), there is no ESTABLISHED baseline to burst from, so the
+        kill must DISARM (return False), not false-fire. Pre-FX-087 this clamped
+        lo to 0.0001 and false-killed at hi/0.0001 — which fired on the canary's
+        first live placement (0 -> 0.16x) and would fire on every live restart.
+        Must also never raise ZeroDivisionError."""
         rf = _make_farmer_stub()
         now = time.time()
         rf._notional_ratio_samples.append((now - 60, 0.0))
-        # 0.0 / clamped 0.0001 → 100× — this WILL kill (correct behavior),
-        # but must not raise ZeroDivisionError
         try:
-            kill, mult = rf._guardrail_rapid_notional_growth(0.5)
-            # Either kill or no-kill is acceptable — what matters is no crash
-            self.assertIsInstance(mult, float)
+            kill, mult = rf._guardrail_rapid_notional_growth(0.5)  # ~0 baseline
         except ZeroDivisionError:
-            self.fail("rapid-growth kill must guard against div-by-zero on cold-start")
+            self.fail("must not raise on near-zero baseline")
+        self.assertFalse(kill, "near-zero baseline must NOT false-kill (FX-087)")
+        self.assertIsNone(mult)
 
 
 # ════════════════════════════════════════════════════════════════════════════
