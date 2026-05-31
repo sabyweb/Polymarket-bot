@@ -2,7 +2,7 @@
 
 [![Tests](https://github.com/sabyweb/Polymarket-bot/actions/workflows/test.yml/badge.svg)](https://github.com/sabyweb/Polymarket-bot/actions/workflows/test.yml)
 
-Two-process bot that farms Polymarket liquidity rewards while remaining profitable. An `oversight_agent` plans every ~30 minutes; a `reward_farmer` executes every ~30 seconds. Capital, risk, and state flow between them via SQLite (WAL) and a single allocation JSON.
+Two-process bot that farms Polymarket liquidity rewards while remaining profitable. A `simple_oversight` planner plans every ~30 minutes; a `reward_farmer` executes every ~30 seconds. Capital, risk, and state flow between them via SQLite (WAL) and a single allocation JSON. (`oversight_agent.py` is the legacy/rollback planner — not the production path.)
 
 ## Documentation
 
@@ -18,4 +18,4 @@ Two-process bot that farms Polymarket liquidity rewards while remaining profitab
 
 - Python 3.14
 - Polymarket SDK: `py-clob-client-v2==1.0.0`
-- Production server: Hetzner Helsinki (LIVE)
+- Production server: Hetzner Helsinki — currently P5 Stage-B dry shadow (`--mode dry`); not yet trading live

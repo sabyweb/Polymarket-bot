@@ -198,7 +198,7 @@ KILL=$(journalctl -u polymarket-farmer --since "4 hours ago" | \
 echo "Kill switch activations: $KILL" >> $SUMMARY_LOG
 
 # 3. Notional overcommit ratio range
-sqlite3 bot_history.db "SELECT MIN(value), AVG(value), MAX(value) FROM portfolio_snapshots WHERE ts > strftime('%s','now') - 14400;" >> $SUMMARY_LOG
+sqlite3 bot_history.db "SELECT MIN(total_value), AVG(total_value), MAX(total_value) FROM portfolio_snapshots WHERE ts > strftime('%s','now') - 14400;" >> $SUMMARY_LOG
 
 # 4. Slippage on last 10 unwinds
 sqlite3 bot_history.db <<SQL >> $SUMMARY_LOG

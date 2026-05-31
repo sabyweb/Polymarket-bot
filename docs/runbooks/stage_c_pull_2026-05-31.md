@@ -76,9 +76,11 @@ $SSH 'cd /home/polymarket/Polymarket-bot && \
   sudo systemctl restart polymarket-oversight polymarket-farmer'
 ```
 
-Expect HEAD `4778b1d`. DB migrations (e.g. FX-067 `unwinds.unwind_event_id`) auto-apply on
-first start — watch for the schema-ready line. **P4: keep `journalctl -f` open for the
-first 5–10 cycles:**
+Expect HEAD at the current `main` tip — do NOT match a hardcoded hash (this session shipped
+FX-078/080/081/082 **and** FX-083/084/085/086, so HEAD is well past the old `4778b1d`).
+Confirm with `git rev-parse --short HEAD` == `git rev-parse --short origin/main`. DB migrations
+(e.g. FX-067 `unwinds.unwind_event_id`) auto-apply on first start — watch for the schema-ready
+line. **P4: keep `journalctl -f` open for the first 5–10 cycles:**
 
 ```bash
 $SSH 'journalctl -u polymarket-oversight -u polymarket-farmer -f'   # Ctrl-C after ~10 min

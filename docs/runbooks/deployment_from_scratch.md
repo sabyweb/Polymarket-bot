@@ -384,7 +384,10 @@ User=polymarket
 Group=polymarket
 WorkingDirectory=/home/polymarket/Polymarket-bot
 
-ExecStart=/home/polymarket/Polymarket-bot/venv/bin/python3 oversight_agent.py --loop
+# Production planner is simple_oversight.py (the v6.0 SimpleAllocator swap).
+# oversight_agent.py is the LEGACY/rollback planner — do NOT launch it for a
+# fresh deploy (it would also leave portfolio_snapshots table-less; see FX-078).
+ExecStart=/home/polymarket/Polymarket-bot/venv/bin/python3 simple_oversight.py --loop
 
 Restart=on-failure
 RestartSec=30s
