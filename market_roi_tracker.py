@@ -607,6 +607,13 @@ class MarketROITracker:
                 "total_loss": float(tl),
                 "total_capital": float(tc),
                 "daily_roi": (float(tr) - float(tl)) / denom,
+                # FX-085: Ground Rule 1 scorecard — GROSS rewards earned per $ of
+                # capital committed over the window. Distinct from daily_roi
+                # (which nets out losses): capital_efficiency answers "how much
+                # reward is each committed dollar farming?", the metric Rule 1
+                # optimizes. Was previously UNMEASURED (eval gap). Meaningful
+                # only when total_capital is real (>0); the consumer guards on it.
+                "capital_efficiency": float(tr) / denom,
                 "n_markets": int(nm),
                 "n_loss_markets": int(nlm or 0),
                 "n_reward_markets": int(nrm or 0),

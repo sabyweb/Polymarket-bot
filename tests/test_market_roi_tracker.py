@@ -89,6 +89,21 @@ def _insert_capital_snapshot(db_path: str, cid: str, ts: float, capital: float):
     conn.close()
 
 
+def _insert_market_roi(db_path: str, cid: str, window: str, reward: float,
+                       capital: float, loss: float = 0.0, fills: int = 0):
+    """Insert a market_roi row directly (bypasses tick) so get_global_summary
+    reads a known reward/capital pair — used by the FX-085 capital_efficiency tests."""
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "INSERT INTO market_roi (condition_id, window, window_end_ts, reward_earned, "
+        "fill_loss, capital_committed_avg, roi, fill_count, fill_rate_per_hour, "
+        "samples, last_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (cid, window, 0.0, reward, loss, capital, 0.0, fills, 0.0, fills, 0.0),
+    )
+    conn.commit()
+    conn.close()
+
+
 # ── R1: empty DB ──
 
 def test_R1_empty_db_tick_is_noop():
@@ -305,6 +320,43 @@ def test_R12_get_global_summary_aggregates():
     assert gs["n_loss_markets"] == 2  # 0xA + 0xB
     assert gs["n_reward_markets"] == 0  # no API data
     assert gs["fill_count_total"] >= 1  # at least 0xC's fill
+    assert "capital_efficiency" in gs  # FX-085: always present
+    os.unlink(db)
+
+
+# ── FX-085: capital_efficiency (Ground Rule 1 scorecard) ──
+
+def test_FX085_capital_efficiency_ratio():
+    db = _make_db()
+    _insert_market_roi(db, "0xA", "24h", reward=1.5, capital=100.0)
+    _insert_market_roi(db, "0xB", "24h", reward=0.5, capital=100.0)
+    tracker = _make_tracker(db)
+    gs = tracker.get_global_summary("24h")  # no tick() → reads inserted rows
+    # total_reward 2.0 / total_capital 200.0 = 0.01 reward per $ committed.
+    assert gs["total_reward"] == pytest.approx(2.0)
+    assert gs["total_capital"] == pytest.approx(200.0)
+    assert gs["capital_efficiency"] == pytest.approx(0.01)
+    os.unlink(db)
+
+
+def test_FX085_capital_efficiency_zero_capital_is_safe():
+    db = _make_db()
+    _insert_market_roi(db, "0xA", "24h", reward=0.0, capital=0.0)
+    tracker = _make_tracker(db)
+    gs = tracker.get_global_summary("24h")
+    # denom floored at 0.01 → no div-by-zero; efficiency resolves to 0.0.
+    assert gs["capital_efficiency"] == pytest.approx(0.0)
+    os.unlink(db)
+
+
+def test_FX085_capital_efficiency_is_gross_not_net():
+    # capital_efficiency is GROSS reward/capital; daily_roi nets out loss.
+    db = _make_db()
+    _insert_market_roi(db, "0xA", "24h", reward=2.0, capital=100.0, loss=1.0)
+    tracker = _make_tracker(db)
+    gs = tracker.get_global_summary("24h")
+    assert gs["capital_efficiency"] == pytest.approx(0.02)        # 2.0 / 100
+    assert gs["daily_roi"] == pytest.approx(0.01)                 # (2.0-1.0) / 100
     os.unlink(db)
 
 

@@ -373,6 +373,46 @@ def run_once(
     # 5. Write alloc file
     allocator.write_allocation_json(result, output_path=output_path)
 
+    # 5a. FX-085: capital-efficiency metric (Ground Rule 1 scorecard — GROSS
+    # rewards per $ of committed capital). Previously UNMEASURED (the eval's
+    # capital-efficiency gap). Computed from the ROI tracker's 24h global
+    # summary, logged each cycle ([LEARN_CAPEFF]) and stamped into the
+    # [SIMPLE_ALLOC] line. Observational only: an auto-correction trigger on
+    # this metric (Ground Rule 3 #2) needs live reward data to calibrate and is
+    # intentionally NOT wired to allocation yet. Fail-quiet.
+    capital_efficiency = None
+    daily_roi = None
+    if tracker is not None:
+        try:
+            from config import cfg as _cfg_ce
+            gsum = tracker.get_global_summary("24h")
+            capital_efficiency = gsum.get("capital_efficiency")
+            daily_roi = gsum.get("daily_roi")
+            tcap = float(gsum.get("total_capital", 0.0) or 0.0)
+            ce_line = {
+                "window": "24h",
+                "capital_efficiency": (
+                    round(capital_efficiency, 6) if capital_efficiency is not None else None
+                ),
+                "daily_roi": round(daily_roi, 6) if daily_roi is not None else None,
+                "total_reward": round(float(gsum.get("total_reward", 0.0) or 0.0), 4),
+                "total_capital": round(tcap, 2),
+            }
+            log.info(f"[LEARN_CAPEFF] {ce_line}")
+            target = _cfg_ce("RF_CAPITAL_EFFICIENCY_TARGET_24H")
+            if (
+                target and target > 0 and tcap >= 1.0
+                and capital_efficiency is not None
+                and capital_efficiency < target
+            ):
+                log.warning(
+                    f"[LEARN_WARN] capital_efficiency {capital_efficiency:.5f} "
+                    f"< target {target:.5f} (24h, capital ${tcap:.2f}) — "
+                    f"reward yield per $ below floor"
+                )
+        except Exception as e:
+            log.debug(f"[LEARN_CAPEFF] skipped (fail-quiet): {e}")
+
     # 6. Telemetry
     summary = {
         "wallet": round(wallet, 2),
@@ -382,6 +422,10 @@ def run_once(
         "num_avoid": len(result.avoids),
         "capital_deployed": result.capital_deployed,
         "expected_total_reward": result.expected_total_reward,
+        "capital_efficiency": (
+            round(capital_efficiency, 6) if capital_efficiency is not None else None
+        ),
+        "daily_roi": round(daily_roi, 6) if daily_roi is not None else None,
         "kill_switch": result.kill_switch,
         "kill_reason": result.kill_reason,
         "sources": result.sources_used,
