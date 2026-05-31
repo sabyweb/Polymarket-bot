@@ -238,5 +238,51 @@ class TestMarketExpiryCacheMigration(unittest.TestCase):
             db.close()
 
 
+class TestRollbackQuietFX080(unittest.TestCase):
+    """FX-080: a failed write must roll back so it never leaves an OPEN
+    transaction wedging the shared thread-local connection. An un-rolled-back
+    transaction holds the WAL write lock -> 'database is locked' for every other
+    writer + stalled checkpoint (the oversight wedge that froze
+    wallet_reconcile_history and made the ROI cache upsert fail every cycle)."""
+
+    def setUp(self):
+        self.db_fd, self.db_path = tempfile.mkstemp(suffix=".db")
+        self.db = BotDatabase(self.db_path)
+
+    def tearDown(self):
+        self.db.close()
+        os.close(self.db_fd)
+        os.unlink(self.db_path)
+
+    def test_rollback_quiet_clears_wedge_and_connection_recovers(self):
+        conn = self.db._get_conn()
+        # Simulate a write whose commit failed without rollback: an open
+        # transaction left behind (the wedge that held the WAL write lock).
+        conn.execute(
+            "INSERT INTO reward_tracker_state (key, value) VALUES ('wedge', '1')"
+        )
+        self.assertTrue(conn.in_transaction)
+
+        self.db._rollback_quiet()
+
+        # Wedge cleared: no open transaction, and the speculative row is gone.
+        self.assertFalse(conn.in_transaction)
+        n = conn.execute(
+            "SELECT COUNT(*) FROM reward_tracker_state WHERE key='wedge'"
+        ).fetchone()[0]
+        self.assertEqual(n, 0)
+
+        # Connection usable again — a normal write commits cleanly.
+        self.db.save_usdc_balance(123.45)
+        bal, _ = self.db.load_usdc_balance()
+        self.assertEqual(bal, 123.45)
+
+    def test_rollback_quiet_is_noop_when_clean(self):
+        # No open transaction -> must not raise, must not change state.
+        self.assertFalse(self.db._get_conn().in_transaction)
+        self.db._rollback_quiet()  # no-op
+        self.assertFalse(self.db._get_conn().in_transaction)
+
+
 if __name__ == "__main__":
     unittest.main()

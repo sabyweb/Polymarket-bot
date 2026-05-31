@@ -499,6 +499,23 @@ class BotDatabase:
             self._local.conn = conn
         return self._local.conn
 
+    def _rollback_quiet(self) -> None:
+        """FX-080: roll back the thread-local connection's pending transaction so
+        a FAILED write never leaves an open transaction behind.
+
+        An un-rolled-back transaction holds the WAL write lock — every other
+        writer then gets ``database is locked`` (busy_timeout exhausted), and WAL
+        checkpointing stalls (unbounded WAL growth). That was the oversight-process
+        wedge that froze ``wallet_reconcile_history`` and made the ROI cache upsert
+        fail every cycle. Call from any write method's ``except`` block; it is a
+        no-op when there is nothing to roll back (and never raises)."""
+        try:
+            conn = getattr(self._local, "conn", None)
+            if conn is not None:
+                conn.rollback()
+        except Exception:
+            pass
+
     def _init_schema(self) -> None:
         """Create tables if they don't exist, and migrate existing tables."""
         try:
@@ -658,6 +675,7 @@ class BotDatabase:
             conn.commit()
             return cur.rowcount > 0
         except Exception as e:
+            self._rollback_quiet()
             log.warning(
                 f"[FILL_WRITE] DB log_fill error: cid={condition_id[:12]} "
                 f"side={side} shares={shares:.2f} event_id={fill_event_id[:32]} "
@@ -773,6 +791,7 @@ class BotDatabase:
             conn.commit()
             return cur.rowcount > 0
         except Exception as e:
+            self._rollback_quiet()
             log.warning(
                 f"[UNWIND_WRITE] DB log_unwind error: cid={condition_id[:12]} "
                 f"side={side} shares={shares:.2f} pnl=${pnl:+.2f} "
@@ -795,7 +814,8 @@ class BotDatabase:
             )
             conn.commit()
         except Exception as e:
-            log.debug(f"DB log_order_placed error: {e}")
+            self._rollback_quiet()
+            log.warning(f"DB log_order_placed error: {e}")
 
     def log_order_cancelled(
         self, order_id: str, reason: str = "",
@@ -814,7 +834,8 @@ class BotDatabase:
             )
             conn.commit()
         except Exception as e:
-            log.debug(f"DB log_order_cancelled error: {e}")
+            self._rollback_quiet()
+            log.warning(f"DB log_order_cancelled error: {e}")
 
     def log_cycle_snapshot(
         self, cycle_num: int, condition_id: str,
@@ -839,7 +860,8 @@ class BotDatabase:
             )
             conn.commit()
         except Exception as e:
-            log.debug(f"DB log_cycle_snapshot error: {e}")
+            self._rollback_quiet()
+            log.warning(f"DB log_cycle_snapshot error: {e}")
 
     def log_merge(
         self, condition_id: str, shares: float, freed_usd: float,
@@ -854,7 +876,8 @@ class BotDatabase:
             )
             conn.commit()
         except Exception as e:
-            log.debug(f"DB log_merge error: {e}")
+            self._rollback_quiet()
+            log.warning(f"DB log_merge error: {e}")
 
     def log_stop_loss(
         self, condition_id: str, side: str, shares: float,
@@ -872,7 +895,8 @@ class BotDatabase:
             )
             conn.commit()
         except Exception as e:
-            log.debug(f"DB log_stop_loss error: {e}")
+            self._rollback_quiet()
+            log.warning(f"DB log_stop_loss error: {e}")
 
     def log_hourly_snapshot(
         self, hour_label: str, num_markets: int,
@@ -903,7 +927,8 @@ class BotDatabase:
             )
             conn.commit()
         except Exception as e:
-            log.debug(f"DB log_hourly_snapshot error: {e}")
+            self._rollback_quiet()
+            log.warning(f"DB log_hourly_snapshot error: {e}")
 
     def log_market_selection(
         self, condition_id: str, question: str, action: str,
@@ -923,7 +948,8 @@ class BotDatabase:
             )
             conn.commit()
         except Exception as e:
-            log.debug(f"DB log_market_selection error: {e}")
+            self._rollback_quiet()
+            log.warning(f"DB log_market_selection error: {e}")
 
     def log_reward_comparison(
         self, condition_id: str = "",
@@ -944,7 +970,8 @@ class BotDatabase:
             )
             conn.commit()
         except Exception as e:
-            log.debug(f"DB log_reward_comparison error: {e}")
+            self._rollback_quiet()
+            log.warning(f"DB log_reward_comparison error: {e}")
 
     def get_reward_accuracy_history(self, days: int = 7) -> list[dict]:
         """Get reward estimate vs actual history for variance analysis."""
@@ -1087,7 +1114,8 @@ class BotDatabase:
             )
             conn.commit()
         except Exception as e:
-            log.debug(f"DB save_position error: {e}")
+            self._rollback_quiet()
+            log.warning(f"DB save_position error: {e}")
 
     def save_all_positions(self, positions: dict) -> None:
         """Batch UPSERT all positions in a single transaction.
@@ -1124,7 +1152,7 @@ class BotDatabase:
                 )
             conn.commit()
         except Exception as e:
-            log.debug(f"DB save_all_positions error: {e}")
+            log.warning(f"DB save_all_positions error: {e}")
             try:
                 conn.rollback()
             except Exception:
@@ -1164,7 +1192,8 @@ class BotDatabase:
             )
             conn.commit()
         except Exception as e:
-            log.debug(f"DB delete_position error: {e}")
+            self._rollback_quiet()
+            log.warning(f"DB delete_position error: {e}")
 
     # ── A3: Reward Tracker Persistence (replaces reward_history.json) ─────
 
@@ -1182,7 +1211,8 @@ class BotDatabase:
                 )
             conn.commit()
         except Exception as e:
-            log.debug(f"DB save_reward_state error: {e}")
+            self._rollback_quiet()
+            log.warning(f"DB save_reward_state error: {e}")
 
     def load_reward_state(self) -> dict:
         """Load scalar reward tracker state."""
@@ -1209,7 +1239,8 @@ class BotDatabase:
             )
             conn.commit()
         except Exception as e:
-            log.debug(f"DB save_usdc_balance error: {e}")
+            self._rollback_quiet()
+            log.warning(f"DB save_usdc_balance error: {e}")
 
     def load_usdc_balance(self) -> tuple[float | None, float]:
         """Load USDC balance written by bot. Returns (balance, timestamp)."""
@@ -1258,7 +1289,7 @@ class BotDatabase:
                 )
             conn.commit()
         except Exception as e:
-            log.debug(f"DB save_all_reward_stats error: {e}")
+            log.warning(f"DB save_all_reward_stats error: {e}")
             try:
                 conn.rollback()
             except Exception:
@@ -1428,7 +1459,8 @@ class BotDatabase:
             )
             self._get_conn().commit()
         except Exception as e:
-            log.debug(f"write_placement_feedback error: {e}")
+            self._rollback_quiet()
+            log.warning(f"write_placement_feedback error: {e}")
 
     def query_all_placement_feedback(self) -> dict[str, dict]:
         """Read all placement feedback. Returns {condition_id: {"yes": {status, reason, ts}, "no": ...}}."""
@@ -1471,7 +1503,8 @@ class BotDatabase:
             )
             self._get_conn().commit()
         except Exception as e:
-            log.debug(f"save_performance_snapshot error: {e}")
+            self._rollback_quiet()
+            log.warning(f"save_performance_snapshot error: {e}")
 
     def save_performance_batch(self, snapshots: list[dict]) -> None:
         """Write multiple performance snapshots in one transaction."""
@@ -1498,7 +1531,8 @@ class BotDatabase:
             conn.commit()
             log.debug(f"Saved {len(snapshots)} performance snapshots")
         except Exception as e:
-            log.debug(f"save_performance_batch error: {e}")
+            self._rollback_quiet()
+            log.warning(f"save_performance_batch error: {e}")
 
     def get_market_performance_history(
         self, condition_id: str, days: int = 7
@@ -1556,7 +1590,8 @@ class BotDatabase:
             )
             self._get_conn().commit()
         except Exception as e:
-            log.debug(f"save_dump_state error: {e}")
+            self._rollback_quiet()
+            log.warning(f"save_dump_state error: {e}")
 
     def load_all_dump_states(self) -> dict[str, dict]:
         """Load all saved dump states. Returns {(cid, side): state_dict}."""
@@ -1587,7 +1622,8 @@ class BotDatabase:
             )
             self._get_conn().commit()
         except Exception as e:
-            log.debug(f"delete_dump_state error: {e}")
+            self._rollback_quiet()
+            log.warning(f"delete_dump_state error: {e}")
 
     # ── Unliquidatable Markets (FX-005/006/007/008/009/028) ──────────
     # A market lands in this table when the bot definitively confirms its
@@ -1609,7 +1645,8 @@ class BotDatabase:
             )
             self._get_conn().commit()
         except Exception as e:
-            log.debug(f"mark_unliquidatable error: {e}")
+            self._rollback_quiet()
+            log.warning(f"mark_unliquidatable error: {e}")
 
     def is_unliquidatable(self, condition_id: str) -> bool:
         """Single-cid lookup. Returns False on DB errors (conservative —
@@ -1634,7 +1671,8 @@ class BotDatabase:
             )
             self._get_conn().commit()
         except Exception as e:
-            log.debug(f"delete_unliquidatable error: {e}")
+            self._rollback_quiet()
+            log.warning(f"delete_unliquidatable error: {e}")
 
     def update_unliquidatable_retry(self, condition_id: str) -> None:
         """Stamp last_retry_at without un-marking (re-probe found the
@@ -1647,7 +1685,8 @@ class BotDatabase:
             )
             self._get_conn().commit()
         except Exception as e:
-            log.debug(f"update_unliquidatable_retry error: {e}")
+            self._rollback_quiet()
+            log.warning(f"update_unliquidatable_retry error: {e}")
 
     def load_unliquidatable_set(self) -> set[str]:
         """Return the full set of unliquidatable cids.
@@ -1699,7 +1738,8 @@ class BotDatabase:
             )
             self._get_conn().commit()
         except Exception as e:
-            log.debug(f"save_active_order error: {e}")
+            self._rollback_quiet()
+            log.warning(f"save_active_order error: {e}")
 
     def load_active_orders(self) -> list[dict]:
         """Load all saved active orders."""
@@ -1718,7 +1758,8 @@ class BotDatabase:
             )
             self._get_conn().commit()
         except Exception as e:
-            log.debug(f"delete_active_order error: {e}")
+            self._rollback_quiet()
+            log.warning(f"delete_active_order error: {e}")
 
     # ── FX-049: Wallet reconciliation history ───────────────────────────
 
@@ -1763,7 +1804,8 @@ class BotDatabase:
             )
             conn.commit()
         except Exception as e:
-            log.debug(f"insert_wallet_reconcile error: {e}")
+            self._rollback_quiet()
+            log.warning(f"insert_wallet_reconcile error: {e}")
 
     def sum_fills_usd_since(self, since_ts: float) -> float:
         """Σ usd_value of fills strictly after ``since_ts``. 0 on empty/err.
@@ -1806,7 +1848,8 @@ class BotDatabase:
             self._get_conn().execute("DELETE FROM dump_states")
             self._get_conn().commit()
         except Exception as e:
-            log.debug(f"clear_all_active_orders error: {e}")
+            self._rollback_quiet()
+            log.warning(f"clear_all_active_orders error: {e}")
 
     def purge_all_active_orders(self) -> int:
         """Purge all active orders and dump states. Returns count deleted."""
@@ -1818,7 +1861,8 @@ class BotDatabase:
             conn.commit()
             return count
         except Exception as e:
-            log.debug(f"purge_all_active_orders error: {e}")
+            self._rollback_quiet()
+            log.warning(f"purge_all_active_orders error: {e}")
             return 0
 
     # ── Phase 0: Data Collection Methods ──────────────────────────────────
@@ -1861,7 +1905,8 @@ class BotDatabase:
             )
             conn.commit()
         except Exception as e:
-            log.debug(f"DB log_book_snapshot error: {e}")
+            self._rollback_quiet()
+            log.warning(f"DB log_book_snapshot error: {e}")
 
     def log_scoring_snapshot(self, scoring_data: list[tuple]) -> None:
         """Batch-insert scoring status for all orders.
@@ -1883,7 +1928,8 @@ class BotDatabase:
             )
             conn.commit()
         except Exception as e:
-            log.debug(f"DB log_scoring_snapshot error: {e}")
+            self._rollback_quiet()
+            log.warning(f"DB log_scoring_snapshot error: {e}")
 
     def prune_phase0_data(self, retention_days: int = 7) -> int:
         """Delete book_snapshots and scoring_snapshots older than retention window."""
@@ -1898,7 +1944,8 @@ class BotDatabase:
                 log.info(f"Phase0 pruning: removed {d1} book + {d2} scoring snapshots (>{retention_days}d)")
             return total
         except Exception as e:
-            log.debug(f"DB prune_phase0_data error: {e}")
+            self._rollback_quiet()
+            log.warning(f"DB prune_phase0_data error: {e}")
             return 0
 
     def close(self) -> None:
