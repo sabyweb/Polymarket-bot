@@ -6,6 +6,7 @@ Two-process bot that farms Polymarket liquidity rewards while remaining profitab
 
 ## Documentation
 
+- **`docs/HANDOFF.md`** — ⭐ start here: complete system handoff + status + file manifest (what to read, what's live, what's legacy, server-only files, operations).
 - **`Polymarket bot architecture v5.1.md`** — system reference (states, invariants, allocator math, ops runbook).
 - **`Polymarket bot fixit.md`** — living tracker of open issues, the FX-NNN backlog, and the phased hardening roadmap.
 
