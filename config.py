@@ -287,6 +287,27 @@ RF_FILL_BREAKER_SIDE_THRESHOLD: int = 2      # Same-side fills to trigger block
 RF_KILL_FILL_HISTORY_SECS: int = 21600       # FX-069: prune horizon for MarketState.kill_fill_times — the fill-rate KILL-SWITCH history, kept SEPARATE from the 180s RF_FILL_BREAKER_WINDOW (which can_place prunes for placement throttling). MUST stay >= GUARDRAIL_FILLRATE_BASELINE_SECS (21600/6h, reward_farmer.py) or the 6h baseline can't accumulate and the slow-bleed spike kill silently regresses to ">=5 fills/180s" (the FX-069 bug).
 RF_SPORTS_BLOCK_HOURS: float = 4.0           # Block sports markets expiring within this many hours
 RF_GAME_BLOCK_HOURS: float = 1.0             # Block sports markets within N hours of game_start_time (pre-kickoff + in-play); 0 disables
+
+# ── FX-090: Allocator-side adverse-selection / time-to-event filter ──────────
+# The OverCommitAllocator (simple_allocator.py) ranks markets purely by
+# expected_daily_reward = daily_rate × q_share. The highest-rate markets are
+# disproportionately short-dated daily/news/sports markets near a decisive
+# event (resolution or game start) — exactly the markets the farmer's own
+# guards (EXPIRY SWEEP at <1h to end_date, RF_SPORTS/GAME_BLOCK_HOURS) then
+# REFUSE to place. Observed on Helsinki 2026-06-01: oversight deployed 5
+# markets, farmer placed 0 ("0/5 on-book") → farming nothing; and when such
+# markets DID fill (first canary) they filled adversely (price converged /
+# news moved) → loss. These knobs let the ALLOCATOR exclude near-event markets
+# UPSTREAM so it only proposes markets the farmer will place + that are
+# slow-moving enough for passive making. game_start_time + end_date_iso come
+# from one CLOB /markets/{cid} lookup per ranked candidate, cached. Fail-open:
+# markets whose timing can't be fetched are NOT excluded (the farmer's live
+# sweep stays the real-time backstop).
+RF_ALLOC_MIN_HOURS_TO_RESOLUTION: float = 48.0  # Exclude markets resolving within this many hours of end_date_iso (or already past). Catches daily up/down + near-resolution convergence. 0 disables this axis.
+RF_ALLOC_MIN_HOURS_TO_GAME_START: float = 12.0  # Exclude markets within this many hours of game_start_time (pre-event + in-play). Wider than the farmer's RF_GAME_BLOCK_HOURS (1.0) so the allocator never proposes a market that will enter the farmer's block window mid-cycle. 0 disables this axis.
+RF_ALLOC_MAX_TIMING_FETCHES: int = 300          # Per-oversight-cycle budget on CLOB /markets/{cid} timing-enrichment calls. Only ranked candidates we'd actually deploy are enriched, until the deploy cap fills; with the TTL cache below, steady-state cost is near zero. 0 disables enrichment (filter then acts only on pre-populated timing).
+RF_ALLOC_TIMING_CACHE_TTL_SEC: float = 21600.0  # Cache TTL for fetched (game_start_time, end_date_iso) per cid — ~immutable data, so 6h keeps re-fetches rare while tolerating the occasional reschedule.
+
 RF_BOOK_CACHE_TTL: int = 180                 # Max age (seconds) for MarketState.cached_book used by Q-score sampling in record_cycle; 0 disables
 RF_ORDER_STALE_CHECK_SECS: int = 300         # Force-check orders still in open_ids after this many seconds
 

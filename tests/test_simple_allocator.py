@@ -671,3 +671,155 @@ def test_C23_excluded_cids_param_omitted_works():
         realized_loss_24h=0, markets=[cand],
     )
     assert {m.condition_id for m in result.deploys} == {"0xLEGACY"}
+
+
+# ── FX-090 adverse-selection / time-to-event filter contracts ──
+#
+# The allocator ranks by daily_rate × q_share, so the highest-rate markets are
+# disproportionately short-dated daily/news/sports markets near a decisive
+# event — exactly the ones the farmer's EXPIRY SWEEP / RF_GAME_BLOCK refuse to
+# place (→ 0 orders, farming nothing) and that fill adversely. FX-090 excludes
+# them UPSTREAM in the allocator. Defaults: RF_ALLOC_MIN_HOURS_TO_RESOLUTION=48,
+# RF_ALLOC_MIN_HOURS_TO_GAME_START=12.
+
+from datetime import datetime as _dt, timezone as _tz
+
+_NOW = 1700000000  # matches _make_allocator default _now
+
+
+def _iso(hours_from_now, now_epoch=_NOW):
+    """ISO8601 (…Z) timestamp `hours_from_now` hours from the fixed test clock."""
+    return _dt.fromtimestamp(now_epoch + hours_from_now * 3600, tz=_tz.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+
+def _alloc_with_q(cid_to_q):
+    a = _make_allocator()
+    a.fetch_current_q_shares = lambda: {}
+    a.load_cumulative_ratios = lambda: dict(cid_to_q)
+    return a
+
+
+def _compute_one(a, candidates):
+    return a.compute(
+        wallet_usd=2000, wallet_peak_usd=2000, wallet_24h_ago_usd=2000,
+        realized_loss_24h=0, markets=candidates,
+    )
+
+
+def test_C24_filters_market_resolving_within_horizon():
+    """C24: a market resolving inside RF_ALLOC_MIN_HOURS_TO_RESOLUTION (48h) is
+    excluded — this is the daily 'Up or Down on <today>' class."""
+    a = _alloc_with_q({"0xSOON": 0.05})
+    soon = _make_candidate("0xSOON", daily_rate=500)
+    soon.end_date_iso = _iso(10)  # resolves in 10h < 48h floor
+    result = _compute_one(a, [soon])
+    assert "0xSOON" not in {m.condition_id for m in result.deploys}
+    assert "0xSOON" in {m.condition_id for m in result.avoids}
+
+
+def test_C25_keeps_market_resolving_far_out():
+    """C25: a market resolving well beyond the horizon (5 days) is kept."""
+    a = _alloc_with_q({"0xFAR": 0.05})
+    far = _make_candidate("0xFAR", daily_rate=500)
+    far.end_date_iso = _iso(120)  # 5 days out
+    result = _compute_one(a, [far])
+    assert "0xFAR" in {m.condition_id for m in result.deploys}
+
+
+def test_C26_filters_already_resolved_market():
+    """C26: a market already past its end_date (negative hours) is excluded."""
+    a = _alloc_with_q({"0xPAST": 0.05})
+    past = _make_candidate("0xPAST", daily_rate=500)
+    past.end_date_iso = _iso(-5)  # resolved 5h ago
+    result = _compute_one(a, [past])
+    assert "0xPAST" not in {m.condition_id for m in result.deploys}
+
+
+def test_C27_filters_imminent_game_start():
+    """C27 (the user's scenario): a sports market whose game starts soon is
+    excluded even though resolution is far out — informed flow picks off stale
+    quotes once the event begins."""
+    a = _alloc_with_q({"0xGAME": 0.05})
+    g = _make_candidate("0xGAME", daily_rate=500)
+    g.end_date_iso = _iso(120)      # resolution far → resolution axis won't catch it
+    g.game_start_time = _iso(2)     # kickoff in 2h < 12h game floor
+    result = _compute_one(a, [g])
+    assert "0xGAME" not in {m.condition_id for m in result.deploys}
+
+
+def test_C28_keeps_distant_game():
+    """C28: a sports market whose game is days away (and resolves far out) is kept."""
+    a = _alloc_with_q({"0xLATER": 0.05})
+    g = _make_candidate("0xLATER", daily_rate=500)
+    g.end_date_iso = _iso(168)      # a week out
+    g.game_start_time = _iso(120)   # game in 5 days > 12h floor
+    result = _compute_one(a, [g])
+    assert "0xLATER" in {m.condition_id for m in result.deploys}
+
+
+def test_C29_enriches_via_provider_and_excludes():
+    """C29: when a candidate carries no timing, the allocator enriches it via the
+    timing provider (prod: CLOB /markets/{cid}) and applies the filter."""
+    a = _alloc_with_q({"0xENR": 0.05})
+    a._timing_provider = lambda cid: ("", _iso(5))  # resolves in 5h
+    cand = _make_candidate("0xENR", daily_rate=500)  # no timing on the candidate
+    result = _compute_one(a, [cand])
+    assert "0xENR" not in {m.condition_id for m in result.deploys}
+
+
+def test_C30_fail_open_on_timing_error():
+    """C30: if timing can't be obtained (provider raises), the market is NOT
+    excluded — fail-open; the farmer's live sweep is the backstop."""
+    def boom(cid):
+        raise ConnectionError("network down")
+    a = _alloc_with_q({"0xFAILOPEN": 0.05})
+    a._timing_provider = boom
+    cand = _make_candidate("0xFAILOPEN", daily_rate=500)
+    result = _compute_one(a, [cand])
+    assert "0xFAILOPEN" in {m.condition_id for m in result.deploys}
+
+
+def test_C31_filter_disabled_via_knobs(monkeypatch):
+    """C31: setting both hour-floors to 0 disables the filter — a near-resolution
+    market deploys (escape hatch / reversibility)."""
+    monkeypatch.setattr(sa, "ALLOC_MIN_HOURS_TO_RESOLUTION", lambda: 0.0)
+    monkeypatch.setattr(sa, "ALLOC_MIN_HOURS_TO_GAME_START", lambda: 0.0)
+    a = _alloc_with_q({"0xDIS": 0.05})
+    cand = _make_candidate("0xDIS", daily_rate=500)
+    cand.end_date_iso = _iso(1)  # would be excluded if the filter were on
+    result = _compute_one(a, [cand])
+    assert "0xDIS" in {m.condition_id for m in result.deploys}
+
+
+def test_C32_backfills_safe_market_when_top_excluded():
+    """C32: the highest-reward market being near-resolution does not waste a
+    deploy slot — the allocator walks past it to a safe lower-ranked market."""
+    a = _alloc_with_q({"0xTOP": 0.10, "0xSAFE": 0.05})
+    top = _make_candidate("0xTOP", daily_rate=1000)   # ranks first (expected=100)
+    top.end_date_iso = _iso(3)                        # near resolution → excluded
+    safe = _make_candidate("0xSAFE", daily_rate=500)  # expected=25
+    safe.end_date_iso = _iso(200)                     # far → safe
+    result = _compute_one(a, [top, safe])
+    deploys = {m.condition_id for m in result.deploys}
+    assert "0xTOP" not in deploys
+    assert "0xSAFE" in deploys
+
+
+def test_C33_alloc_json_carries_timing_when_known():
+    """C33: when timing is known, the deploy row carries end_date_iso +
+    game_start_time so the farmer doesn't have to re-fetch (and its own
+    sweep has the data immediately)."""
+    a = _alloc_with_q({"0xT": 0.05})
+    cand = _make_candidate("0xT", daily_rate=500)
+    cand.end_date_iso = _iso(200)
+    result = _compute_one(a, [cand])
+    tmp = tempfile.mktemp(suffix=".json")
+    a.write_allocation_json(result, output_path=tmp)
+    with open(tmp) as f:
+        data = json.load(f)
+    deploy = next(m for m in data["markets"] if m.get("action") == "deploy")
+    assert deploy["end_date_iso"] == cand.end_date_iso
+    assert "game_start_time" in deploy
+    os.unlink(tmp)

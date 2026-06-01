@@ -69,6 +69,11 @@ def MAX_DEPLOYED_MARKETS(): return cfg("RF_OVERCOMMIT_MAX_DEPLOYED_MARKETS")
 def PER_MARKET_BUFFER_FRAC(): return cfg("RF_OVERCOMMIT_PER_MARKET_BUFFER_FRAC")
 def EXPECTED_FILL_COST_FRAC(): return cfg("RF_OVERCOMMIT_EXPECTED_FILL_COST_FRAC")
 def Q_SHARE_CONSERVATIVE_FACTOR(): return cfg("RF_OVERCOMMIT_Q_SHARE_CONSERVATIVE_FACTOR")
+# FX-090: allocator-side adverse-selection / time-to-event filter knobs.
+def ALLOC_MIN_HOURS_TO_RESOLUTION(): return cfg("RF_ALLOC_MIN_HOURS_TO_RESOLUTION")
+def ALLOC_MIN_HOURS_TO_GAME_START(): return cfg("RF_ALLOC_MIN_HOURS_TO_GAME_START")
+def ALLOC_MAX_TIMING_FETCHES(): return cfg("RF_ALLOC_MAX_TIMING_FETCHES")
+def ALLOC_TIMING_CACHE_TTL_SEC(): return cfg("RF_ALLOC_TIMING_CACHE_TTL_SEC")
 COLD_START_Q_SHARE = 0.005         # FX-086 (closes FX-064): DEFAULT mirror of the cfg knob RF_COLD_START_Q_SHARE. The live path (estimate_q_share) reads cfg("RF_COLD_START_Q_SHARE") so the prior is runtime-tunable via config_overrides.json (FX-046 says it is 24-94x off and it binds the EV gate). This module constant is retained as the compile-time default + for import-site arithmetic in tests; keep the two values in sync.
 
 # FX-056: Extreme-price filter. Markets with midpoint < 0.10 or > 0.90
@@ -89,6 +94,7 @@ CLOB_HOST = "https://clob.polymarket.com"
 USER_PCTS_PATH = "/rewards/user/percentages"
 USER_TOTAL_PATH = "/rewards/user/total"
 MARKETS_CURRENT_PATH = "/rewards/markets/current"
+MARKET_DETAIL_PATH = "/markets/"        # FX-090: per-market timing (game_start_time, end_date_iso)
 
 
 @dataclass
@@ -101,6 +107,10 @@ class CandidateMarket:
     max_spread: float           # in basis points per Polymarket convention (e.g., 4.5 = 4.5¢)
     min_size: int
     midpoint_guess: float = 0.5  # used to estimate cost_per_share if no book fetched
+    # FX-090: time-to-event fields (from CLOB /markets/{cid}; "" = unknown).
+    # Pre-populatable by a test or a future bulk source to skip enrichment.
+    game_start_time: str = ""
+    end_date_iso: str = ""
 
     # Filled in by SimpleAllocator
     expected_q_share: float = 0.0
@@ -108,6 +118,7 @@ class CandidateMarket:
     q_share_source: str = ""    # "api" | "cumulative" | "cold_start"
     target_shares: int = 0
     target_capital: float = 0.0
+    timing_excluded_reason: str = ""  # FX-090: set when the time-to-event filter avoids this market
 
 
 @dataclass
@@ -143,6 +154,7 @@ class SimpleAllocator:
         # Override hooks for testability
         _now: Optional[callable] = None,
         _http: Optional[callable] = None,
+        _timing_provider: Optional[callable] = None,
     ):
         self.db_path = db_path
         self.wallet_address = wallet_address
@@ -152,6 +164,11 @@ class SimpleAllocator:
         self.api_passphrase = api_passphrase
         self._now = _now or time.time
         self._http = _http or requests.get
+        # FX-090: optional (cid) -> (game_start_time, end_date_iso) provider for
+        # tests/bulk sources; defaults to a CLOB /markets/{cid} fetch via _http.
+        self._timing_provider = _timing_provider
+        # FX-090: per-cid timing cache {cid: (fetched_at, game_start, end_date)}.
+        self._timing_cache: dict[str, tuple] = {}
 
     # ── Polymarket API integration ──
 
@@ -343,6 +360,100 @@ class SimpleAllocator:
         """
         return position_notional * EXPECTED_FILL_COST_FRAC()
 
+    # ── FX-090: time-to-event (adverse-selection) enrichment + filter ──
+    #
+    # The candidate source (/rewards/markets/current) carries neither the
+    # market resolution date (its end_date is a far-future reward-program
+    # sentinel, e.g. 2500-12-31) nor game_start_time. CLOB /markets/{cid}
+    # carries both. We enrich only the ranked candidates we'd actually deploy
+    # (until the deploy cap fills), cache the ~immutable result, and exclude
+    # markets too close to a decisive event. Fail-open everywhere: a market
+    # whose timing can't be fetched/parsed is NOT excluded — the farmer's live
+    # EXPIRY SWEEP + RF_SPORTS/GAME_BLOCK remain the real-time backstop.
+
+    def _fetch_timing(self, cid: str) -> tuple[str, str]:
+        """Return (game_start_time, end_date_iso) for one market; ("","") on failure."""
+        if self._timing_provider is not None:
+            try:
+                gs, ed = self._timing_provider(cid)
+                return (gs or "", ed or "")
+            except Exception as e:
+                log.debug(f"timing provider error {cid[:10]}: {e}")
+                return ("", "")
+        try:
+            r = self._http(f"{CLOB_HOST}{MARKET_DETAIL_PATH}{cid}", timeout=10)
+            if getattr(r, "status_code", 0) != 200:
+                return ("", "")
+            m = r.json()
+            return (
+                str(m.get("game_start_time", "") or ""),
+                str(m.get("end_date_iso", "") or ""),
+            )
+        except Exception as e:
+            log.debug(f"timing fetch error {cid[:10]}: {e}")
+            return ("", "")
+
+    def _get_timing(self, m: "CandidateMarket", budget: dict) -> None:
+        """Populate m.game_start_time / m.end_date_iso — cached, budget-bounded.
+
+        No-op if timing is already present (pre-populated), if enrichment is
+        disabled (RF_ALLOC_MAX_TIMING_FETCHES <= 0), if BOTH hour-floors are
+        disabled (nothing to filter on), or if the per-cycle fetch budget is
+        spent (fail-open).
+        """
+        if m.end_date_iso or m.game_start_time:
+            return
+        if ALLOC_MAX_TIMING_FETCHES() <= 0:
+            return
+        if ALLOC_MIN_HOURS_TO_RESOLUTION() <= 0 and ALLOC_MIN_HOURS_TO_GAME_START() <= 0:
+            return
+        cid = m.condition_id
+        now = self._now()
+        ttl = ALLOC_TIMING_CACHE_TTL_SEC()
+        cached = self._timing_cache.get(cid)
+        if cached and (ttl <= 0 or (now - cached[0]) < ttl):
+            m.game_start_time, m.end_date_iso = cached[1], cached[2]
+            return
+        if budget["fetches"] >= ALLOC_MAX_TIMING_FETCHES():
+            budget["exhausted"] = True
+            return
+        gs, ed = self._fetch_timing(cid)
+        budget["fetches"] += 1
+        if gs or ed:  # cache only successful lookups so transient failures retry
+            self._timing_cache[cid] = (now, gs, ed)
+        m.game_start_time, m.end_date_iso = gs, ed
+
+    def _timing_excluded(self, m: "CandidateMarket") -> tuple[bool, str]:
+        """True if too close to a decisive event (resolution or game start).
+
+        Pure function of m's timing fields + cfg + now. Fail-open: unparseable
+        or absent timing is never excluded.
+        """
+        from datetime import datetime, timezone
+        now_dt = datetime.fromtimestamp(self._now(), tz=timezone.utc)
+
+        res_floor = ALLOC_MIN_HOURS_TO_RESOLUTION()
+        if m.end_date_iso and res_floor and res_floor > 0:
+            try:
+                dt = datetime.fromisoformat(m.end_date_iso.replace("Z", "+00:00"))
+                hrs = (dt - now_dt).total_seconds() / 3600.0
+                if hrs < res_floor:
+                    return True, f"resolves_in_{hrs:.1f}h<{res_floor:.0f}h"
+            except (ValueError, TypeError):
+                pass
+
+        game_floor = ALLOC_MIN_HOURS_TO_GAME_START()
+        if m.game_start_time and game_floor and game_floor > 0:
+            try:
+                dt = datetime.fromisoformat(m.game_start_time.replace("Z", "+00:00"))
+                hrs = (dt - now_dt).total_seconds() / 3600.0
+                if hrs < game_floor:
+                    return True, f"game_in_{hrs:.1f}h<{game_floor:.0f}h"
+            except (ValueError, TypeError):
+                pass
+
+        return False, ""
+
     def compute(
         self,
         wallet_usd: float,
@@ -491,12 +602,29 @@ class SimpleAllocator:
         avoids: list[CandidateMarket] = []
         used = 0.0
         positive_ev_count = 0
+        # FX-090: time-to-event enrichment budget + counter for this cycle.
+        timing_budget = {"fetches": 0, "exhausted": False}
+        timing_excluded_count = 0
         for m in eligible:
             if len(deploys) >= max_deploys:
                 # Soft cap hit — extremely rare in practice (5k market pool
                 # × eligibility filters typically yields 100-500 markets).
                 # Logged via the SIMPLE_ALLOC telemetry line; operator can
                 # raise RF_OVERCOMMIT_MAX_DEPLOYED_MARKETS if needed.
+                avoids.append(m)
+                continue
+
+            # FX-090: adverse-selection / time-to-event filter. Enrich this
+            # ranked candidate with game_start_time + end_date_iso (cached,
+            # budget-bounded) and skip markets too close to a decisive event —
+            # the high-rate short-dated daily/news/sports markets the farmer's
+            # own guards refuse to place (wasting deploy slots) and that court
+            # adverse fills. Fail-open: unknown timing → not skipped.
+            self._get_timing(m, timing_budget)
+            t_excluded, t_reason = self._timing_excluded(m)
+            if t_excluded:
+                m.timing_excluded_reason = t_reason
+                timing_excluded_count += 1
                 avoids.append(m)
                 continue
 
@@ -542,9 +670,18 @@ class SimpleAllocator:
         expected_total = sum(m.expected_daily_reward for m in deploys)
         notional_overcommit_ratio = (used / wallet_usd) if wallet_usd > 0 else 0.0
 
+        if timing_budget.get("exhausted"):
+            log.warning(
+                f"[OVERCOMMIT_ALLOC] FX-090 timing-fetch budget "
+                f"({ALLOC_MAX_TIMING_FETCHES()}) exhausted this cycle — remaining "
+                f"candidates deployed WITHOUT the adverse-selection check (farmer "
+                f"expiry sweep remains the backstop). Raise RF_ALLOC_MAX_TIMING_FETCHES "
+                f"if this persists."
+            )
         log.info(
             f"[OVERCOMMIT_ALLOC] eligible={len(eligible)} positive_ev={positive_ev_count} "
             f"deploys={len(deploys)} avoids={len(avoids)} "
+            f"timing_excluded={timing_excluded_count} timing_fetches={timing_budget['fetches']} "
             f"notional_total=${used:.2f} wallet=${wallet_usd:.2f} "
             f"overcommit_ratio={notional_overcommit_ratio:.2f}× "
             f"(target band 3-8× per Ground Rule 2) "
@@ -625,7 +762,8 @@ class SimpleAllocator:
                 "daily_rate": m.daily_rate,
                 "max_spread": m.max_spread / 100.0 if m.max_spread > 1 else m.max_spread,
                 "min_size": m.min_size,
-                "end_date_iso": "",           # farmer fetches from CLOB if missing
+                "end_date_iso": m.end_date_iso or "",        # FX-090: populated when known (farmer no longer re-fetches)
+                "game_start_time": m.game_start_time or "",  # FX-090: populated when known
                 "score": round(m.expected_daily_reward, 6),
                 "q_share_pct": round(m.expected_q_share, 6),
                 "q_share_source": m.q_share_source,
