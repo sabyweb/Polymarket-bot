@@ -68,6 +68,11 @@ WINDOWS: dict[str, float] = {
 
 CLOB_HOST = "https://clob.polymarket.com"
 USER_MARKETS_PATH = "/rewards/user/markets"
+# FX-088: authoritative public source for actual reward/rebate CREDITS (on-chain,
+# no auth). The CLOB /rewards/user/markets endpoint returned a {"data":[...]}
+# envelope the old parser mis-read (looked for "markets"), so reward_earned was
+# always 0 — blinding the bot to its own rewards and poisoning the ROI loop.
+DATA_API_HOST = "https://data-api.polymarket.com"
 
 # How old a daily_reward_cache entry can be (in seconds) before we re-fetch.
 # Polymarket pays daily batches at ~00:20 UTC, so we re-fetch once per cycle
@@ -180,72 +185,102 @@ class MarketROITracker:
     def _utc_date_str(self, ts: float) -> str:
         return time.strftime("%Y-%m-%d", time.gmtime(ts))
 
-    def _fetch_rewards_for_date(self, date: str) -> dict[str, float]:
-        """Fetch per-market reward dict for one UTC date.
+    REWARD_TOTAL_KEY = "__TOTAL__"
 
-        Tries `/rewards/user/markets?date=YYYY-MM-DD`. Returns
-        {condition_id: reward_earned_usd}. Returns {} on any failure
-        (caller falls through to cache or zero).
+    def _fetch_rewards_for_date(self, date: str) -> dict[str, float]:
+        """AGGREGATE maker earnings (liquidity REWARD + MAKER_REBATE) credited
+        on one UTC `date`, from the public data-api /activity feed.
+
+        FX-088: the prior CLOB /rewards/user/markets parser looked for a
+        "markets" key (the API returns "data") and a flat `earnings` field
+        (it's nested per-asset), so reward_earned was ALWAYS 0 — blinding the
+        bot to its own rewards and zeroing capital_efficiency. We now source
+        from the data-api /activity feed (public, no auth, authoritative
+        on-chain credits — the same source the wallet reconciler uses). These
+        REWARD/REBATE credits are AGGREGATE daily lumps (their conditionId is
+        EMPTY — Polymarket does not break the credit out per market here), so
+        we return the single-day total under the sentinel key REWARD_TOTAL_KEY.
+        tick() attributes it across markets proportional to committed capital.
+        Fail-open to {} (caller falls through to cache/zero).
         """
-        if not (self.api_key and self.api_secret and self.funder):
-            # No creds wired up — caller will fall through to cached / zero
-            log.debug("[ROI_TRACKER] reward API skipped: no credentials")
+        if not self.funder:
+            log.debug("[ROI_TRACKER] reward fetch skipped: no funder")
             return {}
         try:
-            # CLOB L2 auth — same shape as SimpleAllocator._auth_headers
-            import base64
-            import hashlib
-            import hmac
-            ts = str(int(self._now()))
-            path = f"{USER_MARKETS_PATH}?date={date}"
-            msg = ts + "GET" + USER_MARKETS_PATH
-            sig = base64.urlsafe_b64encode(
-                hmac.new(
-                    base64.urlsafe_b64decode(self.api_secret),
-                    msg.encode(),
-                    hashlib.sha256,
-                ).digest()
-            ).decode()
-            headers = {
-                "POLY_API_KEY": self.api_key,
-                "POLY_ADDRESS": self.wallet_address or self.funder,
-                "POLY_SIGNATURE": sig,
-                "POLY_PASSPHRASE": self.api_passphrase,
-                "POLY_TIMESTAMP": ts,
-            }
-            r = self._http(
-                f"{CLOB_HOST}{USER_MARKETS_PATH}",
-                params={"date": date, "signature_type": 2},
-                headers=headers,
-                timeout=10,
-            )
-            if r.status_code != 200:
-                log.warning(f"[ROI_TRACKER] reward API date={date} status={r.status_code}")
-                return {}
-            raw = r.json()
-            # Schema observed: list of {condition_id, earnings} or
-            # {markets: [...]}; defensively try both.
-            items = raw.get("markets", raw) if isinstance(raw, dict) else raw
-            out: dict[str, float] = {}
-            if isinstance(items, list):
-                for it in items:
-                    cid = it.get("condition_id") or it.get("conditionId")
-                    earn = it.get("earnings", it.get("reward_earned", 0))
-                    if cid:
-                        try:
-                            out[cid] = float(earn or 0)
-                        except (TypeError, ValueError):
-                            pass
-            elif isinstance(items, dict):
-                for cid, v in items.items():
-                    try:
-                        out[cid] = float(v or 0)
-                    except (TypeError, ValueError):
-                        pass
-            return out
-        except Exception as e:
-            log.warning(f"[ROI_TRACKER] reward API date={date} error: {type(e).__name__}: {e}")
+            import calendar
+            day_start = float(calendar.timegm(time.strptime(date, "%Y-%m-%d")))
+        except (ValueError, TypeError) as e:
+            log.warning(f"[ROI_TRACKER] reward fetch bad date={date}: {e}")
             return {}
+        day_end = day_start + 86400.0
+        total = 0.0
+        got_any = False
+        try:
+            for ptype in ("REWARD", "MAKER_REBATE"):
+                offset = 0
+                while True:
+                    r = self._http(
+                        f"{DATA_API_HOST}/activity",
+                        params={"user": self.funder, "type": ptype,
+                                "limit": 500, "offset": offset},
+                        timeout=15,
+                    )
+                    if r.status_code != 200:
+                        log.warning(
+                            f"[ROI_TRACKER] data-api {ptype} date={date} "
+                            f"status={r.status_code}"
+                        )
+                        return {}  # fail-open: don't cache a partial 0
+                    data = r.json() or []
+                    got_any = True
+                    if not data:
+                        break
+                    for it in data:
+                        ts = float(it.get("timestamp", 0) or 0)
+                        if day_start <= ts < day_end:
+                            total += float(it.get("usdcSize", 0) or it.get("amount", 0) or 0)
+                    oldest = min(
+                        (float(it.get("timestamp", 0) or 0) for it in data),
+                        default=0.0,
+                    )
+                    # data-api returns newest-first; stop once a full page is
+                    # older than the window (or the page is short).
+                    if len(data) < 500 or oldest < day_start:
+                        break
+                    offset += 500
+            # Record the day's total (even 0.0) so the cache is truthful.
+            return {self.REWARD_TOTAL_KEY: total} if got_any else {}
+        except Exception as e:
+            log.warning(
+                f"[ROI_TRACKER] reward fetch date={date} "
+                f"error: {type(e).__name__}: {e}"
+            )
+            return {}
+
+    def _read_total_reward_for_window(self, window: str, window_end: float) -> float:
+        """FX-088: sum the AGGREGATE daily reward (sentinel REWARD_TOTAL_KEY)
+        across the date(s) covered by `window`. tick() splits this across
+        markets proportional to committed capital. 1h is approximated as the
+        day total / 24 (the data-api credits daily, not hourly)."""
+        now = window_end
+        try:
+            conn = sqlite3.connect(self.db_path)
+            if window == "7d":
+                dates = [self._utc_date_str(now - 86400 * i) for i in range(7)]
+            else:
+                dates = [self._utc_date_str(now)]
+            ph = ",".join("?" * len(dates))
+            row = conn.execute(
+                f"SELECT COALESCE(SUM(reward_earned), 0) FROM daily_reward_cache "
+                f"WHERE condition_id = ? AND date IN ({ph})",
+                (self.REWARD_TOTAL_KEY, *dates),
+            ).fetchone()
+            conn.close()
+            val = float(row[0]) if row and row[0] is not None else 0.0
+            return (val / 24.0) if window == "1h" else val
+        except Exception as e:
+            log.debug(f"[ROI_TRACKER] total reward read failed/{window}: {e}")
+            return 0.0
 
     def _ensure_reward_cache_fresh(self, date: str) -> None:
         """Refresh daily_reward_cache for one date if stale or missing.
@@ -483,7 +518,18 @@ class MarketROITracker:
             log.warning(f"[ROI_TRACKER] active_cids query failed: {e}")
             return summary
 
+        # FX-088: rewards are only available as a daily AGGREGATE (the data-api
+        # credits carry no per-market conditionId), so we attribute the window's
+        # total reward across markets PROPORTIONAL to time-integrated committed
+        # capital (≈ liquidity provided). Phase 1 computes per-market loss/count/
+        # capital and the capital totals; Phase 2 splits the aggregate reward and
+        # writes each market_roi row. This makes capital_efficiency and ROI
+        # reflect REAL rewards instead of the old always-0 (which had blinded
+        # the bot to its own earnings and biased every market toward "pure loss").
         try:
+            # ── Phase 1: per-(cid, window) loss/count/capital + capital totals ──
+            stats: dict = {}
+            total_capital = {w: 0.0 for w in WINDOWS}
             for cid in cids:
                 for window_name, window_secs in WINDOWS.items():
                     since_ts = now - window_secs
@@ -493,23 +539,38 @@ class MarketROITracker:
                         capital_avg = self._capital_committed_avg(
                             conn, cid, since_ts, now
                         )
-                        # Read reward from cache (already refreshed above)
-                        reward_earned = self._read_reward_for_window(
-                            cid, window_name, now
-                        )
-                        # FX-057: when capital data is absent (no allocator
-                        # cycle has stamped this market yet, or the alloc
-                        # output didn't include it), `capital_avg` is ~0.
-                        # The previous `max(capital_avg, 0.01)` floor caused
-                        # ROI to inflate by 100× — a $1 loss reported as
-                        # roi=-100, polluting [LEARN] telemetry and
-                        # operator triage. Treat as "no signal" instead.
-                        if capital_avg < CAPITAL_AVG_MIN_FOR_ROI:
-                            roi = 0.0
-                        else:
-                            roi = (reward_earned - fill_loss) / capital_avg
-                        fill_rate = fill_count / (window_secs / 3600.0)
+                    except Exception as e:
+                        summary["errors"].append(f"{cid[:12]}/{window_name}: {e}")
+                        continue
+                    stats[(cid, window_name)] = (fill_loss, fill_count, capital_avg)
+                    if capital_avg >= CAPITAL_AVG_MIN_FOR_ROI:
+                        total_capital[window_name] += capital_avg
 
+            # Authoritative aggregate reward per window (data-api total).
+            total_reward = {
+                w: self._read_total_reward_for_window(w, now) for w in WINDOWS
+            }
+
+            # ── Phase 2: attribute reward ∝ capital, compute ROI, upsert ──
+            for cid in cids:
+                for window_name, window_secs in WINDOWS.items():
+                    st = stats.get((cid, window_name))
+                    if st is None:
+                        continue
+                    fill_loss, fill_count, capital_avg = st
+                    tc = total_capital[window_name]
+                    # FX-057: capital below the floor is "no signal" → reward
+                    # share + ROI both 0 (avoids the old 100× ROI inflation on
+                    # ~$0 capital). FX-088: otherwise this market earns its
+                    # capital share of the window's aggregate reward.
+                    if capital_avg >= CAPITAL_AVG_MIN_FOR_ROI and tc > 0:
+                        reward_earned = total_reward[window_name] * (capital_avg / tc)
+                        roi = (reward_earned - fill_loss) / capital_avg
+                    else:
+                        reward_earned = 0.0
+                        roi = 0.0
+                    fill_rate = fill_count / (window_secs / 3600.0)
+                    try:
                         conn.execute(
                             "INSERT INTO market_roi (condition_id, window, window_end_ts, "
                             "reward_earned, fill_loss, capital_committed_avg, roi, "
