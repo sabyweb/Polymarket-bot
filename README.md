@@ -18,4 +18,4 @@ Two-process bot that farms Polymarket liquidity rewards while remaining profitab
 
 - Python 3.14
 - Polymarket SDK: `py-clob-client-v2==1.0.0`
-- Production server: Hetzner Helsinki — P5 Stage-C **live bounded canary** (`--mode live`, 3-market cap) as of 2026-06-01; see `docs/STATUS_2026-05-31.md` (Addendum 3) for live state. Not yet through the G-C real-fill / G-E 7-day-clean soak.
+- Production server: Hetzner Helsinki — P5 Stage-C **live bounded canary** (`--mode live`, ~5-market cap), re-launched 2026-06-01 with corrected reward/loss accounting (FX-088/089) after the first canary surfaced + fixed FX-087/088/089. Current live state + P&L: `docs/STATUS_2026-05-31.md` (Addendum 5). Not yet through G-C (real fill) / G-E (7-day clean); profitability pending the daily reward settlement (~00:20 UTC).

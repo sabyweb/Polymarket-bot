@@ -14,6 +14,29 @@ For the **immutable contract**, see `ground_rules.md`.
 
 ---
 
+## v6.1 → v6.6 (2026-05-28 → 2026-06-01) — summary (detail in fixit doc + STATUS dumps)
+
+This CHANGELOG was not maintained per-commit through the v6.1→v6.6 era; the
+authoritative records are `Polymarket bot fixit.md` (FX-NNN tracker, now v1.35)
+and the `docs/STATUS_*.md` session dumps. What shipped:
+
+- **v6.1–v6.5 (2026-05-28 → 06-01):** 9/10-plan code completion (FX-051→061
+  self-learning), pre-Stage-C live-fill hardening (FX-063→077), the oversight
+  persistence cluster (FX-078/080/081, closes FX-075), and the farmer-side
+  drawdown backstop (FX-082). A 6-agent live-readiness eval rated the system
+  ~5.5/10 (self-learning ~1.5/6 effective; capital efficiency unmeasured).
+- **v6.6 (2026-06-01):** FX-083 production heartbeat/stall alert, FX-084
+  held-inventory unrealized-loss kill, FX-085 `capital_efficiency` metric,
+  FX-086 cold-start q_share cfg (closes FX-064), FX-087 rapid-growth
+  cold-start false-kill fix, **FX-088 reward sourcing → data-api `/activity`
+  (un-blinds capital_efficiency; proven on Helsinki $0→$10.12)**, **FX-089
+  dump unwind execution-price** (recorded −$85 vs on-chain −$22). First live
+  canary (cap-3) → halted → re-launched (cap-5, `--mode live`) on corrected
+  accounting; profitability pending the daily reward settlement. Full suite
+  **1116 pass**. **Helsinki is LIVE (cap-5 bounded canary), not dry shadow.**
+
+---
+
 **v6.0 scope (2026-05-26).** GROUND RULES established. The companion file
 `ground_rules.md` in the repo is now the **immutable contract** for every
 architectural decision. Three rules:
