@@ -98,6 +98,37 @@ class DumpManager:
                         # calibration: 2026-05-22 dump on 0x0ed3f07970 →
                         # bot recorded pnl=−$1.00, wallet actual −$1.34
                         # (gap = 0.88% taker fee on $39 gross).
+                        # FX-089: status["price"] is the order's LIMIT, not the
+                        # execution price. A marketable dump SELL (the aggressive/
+                        # passive dump deliberately sets a low limit to force a fill)
+                        # executes at the BID via price improvement, NOT its limit, so
+                        # deriving proceeds from the limit massively over-states the
+                        # loss. Verified on-chain: a dump booked at limit $0.01
+                        # actually executed at ~$0.24 → recorded −$54 vs real −$8 (the
+                        # source of the WALLET_DESYNC alarms + inflated realized-loss).
+                        # Re-price to the marketable execution (best bid for the sold
+                        # side) when it beats the limit — a sell never realizes LESS
+                        # than its own limit, and a marketable sell realizes ~the bid.
+                        # Fail-open to the limit (the prior loss-over-stating behavior)
+                        # if the book is unavailable; the FX-049/055 wallet reconciler
+                        # backstops any residual drift.
+                        try:
+                            _mb = get_merged_book(self.client, ms.yes_tid, ms.no_tid)
+                            if _mb and _mb.get("bids") and _mb.get("asks"):
+                                if side == "yes":
+                                    _bid = float(_mb["bids"][0]["price"])
+                                else:
+                                    _bid = round(1.0 - float(_mb["asks"][0]["price"]), 4)
+                                if _bid > actual_price:
+                                    log.info(
+                                        f"[FX089] dump exec re-priced {side.upper()} "
+                                        f"limit={actual_price:.4f} -> bid={_bid:.4f} "
+                                        f"(marketable sell fills at the bid) | {ms.question[:30]}"
+                                    )
+                                    actual_price = _bid
+                        except Exception as e:
+                            log.debug(f"[FX089] exec-price book fetch failed, using limit: {e}")
+
                         gross_revenue = actual_matched * actual_price if actual_price > 0 else 0
                         _taker_fee = cfg("RF_POLYMARKET_TAKER_FEE")
                         sell_revenue = gross_revenue * (1.0 - _taker_fee)
