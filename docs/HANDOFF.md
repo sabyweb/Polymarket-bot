@@ -1,13 +1,18 @@
 # Polymarket Reward-Farming Bot — System Handoff & Status
 
 **Purpose:** one document to hand anyone for a complete, correct understanding of the system.
-**As of:** 2026-06-01 · **Repo:** `github.com/sabyweb/Polymarket-bot` · **main HEAD:** `a67703b`
-**Production (Helsinki):** code at `bea808b` (the two later commits are docs-only), **`--mode live`,
-5-market bounded canary**, wallet **$1184.53**, profitability **pending the daily reward settlement**.
+**As of:** 2026-06-02 · **Repo:** `github.com/sabyweb/Polymarket-bot` · **main HEAD:** `92ec34c`
+**Production (Helsinki):** code at `92ec34c`, **`--mode live`, 5-market bounded canary** + config
+`RF_TARGET_QUEUE_AHEAD_USD:4000`, wallet **~$1,159.76 (flat)**, **net ~−$25 since the FX-090 deploy**;
+profitability **unproven** (the adverse-fill fix is in test). Live-canary ops:
+`docs/runbooks/live_canary_operator.md`; latest session: `docs/STATUS_2026-06-02.md`.
 
-> **One-line state:** the bot is live on a tiny, bounded, monitored canary with *correct* reward/loss
-> accounting (just fixed); it earns real rewards and self-cools losing markets, but whether it is
-> **net-profitable** is unproven and only resolves over a multi-day soak.
+> **One-line state:** the live analysis found the real blocker — the allocator selected near-resolution /
+> news markets the farmer refused (→ 0 orders) or that adversely filled (→ loss). **FX-090** fixed the
+> selection (farming resumed, `0/5`→`5/5 on-book`), **FX-091** made the capital-efficiency scorecard
+> truthful (~1.4%/day gross — good), **FX-092** closed a monitoring gap (kills now page Discord). Gross
+> yield is there; **net is still negative (~−$25) from adverse fills on longer-dated news markets** —
+> round 1 of that fix (deeper queue) is live but unproven. **Net-positive is not yet achieved.**
 
 ---
 
