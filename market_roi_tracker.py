@@ -657,10 +657,36 @@ class MarketROITracker:
                 "FROM market_roi WHERE window = ?",
                 (window,),
             ).fetchone()
+            # FX-091: the global capital denominator must be the time-averaged
+            # TOTAL capital committed across the portfolio — NOT SUM of the
+            # per-market capital_committed_avg. The per-market avg forward-fills
+            # a DROPPED market's last snapshot at full notional all the way to
+            # `now` (see _capital_committed_avg), so summing it across every
+            # market that cycled through the window massively over-counts —
+            # observed on Helsinki at $78,032 on a $1.2k wallet → capital_eff
+            # 0.00013 (nonsense). snapshot_capital() stamps one row per DEPLOYED
+            # market per oversight cycle, all sharing that cycle's ts, so
+            # SUM(est_capital_cost) GROUP BY ts is the instantaneous total
+            # committed that cycle, and AVG across cycles is the time-averaged
+            # total deployed — markets that leave the allocation simply stop
+            # appearing in later cycles. Per-market capital_committed_avg / roi /
+            # cooldowns are deliberately left untouched (single-axis: this
+            # corrects ONLY the global scorecard, not any learning behavior).
+            since_ts = self._now() - WINDOWS.get(window, WINDOWS["24h"])
+            cap_row = conn.execute(
+                "SELECT AVG(cycle_total) FROM ("
+                "  SELECT SUM(est_capital_cost) AS cycle_total "
+                "  FROM capital_committed_snapshots "
+                "  WHERE ts >= ? AND ts <= ? "
+                "  GROUP BY ts"
+                ")",
+                (since_ts, self._now()),
+            ).fetchone()
             conn.close()
             if not row:
                 return {}
-            tr, tl, tc, nm, nlm, nrm, fct = row
+            tr, tl, _legacy_market_roi_capital, nm, nlm, nrm, fct = row
+            tc = float(cap_row[0]) if (cap_row and cap_row[0] is not None) else 0.0
             denom = max(float(tc), 0.01)
             return {
                 "window": window,

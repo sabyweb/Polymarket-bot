@@ -328,9 +328,15 @@ def test_R12_get_global_summary_aggregates():
 
 def test_FX085_capital_efficiency_ratio():
     db = _make_db()
+    now = 1_700_000_000.0
     _insert_market_roi(db, "0xA", "24h", reward=1.5, capital=100.0)
     _insert_market_roi(db, "0xB", "24h", reward=0.5, capital=100.0)
-    tracker = _make_tracker(db)
+    # FX-091: total_capital = time-averaged per-cycle committed capital from
+    # capital_committed_snapshots. One oversight cycle committing $100 to each
+    # of two markets → cycle total $200 → avg $200.
+    _insert_capital_snapshot(db, "0xA", now - 100, 100.0)
+    _insert_capital_snapshot(db, "0xB", now - 100, 100.0)
+    tracker = _make_tracker(db, now=now)
     gs = tracker.get_global_summary("24h")  # no tick() → reads inserted rows
     # total_reward 2.0 / total_capital 200.0 = 0.01 reward per $ committed.
     assert gs["total_reward"] == pytest.approx(2.0)
@@ -352,11 +358,55 @@ def test_FX085_capital_efficiency_zero_capital_is_safe():
 def test_FX085_capital_efficiency_is_gross_not_net():
     # capital_efficiency is GROSS reward/capital; daily_roi nets out loss.
     db = _make_db()
+    now = 1_700_000_000.0
     _insert_market_roi(db, "0xA", "24h", reward=2.0, capital=100.0, loss=1.0)
-    tracker = _make_tracker(db)
+    # FX-091: capital from a per-cycle snapshot (one market, $100, one cycle).
+    _insert_capital_snapshot(db, "0xA", now - 100, 100.0)
+    tracker = _make_tracker(db, now=now)
     gs = tracker.get_global_summary("24h")
     assert gs["capital_efficiency"] == pytest.approx(0.02)        # 2.0 / 100
     assert gs["daily_roi"] == pytest.approx(0.01)                 # (2.0-1.0) / 100
+    os.unlink(db)
+
+
+# ── FX-091: global capital denominator (per-cycle avg, not per-market sum) ──
+
+def test_FX091_total_capital_is_per_cycle_average_not_sum():
+    """FX-091: total_capital is the time-averaged TOTAL committed per oversight
+    cycle (SUM est_capital_cost GROUP BY ts, then AVG across cycles) — NOT the
+    sum of per-market capital_committed_avg, which forward-fills dropped markets
+    to `now` and ballooned the Helsinki denominator to $78k on a $1.2k wallet."""
+    db = _make_db()
+    now = 1_700_000_000.0
+    # Cycle A (1h ago): two markets, $100 each → cycle total $200
+    _insert_capital_snapshot(db, "0xX", now - 3600, 100.0)
+    _insert_capital_snapshot(db, "0xY", now - 3600, 100.0)
+    # Cycle B (30m ago): three markets, $100 each → cycle total $300
+    _insert_capital_snapshot(db, "0xX", now - 1800, 100.0)
+    _insert_capital_snapshot(db, "0xY", now - 1800, 100.0)
+    _insert_capital_snapshot(db, "0xZ", now - 1800, 100.0)
+    tracker = _make_tracker(db, now=now)
+    gs = tracker.get_global_summary("24h")
+    # avg per-cycle total = (200 + 300) / 2 = 250 (NOT a held-to-now sum)
+    assert gs["total_capital"] == pytest.approx(250.0, rel=0.01)
+    os.unlink(db)
+
+
+def test_FX091_dropped_market_not_forward_filled_to_now():
+    """FX-091: a market deployed in one early cycle then DROPPED contributes
+    only to that cycle's total — it is not forward-filled at full notional
+    across the rest of the window (the root cause of the $78k denominator)."""
+    db = _make_db()
+    now = 1_700_000_000.0
+    # Cycle 1 (20h ago): a $500 market, then dropped (no later snapshots)
+    _insert_capital_snapshot(db, "0xDROPPED", now - 72000, 500.0)
+    # Cycle 2 (30m ago): a $100 market currently deployed
+    _insert_capital_snapshot(db, "0xCURRENT", now - 1800, 100.0)
+    tracker = _make_tracker(db, now=now)
+    gs = tracker.get_global_summary("24h")
+    # Two cycles: totals 500 and 100 → avg 300. The dropped $500 is NOT held to
+    # now (the old sum-of-per-market-avg counted such markets ~full-window).
+    assert gs["total_capital"] == pytest.approx(300.0, rel=0.01)
     os.unlink(db)
 
 
