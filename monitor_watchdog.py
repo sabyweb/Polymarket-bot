@@ -66,7 +66,12 @@ def _post(msg: str, dry: bool) -> None:
     try:
         data = json.dumps({"content": text}).encode()
         req = urllib.request.Request(
-            url, data=data, headers={"Content-Type": "application/json"}
+            url, data=data,
+            headers={
+                "Content-Type": "application/json",
+                # Discord/Cloudflare 403s the default Python-urllib UA.
+                "User-Agent": "polymarket-watchdog/1.0",
+            },
         )
         urllib.request.urlopen(req, timeout=10)
     except Exception as e:  # pragma: no cover - network
