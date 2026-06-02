@@ -308,6 +308,22 @@ RF_ALLOC_MIN_HOURS_TO_GAME_START: float = 12.0  # Exclude markets within this ma
 RF_ALLOC_MAX_TIMING_FETCHES: int = 300          # Per-oversight-cycle budget on CLOB /markets/{cid} timing-enrichment calls. Only ranked candidates we'd actually deploy are enriched, until the deploy cap fills; with the TTL cache below, steady-state cost is near zero. 0 disables enrichment (filter then acts only on pre-populated timing).
 RF_ALLOC_TIMING_CACHE_TTL_SEC: float = 21600.0  # Cache TTL for fetched (game_start_time, end_date_iso) per cid — ~immutable data, so 6h keeps re-fetches rare while tolerating the occasional reschedule.
 
+# ── FX-093: Allocator-side recent-volatility exclusion ──────────────────────
+# FX-090's clock filter excludes near-resolution / sports markets, but the live
+# canary kept adversely filling on longer-dated NEWS markets (ships-transit,
+# IPO, elections) — they pass the clock filter (resolve >48h out) yet move on
+# news and pick off our resting quotes. The FX-051 cooldown is REACTIVE (cools
+# only after ~$1 of fill loss ≈ 3 fills), so a stream of news markets each
+# bleeds us before exclusion. This filter is PROACTIVE: it reads the per-market
+# midpoint history the farmer already logs to `book_snapshots` and excludes a
+# candidate whose midpoint RANGE over the recent window exceeds the cap —
+# triggered by book MOVEMENT, no fill required. Fail-open: a market with too
+# few snapshots (or any DB error) is NOT excluded (FX-051 cooldown backstops).
+# Observed 2026-06-02: 40-ships midpoint swung 0.235→0.38 in ~3 min.
+RF_ALLOC_MAX_RECENT_VOLATILITY: float = 0.10   # Exclude a candidate if its book_snapshots midpoint range (max-min) over the window exceeds this (price units; 0.10 = 10c). Stable reward markets barely move; news markets swing >10c. 0 disables this filter.
+RF_ALLOC_VOLATILITY_WINDOW_HOURS: float = 6.0  # Look-back window for the midpoint-range volatility estimate.
+RF_ALLOC_VOLATILITY_MIN_SAMPLES: int = 5       # Require ≥ this many book_snapshots in the window to compute volatility; below it, fail-open (insufficient signal → no exclusion).
+
 RF_BOOK_CACHE_TTL: int = 180                 # Max age (seconds) for MarketState.cached_book used by Q-score sampling in record_cycle; 0 disables
 RF_ORDER_STALE_CHECK_SECS: int = 300         # Force-check orders still in open_ids after this many seconds
 

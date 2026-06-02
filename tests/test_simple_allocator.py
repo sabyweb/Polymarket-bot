@@ -823,3 +823,94 @@ def test_C33_alloc_json_carries_timing_when_known():
     assert deploy["end_date_iso"] == cand.end_date_iso
     assert "game_start_time" in deploy
     os.unlink(tmp)
+
+
+# ── FX-093 recent-volatility exclusion (book_snapshots-based) ──
+#
+# The allocator excludes a candidate whose midpoint RANGE over the recent
+# window (from book_snapshots) exceeds RF_ALLOC_MAX_RECENT_VOLATILITY (0.10).
+# Triggered by book movement (no fill needed); fail-open on insufficient data.
+
+def _db_with_book_snapshots(rows):
+    """rows: list of (cid, ts, midpoint). Returns a temp DB path with a
+    populated book_snapshots table (file-based so the allocator's own
+    sqlite3.connect sees the data)."""
+    db_path = tempfile.mktemp(suffix=".db")
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE book_snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "ts REAL NOT NULL, condition_id TEXT NOT NULL, best_bid REAL NOT NULL DEFAULT 0, "
+        "best_ask REAL NOT NULL DEFAULT 0, midpoint REAL NOT NULL, spread REAL NOT NULL DEFAULT 0, "
+        "bid_depth_5c REAL NOT NULL DEFAULT 0, ask_depth_5c REAL NOT NULL DEFAULT 0)"
+    )
+    for cid, ts, mid in rows:
+        conn.execute(
+            "INSERT INTO book_snapshots (ts, condition_id, best_bid, best_ask, midpoint, spread) "
+            "VALUES (?, ?, ?, ?, ?, ?)", (ts, cid, mid - 0.01, mid + 0.01, mid, 0.02),
+        )
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+def _alloc_with_book_snapshots(rows, cumulative):
+    db_path = _db_with_book_snapshots(rows)
+    a = SimpleAllocator(
+        db_path=db_path, wallet_address="x", funder="x",
+        api_key="x", api_secret="MTIzNDU2Nzg5MDEyMzQ1Ng==", api_passphrase="x",
+        _now=lambda: _NOW,
+        _http=lambda *a, **k: SimpleNamespace(status_code=500, text="", json=lambda: {}),
+    )
+    a.fetch_current_q_shares = lambda: {}
+    a.load_cumulative_ratios = lambda: dict(cumulative)
+    return a, db_path
+
+
+def _wide_rows(cid):  # midpoint range 0.20 (> 0.10 cap), 6 samples (>= 5)
+    return [(cid, _NOW - 100 * (i + 1), m) for i, m in
+            enumerate([0.20, 0.25, 0.30, 0.40, 0.38, 0.35])]
+
+
+def test_C34_volatile_market_excluded():
+    """C34: a candidate whose recent midpoint range exceeds the cap is excluded."""
+    cid = "0xVOL"
+    a, db = _alloc_with_book_snapshots(_wide_rows(cid), {cid: 0.05})
+    cand = _make_candidate(cid, daily_rate=500); cand.midpoint_guess = 0.5
+    result = _compute_one(a, [cand])
+    assert cid not in {m.condition_id for m in result.deploys}
+    assert cid in {m.condition_id for m in result.avoids}
+    os.unlink(db)
+
+
+def test_C35_stable_market_kept():
+    """C35: a candidate with a narrow recent midpoint range is kept."""
+    cid = "0xSTABLE"
+    rows = [(cid, _NOW - 100 * (i + 1), m) for i, m in
+            enumerate([0.40, 0.41, 0.42, 0.43, 0.42, 0.41])]  # range 0.03
+    a, db = _alloc_with_book_snapshots(rows, {cid: 0.05})
+    cand = _make_candidate(cid, daily_rate=500); cand.midpoint_guess = 0.5
+    result = _compute_one(a, [cand])
+    assert cid in {m.condition_id for m in result.deploys}
+    os.unlink(db)
+
+
+def test_C36_insufficient_samples_fail_open():
+    """C36: a wide range but < MIN_SAMPLES snapshots → fail-open (kept)."""
+    cid = "0xFEW"
+    rows = [(cid, _NOW - 100, 0.20), (cid, _NOW - 200, 0.40)]  # range 0.20 but only 2 < 5
+    a, db = _alloc_with_book_snapshots(rows, {cid: 0.05})
+    cand = _make_candidate(cid, daily_rate=500); cand.midpoint_guess = 0.5
+    result = _compute_one(a, [cand])
+    assert cid in {m.condition_id for m in result.deploys}
+    os.unlink(db)
+
+
+def test_C37_volatility_filter_disabled(monkeypatch):
+    """C37: cap=0 disables the filter — a volatile market deploys."""
+    monkeypatch.setattr(sa, "ALLOC_MAX_RECENT_VOLATILITY", lambda: 0.0)
+    cid = "0xVOLDIS"
+    a, db = _alloc_with_book_snapshots(_wide_rows(cid), {cid: 0.05})
+    cand = _make_candidate(cid, daily_rate=500); cand.midpoint_guess = 0.5
+    result = _compute_one(a, [cand])
+    assert cid in {m.condition_id for m in result.deploys}
+    os.unlink(db)

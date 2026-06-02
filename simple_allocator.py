@@ -74,6 +74,10 @@ def ALLOC_MIN_HOURS_TO_RESOLUTION(): return cfg("RF_ALLOC_MIN_HOURS_TO_RESOLUTIO
 def ALLOC_MIN_HOURS_TO_GAME_START(): return cfg("RF_ALLOC_MIN_HOURS_TO_GAME_START")
 def ALLOC_MAX_TIMING_FETCHES(): return cfg("RF_ALLOC_MAX_TIMING_FETCHES")
 def ALLOC_TIMING_CACHE_TTL_SEC(): return cfg("RF_ALLOC_TIMING_CACHE_TTL_SEC")
+# FX-093: allocator-side recent-volatility exclusion knobs.
+def ALLOC_MAX_RECENT_VOLATILITY(): return cfg("RF_ALLOC_MAX_RECENT_VOLATILITY")
+def ALLOC_VOLATILITY_WINDOW_HOURS(): return cfg("RF_ALLOC_VOLATILITY_WINDOW_HOURS")
+def ALLOC_VOLATILITY_MIN_SAMPLES(): return cfg("RF_ALLOC_VOLATILITY_MIN_SAMPLES")
 COLD_START_Q_SHARE = 0.005         # FX-086 (closes FX-064): DEFAULT mirror of the cfg knob RF_COLD_START_Q_SHARE. The live path (estimate_q_share) reads cfg("RF_COLD_START_Q_SHARE") so the prior is runtime-tunable via config_overrides.json (FX-046 says it is 24-94x off and it binds the EV gate). This module constant is retained as the compile-time default + for import-site arithmetic in tests; keep the two values in sync.
 
 # FX-056: Extreme-price filter. Markets with midpoint < 0.10 or > 0.90
@@ -454,6 +458,39 @@ class SimpleAllocator:
 
         return False, ""
 
+    def _recent_volatility(self, cid: str) -> Optional[float]:
+        """FX-093: recent midpoint RANGE (max-min) for `cid` from book_snapshots
+        over the volatility window, or None when there's not enough signal.
+
+        Reads the per-market midpoint series the farmer logs to book_snapshots
+        (shared DB). Returns None (fail-open — caller does NOT exclude) when the
+        filter is disabled, there are fewer than ALLOC_VOLATILITY_MIN_SAMPLES
+        snapshots in the window, or any DB error (e.g. the table is absent in a
+        :memory: test DB). Range, not stdev — a single large news jump IS the
+        signal we want to catch.
+        """
+        if ALLOC_MAX_RECENT_VOLATILITY() <= 0:
+            return None
+        since = self._now() - ALLOC_VOLATILITY_WINDOW_HOURS() * 3600.0
+        try:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                row = conn.execute(
+                    "SELECT MAX(midpoint), MIN(midpoint), COUNT(*) "
+                    "FROM book_snapshots WHERE condition_id = ? AND ts >= ?",
+                    (cid, since),
+                ).fetchone()
+            finally:
+                conn.close()
+        except Exception as e:
+            log.debug(f"volatility query failed {cid[:10]}: {e}")
+            return None
+        if not row or row[0] is None or row[2] is None:
+            return None
+        if int(row[2]) < ALLOC_VOLATILITY_MIN_SAMPLES():
+            return None  # too few samples — insufficient signal, fail-open
+        return float(row[0]) - float(row[1])
+
     def compute(
         self,
         wallet_usd: float,
@@ -605,6 +642,7 @@ class SimpleAllocator:
         # FX-090: time-to-event enrichment budget + counter for this cycle.
         timing_budget = {"fetches": 0, "exhausted": False}
         timing_excluded_count = 0
+        vol_excluded_count = 0  # FX-093
         for m in eligible:
             if len(deploys) >= max_deploys:
                 # Soft cap hit — extremely rare in practice (5k market pool
@@ -627,6 +665,20 @@ class SimpleAllocator:
                 timing_excluded_count += 1
                 avoids.append(m)
                 continue
+
+            # FX-093: recent-volatility filter. Exclude candidates whose
+            # book_snapshots midpoint has swung more than the cap over the
+            # window — news-active markets that adversely fill our resting
+            # quotes. Triggered by book movement (no fill needed); fail-open
+            # when there's insufficient history (FX-051 cooldown backstops).
+            vol_cap = ALLOC_MAX_RECENT_VOLATILITY()
+            if vol_cap and vol_cap > 0:
+                recent_vol = self._recent_volatility(m.condition_id)
+                if recent_vol is not None and recent_vol > vol_cap:
+                    m.timing_excluded_reason = f"volatility_{recent_vol:.3f}>{vol_cap:.2f}"
+                    vol_excluded_count += 1
+                    avoids.append(m)
+                    continue
 
             cost_per_market = self._est_cost_per_market(m)
             expected_fill_cost = self._estimate_fill_cost(m, cost_per_market)
@@ -681,7 +733,7 @@ class SimpleAllocator:
         log.info(
             f"[OVERCOMMIT_ALLOC] eligible={len(eligible)} positive_ev={positive_ev_count} "
             f"deploys={len(deploys)} avoids={len(avoids)} "
-            f"timing_excluded={timing_excluded_count} timing_fetches={timing_budget['fetches']} "
+            f"timing_excluded={timing_excluded_count} vol_excluded={vol_excluded_count} timing_fetches={timing_budget['fetches']} "
             f"notional_total=${used:.2f} wallet=${wallet_usd:.2f} "
             f"overcommit_ratio={notional_overcommit_ratio:.2f}× "
             f"(target band 3-8× per Ground Rule 2) "
