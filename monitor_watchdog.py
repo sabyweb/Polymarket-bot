@@ -106,8 +106,13 @@ def _latest_cycle_summary():
         lines = [ln for ln in r.stdout.splitlines() if "CYCLE_SUMMARY" in ln]
         if not lines:
             return None, "no_cycle_summary_in_8min"
-        payload = lines[-1].split("CYCLE_SUMMARY", 1)[1].strip()
-        d = json.loads(payload)
+        # Log line is: "... | [CYCLE_SUMMARY] {json}". Slice the JSON object
+        # itself ({ .. }) rather than split on the tag (which leaves a "]").
+        ln = lines[-1]
+        start, end = ln.find("{"), ln.rfind("}")
+        if start < 0 or end < 0:
+            return None, "cycle_summary_no_json"
+        d = json.loads(ln[start:end + 1])
         age = time.time() - float(d.get("ts", time.time()))
         return d, age
     except Exception as e:
