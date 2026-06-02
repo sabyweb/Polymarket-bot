@@ -115,3 +115,29 @@ Objective: **max-farm rewards, capital-efficiently, NET-positive.** Gross is the
 (~1.4%/day); the open work is killing the adverse-fill leak on news markets (deeper queue =
 round 1; volatility/news filter = round 2). **Gate G-E = 7 days clean, rewards > losses.**
 Until then this is an unproven canary — keep the cap small and watch the daily settlement.
+
+## 10. Normal behaviors that look alarming (NOT bugs)
+
+- **One-sided placement** (a market with only a YES *or* only a NO order): expected. Placement
+  is per-side (`order_lifecycle.py:976` / `:1037`); each side needs (a) exit-liquidity (≥ our
+  size of book depth to unwind it) and (b) `can_place()` (no fill-breaker / post-fill cooldown /
+  dump-failure block). The exact per-side reason is recorded — read it, don't guess:
+  `sqlite3 bot_history.db "SELECT * FROM placement_feedback WHERE condition_id LIKE '0x...%';"`.
+  Common reasons: `exit_liquidity` (book too thin to exit that side), `dump_failures`
+  (`RF_DUMP_MAX_FAILURES` hit on that market), `resolution_proximity`, `wide_spread`,
+  `capital_exhausted`. One-sided = the bot declining a side it can't safely exit; it still
+  earns reward on the placed side.
+- **`global_tighten=True`** in `[OVERCOMMIT_ALLOC]`: the learning loop staying defensive
+  (24h loss > 0.5×reward) — fewer/smaller deploys until reward recovers. Normal, not stuck.
+- **A lingering `dump_sell @ $0.01`** in `active_orders` after a position closed/merged (on-chain
+  `/positions` shows it gone): an orphan dump order. Harmless (≤$1, can't fill naked on
+  Polymarket). Cancel if you want; the reconciler should sweep it.
+- **WALLET_DESYNC right after ~00:20 UTC:** reward-settlement lag (`rewards_delta=0` until the
+  data-api indexes the credit) → a transient positive divergence that self-heals next cycle.
+  Benign (observational, no halt).
+- **`orders_placed: 0` in a steady-state cycle:** orders already resting; nothing to (re)place
+  that cycle. Normal.
+- **Net-negative-but-stable is NOT "broken"** — it's the unproven-objective state the soak
+  exists to resolve. "Broken" = a kill fires, a process crashes / heartbeat stale, a *real*
+  (persistent or growing) wallet desync, 0-farming for an extended window, or runaway loss
+  (realized_loss_24h approaching 10% of wallet / drawdown approaching 15%).
