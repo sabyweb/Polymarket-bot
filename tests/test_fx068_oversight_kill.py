@@ -50,6 +50,35 @@ def _write_alloc(path: str, payload: dict) -> None:
         json.dump(payload, f)
 
 
+class TestFX092KillSwitchPagesDiscord(unittest.TestCase):
+    """FX-092: _activate_kill_switch must page Discord. A kill leaves the
+    process alive-but-idle, so the stale-heartbeat alert never covers it —
+    without this page the operator only learns of a halt by noticing zero
+    orders (which is exactly how the 2026-06-02 fill-rate kill was missed)."""
+
+    def test_activate_kill_switch_pages_once(self):
+        rf = _make_farmer_stub()
+        with patch.object(reward_farmer.alerts, "alert_kill_switch") as mock_alert:
+            rf._activate_kill_switch("fill_rate_ratio=3.60 > 3.0x")
+        mock_alert.assert_called_once()
+        passed_reason = (
+            mock_alert.call_args.args[0] if mock_alert.call_args.args
+            else mock_alert.call_args.kwargs.get("reason", "")
+        )
+        self.assertIn("fill_rate", passed_reason)
+        self.assertTrue(rf._kill_switch_active)
+
+    def test_kill_switch_alert_failure_is_non_fatal(self):
+        """A Discord failure must NOT prevent the kill from completing."""
+        rf = _make_farmer_stub()
+        with patch.object(
+            reward_farmer.alerts, "alert_kill_switch",
+            side_effect=RuntimeError("discord down"),
+        ):
+            rf._activate_kill_switch("test")  # must not raise
+        self.assertTrue(rf._kill_switch_active)
+
+
 class TestFX068LoadCapturesKill(unittest.TestCase):
     """_load_allocations must capture the alloc kill_switch field even when
     deploys is empty (the exact shape simple_allocator writes on a kill)."""

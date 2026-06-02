@@ -1862,6 +1862,14 @@ class RewardFarmer:
             f"[GUARDRAIL] "
             f"{json.dumps({'event': 'kill_switch_activated', 'cycle': self.cycle_count, 'reason': reason, 'cancelled_orders': cancelled, 'ts': round(time.time(), 3)}, sort_keys=True)}"
         )
+        # 3b. FX-092: page the operator. A kill leaves THIS process alive-but-
+        # idle, so the stale-heartbeat alert never fires for it — without this
+        # page nobody is told the farmer stopped trading. Fail-safe (the kill
+        # must complete even if Discord is down).
+        try:
+            alerts.alert_kill_switch(reason, cancelled)
+        except Exception as e:
+            log.warning(f"[GUARDRAIL] kill-switch Discord alert failed (non-fatal): {e}")
         # 4. Caller returns from run_cycle — see integration in run_cycle.
 
     # ── Hard enforcement helpers ────────────────────────────────────

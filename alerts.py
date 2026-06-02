@@ -599,6 +599,31 @@ def alert_bot_crash(error: str) -> None:
     _send_discord("**BOT CRASHED** — all orders cancelled", embed)
 
 
+def alert_kill_switch(reason: str, cancelled_orders: int = 0) -> None:
+    """Page Discord when a farmer kill switch trips (trading halts until restart).
+
+    FX-092: a kill leaves THIS process ALIVE-but-idle, so the stale-heartbeat
+    alert (maybe_alert_stale_heartbeat) never fires for it — this page is the
+    ONLY thing that surfaces a kill to the operator. Called once per kill
+    episode from reward_farmer._activate_kill_switch. Fail-safe: _send_discord
+    no-ops without a webhook and never raises.
+    """
+    embed = {
+        "title": "KILL SWITCH ACTIVATED",
+        "description": (
+            f"Farmer halted — idle until restarted.\n```{str(reason)[:400]}```"
+        ),
+        "color": 0xFF0000,  # red
+        "fields": [
+            {"name": "Cancelled orders", "value": str(cancelled_orders), "inline": True},
+            {"name": "Action", "value": "Investigate, then restart polymarket-farmer", "inline": False},
+        ],
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+    _send_discord("**KILL SWITCH** — farmer halted (idle until restart)", embed)
+    _write_alert("KILL_SWITCH", f"{reason} | cancelled {cancelled_orders} orders")
+
+
 # ── Alert File Writer ────────────────────────────────────────────────────────
 def _write_alert(alert_type: str, message: str) -> None:
     """Append an alert to the dedicated alerts log file.
