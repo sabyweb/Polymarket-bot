@@ -3,7 +3,7 @@
 > **Purpose of this file:** a single, self-contained brief that gives any human or AI agent
 > complete context on what this system is, its objective, how it's built, where it stands,
 > and every known open issue. Share it as-is. Last verified against live + repo ground truth
-> **2026-06-03 ~07:40 UTC**. When in doubt, trust *verified data* (logs, DB rows, on-chain/API
+> **2026-06-05 ~06:09 UTC**. When in doubt, trust *verified data* (logs, DB rows, on-chain/API
 > responses) over prose — that is the project's first operating principle.
 
 ---
@@ -56,14 +56,15 @@ not §4. **Live path = `simple_oversight.py` → `SimpleAllocator` (OverCommit) 
 
 ---
 
-## 2. Current live state (verified 2026-06-03 ~07:40 UTC)
+## 2. Current live state (verified 2026-06-05 ~06:09 UTC)
 
-- **Repo + Helsinki HEAD `b903c74` on `main`** (1:1, in sync). Local dev: `/Users/sabyasaachikarmakar/code/polymarket_bot`. Production: Hetzner Helsinki `/home/polymarket/Polymarket-bot`.
+- **Helsinki HEAD `4306913`** (FX-094–097 roadmap deployed via staged rollout Wave 0+1). Local dev: `/Users/sabyasaachikarmakar/code/polymarket_bot` at same commit. Production: Hetzner Helsinki `/home/polymarket/Polymarket-bot`.
 - **Mode:** `--mode live`, **cap-5 bounded canary** (`RF_OVERCOMMIT_MAX_DEPLOYED_MARKETS=5`).
-- **Wallet:** $1,118.31 cash, peak $1,201.76 → **drawdown ~6.9%**. **Net since the 17:30 UTC 06-02 restart ≈ −$27** over ~14 h (gross losses ~−$45, reward +$18). Objective net-positive **UNPROVEN**.
-- **Rewards (on-chain, data-api):** 06-02 farming day settled **~$18** ($17.88 + $0.24) — ~3× the recent $5–6 baseline (the higher resting notional earns more scoring). Earlier days: 06-01 $6.41, 05-26 $4.78.
-- **Tests:** 1118 pass / 2 skip (`pytest tests/ --ignore=tests/test_simulation.py`).
-- **`config_overrides.json` (Helsinki, hot-reload):** `{RF_TRIAL_BUDGET_PCT:0.75, RF_OVERCOMMIT_EXPECTED_FILL_COST_FRAC:0.01, RF_OVERCOMMIT_MAX_DEPLOYED_MARKETS:5, RF_TARGET_QUEUE_AHEAD_USD:4000, RF_FILL_BREAKER_WINDOW:900}`.
+- **Wallet:** $1,097.99 cash, peak $1,201.76 → **drawdown ~8.6%** on portfolio value. `kill_switch: false`, 4–5 active markets, farming.
+- **Rollout waves:** Wave 0+1 **live** (merge/drawdown/marks code; escalation + farmer vol guard **disabled** via overrides). Waves 2–4 **pending soak** — see `docs/STATUS_2026-06-05_rollout.md`.
+- **Builder merge creds:** **NOT configured** on Helsinki — merge path disabled; hedged pairs held + `alert_merge_needed` if both sides fill.
+- **Tests:** 1149 pass / 2 skip (`pytest tests/` with venv).
+- **`config_overrides.json` (Helsinki):** adds `RF_COOLDOWN_ESCALATION_ENABLED:false`, `RF_ALLOC_MAX_RECENT_VOLATILITY:0` plus existing cap-5 knobs (`RF_FILL_BREAKER_WINDOW:900`, etc.).
 
 ### What happened in the last session (2026-06-02 → 06-03)
 1. Found the farmer **kill-switched + idle** since 15:55:40 UTC (06-02) — a **fill-rate spike** from a news-market adverse-fill burst ("Gemini Pro" market, 4 fills both sides in 28 min). This was the **2nd** such kill that day (same pattern), so it's a confirmed recurring failure.
@@ -93,13 +94,15 @@ net-positive.** It is NOT to be re-architected blindly; it needs a designed, tes
 directions: a fast 30 s farmer-side adverse-selection/volatility guard; a stability-weighted ranker; a
 pre-emptive cooldown that cools on the *first* adverse fill, not after $1/3 fills).
 
-### 4b. NEW bugs found 2026-06-03 (this session) — not yet ticketed in fixit until now
-| ID | Sev | Bug | Evidence | Fix direction |
-|---|---|---|---|---|
-| **FX-094** | **High** | **`merge_positions` is broken.** When the bot's both-sides reward quotes BOTH fill, it holds a YES+NO pair (worth $1/pair) and *should* merge it back to USDC. The call fails: `'ClobClient' object has no attribute 'merge_positions'` → it falls back to a lossy "dual dump." Same class as FX-035 (V1→V2 SDK method-name miss). | Helsinki log 03:27 UTC 06-03; the Becerra market filled 100 NO + 100 YES ($106) and couldn't merge. | Ground-truth the correct py-clob-client-v2 / on-chain CTF merge call; wire it; test. |
-| **FX-095** | **High** | **Drawdown kill marks cash-only, not cash+inventory.** Buying inventory (a YES+NO pair, or any position) drops *cash*, which the 15% drawdown limb reads as drawdown and **false-trips the kill** even though portfolio value is intact. On 06-03 cash fell $106 into ~$100 of tokens → computed 15.3% drawdown (true ~7%) → killed. | Helsinki 03:30 UTC: kill at dd 15.3%, true portfolio (cash+tokens) ~$1,118 → ~7%. | Mark drawdown to cash + inventory value (the FX-084 unrealized infra exists). Safety-limb change → needs owner sign-off. |
-| **FX-096** | Med | **FX-084 `unrealized_loss` over-counts.** Reported $19.1 on a position whose maximum possible loss was $14.40 (a long can't lose more than cost). Fail-safe direction (kill fires conservatively) but imprecise. | Helsinki GUARDRAIL log 02:29 UTC; flaps null↔$19.1. | Fix the mark-to-cost-basis computation. |
-| **FX-097** | Med | **24 h cooldown expiry re-deploys known losers.** A market FX-051 cooled (e.g. Becerra) is re-deployed when the 24 h cooldown lapses, even though it's a repeat adverse-filler. | Becerra (`0xa5d79e71`) cooled ~00:41, re-deployed + both-sides-filled ~03:08–03:27. | Escalating/longer cooldowns for repeat losers; or exclude chronic losers. |
+### 4b. FX-094–097 (shipped `4306913`, Wave 1 live 2026-06-05; Waves 2–4 soak-gated)
+| ID | Sev | Status | Notes |
+|---|---|---|---|
+| **FX-094** | High | **Deployed** (merge creds pending) | `ctf_merge.py` + poly-web3 Builder Relayer path; no auto dual-dump on failure. **UNSURE:** first live merge not yet observed; `BUILDER_*` env missing on Helsinki. |
+| **FX-095** | High | **Deployed** | Portfolio drawdown on `total_value` (cash + marked inventory). Snapshots populated post-deploy. |
+| **FX-096** | Med | **Deployed** | YES-equiv unrealized marks via `portfolio_mark.py`. |
+| **FX-097** | Med | **Code deployed; override OFF** | Escalating cooldowns disabled until Wave 2 soak (`RF_COOLDOWN_ESCALATION_ENABLED:false`). |
+| **Phase 5b** | — | **Code deployed; override OFF** | Farmer 30s vol guard disabled (`RF_ALLOC_MAX_RECENT_VOLATILITY:0`) until Wave 3. |
+| **Phase 5a/5c/5d** | — | **Pending Wave 4** | Knobs off by default; enable single-axis after Wave 3 soak. |
 
 ### 4c. Pre-existing open issues (from `Polymarket bot fixit.md`)
 - **FX-076** (Med) — trigger #4 `global_reward_low` pulls a **non-binding** lever (EV gate binds, not the rate floor) → inert live.
