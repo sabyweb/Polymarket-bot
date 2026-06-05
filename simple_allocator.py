@@ -503,12 +503,16 @@ class SimpleAllocator:
         global_tighten: bool = False,
         global_reward_low: bool = False,
         q_share_distrust_cids: Optional[set[str]] = None,
+        portfolio_value_usd: Optional[float] = None,
+        portfolio_peak_usd: Optional[float] = None,
     ) -> AllocationResult:
         """Main allocation entry point.
 
         Args:
-            wallet_usd: current wallet balance
-            wallet_peak_usd: highest wallet observed (for drawdown calc)
+            wallet_usd: current wallet balance (cash)
+            wallet_peak_usd: legacy peak alias; used when portfolio_peak omitted
+            portfolio_value_usd: FX-095 cash+inventory mark (defaults to wallet_usd)
+            portfolio_peak_usd: FX-095 peak total portfolio (defaults to wallet_peak_usd)
             wallet_24h_ago_usd: wallet 24h ago (or None if unknown)
             realized_loss_24h: sum of negative pnl from unwinds in last 24h (positive USD)
             markets: optional override (for testing); if None, fetches from Polymarket
@@ -534,8 +538,13 @@ class SimpleAllocator:
         q_distrust = q_share_distrust_cids or set()
 
         # ── Kill switch check FIRST ──
+        pval = portfolio_value_usd if portfolio_value_usd is not None else wallet_usd
+        ppeak = portfolio_peak_usd if portfolio_peak_usd is not None else wallet_peak_usd
         kill, reason = self.check_kill_switch(
-            wallet_usd, wallet_peak_usd, realized_loss_24h
+            wallet_usd=wallet_usd,
+            portfolio_value_usd=pval,
+            portfolio_peak_usd=ppeak,
+            realized_loss_24h=realized_loss_24h,
         )
         if kill:
             return AllocationResult(
@@ -624,8 +633,23 @@ class SimpleAllocator:
             and m.condition_id not in excluded
         ]
 
-        # ── Rank by expected reward ──
-        eligible.sort(key=lambda x: -x.expected_daily_reward)
+        # ── Rank by expected reward (FX-097 Phase 5c: stability-weighted) ──
+        vol_penalty_k = 0.0
+        try:
+            from config import cfg
+            vol_penalty_k = float(cfg("RF_RANK_VOL_PENALTY_K") or 0.0)
+        except Exception:
+            pass
+
+        def _rank_key(m: CandidateMarket) -> float:
+            score = m.expected_daily_reward
+            if vol_penalty_k > 0:
+                vol = self._recent_volatility(m.condition_id)
+                if vol is not None:
+                    score = score / (1.0 + vol_penalty_k * vol)
+            return -score
+
+        eligible.sort(key=_rank_key)
 
         # ── OverCommit allocation (FX-052/053) ──
         # No total-notional budget — Polymarket's collateral-rebalance auto-
@@ -709,6 +733,20 @@ class SimpleAllocator:
                 target_shares = max(m.min_size, int(target_shares * size_multiplier))
                 cost_per_market = target_shares * cost_per_share
 
+            # Phase 5a: per-market capital cap (skip if cap < min_size economics)
+            try:
+                from config import cfg
+                cap_usd = float(cfg("RF_MAX_CAPITAL_PER_MARKET_USD") or 0.0)
+            except Exception:
+                cap_usd = 0.0
+            if cap_usd > 0 and cost_per_market > cap_usd:
+                capped_shares = int(cap_usd / cost_per_share)
+                if capped_shares < m.min_size:
+                    avoids.append(m)
+                    continue
+                target_shares = capped_shares
+                cost_per_market = target_shares * cost_per_share
+
             m.target_shares = target_shares
             m.target_capital = round(cost_per_market, 2)
 
@@ -756,15 +794,17 @@ class SimpleAllocator:
     def check_kill_switch(
         self,
         wallet_usd: float,
-        wallet_peak_usd: float,
+        portfolio_value_usd: float,
+        portfolio_peak_usd: float,
         realized_loss_24h: float,
     ) -> tuple[bool, str]:
         """Two kill triggers: 24h realized loss > 10% wallet, or 15% drawdown.
 
+        FX-095: drawdown uses cash+marked inventory (portfolio_value_usd vs peak).
         Returns (should_kill, reason).
         """
-        if wallet_usd <= 0:
-            return True, f"wallet collapsed to ${wallet_usd:.2f}"
+        if portfolio_value_usd <= 0:
+            return True, f"portfolio collapsed to ${portfolio_value_usd:.2f}"
 
         if realized_loss_24h > wallet_usd * KILL_LOSS_FRAC:
             return True, (
@@ -772,12 +812,14 @@ class SimpleAllocator:
                 f"{KILL_LOSS_FRAC * 100:.0f}% of wallet ${wallet_usd:.2f}"
             )
 
-        if wallet_peak_usd > 0:
-            drawdown = 1.0 - (wallet_usd / wallet_peak_usd)
+        if portfolio_peak_usd > 0:
+            drawdown = 1.0 - (portfolio_value_usd / portfolio_peak_usd)
             if drawdown > KILL_DRAWDOWN_FRAC:
                 return True, (
                     f"drawdown {drawdown * 100:.1f}% > "
-                    f"{KILL_DRAWDOWN_FRAC * 100:.0f}% from peak ${wallet_peak_usd:.2f}"
+                    f"{KILL_DRAWDOWN_FRAC * 100:.0f}% from peak "
+                    f"${portfolio_peak_usd:.2f} "
+                    f"(portfolio=${portfolio_value_usd:.2f}, cash=${wallet_usd:.2f})"
                 )
 
         return False, ""

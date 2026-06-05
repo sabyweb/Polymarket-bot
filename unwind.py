@@ -761,16 +761,26 @@ class UnwindMixin:
         yes_tid = self.market["token_ids"][0]
 
         try:
-            merge_client = None
-            if hasattr(self.client, 'merge_positions'):
-                merge_client = self.client
-            else:
-                inner = getattr(self.client, '_client', None)
-                if inner and hasattr(inner, 'merge_positions'):
-                    merge_client = inner
+            from ctf_merge import try_merge_positions
 
-            if merge_client is None:
-                # No merge capability — fall back to manual alert
+            raw_client = getattr(self.client, "_client", self.client)
+
+            def _yes_balance() -> float:
+                pre_bal = self.client.get_balance_allowance(
+                    BalanceAllowanceParams(
+                        asset_type=AssetType.CONDITIONAL, token_id=yes_tid
+                    )
+                )
+                return float(pre_bal.get("balance", 0)) / 1e6
+
+            ok, reason = try_merge_positions(
+                raw_client,
+                condition_id=condition_id,
+                amount=amount,
+                yes_tid=yes_tid,
+                verify_balance_fn=_yes_balance,
+            )
+            if not ok:
                 now = _time.time()
                 last_alert = getattr(self, '_last_merge_alert', 0)
                 if now - last_alert > 1800:
@@ -780,54 +790,20 @@ class UnwindMixin:
                     alert_merge_needed(question, yes_shares, no_shares, amount, amount)
                 log.warning(
                     f"MERGE NEEDED (manual) | {amount:.2f} YES+NO pairs | "
-                    f"would free ${amount:.2f} USDC | "
-                    f"market={question[:40]} | "
-                    f"Use Polymarket UI to merge positions"
-                )
-                return False
-
-            # ── Pre-merge balance snapshot ────────────────────────────
-            pre_bal = self.client.get_balance_allowance(
-                BalanceAllowanceParams(
-                    asset_type=AssetType.CONDITIONAL, token_id=yes_tid
-                )
-            )
-            pre_yes = float(pre_bal.get("balance", 0)) / 1e6
-
-            # ── Execute merge ─────────────────────────────────────────
-            result = merge_client.merge_positions(
-                condition_id=condition_id,
-                amount=amount,
-            )
-
-            # ── Post-merge balance verification ───────────────────────
-            post_bal = self.client.get_balance_allowance(
-                BalanceAllowanceParams(
-                    asset_type=AssetType.CONDITIONAL, token_id=yes_tid
-                )
-            )
-            post_yes = float(post_bal.get("balance", 0)) / 1e6
-
-            if post_yes >= pre_yes - 0.5:
-                log.critical(
-                    f"PHANTOM MERGE: API returned but exchange YES balance unchanged "
-                    f"(pre={pre_yes:.0f} post={post_yes:.0f}, expected -{amount:.0f}) | "
-                    f"{question[:40]}"
+                    f"reason={reason} | market={question[:40]}"
                 )
                 return False
 
             log.info(
                 f"MERGE SUCCESS | {amount:.2f} pairs merged | "
-                f"freed=${amount:.2f} USDC | "
-                f"market={question[:40]} | result={result}"
+                f"freed=${amount:.2f} USDC | market={question[:40]}"
             )
             get_db().log_merge(condition_id, amount, amount)
             return True
 
         except Exception as e:
             log.error(
-                f"Merge failed for {question[:40]}: {e} — "
-                f"falling back to individual SELL orders"
+                f"Merge failed for {question[:40]}: {e} — holding pair, no auto SELL"
             )
             return False
 

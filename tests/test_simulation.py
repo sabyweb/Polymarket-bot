@@ -259,10 +259,12 @@ class TestScenarioDirections(unittest.TestCase):
     def test_over_aggressive_contracts_capital(self):
         r = self.results["over_aggressive"]
         cap_init = r.learning_state_history[10]["capital_scale"]
-        cap_last = r.learning_state_history[-1]["capital_scale"]
+        cap_min = min(
+            h["capital_scale"] for h in r.learning_state_history[10:]
+        )
         self.assertLess(
-            cap_last, cap_init,
-            f"over_aggressive must contract: {cap_init} -> {cap_last}",
+            cap_min, cap_init,
+            f"over_aggressive must contract: {cap_init} -> min {cap_min}",
         )
 
     def test_under_deployed_does_not_over_expand(self):

@@ -109,6 +109,83 @@ Always: change committed on `main` (tests green) first; `--ff-only` (Helsinki tr
 stay clean; `config_overrides.json`/DB are untracked and survive). Rollback = `git checkout
 <prev> && restart`, or revert the config edit.
 
+### 8.1 FX-094–097 staged rollout (2026-06-05)
+
+**Scope:** merge fix (FX-094), portfolio drawdown (FX-095), unrealized marks (FX-096),
+escalating cooldowns (FX-097), farmer vol guard (phase 5b). Deploy in waves; do not enable
+all knobs at once.
+
+**Pre-flight (before first pull):**
+
+```bash
+RB=/home/polymarket/Polymarket-bot; cd $RB
+git rev-parse HEAD
+cp bot_history.db bot_history.db.bak.pre-fx094-$(date +%Y%m%d)
+cp config_overrides.json config_overrides.json.bak.pre-fx094-$(date +%Y%m%d)
+grep -E '^BUILDER_' .env | sed 's/=.*/=***redacted***/'   # FX-094 needs all three set
+```
+
+**Wave 0 — safety overrides** (apply before or with first pull; restart oversight):
+
+```json
+{
+  "RF_TRIAL_BUDGET_PCT": 0.75,
+  "RF_OVERCOMMIT_EXPECTED_FILL_COST_FRAC": 0.01,
+  "RF_OVERCOMMIT_MAX_DEPLOYED_MARKETS": 5,
+  "RF_TARGET_QUEUE_AHEAD_USD": 4000,
+  "RF_FILL_BREAKER_WINDOW": 900,
+  "RF_COOLDOWN_ESCALATION_ENABLED": false,
+  "RF_ALLOC_MAX_RECENT_VOLATILITY": 0
+}
+```
+
+`RF_COOLDOWN_ESCALATION_ENABLED: false` keeps legacy 24h cooldowns until Wave 2 soak passes.
+`RF_ALLOC_MAX_RECENT_VOLATILITY: 0` disables the 30s farmer vol guard until Wave 3.
+
+**Wave 1 — safety fixes** (FX-094 + FX-095 + FX-096):
+
+```bash
+cd $RB && git pull --ff-only origin main
+venv/bin/pip install -r requirements.txt    # poly-web3, py-builder-relayer-client
+sudo systemctl restart polymarket-oversight polymarket-farmer
+```
+
+Verify (first 2h): `portfolio_snapshots.total_value` populated; no false drawdown kill on
+cash→inventory conversion; merge logs show `[MERGE]` not `merge_positions` AttributeError.
+**Soak gate:** 48h clean before Wave 2.
+
+**Wave 2 — FX-097** (after 48h soak): set `"RF_COOLDOWN_ESCALATION_ENABLED": true`;
+`sudo systemctl restart polymarket-oversight`. **Soak gate:** 7d on breadth/rewards.
+
+**Wave 3 — farmer vol guard** (after Wave 2 stable): set
+`"RF_ALLOC_MAX_RECENT_VOLATILITY": 0.10` (or `0.15` conservative); restart farmer.
+**Soak gate:** 3–7d on adverse-fill $/day.
+
+**Wave 4 — selection knobs** (one at a time, 3–7d soak each): `RF_MAX_CAPITAL_PER_MARKET_USD`,
+`RF_RANK_VOL_PENALTY_K`, `RF_PREEMPTIVE_COOLDOWN_ENABLED`.
+
+**Builder env (FX-094):** `.env` must include `BUILDER_API_KEY`, `BUILDER_SECRET`,
+`BUILDER_PASSPHRASE` for Safe-wallet merge via Builder Relayer. Without them merge is
+disabled — hedged pairs are held and `alert_merge_needed` pages Discord (no auto dual-dump).
+
+**New Discord alert:**
+
+| Alert | Meaning | Action |
+|---|---|---|
+| **MERGE NEEDED** | Both sides filled; merge failed or creds missing | Check builder creds; hold pair (~$1/pair) or manual merge; do not expect auto dual-dump |
+
+**Restart matrix:**
+
+| Change | Restart |
+|---|---|
+| FX-094 merge / FX-096 unrealized | farmer |
+| FX-095 drawdown / FX-097 cooldowns | oversight (+ farmer for FX-095 backstop) |
+| Phase 5b farmer vol | farmer (hot-reloads, restart once to clear state) |
+| Phase 5a/5c allocator | oversight |
+
+**Rollback:** `git checkout <pre-wave-sha> && venv/bin/pip install -r requirements.txt`;
+restore `config_overrides.json.bak.pre-fx094-*`; restart both units.
+
 ## 9. Current objective + gates (so you know what "done" means)
 
 Objective: **max-farm rewards, capital-efficiently, NET-positive.** Gross is there

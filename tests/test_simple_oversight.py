@@ -337,7 +337,9 @@ def test_O12_run_once_excludes_cooled_markets_from_deploys():
     until = now + 3600.0
     conn = sqlite3.connect(db)
     conn.execute(
-        "INSERT INTO market_cooldowns VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO market_cooldowns "
+        "(condition_id, cooled_at, cooldown_until, reason, roi_at_cooldown, "
+        "fill_loss_at_cooldown, samples_at_cooldown) VALUES (?, ?, ?, ?, ?, ?, ?)",
         ("0xCOOLED", now - 100, until, "test_seed", -0.10, 5.0, 5),
     )
     conn.commit()

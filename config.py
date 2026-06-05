@@ -324,6 +324,23 @@ RF_ALLOC_MAX_RECENT_VOLATILITY: float = 0.10   # Exclude a candidate if its book
 RF_ALLOC_VOLATILITY_WINDOW_HOURS: float = 6.0  # Look-back window for the midpoint-range volatility estimate.
 RF_ALLOC_VOLATILITY_MIN_SAMPLES: int = 5       # Require ≥ this many book_snapshots in the window to compute volatility; below it, fail-open (insufficient signal → no exclusion).
 
+# ── FX-097: Escalating cooldowns for repeat losers ───────────────────────────
+RF_COOLDOWN_BASE_SEC: float = 86400.0          # First-strike cooldown (24h)
+RF_COOLDOWN_ESCALATION_MULT: tuple = (1, 3, 7)  # gen 1→24h, 2→72h, 3→7d
+RF_COOLDOWN_CHRONIC_COUNT: int = 3             # lifetime cools ≥ this → chronic_blocked
+RF_COOLDOWN_7D_LOSS_USD: float = 1.0           # 7d fill_loss gate for reactivation
+RF_COOLDOWN_ESCALATION_ENABLED: bool = False   # True = 24h→72h→7d escalation (enable via override after soak)
+
+# ── Phase 5a: Per-market capital cap (canary bite-size limiter) ───────────────
+RF_MAX_CAPITAL_PER_MARKET_USD: float = 0.0     # 0 = disabled; e.g. 20 on canary
+
+# ── Phase 5c: Stability-weighted ranker ───────────────────────────────────────
+RF_RANK_VOL_PENALTY_K: float = 0.0             # 0 = disabled; reward / (1 + k*vol)
+
+# ── Phase 5d: Pre-emptive cooldown on adverse fill ────────────────────────────
+RF_PREEMPTIVE_COOLDOWN_ENABLED: bool = False   # off until 5a–5c soak data
+RF_PREEMPTIVE_SLIPPAGE_USD: float = 0.05       # per-share slippage threshold
+
 RF_BOOK_CACHE_TTL: int = 180                 # Max age (seconds) for MarketState.cached_book used by Q-score sampling in record_cycle; 0 disables
 RF_ORDER_STALE_CHECK_SECS: int = 300         # Force-check orders still in open_ids after this many seconds
 

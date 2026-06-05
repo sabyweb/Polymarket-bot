@@ -42,6 +42,8 @@ def _backstop_farmer(alloc_age_hours, peak, current):
     rf.db = MagicMock()
     rf.db.get_wallet_peak_usd.return_value = peak
     rf.db.load_usdc_balance.return_value = (current, time.time())
+    rf.db.load_all_positions.return_value = {}
+    rf.markets = {}
     return rf
 
 
@@ -102,6 +104,8 @@ def _guardrail_farmer(alloc_age_hours, peak, current):
     rf.db = MagicMock()
     rf.db.get_wallet_peak_usd.return_value = peak
     rf.db.load_usdc_balance.return_value = (current, time.time())
+    rf.db.load_all_positions.return_value = {}
+    rf.markets = {}
     rf._guardrail_total_capital_from_alloc = MagicMock(return_value=1000.0)
     rf._guardrail_live_notional_per_market = MagicMock(return_value={"0xabc": 500.0})
     rf._guardrail_cluster_notional = MagicMock(return_value=({}, {}))  # (cluster_notional, cluster_by_cid) — both dicts

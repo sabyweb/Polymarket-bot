@@ -413,9 +413,11 @@ class TestSafetySweep(unittest.TestCase):
 class TestMergeBalanceVerification(unittest.TestCase):
     """try_merge must verify exchange balance decreased before recording unwind."""
 
-    def test_phantom_merge_falls_back_to_dual_dump(self):
-        """Merge API returns but balance unchanged → record_unwind NOT called, falls back to dump."""
+    @patch("ctf_merge.try_merge_positions")
+    def test_phantom_merge_holds_pair_no_dual_dump(self, mock_merge):
+        """FX-094: phantom merge → no record_unwind, no dual dump (hold hedged pair)."""
         _ensure_clob_types_mock()
+        mock_merge.return_value = (False, "phantom_merge")
 
         ms = _make_ms()
         positions = MagicMock()
@@ -423,26 +425,21 @@ class TestMergeBalanceVerification(unittest.TestCase):
 
         dm = _make_dump_manager(positions=positions)
         dm.dump_position = MagicMock()
-
-        # Merge API "succeeds" but balance doesn't change
-        dm.client.merge_positions.return_value = {"success": True}
         dm.client.update_balance_allowance.return_value = None
-        # Pre and post balance are the same (200 shares = 200_000_000 raw)
         dm.client.get_balance_allowance.return_value = {
             "balance": str(200 * 1_000_000),
         }
 
         dm.try_merge(ms, 200.0)
 
-        # record_unwind should NOT have been called — merge didn't actually happen
         positions.record_unwind.assert_not_called()
-        # Should fall back to dual dump
-        self.assertTrue(dm.dump_position.call_count >= 1,
-                        "Should fall back to dump_position after phantom merge")
+        dm.dump_position.assert_not_called()
 
-    def test_real_merge_records_unwind(self):
-        """Merge succeeds and balance drops → record_unwind called normally."""
+    @patch("ctf_merge.try_merge_positions")
+    def test_real_merge_records_unwind(self, mock_merge):
+        """Merge succeeds → record_unwind called for both sides."""
         _ensure_clob_types_mock()
+        mock_merge.return_value = (True, "")
 
         ms = _make_ms()
         positions = MagicMock()
@@ -450,35 +447,21 @@ class TestMergeBalanceVerification(unittest.TestCase):
 
         dm = _make_dump_manager(positions=positions)
         dm.dump_position = MagicMock()
-
-        dm.client.merge_positions.return_value = {"success": True}
         dm.client.update_balance_allowance.return_value = None
-
-        # Pre-merge: 200 shares. Post-merge: 0 shares.
-        call_count = [0]
-        def mock_balance(*args, **kwargs):
-            call_count[0] += 1
-            # First call = pre-merge snapshot, second = post-merge verification
-            # (update_balance_allowance calls are separate and return None)
-            if call_count[0] == 1:
-                return {"balance": str(200 * 1_000_000)}  # pre: 200 shares
-            else:
-                return {"balance": "0"}  # post: 0 shares (merged)
-
-        dm.client.get_balance_allowance.side_effect = mock_balance
+        dm.client.get_balance_allowance.return_value = {"balance": "0"}
 
         dm.try_merge(ms, 200.0)
 
-        # record_unwind SHOULD have been called for both sides
         self.assertEqual(positions.record_unwind.call_count, 2)
         positions.record_unwind.assert_any_call(ms.cid, "yes", 200.0)
         positions.record_unwind.assert_any_call(ms.cid, "no", 200.0)
-        # dump_position should NOT have been called
         dm.dump_position.assert_not_called()
 
-    def test_merge_api_exception_falls_back_to_dump(self):
-        """Merge API raises exception → falls back to dual dump, no unwind recorded."""
+    @patch("ctf_merge.try_merge_positions")
+    def test_merge_failure_holds_pair_no_dump(self, mock_merge):
+        """FX-094: merge exception → hold pair, no dual dump."""
         _ensure_clob_types_mock()
+        mock_merge.return_value = (False, "merge_exception: timeout")
 
         ms = _make_ms()
         positions = MagicMock()
@@ -486,17 +469,15 @@ class TestMergeBalanceVerification(unittest.TestCase):
 
         dm = _make_dump_manager(positions=positions)
         dm.dump_position = MagicMock()
-
         dm.client.update_balance_allowance.return_value = None
         dm.client.get_balance_allowance.return_value = {
             "balance": str(200 * 1_000_000),
         }
-        dm.client.merge_positions.side_effect = Exception("API timeout")
 
         dm.try_merge(ms, 200.0)
 
         positions.record_unwind.assert_not_called()
-        self.assertTrue(dm.dump_position.call_count >= 1)
+        dm.dump_position.assert_not_called()
 
 
 if __name__ == "__main__":

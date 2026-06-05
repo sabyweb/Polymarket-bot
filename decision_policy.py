@@ -65,7 +65,17 @@ ROI_COOLDOWN_MIN_SAMPLES = 1           # FX-057: was 3; ≥1 fill is enough conf
 ABS_LOSS_FAST_COOLDOWN_USD = 1.0       # FX-057: was $2; lowered to catch the slow-bleed
                                        # band ($1–$1.99 single-fill losses). Calibrated
                                        # against per-market notional of $10–$50.
-COOLDOWN_PERIOD_SEC = 86400.0          # 24h cooldown duration
+COOLDOWN_PERIOD_SEC = 86400.0          # 24h cooldown duration (legacy default)
+
+
+def _cooldown_duration_sec(generation: int) -> float:
+    """FX-097 escalating cooldown: 24h → 72h → 7d by generation."""
+    from config import cfg, RF_COOLDOWN_ESCALATION_MULT, RF_COOLDOWN_BASE_SEC
+    if not cfg("RF_COOLDOWN_ESCALATION_ENABLED"):
+        return COOLDOWN_PERIOD_SEC
+    mults = RF_COOLDOWN_ESCALATION_MULT
+    idx = max(0, min(generation - 1, len(mults) - 1))
+    return float(RF_COOLDOWN_BASE_SEC) * float(mults[idx])
 FILL_RATE_WARNING_PER_HOUR = 1.0       # > 1/hr is suspicious; warn (no auto-action in v1)
 GLOBAL_LOSS_WARNING_RATIO = 0.5        # if total_loss > 0.5 × total_reward → warn
 
@@ -170,7 +180,7 @@ class DecisionPolicy:
         now = self._now()
         existing = self._load_cooldown(cid)
         if existing is not None:
-            cooled_at, until_ts, reason, roi_at, loss_at, samp_at = existing
+            cooled_at, until_ts, reason, roi_at, loss_at, samp_at = existing[:6]
             if until_ts > now:
                 return MarketDecision(
                     condition_id=cid, action="still_cooled",
@@ -183,19 +193,67 @@ class DecisionPolicy:
             # rather than reactivating for one farmer cycle and re-cooling
             # next oversight cycle (the original v1 behaviour leaked one
             # cycle of avoidable fills per expiry on every persistent loser).
+            prev_gen = int(existing[6]) if len(existing) > 6 and existing[6] else 1
+            prev_lifetime = int(existing[7]) if len(existing) > 7 and existing[7] else 1
+            was_chronic = bool(existing[8]) if len(existing) > 8 and existing[8] else False
             self._delete_cooldown(cid)
+            if was_chronic:
+                until = now + _cooldown_duration_sec(prev_gen + 1)
+                self._insert_cooldown(
+                    cid, now, until, "chronic_blocked: manual clear required",
+                    self.tracker.get_roi(cid, "24h") or MarketROISnapshot(
+                        condition_id=cid, window="24h", window_end_ts=now,
+                        reward_earned=0, fill_loss=0, capital_committed_avg=0,
+                        roi=0, fill_count=0, fill_rate_per_hour=0,
+                        samples=0, last_updated=now,
+                    ),
+                    generation=prev_gen + 1,
+                    lifetime=prev_lifetime + 1,
+                    chronic=True,
+                )
+                return MarketDecision(
+                    condition_id=cid, action="cool_down",
+                    reason="chronic_blocked",
+                    cooldown_until=until,
+                )
             roi_now = self.tracker.get_roi(cid, "24h")
+            loss_7d = self._fill_loss_window(cid, 7 * 86400)
             if roi_now is None:
+                if loss_7d >= self._cooldown_7d_loss_threshold():
+                    gen = prev_gen + 1
+                    until = now + _cooldown_duration_sec(gen)
+                    self._insert_cooldown(
+                        cid, now, until,
+                        f"expired+7d_loss=${loss_7d:.2f}",
+                        MarketROISnapshot(
+                            condition_id=cid, window="24h", window_end_ts=now,
+                            reward_earned=0, fill_loss=loss_7d,
+                            capital_committed_avg=0, roi=0, fill_count=0,
+                            fill_rate_per_hour=0, samples=0, last_updated=now,
+                        ),
+                        generation=gen, lifetime=prev_lifetime + 1,
+                    )
+                    return MarketDecision(
+                        condition_id=cid, action="cool_down",
+                        reason=f"7d_loss=${loss_7d:.2f}",
+                        cooldown_until=until,
+                    )
                 return MarketDecision(
                     condition_id=cid, action="reactivate",
                     reason="cooldown expired, no fresh ROI yet",
                     cooldown_until=None,
                 )
             still_bad, bad_reason = self._is_roi_bad(roi_now)
-            if still_bad:
-                until = now + self.cooldown_period_sec
+            if still_bad or loss_7d >= self._cooldown_7d_loss_threshold():
+                gen = prev_gen + 1
+                until = now + _cooldown_duration_sec(gen)
                 full_reason = f"expired+still_bad: {bad_reason}"
-                self._insert_cooldown(cid, now, until, full_reason, roi_now)
+                if loss_7d >= self._cooldown_7d_loss_threshold():
+                    full_reason += f" | 7d_loss=${loss_7d:.2f}"
+                self._insert_cooldown(
+                    cid, now, until, full_reason, roi_now,
+                    generation=gen, lifetime=prev_lifetime + 1,
+                )
                 return MarketDecision(
                     condition_id=cid, action="cool_down",
                     reason=full_reason, cooldown_until=until,
@@ -219,8 +277,8 @@ class DecisionPolicy:
 
         bad, reason = self._is_roi_bad(roi)
         if bad:
-            until = now + self.cooldown_period_sec
-            self._insert_cooldown(cid, now, until, reason, roi)
+            until = now + _cooldown_duration_sec(1)
+            self._insert_cooldown(cid, now, until, reason, roi, generation=1, lifetime=1)
             return MarketDecision(
                 condition_id=cid, action="cool_down",
                 reason=reason, cooldown_until=until,
@@ -405,6 +463,25 @@ class DecisionPolicy:
             log.debug(f"[POLICY] get_excluded_cids failed: {e}")
             return set()
 
+    def preemptive_cooldown(self, cid: str, reason: str) -> bool:
+        """Phase 5d: immediate cooldown on first adverse fill (farmer-side)."""
+        from config import cfg
+        if not cfg("RF_PREEMPTIVE_COOLDOWN_ENABLED"):
+            return False
+        if self.is_cooled_down(cid):
+            return False
+        now = self._now()
+        roi = self.tracker.get_roi(cid, "24h")
+        snap = roi or MarketROISnapshot(
+            condition_id=cid, window="24h", window_end_ts=now,
+            reward_earned=0, fill_loss=0, capital_committed_avg=0,
+            roi=0, fill_count=1, fill_rate_per_hour=0,
+            samples=1, last_updated=now,
+        )
+        until = now + _cooldown_duration_sec(1)
+        self._insert_cooldown(cid, now, until, f"preemptive: {reason}", snap)
+        return True
+
     def is_cooled_down(self, cid: str) -> bool:
         """Single-cid query; equivalent to `cid in get_excluded_cids()`."""
         try:
@@ -422,12 +499,31 @@ class DecisionPolicy:
 
     # ── Cooldown table helpers ──
 
+    def _cooldown_7d_loss_threshold(self) -> float:
+        from config import cfg
+        return float(cfg("RF_COOLDOWN_7D_LOSS_USD") or 0.0)
+
+    def _fill_loss_window(self, cid: str, window_secs: float) -> float:
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cutoff = self._now() - window_secs
+            row = conn.execute(
+                "SELECT COALESCE(SUM(CASE WHEN pnl < 0 THEN -pnl ELSE 0 END), 0) "
+                "FROM unwinds WHERE condition_id = ? AND ts > ?",
+                (cid, cutoff),
+            ).fetchone()
+            conn.close()
+            return float(row[0]) if row else 0.0
+        except Exception:
+            return 0.0
+
     def _load_cooldown(self, cid: str) -> Optional[tuple]:
         try:
             conn = sqlite3.connect(self.db_path)
             row = conn.execute(
                 "SELECT cooled_at, cooldown_until, reason, roi_at_cooldown, "
-                "       fill_loss_at_cooldown, samples_at_cooldown "
+                "       fill_loss_at_cooldown, samples_at_cooldown, "
+                "       cooldown_generation, lifetime_cool_count, chronic_blocked "
                 "FROM market_cooldowns WHERE condition_id = ?",
                 (cid,),
             ).fetchone()
@@ -440,19 +536,33 @@ class DecisionPolicy:
     def _insert_cooldown(
         self, cid: str, cooled_at: float, until: float, reason: str,
         roi: MarketROISnapshot,
+        generation: int = 1,
+        lifetime: int = 1,
+        chronic: bool | None = None,
     ) -> None:
+        from config import cfg
+        chronic_thresh = int(cfg("RF_COOLDOWN_CHRONIC_COUNT") or 3)
+        if chronic is None:
+            chronic = lifetime >= chronic_thresh
         try:
             conn = sqlite3.connect(self.db_path)
             conn.execute(
                 "INSERT INTO market_cooldowns (condition_id, cooled_at, cooldown_until, "
-                "reason, roi_at_cooldown, fill_loss_at_cooldown, samples_at_cooldown) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "reason, roi_at_cooldown, fill_loss_at_cooldown, samples_at_cooldown, "
+                "cooldown_generation, lifetime_cool_count, chronic_blocked) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(condition_id) DO UPDATE SET "
                 "cooled_at=excluded.cooled_at, cooldown_until=excluded.cooldown_until, "
                 "reason=excluded.reason, roi_at_cooldown=excluded.roi_at_cooldown, "
                 "fill_loss_at_cooldown=excluded.fill_loss_at_cooldown, "
-                "samples_at_cooldown=excluded.samples_at_cooldown",
-                (cid, cooled_at, until, reason, roi.roi, roi.fill_loss, roi.samples),
+                "samples_at_cooldown=excluded.samples_at_cooldown, "
+                "cooldown_generation=excluded.cooldown_generation, "
+                "lifetime_cool_count=excluded.lifetime_cool_count, "
+                "chronic_blocked=excluded.chronic_blocked",
+                (
+                    cid, cooled_at, until, reason, roi.roi, roi.fill_loss, roi.samples,
+                    generation, lifetime, 1 if chronic else 0,
+                ),
             )
             conn.commit()
             conn.close()

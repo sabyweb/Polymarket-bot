@@ -1532,16 +1532,25 @@ class RewardFarmer:
         if not total_live_notional or total_live_notional <= 0:
             return False, ""                       # nothing at risk
         peak = self.db.get_wallet_peak_usd()
-        current, _ts = self.db.load_usdc_balance()
-        if peak is None or current is None or peak <= 0:
+        cash, _ts = self.db.load_usdc_balance()
+        if peak is None or cash is None or peak <= 0:
             return False, ""                       # missing wallet signal → fail-open
+        from portfolio_value import compute_portfolio_value
+        positions = self.db.load_all_positions()
+        mids = {
+            cid: getattr(ms, "midpoint", 0.0) or 0.0
+            for cid, ms in self.markets.items()
+        }
+        current = compute_portfolio_value(float(cash), positions, mids)
+        if current <= 0:
+            current = float(cash)
         drawdown = 1.0 - (current / peak)
         frac = cfg("RF_FARMER_DRAWDOWN_KILL_FRAC")
         if drawdown > frac:
             return True, (
                 f"oversight_silent={silent_secs / 3600.0:.2f}h > {silence_hours}h "
                 f"AND farmer_drawdown={drawdown:.1%} > {frac:.0%} "
-                f"(peak=${peak:.2f}, current=${current:.2f}, "
+                f"(peak=${peak:.2f}, portfolio=${current:.2f}, cash=${cash:.2f}, "
                 f"live_notional=${total_live_notional:.2f})"
             )
         return False, ""
@@ -1559,9 +1568,10 @@ class RewardFarmer:
         the sticky kill when NET unrealized loss exceeds
         RF_UNREALIZED_LOSS_KILL_FRAC of total_capital.
 
-        Mark per leg (CLOB terms): YES pnl = yes_shares·(mid − yes_avg_price);
-        NO pnl = no_shares·((1 − mid) − no_avg_price). Cost basis from the
-        positions table; midpoint from the live MarketState.
+        Mark per leg (YES-equivalent avg per state.py): YES pnl =
+        yes_shares·(mid − yes_avg); NO pnl = no_shares·(no_avg − mid)
+        [= no_shares·((1−mid) − (1−no_avg))]. Per-leg loss capped at cost
+        basis. Midpoint from the live MarketState.
 
         Fail-open (returns (False, "")) on any missing signal: disabled knob,
         no/zero total_capital, positions read error, or nothing markable. A leg
@@ -1582,28 +1592,25 @@ class RewardFarmer:
             return False, ""                          # read error → fail-open
         if not positions:
             return False, ""
-        net_unrealized = 0.0
-        marked_legs = 0
+        from portfolio_mark import portfolio_unrealized_loss
+
+        leg_rows: list[tuple[str, float, float, float]] = []
         for cid, pos in positions.items():
             ms = self.markets.get(cid)
             if ms is None:
                 continue
             mid = getattr(ms, "midpoint", 0.0) or 0.0
-            if mid <= 0.0 or mid >= 1.0:
-                continue                              # no fresh/valid mark → skip
             ys = float(pos.get("yes_shares", 0.0) or 0.0)
             ya = float(pos.get("yes_avg_price", 0.0) or 0.0)
             ns = float(pos.get("no_shares", 0.0) or 0.0)
             na = float(pos.get("no_avg_price", 0.0) or 0.0)
-            if ys > 0.0 and ya > 0.0:
-                net_unrealized += ys * (mid - ya)
-                marked_legs += 1
-            if ns > 0.0 and na > 0.0:
-                net_unrealized += ns * ((1.0 - mid) - na)
-                marked_legs += 1
+            if ys > 0 and ya > 0:
+                leg_rows.append(("yes", ys, ya, mid))
+            if ns > 0 and na > 0:
+                leg_rows.append(("no", ns, na, mid))
+        unrealized_loss, marked_legs = portfolio_unrealized_loss(leg_rows)
         if marked_legs == 0:
             return False, ""                          # nothing markable → fail-open
-        unrealized_loss = -net_unrealized             # positive when underwater
         self._last_unrealized_loss = unrealized_loss
         limit = frac * total_capital
         if unrealized_loss > limit:

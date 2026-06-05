@@ -259,64 +259,70 @@ class DumpManager:
                     self.dump_position(ms, side, shares)
 
     def try_merge(self, ms: MarketState, amount: float):
-        """Merge YES + NO positions for $1 each. Falls back to dual dump."""
+        """Merge YES + NO positions for ~$1/pair via CTF relayer (FX-094).
+
+        On failure: alert + hold hedged pair — do NOT auto dual-dump (lossy).
+        """
         if self.dry_run:
             log.info(f"[DRY] MERGE {amount:.0f} pairs | {ms.question[:30]}")
             self.positions.record_unwind(ms.cid, "yes", amount)
             self.positions.record_unwind(ms.cid, "no", amount)
             return
 
-        try:
-            from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
+        from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
+        from ctf_merge import try_merge_positions
+        from alerts import alert_merge_needed
+
+        raw_client = getattr(self.client, "_client", self.client)
+
+        def _yes_balance() -> float:
             for tid in [ms.yes_tid, ms.no_tid]:
                 self.client.update_balance_allowance(
                     BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=tid)
                 )
-
-            # Snapshot YES balance before merge so we can verify it actually happened
-            pre_bal = self.client.get_balance_allowance(
-                BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=ms.yes_tid)
-            )
-            pre_yes = float(pre_bal.get("balance", 0)) / 1e6
-
-            result = self.client.merge_positions(ms.cid, amount)
-
-            # Verify merge actually reduced the exchange balance
-            post_bal = self.client.get_balance_allowance(
-                BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=ms.yes_tid)
-            )
-            post_yes = float(post_bal.get("balance", 0)) / 1e6
-
-            if post_yes >= pre_yes - 0.5:
-                log.critical(
-                    f"PHANTOM MERGE: API returned but exchange YES balance unchanged "
-                    f"(pre={pre_yes:.0f} post={post_yes:.0f}, expected -{amount:.0f}) | "
-                    f"{ms.question[:30]}"
+            bal = self.client.get_balance_allowance(
+                BalanceAllowanceParams(
+                    asset_type=AssetType.CONDITIONAL, token_id=ms.yes_tid
                 )
-                raise RuntimeError("Merge balance verification failed")
-
-            log.info(f"MERGE {amount:.0f} pairs | {ms.question[:30]}")
-            self.positions.record_unwind(ms.cid, "yes", amount)
-            self.positions.record_unwind(ms.cid, "no", amount)
-            # FX-067: append-only (no event_id) — the phantom-merge balance
-            # check above already prevents a double merge-log — but still
-            # check the truthful return so a dropped merge row is visible.
-            _mg_ok = self.db.log_unwind(
-                condition_id=ms.cid, question=ms.question,
-                side="merge", shares=amount,
-                sell_price=1.0, usd_value=amount,
             )
-            if not _mg_ok:
-                log.warning(
-                    f"[UNWIND_WRITE] cid={ms.cid[:12]} side=merge amount={amount:.0f} "
-                    f"step=not_inserted (DB error — merge unwind row missing)"
+            return float(bal.get("balance", 0)) / 1e6
+
+        ok, reason = try_merge_positions(
+            raw_client,
+            condition_id=ms.cid,
+            amount=amount,
+            yes_tid=ms.yes_tid,
+            verify_balance_fn=_yes_balance,
+        )
+        if not ok:
+            yes_sh = self.positions.get_shares(ms.cid, "yes")
+            no_sh = self.positions.get_shares(ms.cid, "no")
+            mergeable = min(yes_sh, no_sh, amount)
+            log.warning(
+                f"Merge failed ({reason}) — holding hedged pair, NOT dual-dumping | "
+                f"{ms.question[:30]}"
+            )
+            try:
+                alert_merge_needed(
+                    ms.question, yes_sh, no_sh, mergeable, mergeable,
                 )
-        except Exception as e:
-            log.warning(f"Merge failed ({e}) — falling back to dual dump | {ms.question[:30]}")
-            for side in ["yes", "no"]:
-                shares = self.positions.get_shares(ms.cid, side)
-                if shares >= 1:
-                    self.dump_position(ms, side, shares)
+            except Exception:
+                pass
+            return
+
+        log.info(f"MERGE {amount:.0f} pairs | {ms.question[:30]}")
+        self.positions.record_unwind(ms.cid, "yes", amount)
+        self.positions.record_unwind(ms.cid, "no", amount)
+        _mg_ok = self.db.log_unwind(
+            condition_id=ms.cid, question=ms.question,
+            side="merge", shares=amount,
+            sell_price=1.0, usd_value=amount,
+        )
+        if not _mg_ok:
+            log.warning(
+                f"[UNWIND_WRITE] cid={ms.cid[:12]} side=merge amount={amount:.0f} "
+                f"step=not_inserted (DB error — merge unwind row missing)"
+            )
 
     def dump_position(self, ms: MarketState, side: str, shares: float):
         """Smart dump: SELL near fill price, decay over time.

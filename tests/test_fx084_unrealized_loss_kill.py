@@ -65,11 +65,11 @@ class TestFX084UnrealizedLossKill(unittest.TestCase):
         self.assertAlmostEqual(rf._last_unrealized_loss, 30.0, places=4)
 
     def test_kill_on_no_markdown(self):
-        # NO 100 @ $0.80, mid 0.50 → pnl = 100·((1-0.50)-0.80) = -$30 loss > $20.
-        rf = _farmer({"c": _pos(no_shares=100, no_avg=0.80)}, {"c": _mkt(0.50)})
+        # NO 100 @ yes-equiv 0.29, mid 0.50 → loss $21 > $20 kill threshold.
+        rf = _farmer({"c": _pos(no_shares=100, no_avg=0.29)}, {"c": _mkt(0.50)})
         kill, reason = self._call(rf)
         self.assertTrue(kill)
-        self.assertAlmostEqual(rf._last_unrealized_loss, 30.0, places=4)
+        self.assertAlmostEqual(rf._last_unrealized_loss, 21.0, places=1)
 
     # ── Below-threshold / net-offset ─────────────────────────────────────────
 
@@ -82,7 +82,7 @@ class TestFX084UnrealizedLossKill(unittest.TestCase):
         self.assertAlmostEqual(rf._last_unrealized_loss, 10.0, places=4)
 
     def test_net_gain_offsets_loss(self):
-        # c1 YES underwater -$30; c2 NO in profit +$50 → net +$20 → loss -$20, no kill.
+        # c1 YES underwater -$30; c2 NO in profit +$10 → net -$20, no kill at $20.
         rf = _farmer(
             {"c1": _pos(yes_shares=100, yes_avg=0.50),
              "c2": _pos(no_shares=100, no_avg=0.30)},
@@ -90,8 +90,24 @@ class TestFX084UnrealizedLossKill(unittest.TestCase):
         )
         kill, _ = self._call(rf)
         self.assertFalse(kill)
-        # net unrealized = -30 + 50 = +20 → unrealized_loss = -20
-        self.assertAlmostEqual(rf._last_unrealized_loss, -20.0, places=4)
+        self.assertAlmostEqual(rf._last_unrealized_loss, 20.0, places=1)
+
+    def test_hedged_pair_near_zero_unrealized(self):
+        # Symmetric hedged pair @ mid → net unrealized ≈ 0.
+        rf = _farmer(
+            {"c": _pos(yes_shares=100, yes_avg=0.50, no_shares=100, no_avg=0.50)},
+            {"c": _mkt(0.50)},
+        )
+        kill, _ = self._call(rf)
+        self.assertFalse(kill)
+        self.assertAlmostEqual(rf._last_unrealized_loss, 0.0, places=4)
+
+    def test_no_overcount_capped_at_cost_basis(self):
+        # NO markdown: loss capped at cost basis 100*(1-0.80)=20.
+        rf = _farmer({"c": _pos(no_shares=100, no_avg=0.80)}, {"c": _mkt(0.95)})
+        kill, _ = self._call(rf)
+        self.assertAlmostEqual(rf._last_unrealized_loss, 15.0, places=1)
+        self.assertLessEqual(rf._last_unrealized_loss, 20.0 + 0.1)
 
     # ── Fail-open paths (return (False, "") and never false-kill) ─────────────
 

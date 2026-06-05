@@ -677,13 +677,18 @@ class OrderLifecycle:
             f"[FILL_WRITE] cid={cid[:12]} side={side} shares={filled_shares:.2f} "
             f"price={fill_price:.4f} step=attempting event_id={fill_event_id[:32]}"
         )
+        if ms.midpoint > 0:
+            mkt = ms.midpoint if side == "yes" else (1.0 - ms.midpoint)
+            slip = clob_cost - mkt
+        else:
+            slip = 0.0
         inserted = self.db.log_fill(
             condition_id=cid, question=ms.question,
             side=side, fill_type=fill_type,
             shares=filled_shares, price=fill_price,
             clob_cost=clob_cost, usd_value=filled_shares * clob_cost,
             midpoint=ms.midpoint,
-            slippage=clob_cost - ms.midpoint if ms.midpoint > 0 else 0,
+            slippage=slip,
             order_age_secs=_order_age,
             position_usd_after=_pos_usd,
             reward_rate_hr=ms.daily_rate / 24.0 if ms.daily_rate > 0 else 0,
@@ -695,6 +700,23 @@ class OrderLifecycle:
                 f"[FILL_WRITE] cid={cid[:12]} side={side} shares={filled_shares:.2f} "
                 f"step=succeeded"
             )
+            # Phase 5d: pre-emptive cooldown on adverse slippage
+            try:
+                thresh = float(cfg("RF_PREEMPTIVE_SLIPPAGE_USD") or 0.0)
+                if thresh > 0 and slip > thresh:
+                    from decision_policy import DecisionPolicy
+                    from market_roi_tracker import MarketROITracker
+                    pol = DecisionPolicy(
+                        db_path=self.db._db_path,  # noqa: SLF001
+                        tracker=MarketROITracker(
+                            db_path=self.db._db_path, funder="",  # noqa: SLF001
+                        ),
+                    )
+                    pol.preemptive_cooldown(
+                        cid, f"slippage={slip:.4f}>{thresh:.4f}",
+                    )
+            except Exception:
+                pass
         elif fill_event_id:
             # FX-054: distinguish idempotent collision (safe, expected on
             # retry) from genuine DB error. We can tell by re-querying for
@@ -833,6 +855,41 @@ class OrderLifecycle:
             )
         except Exception:
             pass  # never break production
+
+        # Phase 5b: farmer-side FX-093 volatility mirror (~30s cadence)
+        vol_cap = cfg("RF_ALLOC_MAX_RECENT_VOLATILITY")
+        if vol_cap and vol_cap > 0:
+            try:
+                window_h = cfg("RF_ALLOC_VOLATILITY_WINDOW_HOURS")
+                min_samples = cfg("RF_ALLOC_VOLATILITY_MIN_SAMPLES")
+                cutoff = time.time() - float(window_h) * 3600.0
+                row = self.db._get_conn().execute(
+                    "SELECT MAX(midpoint), MIN(midpoint), COUNT(*) "
+                    "FROM book_snapshots WHERE condition_id = ? AND ts >= ?",
+                    (ms.cid, cutoff),
+                ).fetchone()
+                if row and row[2] and int(row[2]) >= int(min_samples):
+                    recent_vol = float(row[0]) - float(row[1])
+                    if recent_vol > float(vol_cap):
+                        log.info(
+                            f"SKIP volatility guard | range={recent_vol:.3f} "
+                            f"| {ms.question[:30]}"
+                        )
+                        self.db.write_placement_feedback(
+                            ms.cid, "yes", "skipped", "volatility_guard",
+                        )
+                        self.db.write_placement_feedback(
+                            ms.cid, "no", "skipped", "volatility_guard",
+                        )
+                        for side in ("yes", "no"):
+                            slot = ms.orders[side]
+                            if slot.order_id:
+                                if self.cancel_order(slot.order_id, reason="volatility_guard"):
+                                    self.db.delete_active_order(slot.order_id)
+                                    slot.order_id = None
+                        return placed_count
+            except Exception:
+                pass  # fail-open
 
         if best_ask - best_bid > cfg("RF_MAX_BOOK_SPREAD"):
             self.db.write_placement_feedback(ms.cid, "yes", "skipped", "wide_spread")

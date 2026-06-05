@@ -434,7 +434,10 @@ CREATE TABLE IF NOT EXISTS market_cooldowns (
     reason              TEXT NOT NULL,
     roi_at_cooldown     REAL NOT NULL DEFAULT 0,
     fill_loss_at_cooldown REAL NOT NULL DEFAULT 0,
-    samples_at_cooldown INTEGER NOT NULL DEFAULT 0
+    samples_at_cooldown INTEGER NOT NULL DEFAULT 0,
+    cooldown_generation INTEGER NOT NULL DEFAULT 1,
+    lifetime_cool_count INTEGER NOT NULL DEFAULT 1,
+    chronic_blocked     INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_market_cooldowns_until ON market_cooldowns(cooldown_until);
 
@@ -525,6 +528,7 @@ class BotDatabase:
             self._migrate_fill_quality(conn)
             # Migrate: add enrichment columns for iteration data
             self._migrate_enrichment_columns(conn)
+            self._migrate_cooldown_escalation(conn)
             conn.commit()
             log.info(f"Bot history database ready: {self._db_path}")
         except Exception as e:
@@ -542,6 +546,25 @@ class BotDatabase:
                 log.info("Migrated fills table: added 'slippage' column")
         except Exception as e:
             log.warning(f"Fill quality migration check: {e}")
+
+    def _migrate_cooldown_escalation(self, conn: sqlite3.Connection) -> None:
+        """FX-097: escalating cooldown columns on market_cooldowns."""
+        for col, typedef in (
+            ("cooldown_generation", "INTEGER NOT NULL DEFAULT 1"),
+            ("lifetime_cool_count", "INTEGER NOT NULL DEFAULT 1"),
+            ("chronic_blocked", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            try:
+                existing = {row[1] for row in conn.execute(
+                    "PRAGMA table_info(market_cooldowns)"
+                )}
+                if col not in existing:
+                    conn.execute(
+                        f"ALTER TABLE market_cooldowns ADD COLUMN {col} {typedef}"
+                    )
+                    log.info(f"Migrated market_cooldowns: added '{col}'")
+            except Exception as e:
+                log.warning(f"Migration market_cooldowns.{col}: {e}")
 
     def _migrate_enrichment_columns(self, conn: sqlite3.Connection) -> None:
         """Add iteration-critical context columns to existing tables."""
@@ -1330,21 +1353,25 @@ class BotDatabase:
             return None
 
     def get_wallet_peak_usd(self) -> float | None:
-        """FX-082: wallet high-water mark = MAX(exchange_balance) over all
-        portfolio_snapshots rows (written each oversight cycle; FX-078 fixed the
-        writer). Used by the farmer's oversight-silence drawdown backstop. A
-        stale peak (e.g. oversight down) is still a valid high-water mark — the
-        peak only rises while healthy, and the wallet only falls under drawdown,
-        so 1 - current/peak stays correct (if anything, conservative). Returns
-        None on empty/error so the caller fails OPEN (no false drawdown kill on
-        missing data). Read-only — no transaction to roll back."""
+        """FX-082/FX-095: portfolio high-water mark = MAX(total_value)."""
         try:
             row = self._get_conn().execute(
-                "SELECT MAX(exchange_balance) FROM portfolio_snapshots"
+                "SELECT MAX(total_value) FROM portfolio_snapshots"
             ).fetchone()
             return float(row[0]) if row and row[0] is not None else None
         except Exception as e:
             log.debug(f"DB get_wallet_peak_usd error: {e}")
+            return None
+
+    def get_portfolio_value_usd(self) -> float | None:
+        """FX-095: latest total_value from portfolio_snapshots, or None."""
+        try:
+            row = self._get_conn().execute(
+                "SELECT total_value FROM portfolio_snapshots ORDER BY ts DESC LIMIT 1"
+            ).fetchone()
+            return float(row[0]) if row and row[0] is not None else None
+        except Exception as e:
+            log.debug(f"DB get_portfolio_value_usd error: {e}")
             return None
 
     def save_all_reward_stats(self, markets: dict) -> None:

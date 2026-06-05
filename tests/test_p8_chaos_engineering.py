@@ -333,7 +333,9 @@ class TestCE_F_ClockSkew(unittest.TestCase):
         conn = sqlite3.connect(db)
         now_normal = 1_700_000_000.0
         conn.execute(
-            "INSERT INTO market_cooldowns VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO market_cooldowns "
+            "(condition_id, cooled_at, cooldown_until, reason, roi_at_cooldown, "
+            "fill_loss_at_cooldown, samples_at_cooldown) VALUES (?, ?, ?, ?, ?, ?, ?)",
             ("0xCOOLED", now_normal, now_normal + 86400, "test", 0, 0, 0),
         )
         conn.commit()

@@ -75,8 +75,9 @@ def _setup_balance_responses(stub, pre_balance, post_balance):
 
 class TestMergeVerifiedSuccess(unittest.TestCase):
 
+    @patch("ctf_merge.try_merge_positions", return_value=(True, ""))
     @patch("unwind.get_db")
-    def test_merge_success_balance_decreased(self, mock_get_db):
+    def test_merge_success_balance_decreased(self, mock_get_db, _mock_merge):
         """Merge succeeds AND exchange balance decreased → returns True."""
         stub = _make_unwind_stub(has_merge=True)
 
@@ -87,14 +88,12 @@ class TestMergeVerifiedSuccess(unittest.TestCase):
         result = stub._try_merge_positions("cid_001", 50.0)
 
         self.assertTrue(result)
-        stub.client.merge_positions.assert_called_once_with(
-            condition_id="cid_001", amount=50.0,
-        )
         # DB merge logged
         mock_get_db().log_merge.assert_called_once_with("cid_001", 50.0, 50.0)
 
+    @patch("ctf_merge.try_merge_positions", return_value=(True, ""))
     @patch("unwind.get_db")
-    def test_merge_via_inner_client_verified(self, mock_get_db):
+    def test_merge_via_inner_client_verified(self, mock_get_db, _mock_merge):
         """Merge via inner._client works with balance verification."""
         stub = _make_unwind_stub(has_merge=False, has_inner_merge=True)
 
@@ -106,9 +105,6 @@ class TestMergeVerifiedSuccess(unittest.TestCase):
         result = stub._try_merge_positions("cid_001", 50.0)
 
         self.assertTrue(result)
-        inner.merge_positions.assert_called_once_with(
-            condition_id="cid_001", amount=50.0,
-        )
 
 
 # ═══════════════════════════════════════════════════════════════════════

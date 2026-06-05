@@ -76,23 +76,54 @@ def get_live_wallet_usd(funder: str, signer_key: str, api_creds) -> float:
     return int(b["balance"]) / 1e6
 
 
-def get_wallet_peak_usd(db_path: str, current_wallet: float) -> float:
-    """Max(historical_max from portfolio_snapshots, current_wallet).
-
-    The historical peak is used for drawdown computation in the kill switch.
-    Falls back to current_wallet on any DB issue (no kill on first cycle).
-    """
+def get_wallet_peak_usd(
+    db_path: str,
+    current_wallet: float,
+    current_portfolio: float | None = None,
+) -> float:
+    """Max(historical total_value peak, current portfolio). FX-095."""
+    current = current_portfolio if current_portfolio is not None else current_wallet
     try:
         conn = sqlite3.connect(db_path)
         row = conn.execute(
-            "SELECT MAX(exchange_balance) FROM portfolio_snapshots"
+            "SELECT MAX(total_value) FROM portfolio_snapshots"
         ).fetchone()
         conn.close()
         peak = float(row[0]) if row and row[0] is not None else 0.0
-        return max(peak, current_wallet)
+        return max(peak, current)
     except Exception as e:
         log.debug(f"peak lookup fallback (using current): {e}")
-        return current_wallet
+        return current
+
+
+def _load_positions_and_mids(db_path: str) -> tuple[dict, dict[str, float]]:
+    """Load open positions + latest book_snapshot midpoints for FX-095 marks."""
+    positions: dict = {}
+    mids: dict[str, float] = {}
+    try:
+        conn = sqlite3.connect(db_path)
+        for row in conn.execute(
+            "SELECT condition_id, yes_shares, yes_avg_price, "
+            "no_shares, no_avg_price FROM positions "
+            "WHERE yes_shares > 0 OR no_shares > 0"
+        ):
+            positions[row[0]] = {
+                "yes_shares": float(row[1] or 0),
+                "yes_avg_price": float(row[2] or 0),
+                "no_shares": float(row[3] or 0),
+                "no_avg_price": float(row[4] or 0),
+            }
+        for row in conn.execute(
+            "SELECT condition_id, midpoint FROM book_snapshots bs "
+            "WHERE ts = (SELECT MAX(ts) FROM book_snapshots bs2 "
+            "WHERE bs2.condition_id = bs.condition_id) "
+            "AND midpoint > 0 AND midpoint < 1"
+        ):
+            mids[row[0]] = float(row[1])
+        conn.close()
+    except Exception as e:
+        log.debug(f"portfolio mark load failed (fail-open): {e}")
+    return positions, mids
 
 
 def get_realized_loss_24h(db_path: str) -> float:
@@ -128,27 +159,17 @@ def get_wallet_24h_ago(db_path: str) -> Optional[float]:
         return None
 
 
-def write_portfolio_snapshot(db_path: str, balance: float) -> None:
-    """Persist current wallet to portfolio_snapshots for future peak/24h lookups.
-
-    FX-078: the live oversight (simple_oversight) is now the OWNER of this table.
-    Previously portfolio_snapshots was created ONLY by the legacy
-    oversight/safety_controller path, and this INSERT omitted the NOT-NULL
-    ``total_value`` column — so after the 2026-05-25 swap to simple_oversight
-    every call raised IntegrityError (or, on a fresh DB, "no such table"), which
-    was swallowed at debug level. The table silently froze, which disabled the
-    kill switch's drawdown limb (get_wallet_peak_usd reads MAX(exchange_balance)
-    here, so an empty table makes peak==current => drawdown==0 => never trips).
-
-    We now (a) create the canonical 6-column schema if missing (IF NOT EXISTS is
-    a no-op on DBs the legacy path already populated) and (b) write total_value.
-    Oversight only knows the wallet balance, so total_value == exchange_balance.
-    """
+def write_portfolio_snapshot(
+    db_path: str,
+    balance: float,
+    total_value: float | None = None,
+    locked_capital: float = 0.0,
+) -> None:
+    """Persist portfolio snapshot for peak/24h/drawdown lookups (FX-078/FX-095)."""
+    tv = total_value if total_value is not None else balance
     conn = None
     try:
         conn = sqlite3.connect(db_path)
-        # Canonical schema — mirrors oversight/safety_controller.py so the live
-        # path is self-sufficient and the column set matches existing rows.
         conn.execute(
             """CREATE TABLE IF NOT EXISTS portfolio_snapshots (
                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -159,10 +180,16 @@ def write_portfolio_snapshot(db_path: str, balance: float) -> None:
                 peak_value       REAL NOT NULL DEFAULT 0
             )"""
         )
+        prev_peak_row = conn.execute(
+            "SELECT MAX(total_value) FROM portfolio_snapshots"
+        ).fetchone()
+        prev_peak = float(prev_peak_row[0]) if prev_peak_row and prev_peak_row[0] else 0.0
+        peak_value = max(prev_peak, tv)
         conn.execute(
-            "INSERT INTO portfolio_snapshots (ts, total_value, exchange_balance) "
-            "VALUES (?, ?, ?)",
-            (time.time(), balance, balance),
+            "INSERT INTO portfolio_snapshots "
+            "(ts, total_value, exchange_balance, locked_capital, peak_value) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (time.time(), tv, balance, locked_capital, peak_value),
         )
         conn.commit()
     except Exception as e:
@@ -241,11 +268,17 @@ def run_once(
 
     log.info(f"[CAPITAL_SOURCE] source=live_api value=${wallet:.2f}")
 
-    # 2. Snapshot for history (so future cycles have peak/24h data)
-    write_portfolio_snapshot(db_path, wallet)
+    # 2. FX-095 portfolio value (cash + marked inventory)
+    positions, mids = _load_positions_and_mids(db_path)
+    from portfolio_value import compute_portfolio_value
+    portfolio = compute_portfolio_value(wallet, positions, mids)
+    locked = max(0.0, portfolio - wallet)
 
-    # 3. History reads
-    peak = get_wallet_peak_usd(db_path, wallet)
+    # 3. Snapshot for history (so future cycles have peak/24h data)
+    write_portfolio_snapshot(db_path, wallet, total_value=portfolio, locked_capital=locked)
+
+    # 4. History reads
+    peak = get_wallet_peak_usd(db_path, wallet, current_portfolio=portfolio)
     realized_loss = get_realized_loss_24h(db_path)
     wallet_24h_ago = get_wallet_24h_ago(db_path)
 
@@ -358,6 +391,8 @@ def run_once(
         global_tighten=global_tighten,
         global_reward_low=global_reward_low,
         q_share_distrust_cids=q_share_distrust_cids,
+        portfolio_value_usd=portfolio,
+        portfolio_peak_usd=peak,
     )
 
     # 4a. FX-051: record per-market est_capital_cost rows so future ROI ticks

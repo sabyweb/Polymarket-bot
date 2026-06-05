@@ -212,11 +212,15 @@ def test_P7_get_excluded_cids_returns_active_cooldowns_only():
     # Manually insert two cooldowns: one active, one expired
     conn = sqlite3.connect(db)
     conn.execute(
-        "INSERT INTO market_cooldowns VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO market_cooldowns "
+        "(condition_id, cooled_at, cooldown_until, reason, roi_at_cooldown, "
+        "fill_loss_at_cooldown, samples_at_cooldown) VALUES (?, ?, ?, ?, ?, ?, ?)",
         ("0xACTIVE", st["now"], st["now"] + 1000, "test", 0, 0, 0),
     )
     conn.execute(
-        "INSERT INTO market_cooldowns VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO market_cooldowns "
+        "(condition_id, cooled_at, cooldown_until, reason, roi_at_cooldown, "
+        "fill_loss_at_cooldown, samples_at_cooldown) VALUES (?, ?, ?, ?, ?, ?, ?)",
         ("0xEXPIRED", st["now"] - 1000, st["now"] - 1, "test", 0, 0, 0),
     )
     conn.commit()
