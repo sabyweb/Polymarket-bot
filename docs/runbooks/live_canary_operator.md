@@ -218,3 +218,40 @@ Until then this is an unproven canary — keep the cap small and watch the daily
   exists to resolve. "Broken" = a kill fires, a process crashes / heartbeat stale, a *real*
   (persistent or growing) wallet desync, 0-farming for an extended window, or runaway loss
   (realized_loss_24h approaching 10% of wallet / drawdown approaching 15%).
+
+## 11. Monitoring dashboard (read-only, localhost-only)
+
+`dashboard.py` is a read-only Streamlit view of the live `bot_history.db` +
+`market_allocations.json` + the public data-api (tabs: Overview, Market
+Selection, Market Perf, P&L, Positions, History, System Health). It opens the
+DB with `mode=ro` and never writes. **It reads `.env` (FUNDER) — keep it bound
+to loopback and reach it over an SSH tunnel; do not expose port 8501 publicly.**
+
+**One-time install (on Helsinki):**
+
+```bash
+RB=/home/polymarket/Polymarket-bot; cd $RB
+venv/bin/pip install streamlit pandas   # not in requirements.txt (bot runtime stays lean); jinja2 comes with streamlit
+sudo cp docs/runbooks/polymarket-dashboard.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now polymarket-dashboard
+systemctl is-active polymarket-dashboard   # -> active
+```
+
+The unit (`docs/runbooks/polymarket-dashboard.service`) runs
+`streamlit run dashboard.py --server.port 8501 --server.address 127.0.0.1
+--server.headless true`, so it only listens on `127.0.0.1:8501`.
+
+**Quick one-off (no unit):**
+`venv/bin/streamlit run dashboard.py --server.port 8501 --server.address 127.0.0.1`
+
+**View it from your laptop (SSH tunnel — local 8501 → server 8501):**
+
+```bash
+ssh -i ~/.ssh/polymarket_bot_ed25519 -N -L 8501:127.0.0.1:8501 polymarket@46.62.209.203
+# then open http://localhost:8501  (leave `ssh -N` running; Ctrl-C closes the tunnel)
+```
+
+Restart after a code pull: `sudo systemctl restart polymarket-dashboard`.
+Logs: `journalctl -u polymarket-dashboard -f`. Auto-refreshes every 60s;
+supervisory only — it touches nothing the bot relies on.

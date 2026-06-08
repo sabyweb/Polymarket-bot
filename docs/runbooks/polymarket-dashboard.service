@@ -1,0 +1,33 @@
+# Sample systemd unit for the read-only Streamlit dashboard.
+# Server-only (like the farmer/oversight units) — install to
+#   /etc/systemd/system/polymarket-dashboard.service  on Helsinki.
+# Bound to loopback only: the dashboard reads .env (FUNDER) and the live DB,
+# so it must never be exposed publicly. Reach it over an SSH tunnel
+# (see live_canary_operator.md §11).
+
+[Unit]
+Description=Polymarket reward farmer dashboard (Streamlit, localhost-only)
+Documentation=https://github.com/<your-github-user>/Polymarket-bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=polymarket
+Group=polymarket
+WorkingDirectory=/home/polymarket/Polymarket-bot
+
+# Loopback bind + headless. Requires: venv/bin/pip install streamlit pandas
+ExecStart=/home/polymarket/Polymarket-bot/venv/bin/streamlit run dashboard.py \
+  --server.port 8501 \
+  --server.address 127.0.0.1 \
+  --server.headless true \
+  --browser.gatherUsageStats false
+
+Restart=on-failure
+RestartSec=15s
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target
