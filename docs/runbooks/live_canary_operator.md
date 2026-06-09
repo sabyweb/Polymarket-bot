@@ -255,3 +255,36 @@ ssh -i ~/.ssh/polymarket_bot_ed25519 -N -L 8501:127.0.0.1:8501 polymarket@46.62.
 Restart after a code pull: `sudo systemctl restart polymarket-dashboard`.
 Logs: `journalctl -u polymarket-dashboard -f`. Auto-refreshes every 60s;
 supervisory only — it touches nothing the bot relies on.
+
+## 12. Soak monitor (Loop A — read-only daily digest)
+
+`soak_monitor.py` produces a once-a-day digest: liveness (heartbeats), live
+`kill_switch` (parsed from the farmer's `[CYCLE_SUMMARY]` journal line), last-24h
+P&L vs **authoritative data-api** reward, a rewards-vs-losses verdict, wallet
+reconciliation, and the worst realized-loss markets (from `unwinds`). It is
+**read-only and reports only** — it cannot restart, edit config, trade, or clear
+a kill (CLAUDE.md §7). Safe by default: prints to stdout; `--write` appends
+`docs/soak_log.md`; `--post` sends the digest to Discord.
+
+Run it by hand anytime (pure read):
+
+```bash
+cd /home/polymarket/Polymarket-bot && venv/bin/python3 soak_monitor.py
+```
+
+Schedule it (daily 00:30 UTC, ~10 min after reward settlement):
+
+```bash
+RB=/home/polymarket/Polymarket-bot; cd $RB
+sudo cp docs/runbooks/polymarket-soak-monitor.service /etc/systemd/system/
+sudo cp docs/runbooks/polymarket-soak-monitor.timer   /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now polymarket-soak-monitor.timer
+systemctl list-timers polymarket-soak-monitor.timer    # confirm next run
+```
+
+Trigger a one-off run of the scheduled unit: `sudo systemctl start polymarket-soak-monitor.service`.
+Logs: `journalctl -u polymarket-soak-monitor -n 50 --no-pager`. Digest history: `docs/soak_log.md`.
+Notes: it reads the farmer journal for the live kill flag — if that's ever unreadable, the
+Safety line degrades to "UNKNOWN" and falls back to DB proxies (kills still page Discord via
+`monitor_watchdog.py`). `cycle_snapshots`/`safety_state` are legacy tables and are deliberately NOT read.

@@ -1,0 +1,27 @@
+# Sample systemd unit for Loop A — the read-only daily soak monitor.
+# Server-only (like the farmer/oversight/dashboard units). Install to
+#   /etc/systemd/system/polymarket-soak-monitor.service  on Helsinki.
+# Paired with polymarket-soak-monitor.timer (daily 00:30 UTC).
+#
+# Read-only: opens bot_history.db mode=ro, reads the farmer journal, posts a
+# digest to Discord, and appends docs/soak_log.md. It cannot restart a service,
+# edit config, place/cancel orders, or clear a kill. See CLAUDE.md §7.
+
+[Unit]
+Description=Polymarket soak monitor (read-only daily digest)
+Documentation=https://github.com/<your-github-user>/Polymarket-bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=polymarket
+Group=polymarket
+WorkingDirectory=/home/polymarket/Polymarket-bot
+
+# --write appends docs/soak_log.md ; --post sends the digest to Discord.
+# Reads the farmer journal for the live kill_switch (default unit name below).
+ExecStart=/home/polymarket/Polymarket-bot/venv/bin/python3 soak_monitor.py --write --post --journal-unit polymarket-farmer
+
+# Don't let a transient data-api hiccup wedge anything; it's a oneshot.
+TimeoutStartSec=120

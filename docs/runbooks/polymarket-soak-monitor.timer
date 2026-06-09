@@ -1,0 +1,16 @@
+# Sample systemd timer for Loop A — runs the soak monitor once daily.
+# Install to /etc/systemd/system/polymarket-soak-monitor.timer on Helsinki.
+# 00:30 UTC = ~10 min after rewards settle (~00:20 UTC), so the data-api
+# reward number for the prior day is already indexed.
+
+[Unit]
+Description=Run the Polymarket soak monitor daily at 00:30 UTC
+Documentation=https://github.com/<your-github-user>/Polymarket-bot
+
+[Timer]
+OnCalendar=*-*-* 00:30:00 UTC
+Persistent=true
+Unit=polymarket-soak-monitor.service
+
+[Install]
+WantedBy=timers.target
