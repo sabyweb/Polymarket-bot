@@ -350,9 +350,22 @@ def build_digest(db_path: str, window_hours: int, funder: str,
         L.append("- no reconcile history.")
     else:
         w = wr[0]
-        L.append(f"- {w['status']} · actual {_usd(w['actual_wallet'])} · expected {_usd(w['expected_wallet'])} "
+        status = str(w.get("status", "") or "")
+        is_ok = status.lower() in ("ok", "baseline")
+        dot = "🟢" if is_ok else "🟡"
+        L.append(f"- {dot} {status} · actual {_usd(w['actual_wallet'])} · expected {_usd(w['expected_wallet'])} "
                  f"· divergence {_usd(w['divergence'])} ({_ago(w['ts'])})")
-        L.append("  (a transient desync right after ~00:20 UTC is reward-settlement lag — benign.)")
+        if not is_ok:
+            # Time-aware benign context (runbook §2/§10). The settlement-lag
+            # explanation only applies right after ~00:20 UTC; otherwise it's
+            # more likely taker-fee noise on a dump.
+            t = datetime.now(timezone.utc)
+            near_settlement = t.hour == 0 and t.minute <= 50
+            if near_settlement:
+                L.append("  (just after ~00:20 UTC settlement — likely reward-settlement lag; self-heals next cycle.)")
+            else:
+                L.append("  (off settlement hour — likely taker-fee noise on a dump; "
+                         "benign unless it persists or grows across runs (runbook §2).)")
 
     # ---- worst realized losers in the window ----
     L.append("")
