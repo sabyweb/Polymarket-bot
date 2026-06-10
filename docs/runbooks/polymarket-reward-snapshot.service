@@ -1,0 +1,21 @@
+# Sample systemd unit for the per-market reward collector.
+# Server-only. Install to /etc/systemd/system/polymarket-reward-snapshot.service.
+# Paired with polymarket-reward-snapshot.timer (hourly).
+#
+# Reads the CLOB /rewards/user/markets endpoint (signed GET) and appends
+# per-market earnings to a SEPARATE reward_snapshots.db. It never opens
+# bot_history.db and touches no bot code (see reward_snapshot.py header).
+
+[Unit]
+Description=Polymarket per-market reward collector (writes separate reward_snapshots.db)
+Documentation=https://github.com/<your-github-user>/Polymarket-bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=polymarket
+Group=polymarket
+WorkingDirectory=/home/polymarket/Polymarket-bot
+ExecStart=/home/polymarket/Polymarket-bot/venv/bin/python3 reward_snapshot.py
+TimeoutStartSec=180

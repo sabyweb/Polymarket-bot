@@ -1,0 +1,17 @@
+# Sample systemd timer for the per-market reward collector.
+# Install to /etc/systemd/system/polymarket-reward-snapshot.timer on Helsinki.
+# Hourly: `earnings` accrues through the UTC day and resets ~00:00 UTC, so
+# hourly snapshots let us take the pre-reset daily max per market robustly even
+# if a run is missed. Runs at :07 past each hour.
+
+[Unit]
+Description=Run the Polymarket per-market reward collector hourly
+Documentation=https://github.com/<your-github-user>/Polymarket-bot
+
+[Timer]
+OnCalendar=*-*-* *:07:00 UTC
+Persistent=true
+Unit=polymarket-reward-snapshot.service
+
+[Install]
+WantedBy=timers.target

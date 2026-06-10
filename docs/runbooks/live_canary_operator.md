@@ -288,3 +288,38 @@ Logs: `journalctl -u polymarket-soak-monitor -n 50 --no-pager`. Digest history: 
 Notes: it reads the farmer journal for the live kill flag — if that's ever unreadable, the
 Safety line degrades to "UNKNOWN" and falls back to DB proxies (kills still page Discord via
 `monitor_watchdog.py`). `cycle_snapshots`/`safety_state` are legacy tables and are deliberately NOT read.
+
+## 13. Per-market reward collector (data-foundation fix)
+
+`reward_snapshot.py` closes the gap that per-market reward was never persisted
+(the bot only stored the daily `__TOTAL__`). It reads the authenticated CLOB
+`/rewards/user/markets` endpoint and appends per-market `earnings` to a
+**separate `reward_snapshots.db`** — it never opens `bot_history.db` and touches
+no bot code, so it cannot affect live trading. This is what eventually lets us
+compute per-market NET (reward − loss) and judge which markets are net-bad vs
+net-good — the core market-selection question. `reward_snapshots.db` is gitignored (`*.db`).
+
+Run by hand:
+
+```bash
+cd /home/polymarket/Polymarket-bot
+venv/bin/python3 reward_snapshot.py --dry-run     # fetch + print, write nothing
+venv/bin/python3 reward_snapshot.py               # append a snapshot to reward_snapshots.db
+venv/bin/python3 reward_snapshot.py --report      # per-market daily reward collected so far
+```
+
+Schedule hourly:
+
+```bash
+RB=/home/polymarket/Polymarket-bot; cd $RB
+sudo cp docs/runbooks/polymarket-reward-snapshot.service /etc/systemd/system/
+sudo cp docs/runbooks/polymarket-reward-snapshot.timer   /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now polymarket-reward-snapshot.timer
+systemctl list-timers polymarket-reward-snapshot.timer --no-pager
+```
+
+`earnings` is current-day accrual (resets ~00:00 UTC), so per-market daily reward =
+the pre-reset max per (date, condition_id); `--report` computes that. Logs:
+`journalctl -u polymarket-reward-snapshot -n 30 --no-pager`. Reversible: disable the
+timer and delete `reward_snapshots.db`; nothing else is affected.
