@@ -1,0 +1,15 @@
+# Sample systemd timer for the WEEKLY per-market reward check-in.
+# Install to /etc/systemd/system/polymarket-reward-report.timer on Helsinki.
+# Monday 00:45 UTC — after the prior day settles and the hourly collector has run.
+
+[Unit]
+Description=Run the Polymarket per-market reward check-in weekly (Monday)
+Documentation=https://github.com/<your-github-user>/Polymarket-bot
+
+[Timer]
+OnCalendar=Mon *-*-* 00:45:00 UTC
+Persistent=true
+Unit=polymarket-reward-report.service
+
+[Install]
+WantedBy=timers.target

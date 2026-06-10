@@ -1,0 +1,21 @@
+# Sample systemd unit for the WEEKLY per-market reward check-in.
+# Server-only. Install to /etc/systemd/system/polymarket-reward-report.service.
+# Paired with polymarket-reward-report.timer (weekly, Monday).
+#
+# Read-only: runs `reward_snapshot.py --report --post`, which reads the separate
+# reward_snapshots.db and posts a per-market reward summary to Discord. It does
+# NOT fetch the API or write anything; it only summarizes already-collected data.
+
+[Unit]
+Description=Polymarket weekly per-market reward check-in (Discord)
+Documentation=https://github.com/<your-github-user>/Polymarket-bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=polymarket
+Group=polymarket
+WorkingDirectory=/home/polymarket/Polymarket-bot
+ExecStart=/home/polymarket/Polymarket-bot/venv/bin/python3 reward_snapshot.py --report --post
+TimeoutStartSec=60

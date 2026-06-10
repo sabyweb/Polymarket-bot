@@ -323,3 +323,17 @@ systemctl list-timers polymarket-reward-snapshot.timer --no-pager
 the pre-reset max per (date, condition_id); `--report` computes that. Logs:
 `journalctl -u polymarket-reward-snapshot -n 30 --no-pager`. Reversible: disable the
 timer and delete `reward_snapshots.db`; nothing else is affected.
+
+**Weekly check-in:** `polymarket-reward-report.timer` (Monday 00:45 UTC) runs
+`reward_snapshot.py --report --post`, which summarizes collected per-market reward and
+posts it to Discord (read-only over `reward_snapshots.db`; no API fetch). Install:
+
+```bash
+RB=/home/polymarket/Polymarket-bot; cd $RB
+sudo cp docs/runbooks/polymarket-reward-report.service /etc/systemd/system/
+sudo cp docs/runbooks/polymarket-reward-report.timer   /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now polymarket-reward-report.timer
+```
+One-off: `sudo systemctl start polymarket-reward-report.service`. Note: a useful
+per-market NET picture needs ~1–2 weeks of collection first.

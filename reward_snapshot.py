@@ -155,6 +155,20 @@ def write_snapshots(db_path: str, records: list) -> int:
         conn.close()
 
 
+def _post_discord(text: str):
+    load_dotenv(ENV_PATH)
+    url = os.getenv("DISCORD_WEBHOOK_URL", "")
+    if not url:
+        return False, "DISCORD_WEBHOOK_URL not set"
+    content = text if len(text) <= 1900 else text[:1890] + "\n…(truncated)"
+    try:
+        r = requests.post(url, json={"content": content}, timeout=5)
+        r.raise_for_status()
+        return True, "posted"
+    except Exception as e:
+        return False, f"discord post failed: {e}"
+
+
 def report(db_path: str, days: int = 14) -> str:
     """Per-market daily reward derived as the pre-reset max per (date, condition_id)."""
     if not os.path.exists(db_path):
@@ -191,11 +205,16 @@ def main():
     ap.add_argument("--db", default=DEFAULT_DB, help="separate snapshot DB (never bot_history.db)")
     ap.add_argument("--dry-run", action="store_true", help="fetch + print, write nothing")
     ap.add_argument("--report", action="store_true", help="summarize collected per-market daily reward")
+    ap.add_argument("--post", action="store_true", help="with --report, also send the summary to Discord")
     ap.add_argument("--max-pages", type=int, default=80)
     args = ap.parse_args()
 
     if args.report:
-        print(report(args.db))
+        rep = report(args.db)
+        print(rep)
+        if args.post:
+            ok, msg = _post_discord(rep)
+            print(f"[discord] {msg}")
         return
 
     load_dotenv(ENV_PATH)
