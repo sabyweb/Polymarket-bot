@@ -222,6 +222,16 @@ HEARTBEAT_TIMEOUT_SECS: int = 300  # 5 minutes
 #   Server Settings -> Integrations -> Webhooks -> New Webhook
 # Paste the URL into your .env file as DISCORD_WEBHOOK_URL
 DISCORD_WEBHOOK_URL: str | None = os.getenv("DISCORD_WEBHOOK_URL")
+# CRITICAL alerts (kill switch, crash, stale heartbeat, merge-needed) go to a
+# SEPARATE, low-volume webhook so they aren't buried in (or muted along with)
+# the routine fill/unwind stream. Create a second webhook in a dedicated
+# #alerts-critical channel and put it in .env as DISCORD_CRITICAL_WEBHOOK_URL.
+# DISCORD_CRITICAL_MENTION is prepended to critical messages so they ping even
+# in a muted channel (e.g. "@here", "@everyone", or "<@your_user_id>").
+# If DISCORD_CRITICAL_WEBHOOK_URL is unset, critical alerts fall back to
+# DISCORD_WEBHOOK_URL (never silently dropped).
+DISCORD_CRITICAL_WEBHOOK_URL: str | None = os.getenv("DISCORD_CRITICAL_WEBHOOK_URL")
+DISCORD_CRITICAL_MENTION: str = os.getenv("DISCORD_CRITICAL_MENTION", "@here")
 
 
 # ── Reward Farmer Parameters ───────────────��────────────────────────────────
@@ -409,6 +419,7 @@ _IMMUTABLE: frozenset = frozenset({
     "PRIVATE_KEY", "WALLET_ADDRESS", "CLOB_API_KEY", "CLOB_SECRET",
     "CLOB_PASS_PHRASE", "FUNDER", "SIGNATURE_TYPE", "HOST", "CHAIN_ID",
     "BUILDER_CODE", "GAMMA_API", "DISCORD_WEBHOOK_URL",
+    "DISCORD_CRITICAL_WEBHOOK_URL", "DISCORD_CRITICAL_MENTION",
 })
 
 

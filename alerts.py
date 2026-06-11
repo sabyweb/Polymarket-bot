@@ -11,7 +11,11 @@ import logging.handlers
 import os
 import requests
 from datetime import datetime
-from config import DISCORD_WEBHOOK_URL
+from config import (
+    DISCORD_WEBHOOK_URL,
+    DISCORD_CRITICAL_WEBHOOK_URL,
+    DISCORD_CRITICAL_MENTION,
+)
 
 # ── Log File Setup ───────────────────────────────────────────────────────────
 LOG_DIR: str = "logs"
@@ -291,6 +295,32 @@ def _send_discord(content: str, embed: dict | None = None) -> None:
         log.debug(f"Discord notification failed (non-critical): {e}")
 
 
+def _send_critical(content: str, embed: dict | None = None) -> None:
+    """Send a CRITICAL alert to the dedicated low-volume Discord channel with an
+    @mention so it pierces a muted routine channel.
+
+    Routes to DISCORD_CRITICAL_WEBHOOK_URL; falls back to DISCORD_WEBHOOK_URL if
+    the critical webhook isn't configured — a kill/crash page is never silently
+    dropped. Fail-safe: never raises (notifications must not crash the bot).
+    """
+    url = DISCORD_CRITICAL_WEBHOOK_URL or DISCORD_WEBHOOK_URL
+    if not url:
+        return
+    mention = f"{DISCORD_CRITICAL_MENTION} " if DISCORD_CRITICAL_MENTION else ""
+    try:
+        payload: dict = {
+            "content": f"{mention}{content}",
+            # Webhooks suppress @here/@everyone/role/user pings unless explicitly
+            # allowed — this is what makes the mention actually notify.
+            "allowed_mentions": {"parse": ["everyone", "roles", "users"]},
+        }
+        if embed:
+            payload["embeds"] = [embed]
+        requests.post(url, json=payload, timeout=5)
+    except Exception as e:
+        log.debug(f"Discord critical notification failed (non-critical): {e}")
+
+
 def alert_fill(
     fill_type: str,
     side: str,
@@ -451,7 +481,7 @@ def alert_merge_needed(
         "color": 0xFF0000,  # Red — urgent
         "timestamp": datetime.utcnow().isoformat(),
     }
-    _send_discord("**ACTION REQUIRED** — merge positions to free capital", embed)
+    _send_critical("**ACTION REQUIRED** — merge positions to free capital", embed)
 
     msg = (
         f"MERGE NEEDED | {market_question[:40]} | "
@@ -533,7 +563,7 @@ def alert_heartbeat_failure(last_success_secs_ago: float, process: str = "bot") 
         "color": 0xFF6600,  # Orange — warning
         "timestamp": datetime.utcnow().isoformat(),
     }
-    _send_discord(f"**HEARTBEAT ALERT** — {process} may be stalled", embed)
+    _send_critical(f"**HEARTBEAT ALERT** — {process} may be stalled", embed)
 
     msg = f"HEARTBEAT MISSING | {process} | no cycle in {minutes:.0f} minutes"
     log.warning(msg)
@@ -596,7 +626,7 @@ def alert_bot_crash(error: str) -> None:
         ],
         "timestamp": datetime.utcnow().isoformat(),
     }
-    _send_discord("**BOT CRASHED** — all orders cancelled", embed)
+    _send_critical("**BOT CRASHED** — all orders cancelled", embed)
 
 
 def alert_kill_switch(reason: str, cancelled_orders: int = 0) -> None:
@@ -620,7 +650,7 @@ def alert_kill_switch(reason: str, cancelled_orders: int = 0) -> None:
         ],
         "timestamp": datetime.utcnow().isoformat(),
     }
-    _send_discord("**KILL SWITCH** — farmer halted (idle until restart)", embed)
+    _send_critical("**KILL SWITCH** — farmer halted (idle until restart)", embed)
     _write_alert("KILL_SWITCH", f"{reason} | cancelled {cancelled_orders} orders")
 
 

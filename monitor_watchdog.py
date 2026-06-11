@@ -43,28 +43,44 @@ STALL_SECS = 360          # no cycle / no book snapshot in 6 min => stalled/dead
 DRAWDOWN_FRAC = 0.12      # > 12% off peak => alert (kill fires at 10%/24h realized)
 
 
-def _webhook() -> str:
+def _env(key: str) -> str:
     try:
         with open(ENV_PATH) as f:
             for line in f:
-                if line.startswith("DISCORD_WEBHOOK_URL="):
+                if line.startswith(key + "="):
                     return line.split("=", 1)[1].strip().strip('"').strip("'")
     except Exception:
         pass
     return ""
 
 
-def _post(msg: str, dry: bool) -> None:
+def _webhook() -> str:
+    return _env("DISCORD_WEBHOOK_URL")
+
+
+def _post(msg: str, dry: bool, critical: bool = False) -> None:
+    """Post to Discord. Watchdog anomalies are operator-actionable, so by default
+    they go to the CRITICAL webhook with an @mention (pierces a muted routine
+    channel); falls back to the normal webhook if the critical one isn't set.
+    Healthy/ping posts use critical=False (normal channel)."""
     text = f"[WATCHDOG] {msg}"[:1900]
     if dry:
-        print("DRY ->", text)
+        tag = "DRY(critical) ->" if critical else "DRY ->"
+        print(tag, text)
         return
-    url = _webhook()
+    crit_url = _env("DISCORD_CRITICAL_WEBHOOK_URL")
+    url = (crit_url or _webhook()) if critical else _webhook()
     if not url:
         print("no webhook configured; not posting:", text)
         return
+    payload: dict = {"content": text}
+    if critical:
+        mention = _env("DISCORD_CRITICAL_MENTION") or "@here"
+        payload["content"] = f"{mention} {text}"[:1900]
+        # Webhooks suppress pings unless explicitly allowed.
+        payload["allowed_mentions"] = {"parse": ["everyone", "roles", "users"]}
     try:
-        data = json.dumps({"content": text}).encode()
+        data = json.dumps(payload).encode()
         req = urllib.request.Request(
             url, data=data,
             headers={
@@ -178,7 +194,7 @@ def main() -> int:
     stamp = time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(now))
     status_line = " | ".join(info)
     if problems:
-        _post(f"⚠️ {stamp} ANOMALY: " + "; ".join(problems) + "  ||  " + status_line, dry)
+        _post(f"⚠️ {stamp} ANOMALY: " + "; ".join(problems) + "  ||  " + status_line, dry, critical=True)
         print(stamp, "ALERT:", "; ".join(problems), "||", status_line)
         return 1
     if ping:
@@ -192,7 +208,7 @@ if __name__ == "__main__":
         sys.exit(main())
     except Exception as e:  # never let cron see a traceback as the only signal
         try:
-            _post(f"⚠️ watchdog itself crashed: {e}", "--dry" in sys.argv)
+            _post(f"⚠️ watchdog itself crashed: {e}", "--dry" in sys.argv, critical=True)
         except Exception:
             pass
         print("watchdog crashed:", e)
