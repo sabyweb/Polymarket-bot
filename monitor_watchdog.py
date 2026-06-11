@@ -79,6 +79,28 @@ def _telegram(text: str) -> bool:
         return False
 
 
+def _healthcheck_ping(dry: bool) -> None:
+    """Dead-man's-switch: ping an external Healthchecks.io URL on EVERY completed
+    run. This is the one failure an on-box monitor cannot self-report — if the VPS
+    halts (power / kernel panic / network loss) or cron stops, the watchdog can't
+    run, the ping stops arriving, and Healthchecks alerts the operator that the
+    whole system went silent. Set HEALTHCHECK_URL in .env (e.g. https://hc-ping.com/<uuid>).
+    No-op without it; never raises."""
+    url = _env("HEALTHCHECK_URL")
+    if not url:
+        return
+    if dry:
+        print("DRY healthcheck ping ->", url)
+        return
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "polymarket-watchdog/1.0"}
+        )
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:  # pragma: no cover - network
+        print("healthcheck ping FAILED:", e)
+
+
 def _post(msg: str, dry: bool, critical: bool = False) -> None:
     """Post a watchdog message. Critical anomalies push to Telegram (reliable
     mobile) AND the Discord critical channel with an @mention; healthy/ping posts
@@ -219,9 +241,14 @@ def main() -> int:
     if problems:
         _post(f"⚠️ {stamp} ANOMALY: " + "; ".join(problems) + "  ||  " + status_line, dry, critical=True)
         print(stamp, "ALERT:", "; ".join(problems), "||", status_line)
+        # The watchdog itself ran, so prove liveness to the external dead-man's-switch
+        # even on an anomaly (bot problems are handled by Telegram; Healthchecks only
+        # alarms when the box/watchdog goes fully silent).
+        _healthcheck_ping(dry)
         return 1
     if ping:
         _post(f"✅ {stamp} watchdog armed / healthy  ||  " + status_line, dry)
+    _healthcheck_ping(dry)
     print(stamp, "OK:", status_line)
     return 0
 

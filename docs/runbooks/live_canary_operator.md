@@ -337,3 +337,30 @@ sudo systemctl enable --now polymarket-reward-report.timer
 ```
 One-off: `sudo systemctl start polymarket-reward-report.service`. Note: a useful
 per-market NET picture needs ~1–2 weeks of collection first.
+
+## 14. Alerting + dead-man's-switch (so a halt can't go unnoticed)
+
+Critical alerts (kill switch, crash, stale heartbeat, merge-needed) push to **Telegram**
+(`alerts._send_critical` → `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`) plus the Discord
+`#alerts-critical` channel; routine fills/unwinds stay on the normal Discord webhook.
+`monitor_watchdog.py` (cron */30) re-pings Telegram every 30 min while a kill persists,
+so the worst-case blind window is ~30 min, not hours.
+
+**The on-box monitor can't report its own death.** A full VPS halt (power, kernel panic,
+network loss, cron stopped) means nothing on the box can alert. The fix is an external
+dead-man's-switch: the watchdog pings `HEALTHCHECK_URL` (e.g. Healthchecks.io
+`https://hc-ping.com/<uuid>`) on every completed run; if those pings stop, the external
+service alerts you. Setup: create a check (period 30m, grace 15m), connect its Telegram/
+email integration, and put the ping URL in `.env` as `HEALTHCHECK_URL`.
+
+**Survive reboot:** the long-running services and timers must be `enabled` or they won't
+come back after a reboot (e.g. a pending kernel update). Verify/repair:
+
+```bash
+sudo systemctl enable polymarket-farmer polymarket-oversight polymarket-dashboard \
+  polymarket-soak-monitor.timer polymarket-reward-snapshot.timer polymarket-reward-report.timer
+systemctl is-enabled polymarket-farmer polymarket-oversight   # expect: enabled
+```
+The watchdog runs from cron (survives reboot as long as the crontab is intact). After any
+reboot, confirm `systemctl is-active polymarket-farmer polymarket-oversight` and that a
+fresh `[CYCLE_SUMMARY]` with `kill_switch:false` is appearing.
