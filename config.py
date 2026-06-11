@@ -233,6 +233,16 @@ DISCORD_WEBHOOK_URL: str | None = os.getenv("DISCORD_WEBHOOK_URL")
 DISCORD_CRITICAL_WEBHOOK_URL: str | None = os.getenv("DISCORD_CRITICAL_WEBHOOK_URL")
 DISCORD_CRITICAL_MENTION: str = os.getenv("DISCORD_CRITICAL_MENTION", "@here")
 
+# Telegram critical-alert push — a reliable mobile notification in a separate app
+# you won't accidentally mute like a Discord channel. When BOTH are set, critical
+# alerts (kill switch, crash, stale heartbeat, merge-needed) are pushed to Telegram
+# IN ADDITION to the Discord critical channel. Setup: DM @BotFather -> /newbot to
+# get TELEGRAM_BOT_TOKEN; DM your new bot once, then read your numeric id from
+# https://api.telegram.org/bot<TOKEN>/getUpdates (or message @userinfobot) and put
+# it in TELEGRAM_CHAT_ID.
+TELEGRAM_BOT_TOKEN: str | None = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID: str | None = os.getenv("TELEGRAM_CHAT_ID")
+
 
 # ── Reward Farmer Parameters ───────────────��────────────────────────────────
 # All parameters for reward_farmer.py. Hot-reloadable via config_overrides.json.
@@ -420,6 +430,7 @@ _IMMUTABLE: frozenset = frozenset({
     "CLOB_PASS_PHRASE", "FUNDER", "SIGNATURE_TYPE", "HOST", "CHAIN_ID",
     "BUILDER_CODE", "GAMMA_API", "DISCORD_WEBHOOK_URL",
     "DISCORD_CRITICAL_WEBHOOK_URL", "DISCORD_CRITICAL_MENTION",
+    "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
 })
 
 

@@ -15,6 +15,8 @@ from config import (
     DISCORD_WEBHOOK_URL,
     DISCORD_CRITICAL_WEBHOOK_URL,
     DISCORD_CRITICAL_MENTION,
+    TELEGRAM_BOT_TOKEN,
+    TELEGRAM_CHAT_ID,
 )
 
 # ── Log File Setup ───────────────────────────────────────────────────────────
@@ -295,30 +297,75 @@ def _send_discord(content: str, embed: dict | None = None) -> None:
         log.debug(f"Discord notification failed (non-critical): {e}")
 
 
-def _send_critical(content: str, embed: dict | None = None) -> None:
-    """Send a CRITICAL alert to the dedicated low-volume Discord channel with an
-    @mention so it pierces a muted routine channel.
-
-    Routes to DISCORD_CRITICAL_WEBHOOK_URL; falls back to DISCORD_WEBHOOK_URL if
-    the critical webhook isn't configured — a kill/crash page is never silently
-    dropped. Fail-safe: never raises (notifications must not crash the bot).
-    """
-    url = DISCORD_CRITICAL_WEBHOOK_URL or DISCORD_WEBHOOK_URL
-    if not url:
-        return
-    mention = f"{DISCORD_CRITICAL_MENTION} " if DISCORD_CRITICAL_MENTION else ""
+def _send_telegram(text: str) -> bool:
+    """Push a plain-text message to Telegram (reliable mobile notification in a
+    separate app you won't accidentally mute). Returns True on a sent attempt.
+    No-ops without TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID; never raises."""
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        return False
     try:
-        payload: dict = {
-            "content": f"{mention}{content}",
-            # Webhooks suppress @here/@everyone/role/user pings unless explicitly
-            # allowed — this is what makes the mention actually notify.
-            "allowed_mentions": {"parse": ["everyone", "roles", "users"]},
-        }
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text[:4000],
+                  "disable_web_page_preview": True},
+            timeout=5,
+        )
+        return True
+    except Exception as e:
+        log.debug(f"Telegram notification failed (non-critical): {e}")
+        return False
+
+
+def _discord_webhook_post(url: str, content: str, embed: dict | None, mention: bool) -> bool:
+    """Post to a Discord webhook. Returns True on a sent attempt; never raises."""
+    if not url:
+        return False
+    body = f"{DISCORD_CRITICAL_MENTION} {content}" if (mention and DISCORD_CRITICAL_MENTION) else content
+    try:
+        payload: dict = {"content": body, "allowed_mentions": {"parse": ["everyone", "roles", "users"]}}
         if embed:
             payload["embeds"] = [embed]
         requests.post(url, json=payload, timeout=5)
+        return True
     except Exception as e:
-        log.debug(f"Discord critical notification failed (non-critical): {e}")
+        log.debug(f"Discord webhook post failed (non-critical): {e}")
+        return False
+
+
+def _send_critical(content: str, embed: dict | None = None) -> None:
+    """Send a CRITICAL alert (kill switch, crash, stale heartbeat, merge-needed)
+    across all configured high-priority channels, so a page is never missed:
+
+      1) Telegram  — the reliable mobile push (separate app, not muted like Discord).
+      2) Discord critical channel — searchable record + @mention.
+      3) Fallback  — if neither of the above is configured, the normal Discord
+         webhook (with mention) so a kill is never silently dropped.
+
+    Fail-safe: every send is independent and best-effort; never raises.
+    """
+    delivered = False
+
+    # 1) Telegram (plain text — strip Discord markdown; fold in the embed detail)
+    tg = content.replace("**", "").replace("`", "")
+    if embed:
+        if embed.get("title"):
+            tg += "\n" + str(embed["title"])
+        if embed.get("description"):
+            tg += "\n" + str(embed["description"]).replace("`", "")
+        for fld in embed.get("fields", []) or []:
+            tg += f"\n{fld.get('name', '')}: {fld.get('value', '')}"
+    if _send_telegram(tg):
+        delivered = True
+
+    # 2) Discord critical channel (record + mention)
+    if DISCORD_CRITICAL_WEBHOOK_URL and _discord_webhook_post(
+        DISCORD_CRITICAL_WEBHOOK_URL, content, embed, mention=True
+    ):
+        delivered = True
+
+    # 3) Fallback so a kill is never silently dropped
+    if not delivered and DISCORD_WEBHOOK_URL:
+        _discord_webhook_post(DISCORD_WEBHOOK_URL, content, embed, mention=True)
 
 
 def alert_fill(

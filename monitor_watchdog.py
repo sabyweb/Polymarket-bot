@@ -58,20 +58,43 @@ def _webhook() -> str:
     return _env("DISCORD_WEBHOOK_URL")
 
 
+def _telegram(text: str) -> bool:
+    """Best-effort Telegram push for critical pages (reliable mobile notification).
+    No-op without TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID. Never raises."""
+    token, chat = _env("TELEGRAM_BOT_TOKEN"), _env("TELEGRAM_CHAT_ID")
+    if not (token and chat):
+        return False
+    try:
+        data = json.dumps({"chat_id": chat, "text": text[:4000],
+                           "disable_web_page_preview": True}).encode()
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/sendMessage", data=data,
+            headers={"Content-Type": "application/json",
+                     "User-Agent": "polymarket-watchdog/1.0"},
+        )
+        urllib.request.urlopen(req, timeout=10)
+        return True
+    except Exception as e:  # pragma: no cover - network
+        print("telegram post FAILED:", e)
+        return False
+
+
 def _post(msg: str, dry: bool, critical: bool = False) -> None:
-    """Post to Discord. Watchdog anomalies are operator-actionable, so by default
-    they go to the CRITICAL webhook with an @mention (pierces a muted routine
-    channel); falls back to the normal webhook if the critical one isn't set.
-    Healthy/ping posts use critical=False (normal channel)."""
+    """Post a watchdog message. Critical anomalies push to Telegram (reliable
+    mobile) AND the Discord critical channel with an @mention; healthy/ping posts
+    go to the normal Discord channel only."""
     text = f"[WATCHDOG] {msg}"[:1900]
     if dry:
         tag = "DRY(critical) ->" if critical else "DRY ->"
         print(tag, text)
         return
+    if critical:
+        _telegram(text)
     crit_url = _env("DISCORD_CRITICAL_WEBHOOK_URL")
     url = (crit_url or _webhook()) if critical else _webhook()
     if not url:
-        print("no webhook configured; not posting:", text)
+        if not critical:
+            print("no webhook configured; not posting:", text)
         return
     payload: dict = {"content": text}
     if critical:
