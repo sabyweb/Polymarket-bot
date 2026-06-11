@@ -1382,6 +1382,27 @@ class RewardFarmer:
             log.debug(f"[GUARDRAIL] daily realized loss read failed: {e}")
             return None
 
+    def _guardrail_short_realized_loss(self) -> float | None:
+        """Realized loss (positive = how much we lost) over the fill-rate SHORT
+        window (GUARDRAIL_FILLRATE_SHORT_SECS, 1h). Loss-gates the fill-rate spike
+        kill: a burst of benign min_size fills that exit flat shows ~0 here and so
+        must NOT halt the farmer. None on DB error — the caller then FAIL-SAFES to
+        the legacy ratio-only kill (we never relax protection on missing data)."""
+        try:
+            conn = self.db._get_conn()
+            cutoff = time.time() - GUARDRAIL_FILLRATE_SHORT_SECS
+            row = conn.execute(
+                "SELECT COALESCE(SUM(pnl), 0) FROM unwinds "
+                "WHERE ts > ? AND pnl < 0",
+                (cutoff,),
+            ).fetchone()
+            if row is None:
+                return 0.0
+            return -float(row[0] or 0.0)
+        except Exception as e:
+            log.debug(f"[GUARDRAIL] short realized loss read failed: {e}")
+            return None
+
     def _guardrail_fill_rate_ratio(self) -> tuple[float | None, int, int]:
         """Return (ratio, short_count, baseline_count).
 
@@ -1410,10 +1431,13 @@ class RewardFarmer:
                     base_count += 1
                     if t >= short_cutoff:
                         short_count += 1
-        if base_count < MIN_FILL_BASELINE:
+        min_baseline = cfg("RF_FILL_RATE_MIN_BASELINE")
+        if min_baseline is None:
+            min_baseline = MIN_FILL_BASELINE
+        if base_count < min_baseline:
             log.warning(
                 f"[GUARDRAIL_WARNING] missing_signal=fill_rate "
-                f"(baseline={base_count} < MIN_FILL_BASELINE={MIN_FILL_BASELINE})"
+                f"(baseline={base_count} < MIN_FILL_BASELINE={min_baseline})"
             )
             return None, short_count, base_count
         # Scale baseline to the short-window duration for a like-for-like
@@ -1707,11 +1731,47 @@ class RewardFarmer:
             kill_reasons.append(
                 f"correction_factor={cf:.4f} < {CRITICAL_CF_THRESHOLD}"
             )
-        if fill_ratio is not None and fill_ratio > FILL_RATE_SPIKE_FACTOR:
-            kill_reasons.append(
-                f"fill_rate_ratio={fill_ratio:.2f} > {FILL_RATE_SPIKE_FACTOR}× "
-                f"(short={short_fills}, baseline={base_fills})"
+        spike_factor = cfg("RF_FILL_RATE_SPIKE_FACTOR")
+        if spike_factor is None:
+            spike_factor = FILL_RATE_SPIKE_FACTOR
+        if fill_ratio is not None and fill_ratio > spike_factor:
+            # LOSS-GATE: a fill-rate spike only escalates to a KILL when it
+            # coincides with real short-window realized loss. A spike on benign
+            # min_size fills that exit flat (loss below the gate) is logged but
+            # does NOT halt — the 10%/24h realized-loss kill and the 20%
+            # unrealized-loss kill remain the money backstops. FAIL-SAFE: if the
+            # short loss or total_capital can't be computed, preserve the legacy
+            # ratio-only kill (never relax protection on missing data).
+            loss_frac = cfg("RF_FILL_RATE_KILL_LOSS_FRAC")
+            short_loss = self._guardrail_short_realized_loss()
+            loss_gate = (
+                loss_frac * total_capital
+                if (loss_frac is not None and loss_frac > 0
+                    and total_capital is not None and total_capital > 0)
+                else None
             )
+            benign = (
+                short_loss is not None
+                and loss_gate is not None
+                and short_loss <= loss_gate
+            )
+            if benign:
+                log.warning(
+                    f"[GUARDRAIL_WARNING] fill_rate_spike ratio={fill_ratio:.2f} "
+                    f"(short={short_fills}, baseline={base_fills}) but 1h realized "
+                    f"loss ${short_loss:.2f} <= gate ${loss_gate:.2f} "
+                    f"({loss_frac:.2%}·T) — benign, NOT killing"
+                )
+            else:
+                reason = (
+                    f"fill_rate_ratio={fill_ratio:.2f} > {spike_factor}× "
+                    f"(short={short_fills}, baseline={base_fills})"
+                )
+                if short_loss is not None and loss_gate is not None:
+                    reason += f" + 1h_loss=${short_loss:.2f} > ${loss_gate:.2f}"
+                else:
+                    reason += " (loss/capital unknown — fail-safe kill)"
+                kill_reasons.append(reason)
         # FX-058: rapid-growth (acceleration) kill. Catches anomalous bursts
         # like a misconfigured allocator deploying 10× normal. Loose static
         # thresholds (MAX 5×, HARD 8×) intentionally permit healthy
