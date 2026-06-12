@@ -41,6 +41,7 @@ ENV_PATH = f"{REPO}/.env"
 
 STALL_SECS = 360          # no cycle / no book snapshot in 6 min => stalled/dead
 DRAWDOWN_FRAC = 0.12      # > 12% off peak => alert (kill fires at 10%/24h realized)
+IDLE_WINDOW_SECS = 3600   # alive-but-idle: 0 active markets for this long (not killed) => alert (deployed nothing => earning nothing)
 
 
 def _env(key: str) -> str:
@@ -185,6 +186,39 @@ def _latest_cycle_summary():
         return None, f"journal_err:{e}"
 
 
+def _farming_idle() -> str:
+    """Detect a SUSTAINED 'alive-but-idle' state: not killed, process alive, but
+    0 active markets for the whole last hour — deployed nothing, earning nothing.
+    Returns a problem string or "" (none). Stateless: reads the journal window so a
+    transient post-restart ramp or a single between-deploy cycle doesn't false-alarm.
+    Kills are handled separately; this only fires when NOT killed."""
+    try:
+        r = subprocess.run(
+            ["journalctl", "-u", "polymarket-farmer",
+             "--since", f"{IDLE_WINDOW_SECS // 60} min ago", "--no-pager", "-o", "cat"],
+            capture_output=True, text=True, timeout=20,
+        )
+    except Exception:
+        return ""
+    import re
+    sums = re.findall(r"\[CYCLE_SUMMARY\]\s*(\{.*\})", r.stdout)
+    if len(sums) < 10:   # too few cycles in the window to judge (e.g. just restarted)
+        return ""
+    mkts = []
+    for s in sums:
+        try:
+            d = json.loads(s)
+        except Exception:
+            continue
+        if d.get("kill_switch"):
+            return ""    # was killed during the window — kill check owns this
+        mkts.append(int(d.get("active_markets") or 0))
+    if mkts and max(mkts) == 0:
+        return (f"IDLE — 0 active markets for the last {IDLE_WINDOW_SECS // 60} min "
+                f"({len(mkts)} cycles), not killed: deployed nothing, earning nothing")
+    return ""
+
+
 def main() -> int:
     dry = "--dry" in sys.argv
     ping = "--ping" in sys.argv
@@ -213,6 +247,10 @@ def main() -> int:
             problems.append("KILL SWITCH ACTIVE — farmer idle, needs review")
         if age > STALL_SECS:
             problems.append(f"farmer stalled (last cycle {age:.0f}s ago)")
+
+    idle_problem = _farming_idle()
+    if idle_problem:
+        problems.append(idle_problem)
 
     row = _one("SELECT strftime('%s','now') - MAX(ts) FROM book_snapshots")
     if row and row[0] is not None and row[0] != "__ERR__":
