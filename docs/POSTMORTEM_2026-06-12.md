@@ -4,10 +4,12 @@
 **Status of bot at write time:** recovered and farming on the new loss-gated kill
 (06-12 03:43, `kill_switch:false`, 5 markets, ~$323 notional, wallet ~$1,122).
 
-> **Update 2026-06-13.** Extended after deeper investigation: two further root causes
-> were *proven* against live `compute()` and the activity ledger — **RC-3** (price-blind
-> EV gate) and **RC-4** (sentinel/null `end_date` defeats the resolution filter; the
-> SpaceX IPO trades). See §5 and the locked plan of action in §11.
+> **Update 2026-06-13.** Extended after deeper investigation: three further root causes were
+> *proven* against live `compute()`, the data-api, and the portfolio ledger — **RC-3** (price-blind
+> EV gate), **RC-4** (sentinel/null `end_date` defeats the resolution filter; the SpaceX IPO
+> trades), and **RC-5** (the loss/drawdown safety metric is blind to held-to-resolution losses —
+> a −$88 position that evaded every kill). See §5; the locked plan of action (FIX-1→FIX-2→FIX-3)
+> is in §11.
 
 > **Sourcing note.** Every figure below comes from read-only probes run against the
 > live Helsinki DB / data-api *during* this investigation (timestamps cited inline).
@@ -150,13 +152,39 @@ at market close *that same day*. The filter therefore computed **~13,590h to res
 farmer's two backstops don't cover this: its `resolution_proximity` block is **price-based**
 (mid <0.10/>0.90; these traded 0.22–0.74) and its expiry/game guard is **sports-keyword-only**
 ("SpaceX IPO" isn't sports). **Result:** on 06-12 the bot farmed the SpaceX IPO-cap markets
-hours before resolution and they adversely filled — the `$2T` market alone lost **−$6.76**
-(and tripped `fill_rate_breaker`), the IPO suite totalling **~−$7.65, the single largest
-chunk of the −$13.54 24h realized loss**; the 13:35–13:47 fill burst is the likely trigger
-of the ~14:00 fill-rate kill. **Proof the filter logic is sound:** *SpaceX IPO: Will Elon
+hours before resolution and they adversely filled — and **this was the dominant driver of a
+true 24h loss of −$72.58** (authoritative: portfolio total_value $1,120.42→$1,047.84,
+confirmed to the cent by the data-api net cash flow; gross position loss ≈ −$83 before +$10.38
+rewards). ⚠ **The `unwinds`-based `realized_loss_24h` ($13.54, of which the `$2T` dump was
+−$6.76) materially undercounts this** — `unwinds` records only active dumps, not the positions
+held to resolution and **redeemed at a loss** (the bulk of the SpaceX IPO loss). The `$2T`
+market's 13:35–13:47 fill burst is the likely trigger of the ~14:00 fill-rate kill. *Lesson:
+`unwinds.pnl` is a subset of realized P&L; the authoritative 24h figure is the portfolio
+total_value delta / data-api net cash flow.* **Proof the filter logic is sound:** *SpaceX IPO: Will Elon
 Musk Ring the Bell?* carried a *real* `end_date` (2026-06-13) and was traded at **72h out →
 correctly allowed**. Same filter, good date, right call — the defect is the input date, not
 the logic.
+
+### RC-5 — Loss/drawdown safety metric is blind to held-to-resolution losses (proven 06-13)
+The realized-loss kill and the loss-gate on the fill-rate kill both key off `realized_loss_24h`,
+computed from the **`unwinds` table — active dumps only.** A position **held to resolution and
+redeemed at a loss produces no `unwinds` row**, so it is invisible to those kills. On 06-13 this
+was decisive, not academic: a single position — *"SpaceX IPO closing market cap above $2.4T?"* —
+was bought for **~$88** (YES @0.22), **held to resolution and redeemed for $0** (resolved
+worthless) = a **−$88** loss that was **~the entire −$72.58 24h loss**, yet produced **zero loss
+signal.** It evaded every guard:
+- **realized-loss kill** — `unwinds`-blind (no dump);
+- **drawdown kill** — cash-based (per the FX-095 caveat): the inventory mark-down that took
+  *portfolio* value to a **$907 trough** (~−26% from the $1,220 peak, well past the 15% line)
+  never showed in *cash* (~$1,077), so it didn't fire;
+- **unrealized-loss kill** — $88 ≈ 8% of book, under the 20% threshold.
+
+The fill-rate kill that *did* fire (~14:00) was triggered by a **different, smaller** event — the
+`$2T` **dump** burst ($7.64/1h) — not the $88 that actually hurt. The authoritative loss *was*
+visible (portfolio `total_value` delta and data-api net cash flow both pegged −$72.58 to the
+cent); the safety stack simply wasn't reading those sources. **This is a safety gap, not just a
+selection one.** (Confirm the exact kill input bases in code when building FIX-3; the
+drawdown-cash basis is asserted per FX-095, not re-verified this session.)
 
 ---
 
@@ -280,7 +308,8 @@ at a time** through the gate below; this document is the ledger, not a worklog.
 5. **≥7 days clean live = proof.**
 6. Operator decides rollout. **Never two candidates live simultaneously.**
 
-**Sequence (approved 2026-06-13): FIX-1 → FIX-2 → operational.**
+**Sequence (approved 2026-06-13): FIX-1 → FIX-2 → FIX-3 → operational.** (FIX-3 is a *safety*
+gap and may warrant jumping ahead of FIX-2, since FIX-2 widens deployment — operator's call.)
 
 ### FIX-1 (first) — Sentinel/null `end_date` handling  [RC-4]
 - **Why first:** defensive (stops trading mis-dated near-resolution markets), small and
@@ -307,10 +336,29 @@ at a time** through the gate below; this document is the ledger, not a worklog.
   non-negative and the invariant gate passes.
 - **Reversibility:** price source behind a flag; fall back to 0.5 default if disabled.
 
+### FIX-3 (queued) — Loss/drawdown kills off authoritative value, not `unwinds`/cash  [RC-5]
+- **Why:** the worst loss type (held-to-resolution) is invisible to the current loss metric, so
+  the kills can under-fire by ~10× on redemption-heavy days (06-13: $13.54 measured vs −$72.58
+  real; the −$88 position fired *no* loss signal). This is a **safety** gap — weigh prioritizing
+  it ahead of FIX-2 despite the locked order, since FIX-2 *widens* deployment.
+- **Single axis (pick ONE measurement change):** feed the realized-loss kill + the fill-rate
+  loss-gate from an authoritative source (portfolio `total_value` delta, or the data-api net cash
+  flow) instead of `unwinds`-only; and/or make the drawdown kill portfolio-based rather than
+  cash-only (intersects FX-095).
+- **Adversarial cases:** data-api latency/availability must **fail-safe, not fail-open** (a
+  missing reading must not silently disable the kill); avoid double-counting realized vs
+  unrealized; net out the reward credit so it doesn't mask a loss.
+- **Reversibility:** new loss-basis behind a flag defaulting to the current `unwinds`/cash basis.
+- **Success metric:** on a replay of 06-13, the measured 24h loss tracks the −$72.58 portfolio
+  delta (not $13.54), and the kill logic responds to held-to-resolution losses.
+
 ### Operational (not a code change) — chronic-blocked markets
 Several markets are parked in `chronic_blocked: manual clear required` (incl. the
 Trump-ceasefire market showing ~$87/day expected reward). Review periodically and clear by
 hand **only** after confirming they no longer adverse-fill. Deliberately manual, per the
 cardinal kill rule.
 
-**Status (2026-06-13):** plan locked, no fix code written yet. Next action = build FIX-1.
+**Status (2026-06-13):** **FIX-1 built** (default-off `RF_ALLOC_EVENT_DATE_GUARD`; invariant gate
++ unit tests green; commit + 7-day canary trial pending). **FIX-2 and FIX-3 scoped, not started.**
+RC-5 logged after the −$72.58 / −$88 attribution. Next action = commit FIX-1, then its canary
+trial; decide FIX-3-vs-FIX-2 ordering.
