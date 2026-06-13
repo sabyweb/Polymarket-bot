@@ -793,6 +793,78 @@ def test_C31_filter_disabled_via_knobs(monkeypatch):
     assert "0xDIS" in {m.condition_id for m in result.deploys}
 
 
+# ── FIX-1 (RC-4): event/same-day guard for markets with sentinel/null end_date ──
+
+def _meta(end_iso="", game="", closed=False, accepting=True, question=""):
+    """Shape a _fetch_timing() return for tests (overrides a._fetch_timing)."""
+    return {"game_start_time": game, "end_date_iso": end_iso,
+            "closed": closed, "accepting_orders": accepting, "question": question}
+
+
+def _guard_on(monkeypatch):
+    """Turn RF_ALLOC_EVENT_DATE_GUARD on without disturbing other cfg lookups."""
+    orig = sa.cfg
+    monkeypatch.setattr(sa, "cfg",
+                        lambda k: True if k == "RF_ALLOC_EVENT_DATE_GUARD" else orig(k))
+
+
+def test_FIX1_event_guard_off_by_default_keeps_misdated_market():
+    """Default-off: a same-day event market carrying a far-future end_date (the
+    SpaceX-IPO case) still deploys — proves the change is reversible / no-op when off."""
+    a = _alloc_with_q({"0xIPO": 0.05})
+    a._fetch_timing = lambda cid: _meta(end_iso=_iso(13000),
+                                        question="SpaceX IPO closing market cap above $2T?")
+    result = _compute_one(a, [_make_candidate("0xIPO", daily_rate=500)])
+    assert "0xIPO" in {m.condition_id for m in result.deploys}
+
+
+def test_FIX1_event_guard_excludes_same_day_question(monkeypatch):
+    """Guard on: a market whose question matches a same-day pattern is excluded
+    despite a far-future end_date that `_timing_excluded` can't catch."""
+    _guard_on(monkeypatch)
+    a = _alloc_with_q({"0xIPO": 0.05})
+    a._fetch_timing = lambda cid: _meta(end_iso=_iso(13000),
+                                        question="SpaceX IPO closing market cap above $2T?")
+    result = _compute_one(a, [_make_candidate("0xIPO", daily_rate=500)])
+    assert "0xIPO" not in {m.condition_id for m in result.deploys}
+    assert "0xIPO" in {m.condition_id for m in result.avoids}
+
+
+def test_FIX1_event_guard_excludes_closed_market(monkeypatch):
+    """Guard on: a market the CLOB reports closed / not-accepting-orders is excluded
+    (definitive signal, no keyword needed)."""
+    _guard_on(monkeypatch)
+    a = _alloc_with_q({"0xCLOSED": 0.05})
+    a._fetch_timing = lambda cid: _meta(end_iso=_iso(13000), closed=True, accepting=False,
+                                        question="A neutral far-dated question")
+    result = _compute_one(a, [_make_candidate("0xCLOSED", daily_rate=500)])
+    assert "0xCLOSED" not in {m.condition_id for m in result.deploys}
+
+
+def test_FIX1_event_guard_keeps_legit_far_dated_market(monkeypatch):
+    """Guard on: a legitimately far-dated market (open, non-matching question) is NOT
+    excluded — no false positive. 'Will SpaceX IPO by 2027' must survive."""
+    _guard_on(monkeypatch)
+    a = _alloc_with_q({"0xLEGIT": 0.05})
+    a._fetch_timing = lambda cid: _meta(end_iso=_iso(5000), closed=False, accepting=True,
+                                        question="Will SpaceX IPO by December 31, 2027?")
+    result = _compute_one(a, [_make_candidate("0xLEGIT", daily_rate=500)])
+    assert "0xLEGIT" in {m.condition_id for m in result.deploys}
+
+
+def test_FIX1_event_guard_fail_open_when_not_enriched(monkeypatch):
+    """Guard on, but the market was never enriched (timing already known → no fetch):
+    the guard must NOT fire, so the un-enriched long tail is unaffected even if its
+    question would otherwise match."""
+    _guard_on(monkeypatch)
+    a = _alloc_with_q({"0xTAIL": 0.05})
+    cand = _make_candidate("0xTAIL", daily_rate=500)
+    cand.end_date_iso = _iso(2000)          # timing known → _get_timing won't fetch
+    cand.question = "closing market cap"    # would match IF the guard ran — it must not
+    result = _compute_one(a, [cand])
+    assert "0xTAIL" in {m.condition_id for m in result.deploys}
+
+
 def test_C32_backfills_safe_market_when_top_excluded():
     """C32: the highest-reward market being near-resolution does not waste a
     deploy slot — the allocator walks past it to a safe lower-ranked market."""

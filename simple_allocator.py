@@ -89,6 +89,20 @@ COLD_START_Q_SHARE = 0.005         # FX-086 (closes FX-064): DEFAULT mirror of t
 EXTREME_PRICE_LOW = 0.10
 EXTREME_PRICE_HIGH = 0.90
 
+# FIX-1 (RC-4): conservative same-day / event-resolution patterns (lowercase
+# substring match on the market question). Tight by design — must catch the
+# IPO-day / first-day / intraday markets that carry a wrong far-future or null
+# end_date_iso (e.g. "SpaceX IPO closing market cap above $2T?",
+# "...Closing Share Price Up/Down on First Day?"), WITHOUT catching legitimate
+# far-dated markets ("...by December 31, 2026"). Deliberately omits bare "ipo"
+# (a "Will X IPO by 2027?" market is genuinely far-dated). Only consulted when
+# RF_ALLOC_EVENT_DATE_GUARD is on AND timing enrichment was attempted.
+_EVENT_SAME_DAY_PATTERNS = (
+    "on ipo day", "first day", "closing market cap", "closing share price",
+    "intraday", "at market close", "market close on", "by market close",
+    "end of day", "opening day",
+)
+
 # Kill switch thresholds — these replace SafetyController's 14 invariants
 KILL_LOSS_FRAC = 0.10              # halt on 24h realized loss > 10% of wallet
 KILL_DRAWDOWN_FRAC = 0.15          # halt on 15% drawdown from peak wallet
@@ -123,6 +137,12 @@ class CandidateMarket:
     target_shares: int = 0
     target_capital: float = 0.0
     timing_excluded_reason: str = ""  # FX-090: set when the time-to-event filter avoids this market
+    # FIX-1 (RC-4): event/same-day guard inputs, populated during timing enrichment.
+    timing_fetch_attempted: bool = False  # True once enrichment actually tried to fetch this market's timing/status
+    closed: bool = False                  # CLOB `closed` flag (market resolved/closed)
+    accepting_orders: bool = True         # CLOB `accepting_orders` flag (False = book closed)
+    question: str = ""                    # market question text (for same-day/event pattern match)
+    event_guard_reason: str = ""          # FIX-1: set when the event-date guard avoids this market
 
 
 @dataclass
@@ -375,27 +395,42 @@ class SimpleAllocator:
     # whose timing can't be fetched/parsed is NOT excluded — the farmer's live
     # EXPIRY SWEEP + RF_SPORTS/GAME_BLOCK remain the real-time backstop.
 
-    def _fetch_timing(self, cid: str) -> tuple[str, str]:
-        """Return (game_start_time, end_date_iso) for one market; ("","") on failure."""
+    def _fetch_timing(self, cid: str) -> dict:
+        """Return a market timing+status dict for one cid:
+        {game_start_time, end_date_iso, closed, accepting_orders, question}.
+        Safe defaults (blank dates, closed=False, accepting_orders=True, "") on
+        failure — so a failed lookup never *causes* an exclusion (fail-open). The
+        test `_timing_provider` hook still returns just (game_start_time,
+        end_date_iso); its status fields fall back to the safe defaults.
+        """
+        base = {"game_start_time": "", "end_date_iso": "",
+                "closed": False, "accepting_orders": True, "question": ""}
         if self._timing_provider is not None:
             try:
                 gs, ed = self._timing_provider(cid)
-                return (gs or "", ed or "")
+                base["game_start_time"] = gs or ""
+                base["end_date_iso"] = ed or ""
+                return base
             except Exception as e:
                 log.debug(f"timing provider error {cid[:10]}: {e}")
-                return ("", "")
+                return base
         try:
             r = self._http(f"{CLOB_HOST}{MARKET_DETAIL_PATH}{cid}", timeout=10)
             if getattr(r, "status_code", 0) != 200:
-                return ("", "")
+                return base
             m = r.json()
-            return (
-                str(m.get("game_start_time", "") or ""),
-                str(m.get("end_date_iso", "") or ""),
-            )
+            return {
+                "game_start_time": str(m.get("game_start_time", "") or ""),
+                "end_date_iso": str(m.get("end_date_iso", "") or ""),
+                "closed": bool(m.get("closed", False)),
+                # CLOB omits accepting_orders on some payloads — default True so a
+                # missing flag never triggers the guard (fail-open).
+                "accepting_orders": bool(m.get("accepting_orders", True)),
+                "question": str(m.get("question", "") or ""),
+            }
         except Exception as e:
             log.debug(f"timing fetch error {cid[:10]}: {e}")
-            return ("", "")
+            return base
 
     def _get_timing(self, m: "CandidateMarket", budget: dict) -> None:
         """Populate m.game_start_time / m.end_date_iso — cached, budget-bounded.
@@ -409,23 +444,37 @@ class SimpleAllocator:
             return
         if ALLOC_MAX_TIMING_FETCHES() <= 0:
             return
-        if ALLOC_MIN_HOURS_TO_RESOLUTION() <= 0 and ALLOC_MIN_HOURS_TO_GAME_START() <= 0:
+        # Both date-floors disabled normally means "nothing to filter on" → skip.
+        # But the FIX-1 event-date guard reuses this same enrichment fetch, so keep
+        # enriching when it is enabled even if the hour-floors are off.
+        if (ALLOC_MIN_HOURS_TO_RESOLUTION() <= 0 and ALLOC_MIN_HOURS_TO_GAME_START() <= 0
+                and not bool(cfg("RF_ALLOC_EVENT_DATE_GUARD"))):
             return
         cid = m.condition_id
         now = self._now()
         ttl = ALLOC_TIMING_CACHE_TTL_SEC()
         cached = self._timing_cache.get(cid)
         if cached and (ttl <= 0 or (now - cached[0]) < ttl):
-            m.game_start_time, m.end_date_iso = cached[1], cached[2]
+            self._apply_timing_meta(m, cached[1])
             return
         if budget["fetches"] >= ALLOC_MAX_TIMING_FETCHES():
             budget["exhausted"] = True
             return
-        gs, ed = self._fetch_timing(cid)
+        meta = self._fetch_timing(cid)
         budget["fetches"] += 1
-        if gs or ed:  # cache only successful lookups so transient failures retry
-            self._timing_cache[cid] = (now, gs, ed)
-        m.game_start_time, m.end_date_iso = gs, ed
+        self._apply_timing_meta(m, meta)
+        # cache only lookups that returned something so transient failures retry
+        if meta.get("game_start_time") or meta.get("end_date_iso") or meta.get("question"):
+            self._timing_cache[cid] = (now, meta)
+
+    def _apply_timing_meta(self, m: "CandidateMarket", meta: dict) -> None:
+        """Copy a _fetch_timing dict onto the candidate + mark enrichment attempted."""
+        m.game_start_time = meta.get("game_start_time", "") or ""
+        m.end_date_iso = meta.get("end_date_iso", "") or ""
+        m.closed = bool(meta.get("closed", False))
+        m.accepting_orders = bool(meta.get("accepting_orders", True))
+        m.question = meta.get("question", "") or m.question
+        m.timing_fetch_attempted = True
 
     def _timing_excluded(self, m: "CandidateMarket") -> tuple[bool, str]:
         """True if too close to a decisive event (resolution or game start).
@@ -456,6 +505,34 @@ class SimpleAllocator:
             except (ValueError, TypeError):
                 pass
 
+        return False, ""
+
+    def _event_guard_excluded(self, m: "CandidateMarket") -> tuple[bool, str]:
+        """FIX-1 (RC-4): exclude event/same-day markets whose end_date_iso is an
+        unreliable sentinel/null, which `_timing_excluded` can't catch.
+
+        Off by default (RF_ALLOC_EVENT_DATE_GUARD). Acts ONLY on candidates whose
+        timing was actually enriched this cycle (`timing_fetch_attempted`), so it
+        never fires for the un-enriched tail — un-enriched markets stay fail-open,
+        preserving Ground Rule 1 coverage. Two signals:
+          (a) the CLOB reports the market closed / not accepting orders — definitive;
+          (b) the question matches a conservative same-day/event pattern (e.g. the
+              SpaceX IPO-day suite, which carried end_date=2027 or None).
+        Single-axis: timing exclusion only — no effect on sizing, ranking, or EV.
+        """
+        if not bool(cfg("RF_ALLOC_EVENT_DATE_GUARD")):
+            return False, ""
+        if not m.timing_fetch_attempted:
+            return False, ""  # never enriched → unknown timing, stay fail-open
+        if m.closed:
+            return True, "event_guard:closed"
+        if not m.accepting_orders:
+            return True, "event_guard:not_accepting_orders"
+        q = (m.question or "").lower()
+        if q:
+            for pat in _EVENT_SAME_DAY_PATTERNS:
+                if pat in q:
+                    return True, f"event_guard:same_day[{pat}]"
         return False, ""
 
     def _recent_volatility(self, cid: str) -> Optional[float]:
@@ -667,6 +744,7 @@ class SimpleAllocator:
         timing_budget = {"fetches": 0, "exhausted": False}
         timing_excluded_count = 0
         vol_excluded_count = 0  # FX-093
+        event_excluded_count = 0  # FIX-1 (RC-4): event/same-day guard
         for m in eligible:
             if len(deploys) >= max_deploys:
                 # Soft cap hit — extremely rare in practice (5k market pool
@@ -687,6 +765,19 @@ class SimpleAllocator:
             if t_excluded:
                 m.timing_excluded_reason = t_reason
                 timing_excluded_count += 1
+                avoids.append(m)
+                continue
+
+            # FIX-1 (RC-4): event/same-day guard (default-off via
+            # RF_ALLOC_EVENT_DATE_GUARD). Catches markets whose end_date_iso is an
+            # unreliable sentinel/null (e.g. the SpaceX IPO-day suite) that
+            # `_timing_excluded` cannot. Reuses the same enrichment fetch above; only
+            # acts on enriched candidates, so the un-enriched tail is unaffected.
+            e_excluded, e_reason = self._event_guard_excluded(m)
+            if e_excluded:
+                m.event_guard_reason = e_reason
+                m.timing_excluded_reason = e_reason  # surface in existing telemetry/feedback
+                event_excluded_count += 1
                 avoids.append(m)
                 continue
 
@@ -771,7 +862,7 @@ class SimpleAllocator:
         log.info(
             f"[OVERCOMMIT_ALLOC] eligible={len(eligible)} positive_ev={positive_ev_count} "
             f"deploys={len(deploys)} avoids={len(avoids)} "
-            f"timing_excluded={timing_excluded_count} vol_excluded={vol_excluded_count} timing_fetches={timing_budget['fetches']} "
+            f"timing_excluded={timing_excluded_count} event_excluded={event_excluded_count} vol_excluded={vol_excluded_count} timing_fetches={timing_budget['fetches']} "
             f"notional_total=${used:.2f} wallet=${wallet_usd:.2f} "
             f"overcommit_ratio={notional_overcommit_ratio:.2f}× "
             f"(target band 3-8× per Ground Rule 2) "
