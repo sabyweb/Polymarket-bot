@@ -110,7 +110,10 @@ drawdown/loss kill AUTO-CLEARS on recovery.
 `database.py`, `config.py`.
 **Support:** `models.py`, `alerts.py`, `market_discovery.py`, `state.py`, `reward_tracker.py`,
 `oversight/wallet_reconciliation.py`, `monitor_watchdog.py`, `dashboard.py`.
-**Docs:** `ground_rules.md` (the contract), `docs/SYSTEM_CONTEXT.md`, `docs/HANDOFF.md`,
+**Docs:** `ground_rules.md` (the contract), **`docs/ONBOARDING_PROMPT.md` (the full architect's
+manual — understand/build/audit/modify; read after this index)**, `docs/POSTMORTEM_2026-06-12.md`
+(root-cause ledger RC-1..RC-4 + the locked single-axis fix plan §11), `docs/STATUS_2026-06-13.md`
+(latest point-in-time snapshot), `docs/SYSTEM_CONTEXT.md`, `docs/HANDOFF.md`,
 `Polymarket bot architecture v5.1.md` (current production = v6.7 table), `Polymarket bot fixit.md`,
 `docs/runbooks/live_canary_operator.md`, `LOOP_PLAN.md` (this initiative).
 **Server-only (not in repo):** systemd units, `config_overrides.json`, `bot_history.db`, `.env` (SECRETS), `logs/`.
