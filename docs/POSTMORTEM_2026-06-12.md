@@ -11,6 +11,26 @@
 > a −$88 position that evaded every kill). See §5; the locked plan of action (FIX-1→FIX-2→FIX-3)
 > is in §11.
 
+> **Update 2026-06-13b (18:20 UTC) — LIVE INCIDENT: FX-095/RC-5's *other* face, a false-kill
+> deadlock.** The farmer halted on `oversight:drawdown 16.1% > 15% (portfolio=$1024.57,
+> cash=$1024.57)`. **It is a FALSE kill.** Ground-truthed on-chain: at 17:58:46 the bot bought
+> $22.17 of "JD Vance signs a U.S.×Iran deal" YES @0.47 and still holds it (data-api `/value`
+> $22.41, pnl +$0.24). Cash −$22 simply converted into $22 of inventory, so **true portfolio =
+> $1024.57 + $22.41 = $1046.98 ≈ 14.2% drawdown — UNDER the 15% line.** The fill was never written
+> to the DB `fills`/`positions` tables (the kill fired ~35 s after the buy → the farmer began
+> skipping cycles before recording it), and `simple_oversight.run_once` sources inventory from the
+> **DB** (`_load_positions_and_mids`, line 272) → empty positions dict → `compute_portfolio_value`
+> returns **cash-only** → false 16.1%. `portfolio_value.py` (FX-095) is correct; it was *starved of
+> position data*. **Deadlock:** halted → skips cycles → never records the fill → metric never
+> corrects → stays killed; **it will NOT auto-clear.** A farmer **restart** would clear it (startup
+> `_sync_exchange_positions`, reward_farmer.py:2647, registers the on-chain orphan → next oversight
+> cycle reads $1047 → 14.2% → kill clears) — **but that resumes the RC-2 leak at a real ~14%
+> drawdown with the RC-5 safety hole still open, so it is an operator decision, not an unsupervised
+> reflex.** Capital is safe halted ($1,047 true). **This upgrades FIX-3 to a both-ways defect
+> (under-fires on real held losses AND over-fires/deadlocks on benign fills) → prioritize FIX-3
+> ahead of FIX-2.** (NB: the earlier chat read `portfolio=cash=$1024.57` and concluded "real 16%
+> erosion" — it did not check on-chain positions and missed the $22 held inventory.)
+>
 > **Sourcing note.** Every figure below comes from read-only probes run against the
 > live Helsinki DB / data-api *during* this investigation (timestamps cited inline).
 > A couple of aggregates may have moved slightly since they were pulled; the
@@ -340,7 +360,14 @@ gap and may warrant jumping ahead of FIX-2, since FIX-2 widens deployment — op
 - **Why:** the worst loss type (held-to-resolution) is invisible to the current loss metric, so
   the kills can under-fire by ~10× on redemption-heavy days (06-13: $13.54 measured vs −$72.58
   real; the −$88 position fired *no* loss signal). This is a **safety** gap — weigh prioritizing
-  it ahead of FIX-2 despite the locked order, since FIX-2 *widens* deployment.
+  it ahead of FIX-2 despite the locked order, since FIX-2 *widens* deployment. **Update 06-13
+  18:00 — the same DB-sourced metric also OVER-fired:** a $22 on-chain fill not yet written to the
+  DB made the drawdown kill read cash-only and FALSE-trip into a deadlock (true dd 14.2%; see the
+  top-of-doc 06-13b update). The defect cuts both ways. **Exact locus:** `simple_oversight.run_once`
+  line 272 — `_load_positions_and_mids(db_path)` feeds the kill's inventory from the DB; reconcile
+  it against the data-api `/positions` (authoritative) for the kill input, **fail-safe** if the API
+  is unavailable (a missing reading must not silently disable *or* falsely fire the kill).
+  **Prioritize FIX-3 ahead of FIX-2.**
 - **Single axis (pick ONE measurement change):** feed the realized-loss kill + the fill-rate
   loss-gate from an authoritative source (portfolio `total_value` delta, or the data-api net cash
   flow) instead of `unwinds`-only; and/or make the drawdown kill portfolio-based rather than
