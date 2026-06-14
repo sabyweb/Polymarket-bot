@@ -126,6 +126,92 @@ def _load_positions_and_mids(db_path: str) -> tuple[dict, dict[str, float]]:
     return positions, mids
 
 
+# ── FIX-3 (RC-5): authoritative on-chain portfolio value for the kill input ──
+# The DB `positions` table can lag or miss an on-chain fill (a fill recorded late,
+# or never if a protective kill halts the farmer before it syncs). When that happens
+# the drawdown/loss kill reads cash-only and FALSE-trips (the 2026-06-13 deadlock) —
+# or misses a held-to-resolution loss and UNDER-fires (2026-06-12). When
+# RF_KILL_PORTFOLIO_SOURCE == "onchain" the kill's portfolio value is sourced from the
+# data-api instead. Off by default (reversible single-axis change).
+
+_LAST_ONCHAIN_INV: Optional[tuple[float, float]] = None  # (ts, inventory_value_usd)
+
+
+def _onchain_inventory_value() -> Optional[float]:
+    """Authoritative marked inventory value from the data-api: sum of size*curPrice
+    over /positions. `curPrice` is the exchange mark, so no midpoint convention is
+    needed. Returns None on any failure (caller applies the fail-safe)."""
+    try:
+        import requests
+        from config import FUNDER
+
+        if not FUNDER:
+            log.warning("[FIX-3] FUNDER unset — cannot source on-chain portfolio")
+            return None
+        resp = requests.get(
+            "https://data-api.polymarket.com/positions",
+            params={"user": FUNDER, "sizeThreshold": "0.1"},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            log.warning(f"[FIX-3] data-api /positions returned {resp.status_code}")
+            return None
+        data = resp.json()
+        if not isinstance(data, list):
+            log.warning("[FIX-3] data-api /positions unexpected format")
+            return None
+        return sum(
+            float(p.get("size", 0) or 0) * float(p.get("curPrice", 0) or 0)
+            for p in data
+        )
+    except Exception as e:
+        log.warning(f"[FIX-3] on-chain inventory fetch failed: {e}")
+        return None
+
+
+def _portfolio_value_for_kill(wallet: float, db_portfolio: float) -> float:
+    """FIX-3: the portfolio value fed to the kill switch.
+
+    With RF_KILL_PORTFOLIO_SOURCE == "onchain", return cash + the authoritative
+    on-chain marked inventory. Fail-safe — a missing data-api reading must never
+    silently disable NOR falsely fire the kill:
+      * good reading           -> cash + on-chain inventory (cached);
+      * miss + fresh cache      -> cash + cached inventory (WARN);
+      * miss + no fresh cache   -> the DB-based value (WARN; no worse than legacy).
+    With "db" (default) it returns the DB-based value unchanged.
+    """
+    from config import cfg
+
+    global _LAST_ONCHAIN_INV
+    source = str(cfg("RF_KILL_PORTFOLIO_SOURCE") or "db").lower()
+    if source != "onchain":
+        return db_portfolio
+
+    inv = _onchain_inventory_value()
+    if inv is not None:
+        _LAST_ONCHAIN_INV = (time.time(), inv)
+        return wallet + inv
+
+    if _LAST_ONCHAIN_INV is not None:
+        age = time.time() - _LAST_ONCHAIN_INV[0]
+        try:
+            max_stale = float(cfg("RF_KILL_ONCHAIN_MAX_STALE_SECS"))
+        except (TypeError, ValueError):
+            max_stale = 3600.0
+        if age <= max_stale:
+            log.warning(
+                f"[FIX-3] data-api unavailable; reusing on-chain inventory from "
+                f"{age:.0f}s ago for the kill metric (cash=${wallet:.2f})"
+            )
+            return wallet + _LAST_ONCHAIN_INV[1]
+
+    log.warning(
+        "[FIX-3] data-api unavailable and no fresh cached inventory; falling back "
+        f"to DB-based portfolio ${db_portfolio:.2f} for the kill metric"
+    )
+    return db_portfolio
+
+
 def get_realized_loss_24h(db_path: str) -> float:
     """Sum of |pnl| for pnl<0 unwinds in last 24h. Returns positive USD."""
     try:
@@ -272,6 +358,11 @@ def run_once(
     positions, mids = _load_positions_and_mids(db_path)
     from portfolio_value import compute_portfolio_value
     portfolio = compute_portfolio_value(wallet, positions, mids)
+    # FIX-3 (RC-5): optionally source the inventory half from the authoritative
+    # data-api so the kill can't FALSE-trip on a DB-missed fill (the 06-13 deadlock)
+    # or UNDER-fire on a held-to-resolution loss (06-12). No-op unless the flag
+    # RF_KILL_PORTFOLIO_SOURCE == "onchain"; fail-safe on a data-api miss.
+    portfolio = _portfolio_value_for_kill(wallet, portfolio)
     locked = max(0.0, portfolio - wallet)
 
     # 3. Snapshot for history (so future cycles have peak/24h data)
