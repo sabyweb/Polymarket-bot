@@ -385,7 +385,18 @@ Trump-ceasefire market showing ~$87/day expected reward). Review periodically an
 hand **only** after confirming they no longer adverse-fill. Deliberately manual, per the
 cardinal kill rule.
 
-**Status (2026-06-13):** **FIX-1 built** (default-off `RF_ALLOC_EVENT_DATE_GUARD`; invariant gate
-+ unit tests green; commit + 7-day canary trial pending). **FIX-2 and FIX-3 scoped, not started.**
-RC-5 logged after the −$72.58 / −$88 attribution. Next action = commit FIX-1, then its canary
-trial; decide FIX-3-vs-FIX-2 ordering.
+**Status (2026-06-14):** **FIX-3 BUILT + DEPLOYED to the live canary** (2026-06-14 08:44 UTC,
+commit `9688d38`; flag `RF_KILL_PORTFOLIO_SOURCE="onchain"` in Helsinki `config_overrides.json`,
+instantly reversible to `"db"` via hot-reload). It was promoted ahead of FIX-1's trial and ahead
+of FIX-2 because the 06-13 false drawdown-kill deadlock (Update 06-13b) made the safety gap urgent.
+Invariant gate (INV3/5/7, 6 scenarios) PASS; 9 unit tests incl. the 06-13 replay; local regression
+clean (1,128 pass). On deploy it cleared the false kill **correctly** (cash-only would read 16.4%;
+the on-chain portfolio reads 14.3% < 15%) and the farmer resumed (kill=false, 3 markets, ~$606
+notional, ~30s cadence, no `[FIX-3]` fail-safe fallback). **7-day canary clock STARTED 2026-06-14
+08:44.** **FIX-1 committed** (`78dc363`; guard `RF_ALLOC_EVENT_DATE_GUARD` default-OFF = inert, so
+it is NOT a live candidate — only FIX-3 is active; "never two candidates live" holds); its trial is
+deferred until FIX-3's window completes. **FIX-2 scoped, not started.** Next = soak FIX-3 ≥7 days
+clean, watching for any drawdown re-kill (distinguish a *real* drawdown from a FIX-3 data-api
+fail-safe fallback in the logs); then FIX-1's trial; then FIX-2. (Observed at deploy: first cycle
+took ~7 min grinding 8,025 markets — startup-only; and two startup orphan-dumps of the inherited
+JD-Vance/Mythos positions failed on a fee-rounding balance check — held, no loss, pre-existing.)
