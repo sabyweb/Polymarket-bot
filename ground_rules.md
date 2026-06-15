@@ -222,6 +222,45 @@ below.
   7-day clean run on Helsinki). Both require live operation; runbook
   at `docs/runbooks/9_of_10_p5_p7_operator_runbook.md`.
 
+- 2026-06-14 — **TEMPORARY, TIME-BOUNDED safety loosening (operator-authorized).**
+  Operator (Saby) explicitly authorized loosening the **oversight drawdown kill**
+  from 15% to **20%** for **8 hours only**, to keep the canary farming through a
+  deliberately-accepted ~15% drawdown (peak $1,220.52 is stale; portfolio has held
+  ~$1,020–1,050 for days) and continue gathering the per-market net data needed for
+  RC-2 market selection. NOT a change to the three core rules; this is a bounded
+  override of a *safety threshold*, recorded per the clause above.
+  - Mechanism: new `RF_KILL_DRAWDOWN_FRAC` config knob (default 0.15 = unchanged);
+    set to **0.20** in `config_overrides.json` for the window; `RF_FARMER_DRAWDOWN_KILL_FRAC`
+    raised to 0.20 to match the FX-082 backstop.
+  - **Unaffected / still armed:** realized-loss kill (10%/24h), unrealized-loss kill
+    (20%), loss-gated fill-rate kill, per-market fill breaker. Only the drawdown-from-peak
+    threshold is loosened, and only to 20% (floor ≈ $976, not removed).
+  - **Revert:** auto-revert at +8h to 0.15 (remove the overrides; hot-reload). After
+    revert the drawdown kill returns to 15% and will fire if still breached — by design.
+  - Risk acknowledged: the bot is net-negative (RC-2); farming through the drawdown may
+    bleed further. The override trades capital risk for uptime + data, by operator choice.
+
+- 2026-06-15 — **Operator-authorized baseline acceptance + cooldown-soak resume.** (Supersedes the
+  2026-06-14 8h entry, which was NOT executed.) Verified ground truth: the $1,220.52 peak is only
+  3.3 days old and the portfolio declined steadily ($1,220→$1,117→$1,048→$1,018) — a **real,
+  recent ~16% drawdown**, not a stale high-water mark (a windowed peak would hide a real loss, so
+  it was rejected). Operator (Saby) explicitly **accepts the ~$200 realized drawdown as the new
+  baseline** and authorizes resuming the canary with:
+  - **`RF_PREEMPTIVE_COOLDOWN_ENABLED=true`** — the *actual fix* (cools a market after its first
+    >0.05/share-slippage fill; addresses the repeat-fill bucket = 66% / ~$153 of 14d losses).
+    This is the single measured lever of the soak.
+  - **`RF_KILL_DRAWDOWN_FRAC=0.20` + `RF_FARMER_DRAWDOWN_KILL_FRAC=0.20`** — bounded drawdown
+    tolerance so it can resume past the real 16.6% drawdown. Kill re-fires at ~$976 (20% of peak),
+    i.e. **bounded ~$42 of further downside** while the cooldown is tested.
+  - **Still armed:** realized-loss (10%/24h), unrealized-loss (20%), loss-gated fill-rate kill.
+    Only the drawdown-from-peak threshold is loosened, to 20%, not removed.
+  - **Revert:** `RF_KILL_DRAWDOWN_FRAC`/`RF_FARMER_DRAWDOWN_KILL_FRAC` → 0.15 once the portfolio
+    recovers stably above $1,037 (the 15% line), restoring full drawdown protection at the new
+    baseline. If instead it bleeds to the 20% line, the re-kill is the signal that cooldown alone
+    is insufficient → add the volatility lever (Phase 1.3).
+  - Rationale vs the declined 8h override: that was "run and bleed with no fix"; this pairs the
+    bounded tolerance with the fix that addresses the majority of the bleed, as a measured soak.
+
 - 2026-05-26 v1.0 — Created. Three core rules defined after the
   SimpleAllocator kill-switch event of 2026-05-25 demonstrated that the
   deployed code violated all three rules simultaneously.

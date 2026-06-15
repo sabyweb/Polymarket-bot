@@ -905,10 +905,20 @@ class SimpleAllocator:
 
         if portfolio_peak_usd > 0:
             drawdown = 1.0 - (portfolio_value_usd / portfolio_peak_usd)
-            if drawdown > KILL_DRAWDOWN_FRAC:
+            # KILL_DRAWDOWN_FRAC (0.15) is the hardcoded default. RF_KILL_DRAWDOWN_FRAC
+            # allows a RECORDED, time-bounded operator loosening (see ground_rules.md
+            # change log) WITHOUT a redeploy — e.g. to ride out a stale-peak window
+            # deliberately. Falsy/invalid override falls back to the 0.15 default, so
+            # the override can only ever be an explicit, valid number (you can't
+            # accidentally disable the kill by setting 0).
+            try:
+                dd_frac = float(cfg("RF_KILL_DRAWDOWN_FRAC") or KILL_DRAWDOWN_FRAC)
+            except (TypeError, ValueError):
+                dd_frac = KILL_DRAWDOWN_FRAC
+            if drawdown > dd_frac:
                 return True, (
                     f"drawdown {drawdown * 100:.1f}% > "
-                    f"{KILL_DRAWDOWN_FRAC * 100:.0f}% from peak "
+                    f"{dd_frac * 100:.0f}% from peak "
                     f"${portfolio_peak_usd:.2f} "
                     f"(portfolio=${portfolio_value_usd:.2f}, cash=${wallet_usd:.2f})"
                 )
