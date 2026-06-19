@@ -261,6 +261,37 @@ below.
   - Rationale vs the declined 8h override: that was "run and bleed with no fix"; this pairs the
     bounded tolerance with the fix that addresses the majority of the bleed, as a measured soak.
 
+- 2026-06-19 — **Operator-authorized resume as a bounded A/B soak + Halt-Doctor Stage-2
+  auto-recovery (recorded per the cardinal-rule clause).** Operator (Saby) authorized, after a
+  full ground-truth investigation (snapshot `snapshots/2026-06-19/`, see [[net_unrecoverable_offline]]):
+  - **Baseline reset:** accept ~$985 as the resume reference. The $1,220.52 peak is stale deposit-era
+    (verified: portfolio $201→$985 over the month was mostly deposits, not P&L; held-to-resolution net
+    is NOT recoverable offline). Recorded; deposits FROZEN for the experiment (no money in/out) so the
+    forward net is measurable (the only clean net path).
+  - **Drawdown floor ~$920:** `RF_KILL_DRAWDOWN_FRAC` AND `RF_FARMER_DRAWDOWN_KILL_FRAC` → **0.246**
+    (= $920 vs the $1,220.52 peak; ~$65 runway from $985). Tight by operator choice; real breaches
+    escalate (the Halt-Doctor does NOT auto-recover a real drawdown).
+  - **Bounded A/B from start:** `RF_AB_EXPERIMENT_ENABLED=true`, `RF_AB_COHORT_COUNT=2` (C0 baseline vs
+    C1 calmer-pond `RF_AB_C1_MAX_RECENT_VOLATILITY=0.03`); breadth `RF_OVERCOMMIT_MAX_DEPLOYED_MARKETS=20`,
+    per-market cap `RF_MAX_CAPITAL_PER_MARKET_USD=25` (raised from the proposed $15 — ground truth: $15
+    is below the ~$22 min_size cost-to-score and would collapse breadth).
+  - **Still armed (unchanged):** realized-loss 10%/24h, unrealized-loss 20%, fill-rate spike,
+    per-market breaker, per-cohort breaker. Only the drawdown-from-(stale)-peak threshold is loosened.
+  - **Halt-Doctor Stage-2 auto-recovery envelope (graduated autonomy, KILL axis):** the supervisor may
+    auto-clear + restart ONLY on a `FALSE_POSITIVE` diagnosis (claimed metric POSITIVELY contradicted by
+    authoritative on-chain/data-api ground truth AND trip is recent — e.g. the verified 2026-06-13
+    DB-missed-fill drawdown deadlock). Bounds: **max 2 auto-recoveries / 24h**, a **re-kill within T
+    minutes → permanent hard-stop + escalate**, **always Discord-paged**, **never loosens a threshold**,
+    **instant operator override file**, and the **full kill stack stays armed**. `REAL_ACTIVE` /
+    `REAL_RESOLVED` / `UNCERTAIN` ALWAYS escalate to a human (cardinal rule intact). The supervisor runs
+    only AFTER the first MANUAL operator resume, and is operator-reviewed before deploy. Stage 3
+    (unattended widening) remains out of scope.
+  - **Revert:** flip the A/B/cap flags off and `*_DRAWDOWN_FRAC` → 0.15 once net-positive + recovered;
+    disable auto-recovery via the override file. All reversible (config + flags), recorded, gated
+    (`run_audit_v5 --seeds 1 42 1337` + fast `pytest`).
+  - Risk acknowledged: strategy is net-negative/unproven; the sweep lever's offline edge rested on ~1
+    market and its J was lookahead-inflated; the tight floor may halt mid-soak. The soak is the proof.
+
 - 2026-05-26 v1.0 — Created. Three core rules defined after the
   SimpleAllocator kill-switch event of 2026-05-25 demonstrated that the
   deployed code violated all three rules simultaneously.

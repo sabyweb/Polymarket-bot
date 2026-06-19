@@ -71,11 +71,21 @@ def fetch_reward_markets(creds: dict, max_pages: int = 80, http=requests.get) ->
         params = {"signature_type": 2}
         if cursor:
             params["next_cursor"] = cursor
-        r = http(
-            CLOB_HOST + REWARDS_PATH, params=params,
-            headers=auth_headers("GET", REWARDS_PATH, **creds), timeout=15,
-        )
-        r.raise_for_status()
+        # Retry transient network errors (the service died 2026-06-18 on a single CLOB ReadTimeout
+        # with no retry). 3 attempts, exponential backoff, longer timeout.
+        r = None
+        for attempt in range(3):
+            try:
+                r = http(
+                    CLOB_HOST + REWARDS_PATH, params=params,
+                    headers=auth_headers("GET", REWARDS_PATH, **creds), timeout=30,
+                )
+                r.raise_for_status()
+                break
+            except Exception:
+                if attempt == 2:
+                    raise
+                time.sleep(2 ** attempt)  # 1s, 2s
         j = r.json()
         items.extend(j.get("data", []) or [])
         cursor = j.get("next_cursor") or ""
@@ -226,7 +236,14 @@ def main():
         raise SystemExit("missing CLOB creds in .env (CLOB_SECRET/CLOB_API_KEY/WALLET_ADDRESS/CLOB_PASS_PHRASE)")
 
     ts = time.time()
-    items = fetch_reward_markets(creds, max_pages=args.max_pages)
+    try:
+        items = fetch_reward_markets(creds, max_pages=args.max_pages)
+    except Exception as e:
+        # Persistent failure after retries: exit CLEANLY so systemd doesn't mark the unit failed;
+        # the next scheduled run retries. (A crash here is what left the service in 'failed' state.)
+        print(f"[reward_snapshot] fetch failed after retries: {type(e).__name__}: {e} — "
+              f"exiting cleanly, will retry next run")
+        return
     records = extract(items, ts, min_earnings=0.0)
     total = sum(r["earnings_usd"] for r in records)
     when = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")

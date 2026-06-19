@@ -331,6 +331,12 @@ RF_GAME_BLOCK_HOURS: float = 1.0             # Block sports markets within N hou
 # sweep stays the real-time backstop).
 RF_ALLOC_MIN_HOURS_TO_RESOLUTION: float = 48.0  # Exclude markets resolving within this many hours of end_date_iso (or already past). Catches daily up/down + near-resolution convergence. 0 disables this axis.
 RF_ALLOC_MIN_HOURS_TO_GAME_START: float = 12.0  # Exclude markets within this many hours of game_start_time (pre-event + in-play). Wider than the farmer's RF_GAME_BLOCK_HOURS (1.0) so the allocator never proposes a market that will enter the farmer's block window mid-cycle. 0 disables this axis.
+# Verified 2026-06-17: held-to-resolution loss (−$99/14d) concentrates in UNSCHEDULED news/geopolitical
+# markets which carry NO game_start_time (0% coverage) — so the game-start filter above fails OPEN and
+# admits exactly the markets a human would avoid. This guard stops failing open on them: a market with
+# no game_start_time AND a discrete-political-event question is treated as an unknowable catalyst → avoid.
+# Conservative keyword list (targets the verified losers, not continuous-metric markets). Default off.
+RF_ALLOC_NO_GAMESTART_EVENT_GUARD: bool = False
 RF_ALLOC_MAX_TIMING_FETCHES: int = 300          # Per-oversight-cycle budget on CLOB /markets/{cid} timing-enrichment calls. Only ranked candidates we'd actually deploy are enriched, until the deploy cap fills; with the TTL cache below, steady-state cost is near zero. 0 disables enrichment (filter then acts only on pre-populated timing).
 RF_ALLOC_TIMING_CACHE_TTL_SEC: float = 21600.0  # Cache TTL for fetched (game_start_time, end_date_iso) per cid — ~immutable data, so 6h keeps re-fetches rare while tolerating the occasional reschedule.
 RF_ALLOC_EVENT_DATE_GUARD: bool = False  # FIX-1 (RC-4): when True, the allocator also excludes event/same-day markets whose end_date_iso is an unreliable sentinel/null (e.g. the SpaceX IPO-day suite carried end_date=2027 or None while resolving same-day). Acts ONLY on candidates whose timing was enriched this cycle: excludes if the CLOB reports the market closed / not-accepting-orders (definitive), OR the question matches a conservative same-day/event pattern (see _EVENT_SAME_DAY_PATTERNS in simple_allocator.py). Never fires for un-enriched markets (preserves coverage). Default False = legacy behavior (date-only RF_ALLOC_MIN_HOURS_* filters). Single-axis + reversible. See docs/POSTMORTEM_2026-06-12.md §11 FIX-1.
@@ -350,6 +356,13 @@ RF_ALLOC_EVENT_DATE_GUARD: bool = False  # FIX-1 (RC-4): when True, the allocato
 RF_ALLOC_MAX_RECENT_VOLATILITY: float = 0.10   # Exclude a candidate if its book_snapshots midpoint range (max-min) over the window exceeds this (price units; 0.10 = 10c). Stable reward markets barely move; news markets swing >10c. 0 disables this filter.
 RF_ALLOC_VOLATILITY_WINDOW_HOURS: float = 6.0  # Look-back window for the midpoint-range volatility estimate.
 RF_ALLOC_VOLATILITY_MIN_SAMPLES: int = 5       # Require ≥ this many book_snapshots in the window to compute volatility; below it, fail-open (insufficient signal → no exclusion).
+# Verified 2026-06-17 on REAL per-market net: book SWEEP RATE separates net-good from net-bad markets
+# (J≈0.49 moderate; net-good markets have sweep ≈ 0). Sweep = fraction of consecutive book_snapshots
+# whose midpoint jumped > RF_ALLOC_SWEEP_JUMP_USD over the volatility window. This is the automatable
+# form of the operator's "deep, calm book" rule — a behavioural signal (book getting swept by news),
+# more robust than question-keyword matching. Exclude a candidate if its sweep rate exceeds the cap.
+RF_ALLOC_MAX_RECENT_SWEEP_RATE: float = 0.0    # 0 disables. e.g. 0.03 = exclude markets swept >3% of snapshots
+RF_ALLOC_SWEEP_JUMP_USD: float = 0.02          # a consecutive-snapshot midpoint move > this (2c) counts as a sweep
 
 # ── FX-097: Escalating cooldowns for repeat losers ───────────────────────────
 RF_COOLDOWN_BASE_SEC: float = 86400.0          # First-strike cooldown (24h)
@@ -367,6 +380,15 @@ RF_RANK_VOL_PENALTY_K: float = 0.0             # 0 = disabled; reward / (1 + k*v
 # ── Phase 5d: Pre-emptive cooldown on adverse fill ────────────────────────────
 RF_PREEMPTIVE_COOLDOWN_ENABLED: bool = False   # off until 5a–5c soak data
 RF_PREEMPTIVE_SLIPPAGE_USD: float = 0.05       # per-share slippage threshold
+
+# ── A/B learning experiment (bounded cohort soak; see docs/AB_RESUME_DESIGN.md) ──
+# Master flag OFF = byte-identical baseline behaviour. When ON, the allocator assigns
+# each market to a cohort by stable hash(condition_id) % RF_AB_COHORT_COUNT and applies
+# cohort-specific treatments + a total deployed-notional budget for the bounded run.
+RF_AB_EXPERIMENT_ENABLED: bool = False        # master switch; off = no behaviour change
+RF_AB_COHORT_COUNT: int = 2                   # Phase 1: C0 baseline + C1 calmer-pond (3 when C2 added)
+RF_AB_C1_MAX_RECENT_VOLATILITY: float = 0.03  # C1 calmer-pond cohort: tighter vol gate vs RF_ALLOC_MAX_RECENT_VOLATILITY
+RF_AB_TOTAL_CAPITAL_USD: float = 0.0          # 0 = no experiment budget cap; e.g. 400 caps total deployed notional
 
 RF_BOOK_CACHE_TTL: int = 180                 # Max age (seconds) for MarketState.cached_book used by Q-score sampling in record_cycle; 0 disables
 RF_ORDER_STALE_CHECK_SECS: int = 300         # Force-check orders still in open_ids after this many seconds

@@ -103,6 +103,32 @@ _EVENT_SAME_DAY_PATTERNS = (
     "end of day", "opening day",
 )
 
+# Discrete unscheduled-political-event patterns. These resolve on a sudden news event
+# (announcement, agreement, signing, closure, strike) that has NO scheduled game_start_time,
+# so the game-start filter is blind to them — they are the verified held-to-resolution losers
+# (Iran/Trump/Israel). Deliberately CONSERVATIVE: action verbs + specific geopolitical nouns,
+# chosen NOT to match continuous-metric markets ("USD reaches X rials", "margin between X-Y"),
+# which are safe even without a start time. Used by _no_gamestart_event_excluded.
+# Patterns are matched as substrings on the lowercased question, so they are written with
+# leading spaces / specific phrasing to avoid substring false positives (e.g. " agree" not
+# "agree" so "disagree" doesn't match; "military coup"/"coup d" not "coup" so "couple" doesn't;
+# "to sign"/"signs a" not "sign a" so "design a" doesn't).
+_DISCRETE_EVENT_PATTERNS = (
+    "announce", " agrees", " agree to", " agree on", "will sign", "to sign", "signs a", "signs the",
+    "ceasefire", "airspace", "enrichment", "summit", "meet with", "meeting be", "diplomatic",
+    "memorandum", "peace deal", "reach a deal", "reach an agreement", "reach agreement",
+    "strike on", "invade", "military coup", "coup d", "resign", "step down",
+    "sanction", "treaty", "end the war", "close the strait", "blockade",
+)
+# Continuous-metric / level markets: SAFE even with no game_start_time — never excluded by the
+# no-gamestart guard. Checked BEFORE the discrete-event list so a level market is always allowed.
+# Deliberately excludes bare "reach " (matches "reach a deal", a discrete event) and "closing
+# price" (IPO-ish, FIX-1's domain) to avoid wrongly allowing discrete-event markets.
+_CONTINUOUS_METRIC_PATTERNS = (
+    " between ", "be between", " above ", " below ", "gross margin", "exchange rate",
+    "rials by", "rial by", "index be", " cpi ", "gdp", "unemployment rate",
+)
+
 # Kill switch thresholds — these replace SafetyController's 14 invariants
 KILL_LOSS_FRAC = 0.10              # halt on 24h realized loss > 10% of wallet
 KILL_DRAWDOWN_FRAC = 0.15          # halt on 15% drawdown from peak wallet
@@ -467,6 +493,26 @@ class SimpleAllocator:
         if meta.get("game_start_time") or meta.get("end_date_iso") or meta.get("question"):
             self._timing_cache[cid] = (now, meta)
 
+    def _ab_cohort(self, cid: str) -> int:
+        """A/B experiment cohort for a market: stable hash(condition_id) % count.
+
+        Deterministic + pseudo-random so each cohort sees a representative market
+        mix (assignment is fixed per market, never drifts). Returns 0 (baseline)
+        when the experiment is off or the count is <= 1. Cohort is a pure function
+        of condition_id, so the offline analyzer can recompute it without any stored
+        column. See docs/AB_RESUME_DESIGN.md.
+        """
+        import hashlib
+        from config import cfg
+        try:
+            n = int(cfg("RF_AB_COHORT_COUNT") or 1)
+        except (TypeError, ValueError):
+            n = 1
+        if n <= 1:
+            return 0
+        h = int(hashlib.sha1(cid.encode("utf-8")).hexdigest(), 16)
+        return h % n
+
     def _apply_timing_meta(self, m: "CandidateMarket", meta: dict) -> None:
         """Copy a _fetch_timing dict onto the candidate + mark enrichment attempted."""
         m.game_start_time = meta.get("game_start_time", "") or ""
@@ -535,6 +581,37 @@ class SimpleAllocator:
                     return True, f"event_guard:same_day[{pat}]"
         return False, ""
 
+    def _no_gamestart_event_excluded(self, m: "CandidateMarket") -> tuple[bool, str]:
+        """Verified-2026-06-17 guard: exclude DISCRETE unscheduled-political-event markets that
+        carry NO game_start_time. Such markets (Iran/Trump/Israel "will X happen by date") have an
+        unknowable catalyst, so a resting quote gets run over when the news lands and we end up
+        holding to resolution at a loss — they are the source of the −$99/14d held-to-resolution
+        bucket, and the existing game-start filter is structurally blind to them (0% have a start).
+
+        Off by default (RF_ALLOC_NO_GAMESTART_EVENT_GUARD). Like the other timing guards it acts ONLY
+        on enriched candidates (`timing_fetch_attempted`) — un-enriched markets stay fail-open so
+        Ground Rule 1 coverage is preserved. Decision order, all fail-SAFE (do NOT exclude) on miss:
+          1) has a game_start_time            -> NOT excluded (the game-start filter handles it)
+          2) question matches a CONTINUOUS-metric pattern -> NOT excluded (safe level market)
+          3) question matches a DISCRETE-event pattern    -> EXCLUDE
+        Pure timing/text function: no effect on sizing, ranking, or EV (single-axis).
+        """
+        if not bool(cfg("RF_ALLOC_NO_GAMESTART_EVENT_GUARD")):
+            return False, ""
+        if not m.timing_fetch_attempted:
+            return False, ""                       # unknown timing -> fail-open (coverage)
+        if (m.game_start_time or "").strip():
+            return False, ""                       # scheduled -> game-start filter's job
+        q = (m.question or "").lower()
+        if not q:
+            return False, ""
+        if any(p in q for p in _CONTINUOUS_METRIC_PATTERNS):
+            return False, ""                       # safe continuous/level market
+        for pat in _DISCRETE_EVENT_PATTERNS:
+            if pat in q:
+                return True, f"no_gamestart_event[{pat}]"
+        return False, ""
+
     def _recent_volatility(self, cid: str) -> Optional[float]:
         """FX-093: recent midpoint RANGE (max-min) for `cid` from book_snapshots
         over the volatility window, or None when there's not enough signal.
@@ -567,6 +644,43 @@ class SimpleAllocator:
         if int(row[2]) < ALLOC_VOLATILITY_MIN_SAMPLES():
             return None  # too few samples — insufficient signal, fail-open
         return float(row[0]) - float(row[1])
+
+    def _recent_sweep_rate(self, cid: str) -> Optional[float]:
+        """Book SWEEP RATE for `cid`: fraction of consecutive book_snapshots whose midpoint moved
+        more than RF_ALLOC_SWEEP_JUMP_USD over the volatility window. Verified 2026-06-17 to separate
+        net-good (≈0 sweeps) from net-bad markets (J≈0.49) — the behavioural form of the "calm book"
+        rule. Returns None (fail-open — caller does NOT exclude) when the filter is disabled, there
+        are fewer than ALLOC_VOLATILITY_MIN_SAMPLES snapshots, or on any DB error. Reuses the
+        volatility window/min-samples so it shares the existing book-coverage characteristics.
+        """
+        try:
+            cap = float(cfg("RF_ALLOC_MAX_RECENT_SWEEP_RATE") or 0.0)
+        except (TypeError, ValueError):
+            cap = 0.0
+        if cap <= 0:
+            return None
+        try:
+            jump = float(cfg("RF_ALLOC_SWEEP_JUMP_USD") or 0.02)
+        except (TypeError, ValueError):
+            jump = 0.02
+        since = self._now() - ALLOC_VOLATILITY_WINDOW_HOURS() * 3600.0
+        try:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                rows = conn.execute(
+                    "SELECT midpoint FROM book_snapshots WHERE condition_id = ? AND ts >= ? ORDER BY ts",
+                    (cid, since),
+                ).fetchall()
+            finally:
+                conn.close()
+        except Exception as e:
+            log.debug(f"sweep query failed {cid[:10]}: {e}")
+            return None
+        mids = [float(r[0]) for r in rows if r and r[0] is not None]
+        if len(mids) < ALLOC_VOLATILITY_MIN_SAMPLES():
+            return None  # insufficient signal — fail-open
+        jumps = sum(1 for i in range(1, len(mids)) if abs(mids[i] - mids[i - 1]) > jump)
+        return jumps / max(1, len(mids) - 1)
 
     def compute(
         self,
@@ -745,6 +859,8 @@ class SimpleAllocator:
         timing_excluded_count = 0
         vol_excluded_count = 0  # FX-093
         event_excluded_count = 0  # FIX-1 (RC-4): event/same-day guard
+        ng_excluded_count = 0  # no-gamestart discrete-event guard (held-to-resolution lever)
+        sweep_excluded_count = 0  # calm-book sweep-rate filter (net-validated 2026-06-17)
         for m in eligible:
             if len(deploys) >= max_deploys:
                 # Soft cap hit — extremely rare in practice (5k market pool
@@ -781,17 +897,50 @@ class SimpleAllocator:
                 avoids.append(m)
                 continue
 
+            # No-gamestart discrete-event guard (held-to-resolution lever, verified 2026-06-17).
+            ng_excluded, ng_reason = self._no_gamestart_event_excluded(m)
+            if ng_excluded:
+                m.event_guard_reason = ng_reason
+                m.timing_excluded_reason = ng_reason
+                ng_excluded_count += 1
+                avoids.append(m)
+                continue
+
             # FX-093: recent-volatility filter. Exclude candidates whose
             # book_snapshots midpoint has swung more than the cap over the
             # window — news-active markets that adversely fill our resting
             # quotes. Triggered by book movement (no fill needed); fail-open
             # when there's insufficient history (FX-051 cooldown backstops).
             vol_cap = ALLOC_MAX_RECENT_VOLATILITY()
+            # A/B C1 (calmer-pond cohort): apply a TIGHTER volatility gate to its
+            # bucket only. Off (or other cohorts) => unchanged baseline gate.
+            if cfg("RF_AB_EXPERIMENT_ENABLED") and self._ab_cohort(m.condition_id) == 1:
+                try:
+                    c1_cap = float(cfg("RF_AB_C1_MAX_RECENT_VOLATILITY") or 0.0)
+                except (TypeError, ValueError):
+                    c1_cap = 0.0
+                if c1_cap > 0:
+                    vol_cap = c1_cap
             if vol_cap and vol_cap > 0:
                 recent_vol = self._recent_volatility(m.condition_id)
                 if recent_vol is not None and recent_vol > vol_cap:
                     m.timing_excluded_reason = f"volatility_{recent_vol:.3f}>{vol_cap:.2f}"
                     vol_excluded_count += 1
+                    avoids.append(m)
+                    continue
+
+            # Calm-book SWEEP-RATE filter (net-validated 2026-06-17: J≈0.49 on real per-market net).
+            # Exclude markets whose book is being swept (news-driven) beyond the cap. Fail-open when
+            # there's insufficient book history (returns None). Disabled by default (cap 0).
+            try:
+                sweep_cap = float(cfg("RF_ALLOC_MAX_RECENT_SWEEP_RATE") or 0.0)
+            except (TypeError, ValueError):
+                sweep_cap = 0.0
+            if sweep_cap > 0:
+                recent_sweep = self._recent_sweep_rate(m.condition_id)
+                if recent_sweep is not None and recent_sweep > sweep_cap:
+                    m.timing_excluded_reason = f"sweep_{recent_sweep:.3f}>{sweep_cap:.2f}"
+                    sweep_excluded_count += 1
                     avoids.append(m)
                     continue
 
@@ -838,6 +987,18 @@ class SimpleAllocator:
                 target_shares = capped_shares
                 cost_per_market = target_shares * cost_per_share
 
+            # A/B experiment: enforce a total deployed-notional budget so the
+            # bounded learning run cannot exceed its capital allocation. Markets
+            # beyond the budget this cycle are deferred (treated as avoids).
+            if cfg("RF_AB_EXPERIMENT_ENABLED"):
+                try:
+                    ab_budget = float(cfg("RF_AB_TOTAL_CAPITAL_USD") or 0.0)
+                except (TypeError, ValueError):
+                    ab_budget = 0.0
+                if ab_budget > 0 and (used + cost_per_market) > ab_budget:
+                    avoids.append(m)
+                    continue
+
             m.target_shares = target_shares
             m.target_capital = round(cost_per_market, 2)
 
@@ -862,7 +1023,7 @@ class SimpleAllocator:
         log.info(
             f"[OVERCOMMIT_ALLOC] eligible={len(eligible)} positive_ev={positive_ev_count} "
             f"deploys={len(deploys)} avoids={len(avoids)} "
-            f"timing_excluded={timing_excluded_count} event_excluded={event_excluded_count} vol_excluded={vol_excluded_count} timing_fetches={timing_budget['fetches']} "
+            f"timing_excluded={timing_excluded_count} event_excluded={event_excluded_count} ng_event_excluded={ng_excluded_count} vol_excluded={vol_excluded_count} sweep_excluded={sweep_excluded_count} timing_fetches={timing_budget['fetches']} "
             f"notional_total=${used:.2f} wallet=${wallet_usd:.2f} "
             f"overcommit_ratio={notional_overcommit_ratio:.2f}× "
             f"(target band 3-8× per Ground Rule 2) "
