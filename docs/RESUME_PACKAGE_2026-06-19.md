@@ -9,9 +9,9 @@ not restart services. Verified state: portfolio ~$985 all-cash, peak $1,220.52 (
 | Knob | Value | Why |
 |---|---|---|
 | Resume mode | **A/B from start** (C0 baseline vs C1 calmer-pond) | C0 is the concurrent control |
-| Drawdown floor | **~$920** (`*_DRAWDOWN_FRAC=0.246` vs $1,220.52 peak) | conservative; ~$65 runway |
+| Drawdown floor | **~$880** (`*_DRAWDOWN_FRAC=0.28` vs $1,220.52 peak) | ~$105 runway from $985 |
 | Breadth | **20 markets** (`RF_OVERCOMMIT_MAX_DEPLOYED_MARKETS=20`) | enough for A/B signal |
-| Per-market cap | **$25** (`RF_MAX_CAPITAL_PER_MARKET_USD=25`) | **raised from $15** — $15 < ~$22 min_size cost-to-score → would collapse breadth |
+| Per-market cap | **$60** (`RF_MAX_CAPITAL_PER_MARKET_USD=60`) | unlocks min_size≤50 (70% of universe); $25 would deploy only min_size-20 (26%) |
 | Deposits | **FROZEN** | only way forward net is measurable |
 | Halt self-recovery | **gated auto-execute** (FALSE_POSITIVE only) | supervisor is a fast-follow build, operator-reviewed before deploy |
 
@@ -27,10 +27,10 @@ not restart services. Verified state: portfolio ~$985 all-cash, peak $1,220.52 (
   "RF_KILL_PORTFOLIO_SOURCE": "onchain",
   "RF_PREEMPTIVE_COOLDOWN_ENABLED": true,
 
-  "RF_KILL_DRAWDOWN_FRAC": 0.246,
-  "RF_FARMER_DRAWDOWN_KILL_FRAC": 0.246,
+  "RF_KILL_DRAWDOWN_FRAC": 0.28,
+  "RF_FARMER_DRAWDOWN_KILL_FRAC": 0.28,
   "RF_OVERCOMMIT_MAX_DEPLOYED_MARKETS": 20,
-  "RF_MAX_CAPITAL_PER_MARKET_USD": 25,
+  "RF_MAX_CAPITAL_PER_MARKET_USD": 60,
 
   "RF_AB_EXPERIMENT_ENABLED": true,
   "RF_AB_COHORT_COUNT": 2,

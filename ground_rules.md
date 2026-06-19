@@ -268,13 +268,15 @@ below.
     (verified: portfolio $201→$985 over the month was mostly deposits, not P&L; held-to-resolution net
     is NOT recoverable offline). Recorded; deposits FROZEN for the experiment (no money in/out) so the
     forward net is measurable (the only clean net path).
-  - **Drawdown floor ~$920:** `RF_KILL_DRAWDOWN_FRAC` AND `RF_FARMER_DRAWDOWN_KILL_FRAC` → **0.246**
-    (= $920 vs the $1,220.52 peak; ~$65 runway from $985). Tight by operator choice; real breaches
-    escalate (the Halt-Doctor does NOT auto-recover a real drawdown).
+  - **Drawdown floor ~$880:** `RF_KILL_DRAWDOWN_FRAC` AND `RF_FARMER_DRAWDOWN_KILL_FRAC` → **0.28**
+    (= $878.77 vs the $1,220.52 peak; ~$105 runway from $985). Real breaches escalate (the Halt-Doctor
+    does NOT auto-recover a real drawdown).
   - **Bounded A/B from start:** `RF_AB_EXPERIMENT_ENABLED=true`, `RF_AB_COHORT_COUNT=2` (C0 baseline vs
     C1 calmer-pond `RF_AB_C1_MAX_RECENT_VOLATILITY=0.03`); breadth `RF_OVERCOMMIT_MAX_DEPLOYED_MARKETS=20`,
-    per-market cap `RF_MAX_CAPITAL_PER_MARKET_USD=25` (raised from the proposed $15 — ground truth: $15
-    is below the ~$22 min_size cost-to-score and would collapse breadth).
+    per-market cap `RF_MAX_CAPITAL_PER_MARKET_USD=60` (ground truth: live reward-market min_size is
+    dominated by min_size-50 = 43% of 1,738 eligible; a $25 cap deploys only min_size-20 = 26% of the
+    universe, $60 unlocks min_size<=50 = 70% so the A/B covers the representative bulk; per-market
+    notional stays small vs the $880 floor).
   - **Still armed (unchanged):** realized-loss 10%/24h, unrealized-loss 20%, fill-rate spike,
     per-market breaker, per-cohort breaker. Only the drawdown-from-(stale)-peak threshold is loosened.
   - **Halt-Doctor Stage-2 auto-recovery envelope (graduated autonomy, KILL axis):** the supervisor may
