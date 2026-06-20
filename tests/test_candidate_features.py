@@ -14,15 +14,16 @@ import config
 import simple_allocator as sa
 from simple_allocator import SimpleAllocator, CandidateMarket
 
-_real_cfg = config.cfg
-
-
 def _cfg_with_flag(value):
-    """A cfg() that forces RF_CANDIDATE_FEATURE_LOG_ENABLED and delegates everything else to real cfg."""
+    """Hermetic cfg: forces RF_CANDIDATE_FEATURE_LOG_ENABLED and reads module DEFAULTS for every other
+    knob (getattr on the config module) — bypasses config_overrides.json so the test is deterministic
+    on a clean checkout AND on the live box (where A/B is on, cap=60, trial budget 0.75, etc.).
+    Without this, the live A/B-on override makes compute() call _ab_cohort in the deploy loop, which
+    breaks the fail-open test for the wrong reason."""
     def _c(name):
         if name == "RF_CANDIDATE_FEATURE_LOG_ENABLED":
             return value
-        return _real_cfg(name)
+        return getattr(config, name, None)
     return _c
 
 
