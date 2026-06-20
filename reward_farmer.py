@@ -205,6 +205,8 @@ class RewardFarmer:
         self._alloc_mtime = 0.0
         self._last_reconcile = 0.0
         self._last_exchange_sync = 0.0
+        # Orphan-leak backstop: {(cid, side): consecutive_syncs_with_drift} for the debounce guard.
+        self._orphan_drift_pending: dict = {}
         # FX-028: timestamp of the last unliquidatable_markets re-probe sweep.
         # The actual per-cid staleness gate is RF_UNLIQUIDATABLE_REPROBE_SECS
         # (~6h); this loop-level timestamp throttles the SWEEP itself so the
@@ -685,7 +687,6 @@ class RewardFarmer:
         try:
             import requests as req
             from config import FUNDER
-            from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
 
             if not FUNDER:
                 log.warning("Position sync skipped: FUNDER not set")
@@ -793,6 +794,13 @@ class RewardFarmer:
                         )
                         self.dump_mgr.dump_position(ms, side, info["shares"])
 
+            # Share-level drift on tracked cids (orphan-leak backstop, flag-gated, default no-op).
+            # Wrapped so the backstop can NEVER abort the rest of the sync (cid-orphans, stale-clean).
+            try:
+                self._reconcile_share_drift(exchange_by_cid)
+            except Exception as e:
+                log.warning(f"[SHARE_DRIFT] reconcile failed (non-fatal): {e}")
+
             # ── Clean stale positions (in DB but not on exchange) ──
             db_positions = self.positions.get_all_positions()
             stale_removed = 0
@@ -838,6 +846,79 @@ class RewardFarmer:
 
         except Exception as e:
             log.warning(f"Exchange position sync failed: {e}")
+
+    def _reconcile_share_drift(self, exchange_by_cid: dict) -> int:
+        """Orphan-leak backstop: reconcile SHARE-level on-chain drift on TRACKED cids (flag-gated).
+
+        The cid-level orphan path only catches entirely-untracked markets. An under-reported fill
+        (SDK/get_order reports fewer shares than delivered on-chain) leaves untracked shares on a
+        STILL-tracked cid — invisible to the per-cycle drift catch-up (which skips primary_handled
+        sides) and to the fill-rate kills (fed only by recorded fills). For each tracked (cid, side),
+        if on-chain exceeds tracked by >= RF_ORPHAN_DRIFT_MIN_SHARES and the drift PERSISTS across
+        RF_ORPHAN_DRIFT_DEBOUNCE_SYNCS syncs (transient fill-vs-store lag guard), reconcile the store
+        to on-chain truth using the on-chain avgPrice (fixes the orphan cost-basis corruption) and dump.
+
+        Default OFF (RF_SYNC_SHARE_DRIFT_ENABLED) => no-op, byte-identical. Returns count reconciled.
+        """
+        if not cfg("RF_SYNC_SHARE_DRIFT_ENABLED"):
+            return 0
+        try:
+            min_drift = float(cfg("RF_ORPHAN_DRIFT_MIN_SHARES") or 1.0)
+            debounce = int(cfg("RF_ORPHAN_DRIFT_DEBOUNCE_SYNCS") or 2)
+        except (TypeError, ValueError):
+            min_drift, debounce = 1.0, 2
+        pending = self._orphan_drift_pending
+        seen: set = set()
+        reconciled = 0
+        tracked_cids = set(self.markets.keys())
+        for cid in (set(exchange_by_cid.keys()) & tracked_cids):
+            try:
+                if self.db.is_unliquidatable(cid):
+                    continue
+            except Exception:
+                pass
+            ms = self.markets.get(cid)
+            for side, info in exchange_by_cid[cid].items():
+                if side not in ("yes", "no"):
+                    continue
+                on_chain = float(info.get("shares") or 0.0)
+                tracked = self.positions.get_shares(cid, side)
+                if on_chain - tracked < min_drift:
+                    continue
+                # Don't touch a side with a dump already in flight — let it finish; re-evaluate next sync.
+                if ms is not None and (ms.dump_orders.get(side) or ms.dump_state.get(side)):
+                    continue
+                key = (cid, side)
+                seen.add(key)
+                pending[key] = pending.get(key, 0) + 1
+                if pending[key] < debounce:
+                    log.info(
+                        f"[SHARE_DRIFT] pending {pending[key]}/{debounce} {side} "
+                        f"on_chain={on_chain:.1f} tracked={tracked:.1f} | {cid[:12]}"
+                    )
+                    continue
+                # Persisted — reconcile to on-chain truth (on-chain avgPrice basis) + dump.
+                avg = float(info.get("avg_price") or 0.0)
+                if avg <= 0:
+                    try:
+                        _fs, _vwap = self.db.fills_vwap(cid, side)
+                        avg = _vwap if _vwap > 0 else None
+                    except Exception:
+                        avg = None
+                self.positions.set_shares(cid, side, on_chain, avg_price=avg)
+                log.warning(
+                    f"[SHARE_DRIFT] RECONCILE {side.upper()} {tracked:.1f}->{on_chain:.1f}sh "
+                    f"basis={avg} | {(info.get('question') or cid)[:40]}"
+                )
+                if ms is not None:
+                    self.dump_mgr.dump_position(ms, side, on_chain)
+                pending.pop(key, None)
+                reconciled += 1
+        # Decay pending entries whose drift resolved on its own.
+        for key in list(pending.keys()):
+            if key not in seen:
+                pending.pop(key, None)
+        return reconciled
 
     def _restore_dump_states(self):
         """Restore dump states from DB after crash/restart.
@@ -2731,8 +2812,9 @@ class RewardFarmer:
                 self._reconcile_orders()
                 self._last_reconcile = time.time()
 
-            # Exchange position sync every 30 min (Data API → orphans + stale cleanup)
-            if not self.dry_run and time.time() - self._last_exchange_sync >= 1800:
+            # Exchange position sync (Data API → orphans + stale cleanup). Interval is the
+            # RF_EXCHANGE_SYNC_SECS knob (default 1800 = unchanged); lower it to bound orphan exposure.
+            if not self.dry_run and time.time() - self._last_exchange_sync >= float(cfg("RF_EXCHANGE_SYNC_SECS") or 1800):
                 self._sync_exchange_positions()
                 self._last_exchange_sync = time.time()
 

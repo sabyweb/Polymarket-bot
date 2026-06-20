@@ -388,6 +388,17 @@ RF_PREEMPTIVE_SLIPPAGE_USD: float = 0.05       # per-share slippage threshold
 # Non-behavioral: never gates selection/sizing (proven by the output-byte-identical test).
 RF_CANDIDATE_FEATURE_LOG_ENABLED: bool = False
 
+# ── Orphan-leak backstop: fast share-level on-chain reconciliation ────────────
+# When the bot under-detects a fill (SDK/get_order reports fewer shares than delivered on-chain),
+# the remainder leaks as an untracked position — invisible to the per-cycle drift catch-up (which
+# skips primary_handled sides) AND to the fill-rate kills (fed only by recorded fills) — surfacing
+# only at the slow 30-min sync. These bound that exposure. ALL DEFAULT TO NO-OP (byte-identical):
+# RF_SYNC_SHARE_DRIFT_ENABLED off => sync stays cid-level-only; RF_EXCHANGE_SYNC_SECS 1800 => cadence unchanged.
+RF_EXCHANGE_SYNC_SECS: float = 1800.0          # Data-API position-sync interval; lower (e.g. 120) to bound orphan exposure
+RF_SYNC_SHARE_DRIFT_ENABLED: bool = False      # enable share-level orphan reconcile (on-chain > tracked) inside the sync
+RF_ORPHAN_DRIFT_MIN_SHARES: float = 1.0        # min (on_chain - tracked) share excess to act on
+RF_ORPHAN_DRIFT_DEBOUNCE_SYNCS: int = 2        # require drift to persist across this many syncs before reconcile+dump (transient-lag guard)
+
 # ── A/B learning experiment (bounded cohort soak; see docs/AB_RESUME_DESIGN.md) ──
 # Master flag OFF = byte-identical baseline behaviour. When ON, the allocator assigns
 # each market to a cohort by stable hash(condition_id) % RF_AB_COHORT_COUNT and applies
