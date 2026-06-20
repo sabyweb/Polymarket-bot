@@ -182,6 +182,7 @@ class AllocationResult:
     kill_switch: bool = False
     kill_reason: str = ""
     sources_used: dict = field(default_factory=dict)  # {api: N, cumulative: N, cold_start: N}
+    candidate_features: list = field(default_factory=list)  # A3 survivorship log (off by default); not serialized to the alloc JSON
 
 
 class SimpleAllocator:
@@ -1033,12 +1034,45 @@ class SimpleAllocator:
             f"p11_q_distrust_cids={len(q_distrust)}"
         )
 
+        # A3: candidate-features survivorship log (behind RF_CANDIDATE_FEATURE_LOG_ENABLED).
+        # Build the eligible-set feature vectors IN-MEMORY only — pure reads of each m, no
+        # mutation, no I/O. The orchestrator (simple_oversight) writes them to the isolated
+        # candidate_features.db AFTER the alloc file. Fail-open: any error -> empty list, so
+        # the allocator's decision/output is NEVER affected (proven by the byte-identical test).
+        candidate_feature_records: list[dict] = []
+        if cfg("RF_CANDIDATE_FEATURE_LOG_ENABLED"):
+            try:
+                _deploy_ids = {m.condition_id for m in deploys}
+                for m in eligible:
+                    candidate_feature_records.append({
+                        "condition_id": m.condition_id,
+                        "cohort": self._ab_cohort(m.condition_id),
+                        "action": "deploy" if m.condition_id in _deploy_ids else "avoid",
+                        "reason": m.timing_excluded_reason or m.event_guard_reason or "",
+                        "daily_rate": m.daily_rate,
+                        "max_spread": m.max_spread,
+                        "min_size": m.min_size,
+                        "midpoint_guess": m.midpoint_guess,
+                        "expected_q_share": m.expected_q_share,
+                        "q_share_source": m.q_share_source,
+                        "expected_daily_reward": m.expected_daily_reward,
+                        "target_shares": m.target_shares,
+                        "target_capital": m.target_capital,
+                        "end_date_iso": m.end_date_iso,
+                        "game_start_time": m.game_start_time,
+                        "question": m.question,
+                    })
+            except Exception as e:
+                candidate_feature_records = []
+                log.debug(f"[A3] candidate-features capture skipped (fail-open): {e}")
+
         return AllocationResult(
             deploys=deploys, avoids=avoids,
             total_capital=wallet_usd, capital_deployed=round(used, 2),
             expected_total_reward=round(expected_total, 4),
             kill_switch=False, kill_reason="",
             sources_used=sources_used,
+            candidate_features=candidate_feature_records,
         )
 
     # ── Minimal safety (replaces 14-invariant SafetyController) ──

@@ -381,6 +381,13 @@ RF_RANK_VOL_PENALTY_K: float = 0.0             # 0 = disabled; reward / (1 + k*v
 RF_PREEMPTIVE_COOLDOWN_ENABLED: bool = False   # off until 5a–5c soak data
 RF_PREEMPTIVE_SLIPPAGE_USD: float = 0.05       # per-share slippage threshold
 
+# ── A3: candidate-features survivorship log (read-only instrumentation) ───────
+# OFF = no logging, byte-identical behaviour. ON = the allocator builds each eligible
+# candidate's decision-time feature vector (deployed AND avoided) in-memory and the
+# oversight loop writes them to an ISOLATED candidate_features.db (never bot_history.db).
+# Non-behavioral: never gates selection/sizing (proven by the output-byte-identical test).
+RF_CANDIDATE_FEATURE_LOG_ENABLED: bool = False
+
 # ── A/B learning experiment (bounded cohort soak; see docs/AB_RESUME_DESIGN.md) ──
 # Master flag OFF = byte-identical baseline behaviour. When ON, the allocator assigns
 # each market to a cohort by stable hash(condition_id) % RF_AB_COHORT_COUNT and applies

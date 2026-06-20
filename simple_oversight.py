@@ -499,6 +499,16 @@ def run_once(
     # 5. Write alloc file
     allocator.write_allocation_json(result, output_path=output_path)
 
+    # 5b. A3: candidate-features survivorship log — isolated candidate_features.db, written AFTER the
+    # alloc file (so a logging failure can never block the critical output) and fail-quiet (mirrors
+    # snapshot_capital). Non-behavioral; a no-op unless RF_CANDIDATE_FEATURE_LOG_ENABLED made
+    # compute() populate result.candidate_features.
+    try:
+        import candidate_features_log
+        candidate_features_log.log_result(result)
+    except Exception as e:
+        log.debug(f"[A3] candidate-features log skipped (fail-quiet): {e}")
+
     # 5a. FX-085: capital-efficiency metric (Ground Rule 1 scorecard — GROSS
     # rewards per $ of committed capital). Previously UNMEASURED (the eval's
     # capital-efficiency gap). Computed from the ROI tracker's 24h global
