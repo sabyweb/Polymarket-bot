@@ -311,12 +311,39 @@ class DumpManager:
             return
 
         log.info(f"MERGE {amount:.0f} pairs | {ms.question[:30]}")
+        # Realized-loss-kill accounting (RF_KILL_ACCT_MERGE_COST_ENABLED): a complete
+        # set (1 YES + 1 NO) redeems to $1 with no taker fee, so usd_value=amount; the
+        # cost is amount*(yes_clob + no_clob). pnl<0 iff the pair cost >$1 (an adverse
+        # merge) — exactly the loss the kill must see. Capture the per-leg cost basis
+        # BEFORE record_unwind, which zeroes avg_price at 0 shares (state.py). OFF =>
+        # vwap_cost=0 => pnl=+amount, byte-identical to the pre-fix behaviour.
+        _merge_acct = bool(cfg("RF_KILL_ACCT_MERGE_COST_ENABLED"))
+        if _merge_acct:
+            _yes_avg = self.positions.get_avg_price(ms.cid, "yes")
+            _no_avg = self.positions.get_avg_price(ms.cid, "no")
         self.positions.record_unwind(ms.cid, "yes", amount)
         self.positions.record_unwind(ms.cid, "no", amount)
+        if _merge_acct:
+            if 0 < _yes_avg <= 1 and 0 < _no_avg <= 1:
+                from price import to_clob
+                _merge_cost = amount * (to_clob(_yes_avg, "yes") + to_clob(_no_avg, "no"))
+            else:
+                # Unknown/corrupt basis (e.g. an orphan/startup hedge registered via
+                # set_shares with avg_price=0): never book a merge as a profit. Floor
+                # vwap_cost to usd_value so pnl=0 (no phantom profit). True magnitude
+                # for unknown-basis legs is FX-066 Tier-2 reconstruction (separate axis).
+                _merge_cost = float(amount)
+                log.warning(
+                    f"[UNWIND_COST] cid={ms.cid[:12]} side=merge cost_basis_unknown "
+                    f"yes_avg={_yes_avg} no_avg={_no_avg} — floored vwap_cost to "
+                    f"usd ${amount:.2f} so pnl<=0 (FX-066 Tier-2 territory)"
+                )
+        else:
+            _merge_cost = 0.0  # legacy: pnl = usd_value - 0 = +amount (byte-identical)
         _mg_ok = self.db.log_unwind(
             condition_id=ms.cid, question=ms.question,
             side="merge", shares=amount,
-            sell_price=1.0, usd_value=amount,
+            sell_price=1.0, usd_value=amount, vwap_cost=_merge_cost,
         )
         if not _mg_ok:
             log.warning(

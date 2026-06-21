@@ -399,6 +399,15 @@ RF_SYNC_SHARE_DRIFT_ENABLED: bool = False      # enable share-level orphan recon
 RF_ORPHAN_DRIFT_MIN_SHARES: float = 1.0        # min (on_chain - tracked) share excess to act on
 RF_ORPHAN_DRIFT_DEBOUNCE_SYNCS: int = 2        # require drift to persist across this many syncs before reconcile+dump (transient-lag guard)
 
+# ── Realized-loss-kill accounting accuracy: merge cost basis ──────────────────
+# The realized-loss kill (10%/24h) sums unwinds.pnl<0 as its SOLE input. The both-
+# sides MERGE exit (dump_manager.try_merge) logs usd_value with NO vwap_cost =>
+# pnl = +amount, so a pair acquired >$1 (an adverse merge) books a REAL LOSS as a
+# PROFIT — invisible to the kill (memory realized_loss_kill_bypass). When ON,
+# try_merge derives vwap_cost from the per-leg cost basis so an adverse merge
+# records pnl<0. OFF = byte-identical (vwap_cost=0 => pnl=+amount, the pre-fix path).
+RF_KILL_ACCT_MERGE_COST_ENABLED: bool = False  # merge records true cost basis => merge-at-a-loss is kill-visible
+
 # ── A/B learning experiment (bounded cohort soak; see docs/AB_RESUME_DESIGN.md) ──
 # Master flag OFF = byte-identical baseline behaviour. When ON, the allocator assigns
 # each market to a cohort by stable hash(condition_id) % RF_AB_COHORT_COUNT and applies
