@@ -355,11 +355,33 @@ class RewardFarmer:
                     f"@ {fill_price:.4f} (order {order_status}) | cid={cid[:16]}"
                 )
             elif order_type == "dump_sell":
+                # B-1 startup-dump accounting (RF_KILL_ACCT_STARTUP_DUMP_ENABLED): a startup-recovered
+                # dump SELL is a forced loss-exit, but logging usd_value with NO vwap_cost books it as
+                # +pnl (a profit) => invisible to the realized-loss kill. Capture the cost basis BEFORE
+                # record_unwind zeroes avg_price at 0 shares (state.py), then record pnl<=0; key the
+                # unwind_event_id on the order id so a re-processed startup order can't double-count the
+                # now-negative loss (FX-067). OFF => vwap_cost=0 + no event_id => +pnl, byte-identical.
+                _sd_acct = bool(cfg("RF_KILL_ACCT_STARTUP_DUMP_ENABLED"))
+                if _sd_acct:
+                    _sd_avg = self.positions.get_avg_price(cid, side)
                 self.positions.record_unwind(cid, side, matched)
+                if _sd_acct:
+                    if 0 < _sd_avg <= 1:
+                        from price import to_clob
+                        _sd_vwap_cost = matched * to_clob(_sd_avg, side)
+                    else:
+                        # Unknown/orphan basis: floor vwap_cost to proceeds so pnl=0 (never a phantom
+                        # profit; true magnitude for unknown basis is FX-066 Tier-2).
+                        _sd_vwap_cost = matched * fill_price
+                    _sd_eid = f"startup_unwind:{oid}"
+                else:
+                    _sd_vwap_cost = 0.0   # legacy: pnl = +proceeds (byte-identical)
+                    _sd_eid = ""          # legacy: append-only (byte-identical)
                 self.db.log_unwind(
                     condition_id=cid, question=f"startup-recovery",
                     side=side, shares=matched,
                     sell_price=fill_price, usd_value=matched * fill_price,
+                    vwap_cost=_sd_vwap_cost, unwind_event_id=_sd_eid,
                 )
                 unwinds_recovered += 1
                 log.warning(
@@ -1390,7 +1412,12 @@ class RewardFarmer:
                 dump_oid = ms.dump_orders.get(side) if isinstance(ms.dump_orders, dict) else None
                 dump_state = ms.dump_state.get(side) if isinstance(ms.dump_state, dict) else None
                 if dump_oid and isinstance(dump_state, dict):
-                    dp = float(dump_state.get("price") or 0.0)
+                    # B-1 (RF_GUARDRAIL_DUMP_NOTIONAL_FIX_ENABLED): dump_state's price key is
+                    # "fill_price" (dump_manager.py); the old "price" key never existed => dp always 0
+                    # => resting-dump exposure invisible to the notional/cluster/rapid-growth kills.
+                    # OFF reads "price" (=> 0, byte-identical); ON reads "fill_price".
+                    _dn_key = "fill_price" if cfg("RF_GUARDRAIL_DUMP_NOTIONAL_FIX_ENABLED") else "price"
+                    dp = float(dump_state.get(_dn_key) or 0.0)
                     ds = float(dump_state.get("shares") or 0.0)
                     notional += dp * ds
             if notional > 0:

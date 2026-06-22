@@ -407,6 +407,9 @@ RF_ORPHAN_DRIFT_DEBOUNCE_SYNCS: int = 2        # require drift to persist across
 # try_merge derives vwap_cost from the per-leg cost basis so an adverse merge
 # records pnl<0. OFF = byte-identical (vwap_cost=0 => pnl=+amount, the pre-fix path).
 RF_KILL_ACCT_MERGE_COST_ENABLED: bool = False  # merge records true cost basis => merge-at-a-loss is kill-visible
+# B-1 (finish the accounting family). Each default-off = byte-identical; enable ONE at a time (single-axis).
+RF_KILL_ACCT_STARTUP_DUMP_ENABLED: bool = False  # startup-recovered dump SELL records true cost basis (pnl<=0, idempotent via event_id) instead of +pnl
+RF_GUARDRAIL_DUMP_NOTIONAL_FIX_ENABLED: bool = False  # _guardrail_live_notional reads the real dump "fill_price" (fixes the dead "price" key) so notional/cluster/rapid-growth kills see dump exposure
 
 # ── A/B learning experiment (bounded cohort soak; see docs/AB_RESUME_DESIGN.md) ──
 # Master flag OFF = byte-identical baseline behaviour. When ON, the allocator assigns
