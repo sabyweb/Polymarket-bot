@@ -646,17 +646,31 @@ class MarketROITracker:
         """
         try:
             conn = sqlite3.connect(self.db_path)
-            row = conn.execute(
+            # market_roi keeps a row per (cid, window) for EVERY cid ever active
+            # (tick() upserts, never deletes), so SUMming all rows over-counts
+            # reward/loss/counts by the accumulated stale cids. When the fix flag is
+            # on, filter to the latest tick's window_end_ts so the aggregates equal
+            # the value tick() CONSERVED this cycle (== the data-api total it
+            # attributed). RF_GLOBAL_SUMMARY_LATEST_TICK_ENABLED; OFF = byte-identical.
+            from config import cfg as _cfg
+            _agg = (
                 "SELECT COALESCE(SUM(reward_earned), 0), "
-                "       COALESCE(SUM(fill_loss), 0), "
-                "       COALESCE(SUM(capital_committed_avg), 0), "
-                "       COUNT(*), "
-                "       SUM(CASE WHEN fill_loss > 0 THEN 1 ELSE 0 END), "
-                "       SUM(CASE WHEN reward_earned > 0 THEN 1 ELSE 0 END), "
-                "       COALESCE(SUM(fill_count), 0) "
-                "FROM market_roi WHERE window = ?",
-                (window,),
-            ).fetchone()
+                "COALESCE(SUM(fill_loss), 0), "
+                "COALESCE(SUM(capital_committed_avg), 0), "
+                "COUNT(*), "
+                "SUM(CASE WHEN fill_loss > 0 THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN reward_earned > 0 THEN 1 ELSE 0 END), "
+                "COALESCE(SUM(fill_count), 0) "
+                "FROM market_roi WHERE window = ?"
+            )
+            if _cfg("RF_GLOBAL_SUMMARY_LATEST_TICK_ENABLED"):
+                row = conn.execute(
+                    _agg + " AND window_end_ts = (SELECT MAX(window_end_ts) "
+                    "FROM market_roi WHERE window = ?)",
+                    (window, window),
+                ).fetchone()
+            else:
+                row = conn.execute(_agg, (window,)).fetchone()
             # FX-091: the global capital denominator must be the time-averaged
             # TOTAL capital committed across the portfolio — NOT SUM of the
             # per-market capital_committed_avg. The per-market avg forward-fills

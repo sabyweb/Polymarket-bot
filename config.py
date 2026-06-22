@@ -421,6 +421,22 @@ RF_GUARDRAIL_DUMP_NOTIONAL_FIX_ENABLED: bool = False  # _guardrail_live_notional
 RF_KILL_PERSIST_TOTAL_CAPITAL_ENABLED: bool = False
 RF_TOTAL_CAPITAL_MAX_STALE_SECS: float = 7200.0  # max age (s) to reuse a cached total_capital (2h; aligns with the FX-082 oversight-silence kill)
 
+# ── Self-learning signal accuracy: global-summary stale-row fix ───────────────
+# get_global_summary aggregates reward/loss/counts with SUM over EVERY market_roi row
+# for the window, but tick() upserts one row per (cid,window) for every cid EVER active
+# and never deletes them — so the SUM over-counts by all accumulated stale cids (verified
+# 2026-06-22: 1040 rows vs 179 latest-tick => total_reward $47.50 vs the authoritative
+# data-api $8.46, ~5.6x). That inflated reward feeds the global_tighten (loss>0.5*reward)
+# and global_reward_low (reward<target) self-learning triggers and SUPPRESSES them (a
+# loss>reward day fails to tighten). When ON, the row aggregates filter to the latest
+# tick's window_end_ts (== the value tick() CONSERVED for the window == the data-api total
+# it attributed) — the reward-side twin of the FX-091 total_capital fix, which left this
+# path on the stale-prone SUM. OFF = byte-identical. BEHAVIORAL (re-arms the triggers) =>
+# enable as a recorded single-axis change, NOT during another experiment's proving window.
+# Caveat: "24h" reward then tracks today's daily __TOTAL__ (~0 on a settlement-gap/young
+# UTC day) => biases the triggers toward DEFENSIVE on those days (safe-side).
+RF_GLOBAL_SUMMARY_LATEST_TICK_ENABLED: bool = False
+
 # ── A/B learning experiment (bounded cohort soak; see docs/AB_RESUME_DESIGN.md) ──
 # Master flag OFF = byte-identical baseline behaviour. When ON, the allocator assigns
 # each market to a cohort by stable hash(condition_id) % RF_AB_COHORT_COUNT and applies

@@ -37,6 +37,7 @@ from market_roi_tracker import (
 )
 from database import BotDatabase
 from simple_allocator import CandidateMarket, AllocationResult
+from config import BotConfig
 
 
 # ── Fixtures ──
@@ -90,7 +91,8 @@ def _insert_capital_snapshot(db_path: str, cid: str, ts: float, capital: float):
 
 
 def _insert_market_roi(db_path: str, cid: str, window: str, reward: float,
-                       capital: float, loss: float = 0.0, fills: int = 0):
+                       capital: float, loss: float = 0.0, fills: int = 0,
+                       window_end_ts: float = 0.0):
     """Insert a market_roi row directly (bypasses tick) so get_global_summary
     reads a known reward/capital pair — used by the FX-085 capital_efficiency tests."""
     conn = sqlite3.connect(db_path)
@@ -98,7 +100,7 @@ def _insert_market_roi(db_path: str, cid: str, window: str, reward: float,
         "INSERT INTO market_roi (condition_id, window, window_end_ts, reward_earned, "
         "fill_loss, capital_committed_avg, roi, fill_count, fill_rate_per_hour, "
         "samples, last_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (cid, window, 0.0, reward, loss, capital, 0.0, fills, 0.0, fills, 0.0),
+        (cid, window, window_end_ts, reward, loss, capital, 0.0, fills, 0.0, fills, 0.0),
     )
     conn.commit()
     conn.close()
@@ -411,6 +413,42 @@ def test_FX091_dropped_market_not_forward_filled_to_now():
 
 
 # ── R13: prune_old_snapshots ──
+
+def test_FX091R_global_summary_excludes_stale_rows():
+    """Reward-side twin of FX-091: get_global_summary must aggregate only the LATEST
+    tick's rows, not every stale market_roi row. tick() conserves Σ reward_earned = the
+    window's data-api total per cycle, but it upserts a row per (cid, window) for every
+    cid ever active and never deletes them, so SUMming all rows over-counts reward/loss
+    by the accumulated stale cids (live 2026-06-22: 1040 rows vs 179 latest-tick →
+    $47.50 vs the authoritative $8.46). The inflated reward feeds + suppresses the
+    global_tighten / global_reward_low triggers. OFF = byte-identical (sums all)."""
+    db = _make_db()
+    tracker = _make_tracker(db)
+    # Latest tick (window_end_ts=2000): two active cids, conserved totals.
+    _insert_market_roi(db, "0xLATE_A", "24h", reward=5.0, capital=100.0, loss=2.0, window_end_ts=2000.0)
+    _insert_market_roi(db, "0xLATE_B", "24h", reward=3.0, capital=100.0, loss=1.0, window_end_ts=2000.0)
+    # Stale rows from older ticks (cids since inactive) — must NOT be summed.
+    _insert_market_roi(db, "0xSTALE_1", "24h", reward=20.0, capital=100.0, loss=4.0, window_end_ts=1000.0)
+    _insert_market_roi(db, "0xSTALE_2", "24h", reward=19.5, capital=100.0, loss=3.0, window_end_ts=500.0)
+
+    bc = BotConfig.instance()
+
+    # Flag OFF (default) → byte-identical legacy behaviour: sums ALL rows (inflated).
+    bc._overrides.pop("RF_GLOBAL_SUMMARY_LATEST_TICK_ENABLED", None)
+    gs_off = tracker.get_global_summary("24h")
+    assert gs_off["total_reward"] == pytest.approx(47.5)   # 5+3+20+19.5 (stale included)
+    assert gs_off["total_loss"] == pytest.approx(10.0)     # 2+1+4+3
+    assert gs_off["n_markets"] == 4
+
+    # Flag ON → only the latest tick's conserved aggregate (stale excluded).
+    bc._overrides["RF_GLOBAL_SUMMARY_LATEST_TICK_ENABLED"] = True
+    gs_on = tracker.get_global_summary("24h")
+    assert gs_on["total_reward"] == pytest.approx(8.0)     # 5+3 only
+    assert gs_on["total_loss"] == pytest.approx(3.0)       # 2+1 only
+    assert gs_on["n_markets"] == 2
+
+    os.unlink(db)
+
 
 def test_R13_prune_old_snapshots_deletes_only_old():
     db = _make_db()
