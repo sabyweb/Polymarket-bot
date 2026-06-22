@@ -224,6 +224,10 @@ class RewardFarmer:
         self._kill_switch_active: bool = False
         self._kill_switch_reason: str = ""
         self._kill_switch_triggered_at: float = 0.0
+        # B-2: last good total_capital (RAM cache) so the capital-relative kills stay armed if the alloc
+        # file goes missing/corrupt mid-run. Gated by RF_KILL_PERSIST_TOTAL_CAPITAL_ENABLED (default off).
+        self._last_total_capital: float | None = None
+        self._last_total_capital_ts: float = 0.0
         # FX-068: oversight-side kill switch, captured from
         # market_allocations.json by _load_allocations and honored as a
         # real farmer halt (cancel-all + sticky) in run_cycle. Pre-FX-068
@@ -1397,6 +1401,37 @@ class RewardFarmer:
             )
         return None
 
+    def _total_capital_armed(self) -> float | None:
+        """total_capital for the capital-relative kills, with a last-good RAM cache (B-2).
+
+        The raw alloc read returns None only when market_allocations.json is missing/corrupt/unstamped
+        (no TTL — a stale-but-present file still returns its value); when that happens, ALL capital-
+        relative kill limbs skip at once (the total_capital SPOF). When RF_KILL_PERSIST_TOTAL_CAPITAL_
+        ENABLED is on, cache the last good value and reuse it on a None read if it is fresher than
+        RF_TOTAL_CAPITAL_MAX_STALE_SECS, so the kills stay armed across a transient file loss. A
+        stale-high cache only RAISES thresholds (frac*T) => never a false kill, and is strictly safer
+        than the limbs skipping. An expired/absent cache returns None (today's block-new behavior).
+        OFF => returns the raw read unchanged (byte-identical), no caching.
+        """
+        raw = self._guardrail_total_capital_from_alloc()
+        if not cfg("RF_KILL_PERSIST_TOTAL_CAPITAL_ENABLED"):
+            return raw
+        now = time.time()
+        if raw is not None and raw > 0:
+            self._last_total_capital = raw
+            self._last_total_capital_ts = now
+            return raw
+        cap = self._last_total_capital
+        max_stale = float(cfg("RF_TOTAL_CAPITAL_MAX_STALE_SECS") or 7200.0)
+        if cap is not None and (now - self._last_total_capital_ts) <= max_stale:
+            log.warning(
+                f"[GUARDRAIL] total_capital alloc-missing — reusing cached ${cap:.2f} "
+                f"(age {now - self._last_total_capital_ts:.0f}s <= {max_stale:.0f}s) to keep "
+                f"capital-relative kills armed (B-2)"
+            )
+            return cap
+        return raw  # cache absent/expired => None (today's block-new behavior)
+
     def _guardrail_live_notional_per_market(self) -> dict[str, float]:
         """Per-market sum of (price × shares) over both sides for every
         slot that currently holds an order_id. Dump orders are included
@@ -1793,7 +1828,7 @@ class RewardFarmer:
             cluster_by_cid     : dict[str, int | None]
             total_capital      : float | None
         """
-        total_capital = self._guardrail_total_capital_from_alloc()
+        total_capital = self._total_capital_armed()
         live_by_cid = self._guardrail_live_notional_per_market()
         total_live_notional = sum(live_by_cid.values())
         active_markets = len(live_by_cid)

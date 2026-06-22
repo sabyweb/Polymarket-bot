@@ -411,6 +411,16 @@ RF_KILL_ACCT_MERGE_COST_ENABLED: bool = False  # merge records true cost basis =
 RF_KILL_ACCT_STARTUP_DUMP_ENABLED: bool = False  # startup-recovered dump SELL records true cost basis (pnl<=0, idempotent via event_id) instead of +pnl
 RF_GUARDRAIL_DUMP_NOTIONAL_FIX_ENABLED: bool = False  # _guardrail_live_notional reads the real dump "fill_price" (fixes the dead "price" key) so notional/cluster/rapid-growth kills see dump exposure
 
+# ── Kill-stack robustness: total_capital denominator (B-2) ────────────────────
+# The farmer's capital-relative kills (realized-loss, unrealized-loss, notional, cluster, rapid-growth)
+# all divide by total_capital read from market_allocations.json. That read has NO TTL, so it returns None
+# only when the alloc file is MISSING/CORRUPT/unstamped (not merely stale) — and then ALL those limbs skip
+# at once (the total_capital SPOF). When ON, the last good total_capital is cached and reused on a None
+# read (if fresher than the cap) so the kills stay armed across a transient file loss; an expired/absent
+# cache falls through to None (today's block-new behavior). OFF = byte-identical (no cache, raw read).
+RF_KILL_PERSIST_TOTAL_CAPITAL_ENABLED: bool = False
+RF_TOTAL_CAPITAL_MAX_STALE_SECS: float = 7200.0  # max age (s) to reuse a cached total_capital (2h; aligns with the FX-082 oversight-silence kill)
+
 # ── A/B learning experiment (bounded cohort soak; see docs/AB_RESUME_DESIGN.md) ──
 # Master flag OFF = byte-identical baseline behaviour. When ON, the allocator assigns
 # each market to a cohort by stable hash(condition_id) % RF_AB_COHORT_COUNT and applies
