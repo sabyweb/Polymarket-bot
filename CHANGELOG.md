@@ -28,6 +28,23 @@ For the **immutable contract**, see `ground_rules.md`.
 
 ---
 
+## Resume harness — portfolio peak reset (2026-06-23)
+
+- Added `portfolio_snapshots` table to `database.py` `_SCHEMA` for consistency
+  (it was previously created only by `oversight/safety_controller.py`).
+- `get_wallet_peak_usd()` now honors a `portfolio_peak_reset_ts` sentinel in
+  `reward_tracker_state`, allowing a bounded experiment to start from the
+  current portfolio value instead of a stale all-time peak.
+- Added `set_portfolio_peak_reset_ts()` / `clear_portfolio_peak_reset_ts()`
+  DB methods.
+- Added `--reset-portfolio-peak` and `--clear-portfolio-peak-reset` CLI helpers
+  in `reward_farmer.py`.
+- `oversight/safety_controller.py` peak logic also respects the reset sentinel.
+- Tests in `tests/test_database_persistence.py` and
+  `tests/test_safety_controller.py`.
+
+---
+
 ## B-5 — Position correction audit trail (2026-06-23)
 
 - Added `position_corrections` table in `bot_history.db`.

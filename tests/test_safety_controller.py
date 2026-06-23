@@ -513,6 +513,48 @@ class TestI3DrawdownWarmDB(_ControllerTestBase):
         self.assertEqual(DATA_UNAVAILABLE, v[0].severity)
 
 
+class TestI3DrawdownPeakReset(_ControllerTestBase):
+    """B-5/resume-harness: operator-recorded portfolio peak reset is honored."""
+
+    def _record_peak_reset(self, ts: float) -> None:
+        db = sqlite3.connect(self.path)
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS reward_tracker_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        db.execute(
+            "INSERT OR REPLACE INTO reward_tracker_state (key, value) VALUES (?, ?)",
+            ("portfolio_peak_reset_ts", str(ts)),
+        )
+        db.commit()
+        db.execute("PRAGMA wal_checkpoint(FULL)")
+        db.close()
+
+    def test_reset_ignores_old_peak(self):
+        # Old peak at $1000, then drop to $700 would normally be 30% drawdown.
+        self._eval(exchange_balance=1000.0, total_portfolio_value=1000.0)
+        # Reset must be recorded AFTER the old peak snapshot so the snapshot
+        # is excluded from the post-reset peak calculation.
+        now = time.time()
+        self._record_peak_reset(now)
+        # After reset, the same $700 value is the new baseline peak.
+        self.sc = SafetyController(db_path=self.path)
+        self._eval(exchange_balance=700.0, total_portfolio_value=700.0)
+        self.assertEqual([], self._violations_for("drawdown"))
+
+    def test_drawdown_computed_since_reset(self):
+        self._eval(exchange_balance=1000.0, total_portfolio_value=1000.0)
+        now = time.time()
+        self._record_peak_reset(now)
+        self.sc = SafetyController(db_path=self.path)
+        # Post-reset: peak starts at $700, then drop to $594 is >15% drawdown.
+        self._eval(exchange_balance=700.0, total_portfolio_value=700.0)
+        self._eval(exchange_balance=594.0, total_portfolio_value=594.0)
+        v = self._violations_for("drawdown")
+        self.assertEqual(1, len(v))
+        self.assertEqual(UNSAFE, v[0].severity)
+
+
 class TestI4CapitalFloor(_ControllerTestBase):
     """I4 capital_floor — CRITICAL — wallet-scaled max($50, 10% reference)."""
 

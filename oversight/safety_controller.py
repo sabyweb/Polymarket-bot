@@ -245,6 +245,21 @@ class Violation:
     message: str
 
 
+def _get_portfolio_peak_reset_ts(db_path: str) -> float | None:
+    """Return the operator-recorded portfolio peak reset timestamp, if any."""
+    try:
+        row = _query_with_retry(
+            db_path,
+            "SELECT value FROM reward_tracker_state WHERE key = 'portfolio_peak_reset_ts'",
+            fetch="one",
+        )
+        if row and row[0]:
+            return float(row[0])
+    except Exception:
+        pass
+    return None
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # SAFETY CONTROLLER
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1136,9 +1151,13 @@ class SafetyController:
             )
             db.execute("DELETE FROM portfolio_snapshots WHERE ts < ?",
                        (now - 7 * 86400,))
+            # B-5/resume-harness: honor an operator-recorded peak reset so a
+            # bounded experiment can start from the current value.
+            reset_ts = _get_portfolio_peak_reset_ts(self.db_path)
+            cutoff = max(now - 7 * 86400, reset_ts) if reset_ts else (now - 7 * 86400)
             peak_row = db.execute(
                 "SELECT MAX(total_value) FROM portfolio_snapshots WHERE ts > ?",
-                (now - 7 * 86400,),
+                (cutoff,),
             ).fetchone()
             if peak_row and peak_row[0]:
                 self._portfolio_peak = peak_row[0]
@@ -1152,10 +1171,15 @@ class SafetyController:
 
     def _load_portfolio_peak(self):
         try:
+            # B-5/resume-harness: honor an operator-recorded peak reset.
+            reset_ts = _get_portfolio_peak_reset_ts(self.db_path)
+            cutoff = time.time() - 7 * 86400
+            if reset_ts and reset_ts > cutoff:
+                cutoff = reset_ts
             row = _query_with_retry(
                 self.db_path,
                 "SELECT MAX(total_value) FROM portfolio_snapshots WHERE ts > ?",
-                (time.time() - 7 * 86400,),
+                (cutoff,),
                 fetch="one",
             )
             if row and row[0]:

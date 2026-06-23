@@ -411,5 +411,54 @@ class TestPositionCorrectionsPersistence(unittest.TestCase):
         self.assertEqual(len(self.db.get_position_corrections(since_ts=ts - 50)), 1)
 
 
+class TestPortfolioPeakResetPersistence(unittest.TestCase):
+    """B-5/resume-harness: portfolio peak reset sentinel."""
+
+    def setUp(self):
+        self.db_fd, self.db_path = tempfile.mkstemp(suffix=".db")
+        self.db = BotDatabase(self.db_path)
+
+    def tearDown(self):
+        self.db.close()
+        os.close(self.db_fd)
+        os.unlink(self.db_path)
+
+    def test_get_wallet_peak_usd_ignores_pre_reset_snapshots(self):
+        now = time.time()
+        # Pre-reset: old high peak.
+        self.db._get_conn().execute(
+            "INSERT INTO portfolio_snapshots (ts, total_value, exchange_balance, locked_capital, peak_value) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (now - 100, 1500.0, 1000.0, 500.0, 1500.0),
+        )
+        # Latest: current lower value.
+        self.db._get_conn().execute(
+            "INSERT INTO portfolio_snapshots (ts, total_value, exchange_balance, locked_capital, peak_value) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (now - 10, 975.0, 975.0, 0.0, 1500.0),
+        )
+        self.db._get_conn().commit()
+
+        # Without reset, peak is the all-time high.
+        self.assertEqual(self.db.get_wallet_peak_usd(), 1500.0)
+
+        # After reset, peak ignores the old high and uses current value.
+        self.assertTrue(self.db.set_portfolio_peak_reset_ts(now))
+        self.assertEqual(self.db.get_wallet_peak_usd(), 975.0)
+
+        # A new snapshot after reset raises the peak.
+        self.db._get_conn().execute(
+            "INSERT INTO portfolio_snapshots (ts, total_value, exchange_balance, locked_capital, peak_value) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (now + 1, 1000.0, 1000.0, 0.0, 975.0),
+        )
+        self.db._get_conn().commit()
+        self.assertEqual(self.db.get_wallet_peak_usd(), 1000.0)
+
+        # Clearing the reset restores all-time peak behavior.
+        self.assertTrue(self.db.clear_portfolio_peak_reset_ts())
+        self.assertEqual(self.db.get_wallet_peak_usd(), 1500.0)
+
+
 if __name__ == "__main__":
     unittest.main()

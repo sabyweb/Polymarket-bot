@@ -165,6 +165,17 @@ CREATE TABLE IF NOT EXISTS position_corrections (
 );
 CREATE INDEX IF NOT EXISTS idx_pc_cid_ts ON position_corrections(condition_id, ts);
 
+-- Oversight/farmer portfolio value history (used for drawdown and peak tracking)
+CREATE TABLE IF NOT EXISTS portfolio_snapshots (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts               REAL    NOT NULL,
+    total_value      REAL    NOT NULL,
+    exchange_balance REAL    NOT NULL DEFAULT 0,
+    locked_capital   REAL    NOT NULL DEFAULT 0,
+    peak_value       REAL    NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_ps_ts ON portfolio_snapshots(ts);
+
 -- A3: Reward tracker scalar state (replaces reward_history.json top-level keys)
 CREATE TABLE IF NOT EXISTS reward_tracker_state (
     key   TEXT PRIMARY KEY,
@@ -1467,15 +1478,81 @@ class BotDatabase:
             return False
 
     def get_wallet_peak_usd(self) -> float | None:
-        """FX-082/FX-095: portfolio high-water mark = MAX(total_value)."""
+        """FX-082/FX-095: portfolio high-water mark = MAX(total_value).
+
+        B-5/resume-harness: if the operator has recorded a portfolio peak reset
+        (e.g., to start a bounded experiment after a drawdown), only snapshots
+        at or after the reset timestamp count toward the peak. The latest
+        snapshot is also considered so the peak starts from the current value
+        when the reset is first applied.
+        """
         try:
-            row = self._get_conn().execute(
-                "SELECT MAX(total_value) FROM portfolio_snapshots"
+            conn = self._get_conn()
+            reset_ts = None
+            row = conn.execute(
+                "SELECT value FROM reward_tracker_state WHERE key = 'portfolio_peak_reset_ts'"
             ).fetchone()
-            return float(row[0]) if row and row[0] is not None else None
+            if row:
+                reset_ts = float(row["value"])
+
+            candidates: list[float] = []
+            if reset_ts is not None:
+                peak_row = conn.execute(
+                    "SELECT MAX(total_value) FROM portfolio_snapshots WHERE ts >= ?",
+                    (reset_ts,),
+                ).fetchone()
+                if peak_row and peak_row[0] is not None:
+                    candidates.append(float(peak_row[0]))
+                latest_row = conn.execute(
+                    "SELECT total_value FROM portfolio_snapshots ORDER BY ts DESC LIMIT 1"
+                ).fetchone()
+                if latest_row and latest_row[0] is not None:
+                    candidates.append(float(latest_row[0]))
+            else:
+                peak_row = conn.execute(
+                    "SELECT MAX(total_value) FROM portfolio_snapshots"
+                ).fetchone()
+                if peak_row and peak_row[0] is not None:
+                    candidates.append(float(peak_row[0]))
+
+            return max(candidates) if candidates else None
         except Exception as e:
             log.debug(f"DB get_wallet_peak_usd error: {e}")
             return None
+
+    def set_portfolio_peak_reset_ts(self, ts: float) -> bool:
+        """Operator-only: record a portfolio peak reset timestamp.
+
+        After this call, get_wallet_peak_usd() will ignore portfolio snapshots
+        taken before ts, allowing a bounded experiment to start from the current
+        portfolio value instead of a stale all-time peak.
+        """
+        try:
+            conn = self._get_conn()
+            conn.execute(
+                "INSERT OR REPLACE INTO reward_tracker_state (key, value) VALUES (?, ?)",
+                ("portfolio_peak_reset_ts", str(float(ts))),
+            )
+            conn.commit()
+            return True
+        except Exception as e:
+            self._rollback_quiet()
+            log.warning(f"DB set_portfolio_peak_reset_ts error: {e}")
+            return False
+
+    def clear_portfolio_peak_reset_ts(self) -> bool:
+        """Operator-only: remove the portfolio peak reset sentinel."""
+        try:
+            conn = self._get_conn()
+            conn.execute(
+                "DELETE FROM reward_tracker_state WHERE key = 'portfolio_peak_reset_ts'"
+            )
+            conn.commit()
+            return True
+        except Exception as e:
+            self._rollback_quiet()
+            log.warning(f"DB clear_portfolio_peak_reset_ts error: {e}")
+            return False
 
     def get_portfolio_value_usd(self) -> float | None:
         """FX-095: latest total_value from portfolio_snapshots, or None."""

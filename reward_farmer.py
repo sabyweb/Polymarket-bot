@@ -3126,6 +3126,25 @@ def clear_persistent_kill_switch() -> bool:
     return db.clear_kill_switch()
 
 
+def reset_portfolio_peak() -> bool:
+    """Operator helper: record a portfolio peak reset timestamp.
+
+    This allows a bounded experiment to start from the current portfolio value
+    instead of a stale all-time peak. Use only with explicit operator
+    authorization and record the action in ground_rules.md.
+    """
+    from database import get_db
+    db = get_db()
+    return db.set_portfolio_peak_reset_ts(time.time())
+
+
+def clear_portfolio_peak_reset() -> bool:
+    """Operator helper: remove a previously recorded portfolio peak reset."""
+    from database import get_db
+    db = get_db()
+    return db.clear_portfolio_peak_reset_ts()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Reward Farmer — Polymarket LP reward farming bot")
     # Execution mode: staged deployment DRY_RUN → SHADOW → LIVE. Default
@@ -3140,6 +3159,14 @@ def main():
         "--clear-kill-switch", action="store_true",
         help="Clear the persistent kill-switch sentinel and exit (operator only)",
     )
+    parser.add_argument(
+        "--reset-portfolio-peak", action="store_true",
+        help="Record a portfolio peak reset for a bounded experiment and exit (operator only)",
+    )
+    parser.add_argument(
+        "--clear-portfolio-peak-reset", action="store_true",
+        help="Remove the portfolio peak reset sentinel and exit (operator only)",
+    )
     args = parser.parse_args()
 
     if args.clear_kill_switch:
@@ -3147,6 +3174,20 @@ def main():
             log.info("[GUARDRAIL] persistent kill switch cleared by operator")
         else:
             log.error("[GUARDRAIL] failed to clear persistent kill switch")
+        return
+
+    if args.reset_portfolio_peak:
+        if reset_portfolio_peak():
+            log.info("[GUARDRAIL] portfolio peak reset recorded by operator")
+        else:
+            log.error("[GUARDRAIL] failed to record portfolio peak reset")
+        return
+
+    if args.clear_portfolio_peak_reset:
+        if clear_portfolio_peak_reset():
+            log.info("[GUARDRAIL] portfolio peak reset cleared by operator")
+        else:
+            log.error("[GUARDRAIL] failed to clear portfolio peak reset")
         return
 
     duration = parse_duration(args.duration) if args.duration != "0" else 0
