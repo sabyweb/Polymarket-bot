@@ -194,6 +194,41 @@ below.
 
 ### Change log
 
+- 2026-06-23 — **Operator-authorized bounded A/B resume (reverses 2026-06-22 STEP BACK).**
+  Operator (Saby) authorized resuming live trading after the drawdown halt, with the following
+  deliberately bounded envelope:
+  - **Code baseline:** pulled commit efba0e5 ("fix(resume-harness): make simple_oversight peak
+    reset-aware") so that --reset-portfolio-peak lowers the drawdown peak used by BOTH the
+    farmer-side and oversight-side kills. Prior to this fix, simple_oversight.get_wallet_peak_usd
+    ignored portfolio_peak_reset_ts and would have re-killed immediately against the stale
+    $1,220.52 peak.
+  - **Config merge (additive, not replacement):** config_overrides.json was backed up to
+    config_overrides.json.bak.pre-resume-20260624T000000Z, then merged with:
+    - RF_AB_EXPERIMENT_ENABLED=true, RF_AB_COHORT_COUNT=2,
+      RF_AB_C1_MAX_RECENT_VOLATILITY=0.03, RF_AB_TOTAL_CAPITAL_USD=400
+    - RF_MAX_CAPITAL_PER_MARKET_USD=20 (down from 60)
+    - RF_KILL_PERSISTENT_ENABLED=true (B-3 persistent kill switch armed forward)
+    - RF_GLOBAL_SUMMARY_LATEST_TICK_ENABLED=true (c486941 global-summary fix active during A/B)
+    - **Drawdown floors UNCHANGED:** RF_KILL_DRAWDOWN_FRAC=0.28 and
+      RF_FARMER_DRAWDOWN_KILL_FRAC=0.28 were preserved.
+  - **Portfolio peak reset:** reward_farmer.py --reset-portfolio-peak recorded a fresh
+    portfolio_peak_reset_ts at 2026-06-23 ~17:22Z. First oversight allocation after restart
+    used peak=$896.29 (current portfolio) instead of the stale $1,220.52.
+  - **Persistent kill cleared:** reward_farmer.py --clear-kill-switch removed the active
+    kill_switch:active sentinel.
+  - **Restart:** polymarket-farmer.service and polymarket-oversight.service restarted via
+    systemctl. First farmer cycle after restart: cycle=2, active_markets=7,
+    kill_switch=false, total_live_notional=$146.8; by cycle=6:
+    active_markets=12, total_live_notional=$244.2, kill_switch=false.
+  - **Still armed:** realized-loss 10%/24h, unrealized-loss 20%, fill-rate spike, per-market
+    breaker, per-cohort breaker, B-2/B-4 total-capital kills. Only the stale-peak reference was
+    reset; no threshold was loosened.
+  - **Revert plan:** sudo systemctl stop polymarket-farmer polymarket-oversight; restore
+    config_overrides.json.bak.pre-resume-20260624T000000Z; run
+    reward_farmer.py --clear-portfolio-peak-reset; then restart services.
+  - **Risk acknowledged:** the strategy remains net-negative/unproven; the $400 A/B budget is
+    deliberately small; the 28% drawdown floor remains the hard stop.
+
 - 2026-05-28 v1.1 — Implementation-status columns added to three tables
   (auto-correction triggers, required metrics, capital-efficiency target)
   cross-referencing the FX entries that wire each item. No rule changes;
