@@ -81,15 +81,42 @@ def get_wallet_peak_usd(
     current_wallet: float,
     current_portfolio: float | None = None,
 ) -> float:
-    """Max(historical total_value peak, current portfolio). FX-095."""
+    """Max(historical total_value peak, current portfolio). FX-095.
+
+    B-5/resume-harness: honor an operator-recorded portfolio peak reset so a
+    bounded experiment can start from the current value instead of a stale
+    all-time peak.
+    """
     current = current_portfolio if current_portfolio is not None else current_wallet
     try:
         conn = sqlite3.connect(db_path)
-        row = conn.execute(
-            "SELECT MAX(total_value) FROM portfolio_snapshots"
+        reset_row = conn.execute(
+            "SELECT value FROM reward_tracker_state WHERE key = 'portfolio_peak_reset_ts'"
         ).fetchone()
+        reset_ts = float(reset_row[0]) if reset_row and reset_row[0] else None
+
+        candidates = []
+        if reset_ts is not None:
+            peak_row = conn.execute(
+                "SELECT MAX(total_value) FROM portfolio_snapshots WHERE ts >= ?",
+                (reset_ts,),
+            ).fetchone()
+            if peak_row and peak_row[0] is not None:
+                candidates.append(float(peak_row[0]))
+            latest_row = conn.execute(
+                "SELECT total_value FROM portfolio_snapshots ORDER BY ts DESC LIMIT 1"
+            ).fetchone()
+            if latest_row and latest_row[0] is not None:
+                candidates.append(float(latest_row[0]))
+        else:
+            row = conn.execute(
+                "SELECT MAX(total_value) FROM portfolio_snapshots"
+            ).fetchone()
+            if row and row[0] is not None:
+                candidates.append(float(row[0]))
+
         conn.close()
-        peak = float(row[0]) if row and row[0] is not None else 0.0
+        peak = max(candidates) if candidates else 0.0
         return max(peak, current)
     except Exception as e:
         log.debug(f"peak lookup fallback (using current): {e}")

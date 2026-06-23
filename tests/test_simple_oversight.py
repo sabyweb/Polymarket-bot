@@ -66,6 +66,10 @@ def _make_temp_db():
             data TEXT NOT NULL,
             updated_at REAL NOT NULL DEFAULT 0
         );
+        CREATE TABLE reward_tracker_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
     """)
     conn.commit()
     conn.close()
@@ -166,6 +170,26 @@ def test_O5_wallet_peak_handles_empty_snapshots():
     """O5: no snapshots → peak == current_wallet (no kill on first cycle)."""
     db = _make_temp_db()
     assert so.get_wallet_peak_usd(db, current_wallet=500) == 500
+    os.unlink(db)
+
+
+def test_O5b_wallet_peak_honors_portfolio_reset():
+    """B-5/resume-harness: portfolio_peak_reset_ts ignores stale all-time peak."""
+    db = _make_temp_db()
+    now = time.time()
+    conn = sqlite3.connect(db)
+    conn.executemany(
+        "INSERT INTO portfolio_snapshots (ts, total_value, exchange_balance) VALUES (?, ?, ?)",
+        [(now - 100, 1500.0, 1500.0), (now - 10, 900.0, 900.0)],
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO reward_tracker_state (key, value) VALUES (?, ?)",
+        ("portfolio_peak_reset_ts", str(now)),
+    )
+    conn.commit()
+    conn.close()
+    # Without reset, peak would be 1500; with reset it starts from current 900.
+    assert so.get_wallet_peak_usd(db, current_wallet=900) == 900
     os.unlink(db)
 
 
