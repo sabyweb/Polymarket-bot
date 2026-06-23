@@ -336,5 +336,80 @@ class TestFillStormMarkerPersist(unittest.TestCase):
         self.assertEqual(n, 0)
 
 
+class TestPositionCorrectionsPersistence(unittest.TestCase):
+    """B-5: position correction rows persist and read back."""
+
+    def setUp(self):
+        self.db_fd, self.db_path = tempfile.mkstemp(suffix=".db")
+        self.db = BotDatabase(self.db_path)
+
+    def tearDown(self):
+        self.db.close()
+        os.close(self.db_fd)
+        os.unlink(self.db_path)
+
+    def test_save_all_positions_with_corrections(self):
+        ts = time.time()
+        positions = {
+            "0xcid1": {
+                "question": "Test market",
+                "yes_shares": 10.0,
+                "yes_avg_price": 0.5,
+                "yes_halted": False,
+                "no_shares": 0.0,
+                "no_avg_price": 0.0,
+                "no_halted": False,
+            }
+        }
+        corrections = [
+            {
+                "ts": ts,
+                "condition_id": "0xcid1",
+                "side": "yes",
+                "old_shares": 20.0,
+                "new_shares": 10.0,
+                "old_avg_price": 0.48,
+                "new_avg_price": 0.50,
+                "reason": "set_shares",
+            }
+        ]
+        self.assertTrue(self.db.save_all_positions(positions, corrections))
+        rows = self.db.get_position_corrections(condition_id="0xcid1")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["condition_id"], "0xcid1")
+        self.assertEqual(rows[0]["side"], "yes")
+        self.assertEqual(rows[0]["old_shares"], 20.0)
+        self.assertEqual(rows[0]["new_shares"], 10.0)
+        self.assertEqual(rows[0]["reason"], "set_shares")
+
+    def test_save_all_positions_without_corrections(self):
+        positions = {
+            "0xcid1": {
+                "question": "Test market",
+                "yes_shares": 10.0,
+                "yes_avg_price": 0.5,
+                "yes_halted": False,
+                "no_shares": 0.0,
+                "no_avg_price": 0.0,
+                "no_halted": False,
+            }
+        }
+        self.assertTrue(self.db.save_all_positions(positions))
+        self.assertEqual(len(self.db.get_position_corrections()), 0)
+
+    def test_get_position_corrections_filters(self):
+        ts = time.time()
+        corrections = [
+            {"ts": ts, "condition_id": "0xcid1", "side": "yes",
+             "old_shares": 10, "new_shares": 0, "old_avg_price": 0.5, "new_avg_price": 0, "reason": "reset_side"},
+            {"ts": ts - 100, "condition_id": "0xcid2", "side": "no",
+             "old_shares": 5, "new_shares": 3, "old_avg_price": 0.4, "new_avg_price": 0.4, "reason": "set_shares"},
+        ]
+        self.db.save_all_positions({}, corrections)
+        self.assertEqual(len(self.db.get_position_corrections()), 2)
+        self.assertEqual(len(self.db.get_position_corrections(condition_id="0xcid1")), 1)
+        self.assertEqual(len(self.db.get_position_corrections(since_ts=ts - 50)), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

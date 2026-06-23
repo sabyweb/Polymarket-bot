@@ -150,6 +150,21 @@ CREATE TABLE IF NOT EXISTS positions (
     updated_at   REAL    NOT NULL DEFAULT 0
 );
 
+-- B-5: Position correction audit trail. Captures every set_shares/reset_side
+-- mutation so P&L, kill-switch, and post-incident analysis can see write-downs.
+CREATE TABLE IF NOT EXISTS position_corrections (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts              REAL    NOT NULL,
+    condition_id    TEXT    NOT NULL,
+    side            TEXT    NOT NULL,
+    old_shares      REAL    NOT NULL,
+    new_shares      REAL    NOT NULL,
+    old_avg_price   REAL    NOT NULL DEFAULT 0,
+    new_avg_price   REAL    NOT NULL DEFAULT 0,
+    reason          TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_pc_cid_ts ON position_corrections(condition_id, ts);
+
 -- A3: Reward tracker scalar state (replaces reward_history.json top-level keys)
 CREATE TABLE IF NOT EXISTS reward_tracker_state (
     key   TEXT PRIMARY KEY,
@@ -1184,12 +1199,17 @@ class BotDatabase:
             self._rollback_quiet()
             log.warning(f"DB save_position error: {e}")
 
-    def save_all_positions(self, positions: dict) -> None:
+    def save_all_positions(self, positions: dict, corrections: list[dict] | None = None) -> bool:
         """Batch UPSERT all positions in a single transaction.
 
         Args:
             positions: Dict of {condition_id: {question, yes_shares, ...}}
                 matching the format from PositionStore._save().
+            corrections: Optional list of position correction dicts from
+                PositionStore to persist atomically with the positions write.
+
+        Returns:
+            True on commit, False on error.
         """
         try:
             conn = self._get_conn()
@@ -1217,13 +1237,25 @@ class BotDatabase:
                      int(pos.get("no_halted", False)),
                      now),
                 )
+            for corr in corrections or []:
+                conn.execute(
+                    "INSERT INTO position_corrections "
+                    "(ts, condition_id, side, old_shares, new_shares, old_avg_price, new_avg_price, reason) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (corr["ts"], corr["condition_id"], corr["side"],
+                     corr["old_shares"], corr["new_shares"],
+                     corr["old_avg_price"], corr["new_avg_price"],
+                     corr.get("reason", "")),
+                )
             conn.commit()
+            return True
         except Exception as e:
             log.warning(f"DB save_all_positions error: {e}")
             try:
                 conn.rollback()
             except Exception:
                 pass
+            return False
 
     def load_all_positions(self) -> dict:
         """Load all positions from SQLite.
@@ -1249,6 +1281,34 @@ class BotDatabase:
         except Exception as e:
             log.debug(f"DB load_all_positions error: {e}")
             return {}
+
+    def get_position_corrections(self, condition_id: str | None = None,
+                                 since_ts: float | None = None,
+                                 limit: int = 10000) -> list[dict]:
+        """Return position correction rows for diagnostics.
+
+        Args:
+            condition_id: Optional filter by market.
+            since_ts: Optional filter for ts >= since_ts.
+            limit: Max rows to return.
+        """
+        try:
+            conn = self._get_conn()
+            query = "SELECT * FROM position_corrections WHERE 1=1"
+            params: list = []
+            if condition_id is not None:
+                query += " AND condition_id = ?"
+                params.append(condition_id)
+            if since_ts is not None:
+                query += " AND ts >= ?"
+                params.append(since_ts)
+            query += " ORDER BY ts DESC LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(query, params).fetchall()
+            return [dict(r) for r in rows]
+        except Exception as e:
+            log.debug(f"DB get_position_corrections error: {e}")
+            return []
 
     def delete_position(self, condition_id: str) -> None:
         """Remove a market's position."""

@@ -28,6 +28,18 @@ For the **immutable contract**, see `ground_rules.md`.
 
 ---
 
+## B-5 — Position correction audit trail (2026-06-23)
+
+- Added `position_corrections` table in `bot_history.db`.
+- `PositionStore.set_shares()` and `reset_side()` now queue correction rows
+  (old/new shares and avg_price) and flush them atomically with the positions
+  write via `save_all_positions()`.
+- Added `get_position_corrections()` diagnostic reader.
+- New tests: `tests/test_b5_position_corrections.py`, plus regression tests in
+  `tests/test_database_persistence.py`.
+
+---
+
 ## v6.1 → v6.6 (2026-05-28 → 2026-06-01) — summary (detail in fixit doc + STATUS dumps)
 
 This CHANGELOG was not maintained per-commit through the v6.1→v6.6 era; the

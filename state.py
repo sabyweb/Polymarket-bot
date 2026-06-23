@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import threading
+import time
 from config import MAX_POSITION_USD, RESUME_POSITION_USD
 from alerts import alert_position_limit, log_position_update
 
@@ -186,6 +187,9 @@ class PositionStore:
         # {condition_id: {"question": str, "yes": SidePosition, "no": SidePosition}}
         self._markets: dict[str, dict] = {}
         self._lock = threading.Lock()  # Thread safety for concurrent market cycles
+        # B-5: pending position corrections queued by set_shares/reset_side and
+        # flushed atomically with the next _save().
+        self._pending_corrections: list[dict] = []
         self._load()
 
     # ── Internal accessors ───────────────────────────────────────────────────
@@ -377,6 +381,8 @@ class PositionStore:
         """Persist current positions to SQLite (A3).
 
         Thread-safe: called within self._lock from all mutation methods.
+        B-5: corrections queued by set_shares/reset_side are flushed atomically
+        with the positions write, but only cleared after a successful commit.
         """
         from database import get_db
         try:
@@ -400,7 +406,9 @@ class PositionStore:
                     "no_halted": no.halted,
                 }
 
-            get_db().save_all_positions(pruned)
+            ok = get_db().save_all_positions(pruned, self._pending_corrections)
+            if ok:
+                self._pending_corrections.clear()
         except Exception as e:
             log.error(f"Could not save positions to SQLite: {e}")
 
@@ -601,6 +609,20 @@ class PositionStore:
             sp = self._get_side(condition_id, side)
             if sp is None:
                 return
+            old_shares = sp.shares
+            old_avg_price = sp.avg_price
+            # B-5: only record a correction if there was something to reset.
+            if old_shares >= 1.0 or old_avg_price > 0:
+                self._pending_corrections.append({
+                    "ts": time.time(),
+                    "condition_id": condition_id,
+                    "side": side.lower(),
+                    "old_shares": old_shares,
+                    "new_shares": 0.0,
+                    "old_avg_price": old_avg_price,
+                    "new_avg_price": 0.0,
+                    "reason": "reset_side",
+                })
             question = self._markets[condition_id]["question"]
             sp.reset()
             log.info(f"Position side reset | {question[:40]} | {side.upper()} zeroed")
@@ -627,11 +649,27 @@ class PositionStore:
             if sp is None:
                 return
             old_shares = sp.shares
+            old_avg_price = sp.avg_price
             sp.correct_to_exchange(shares)
             cost_note = ""
             if avg_price is not None and avg_price > 0:
                 sp.avg_price = round(float(avg_price), 6)
                 cost_note = f" (cost basis set avg_price={sp.avg_price:.4f})"
+            # B-5: record a correction if shares or cost basis changed.
+            new_shares = sp.shares
+            new_avg_price = sp.avg_price
+            if (abs(old_shares - new_shares) >= 1.0
+                    or abs(old_avg_price - new_avg_price) > 0):
+                self._pending_corrections.append({
+                    "ts": time.time(),
+                    "condition_id": condition_id,
+                    "side": side.lower(),
+                    "old_shares": old_shares,
+                    "new_shares": new_shares,
+                    "old_avg_price": old_avg_price,
+                    "new_avg_price": new_avg_price,
+                    "reason": "set_shares",
+                })
             question = self._markets[condition_id]["question"]
             log.info(
                 f"Position corrected | {question[:40]} | {side.upper()} "
