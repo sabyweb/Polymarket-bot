@@ -480,6 +480,15 @@ CREATE TABLE IF NOT EXISTS q_share_recalibration_events (
 );
 CREATE INDEX IF NOT EXISTS idx_qsre_cid_ts ON q_share_recalibration_events(condition_id, ts);
 CREATE INDEX IF NOT EXISTS idx_qsre_ts ON q_share_recalibration_events(ts);
+
+-- B-3: Persistent kill-switch sentinel. Single-row table (id=1).
+CREATE TABLE IF NOT EXISTS kill_state (
+    id            INTEGER PRIMARY KEY,
+    active        INTEGER NOT NULL DEFAULT 0,
+    reason        TEXT    NOT NULL DEFAULT '',
+    triggered_at  REAL    NOT NULL DEFAULT 0,
+    updated_at    REAL    NOT NULL DEFAULT 0
+);
 """
 
 
@@ -1351,6 +1360,51 @@ class BotDatabase:
         except Exception as e:
             log.debug(f"DB get_heartbeat({process}) error: {e}")
             return None
+
+    # ── B-3: Persistent kill-switch sentinel ────────────────────────────
+
+    def set_kill_switch(self, active: bool, reason: str = "", triggered_at: float = 0.0) -> bool:
+        """Persist kill-switch state. Returns True on commit, False on error."""
+        try:
+            conn = self._get_conn()
+            conn.execute(
+                "INSERT OR REPLACE INTO kill_state (id, active, reason, triggered_at, updated_at) "
+                "VALUES (1, ?, ?, ?, ?)",
+                (1 if active else 0, str(reason)[:500], float(triggered_at), time.time()),
+            )
+            conn.commit()
+            return True
+        except Exception as e:
+            self._rollback_quiet()
+            log.warning(f"DB set_kill_switch error: {e}")
+            return False
+
+    def get_kill_switch(self) -> dict | None:
+        """Return kill state for id=1, or None if no row. Raises on DB error
+        so the caller can fail-safe to halted."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT active, reason, triggered_at FROM kill_state WHERE id = 1"
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "active": bool(row["active"]),
+            "reason": str(row["reason"]),
+            "triggered_at": float(row["triggered_at"]),
+        }
+
+    def clear_kill_switch(self) -> bool:
+        """Operator-only: clear the persistent kill switch sentinel."""
+        try:
+            conn = self._get_conn()
+            conn.execute("DELETE FROM kill_state WHERE id = 1")
+            conn.commit()
+            return True
+        except Exception as e:
+            self._rollback_quiet()
+            log.warning(f"DB clear_kill_switch error: {e}")
+            return False
 
     def get_wallet_peak_usd(self) -> float | None:
         """FX-082/FX-095: portfolio high-water mark = MAX(total_value)."""

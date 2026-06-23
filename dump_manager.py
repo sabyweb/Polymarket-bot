@@ -56,9 +56,23 @@ class DumpManager:
                         actual_price = float(status.get("price", 0))
                         actual_matched = float(status.get("size_matched", 0))
 
+                        if actual_matched < 1.0:
+                            log.warning(
+                                f"DUMP MATCHED with zero size_matched — clearing without "
+                                f"recording | {ms.question[:30]}"
+                            )
+                            if ms.dump_orders[side]:
+                                self.db.delete_active_order(ms.dump_orders[side])
+                            ms.dump_orders[side] = None
+                            ms.dump_state[side] = None
+                            ms.unverified_count[side] = 0
+                            self.db.delete_dump_state(ms.cid, side)
+                            continue
+
                         # Verify exchange balance actually decreased before recording unwind
                         phantom = False
-                        if actual_matched > 0:
+                        unverified = False
+                        if actual_matched >= 1.0:
                             try:
                                 from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
                                 tid = ms.yes_tid if side == "yes" else ms.no_tid
@@ -75,7 +89,34 @@ class DumpManager:
                                     )
                                     phantom = True
                             except Exception as e:
-                                log.warning(f"Dump fill verification failed: {e} — proceeding with record_unwind")
+                                if cfg("RF_DUMP_VERIFY_FAILSAFE_ENABLED"):
+                                    log.warning(
+                                        f"[DUMP_VERIFY_UNVERIFIED] cid={ms.cid[:12]} side={side} "
+                                        f"order={dump_oid[:16]}: verification RPC failed ({e}) — "
+                                        f"NOT recording unwind; will retry next cycle"
+                                    )
+                                    unverified = True
+                                else:
+                                    log.warning(f"Dump fill verification failed: {e} — proceeding with record_unwind")
+
+                        if unverified:
+                            # Leave state intact for retry; count consecutive failures.
+                            ms.unverified_count[side] = ms.unverified_count.get(side, 0) + 1
+                            max_unv = cfg("RF_DUMP_VERIFY_MAX_UNVERIFIED_CYCLES")
+                            if ms.unverified_count[side] >= max_unv:
+                                from alerts import alert_dump_verify_stuck
+                                alert_dump_verify_stuck(
+                                    cid=ms.cid,
+                                    question=ms.question,
+                                    side=side,
+                                    order_id=dump_oid,
+                                    cycles=ms.unverified_count[side],
+                                )
+                                # Cap the counter so we don't page every cycle.
+                                ms.unverified_count[side] = max_unv
+                            continue
+                        else:
+                            ms.unverified_count[side] = 0
 
                         if phantom:
                             # Don't record unwind — clear state for fresh retry

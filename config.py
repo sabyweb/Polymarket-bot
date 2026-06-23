@@ -421,6 +421,36 @@ RF_GUARDRAIL_DUMP_NOTIONAL_FIX_ENABLED: bool = False  # _guardrail_live_notional
 RF_KILL_PERSIST_TOTAL_CAPITAL_ENABLED: bool = False
 RF_TOTAL_CAPITAL_MAX_STALE_SECS: float = 7200.0  # max age (s) to reuse a cached total_capital (2h; aligns with the FX-082 oversight-silence kill)
 
+# ── Kill-stack robustness: dump verification fail-safe (L-1) ──────────────────
+# When ON, a dump-fill balance-verification RPC failure is treated as UNVERIFIED
+# and the bot does NOT record an unwind. OFF = pre-fix behavior (log warning and
+# proceed with record_unwind), byte-identical.
+RF_DUMP_VERIFY_FAILSAFE_ENABLED: bool = False
+RF_DUMP_VERIFY_MAX_UNVERIFIED_CYCLES: int = 5  # emit CRITICAL page after this many consecutive unverified cycles
+
+# ── Kill-stack robustness: unrealized-loss unknown cost basis (L-2) ───────────
+# When ON, orphan/startup legs with avg_price<=0 are included in the unrealized-
+# loss kill using current midpoint as a conservative cost basis (PnL=0, max_loss
+# = current value). OFF = skip them, byte-identical.
+RF_FX084_UNKNOWN_COST_BASIS_FLOOR_ENABLED: bool = False
+
+# ── Kill-stack robustness: total_capital wallet cap (L-10) ────────────────────
+# When ON, the total_capital denominator used by capital-relative kills is capped
+# at the wallet-based capital (cash + marked inventory). Prevents a stale-high
+# alloc value from inflating kill thresholds and delaying protection. OFF = use
+# alloc value directly, byte-identical.
+RF_KILL_TOTAL_CAPITAL_WALLET_CAP_ENABLED: bool = False
+
+# ── Kill-stack robustness: persistent kill switch (B-3) ───────────────────────
+# When ON, the farmer's sticky kill switch is persisted to the SQLite DB on
+# activation and reloaded on process startup. A farmer-own guard kill therefore
+# survives a crash/restart and the bot cannot resume trading until the operator
+# clears the sentinel. Oversight-sourced kills (reason starts with "oversight:")
+# are NOT persisted so they keep their auto-clear semantics. DRY_RUN/SHADOW
+# kills are NOT persisted so a test/dev process cannot lock out LIVE. A read
+# error while loading the sentinel fails SAFE to halted. OFF = byte-identical.
+RF_KILL_PERSISTENT_ENABLED: bool = False
+
 # ── Self-learning signal accuracy: global-summary stale-row fix ───────────────
 # get_global_summary aggregates reward/loss/counts with SUM over EVERY market_roi row
 # for the window, but tick() upserts one row per (cid,window) for every cid EVER active

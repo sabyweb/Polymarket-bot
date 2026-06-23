@@ -93,6 +93,7 @@ def _make_farmer_stub(batch_succeeds: bool = True):
         )
     stub._gated_cancel_order = MagicMock(return_value=True)
     stub.rewards = MagicMock()
+    stub.db = MagicMock()
     # Mode + kill-switch flag start at LIVE / False; the cleanup flips the
     # kill-switch flag mid-method.
     from reward_farmer import MODE_LIVE
@@ -191,6 +192,25 @@ class TestShutdownCleanup(unittest.TestCase):
         RewardFarmer._shutdown_cleanup(stub)
         # Batch cancel still ran.
         stub.client.cancel_orders.assert_called_once()
+
+    def test_shutdown_cleanup_does_not_persist_normal_shutdown(self):
+        # B-3 regression: _shutdown_cleanup sets _kill_switch_active=True to
+        # force cancels, but that is a normal shutdown, NOT a guard kill. It
+        # must not write a persistent kill_state sentinel.
+        from reward_farmer import RewardFarmer
+        from config import BotConfig
+        bc = BotConfig.instance()
+        saved = dict(bc._overrides)
+        bc._overrides["RF_KILL_PERSISTENT_ENABLED"] = True
+        try:
+            stub = _make_farmer_stub()
+            ms = _make_ms(cid="cid_A", yes_oid="oid_yes")
+            stub.markets = {"cid_A": ms}
+            RewardFarmer._shutdown_cleanup(stub)
+            stub.db.set_kill_switch.assert_not_called()
+        finally:
+            bc._overrides.clear()
+            bc._overrides.update(saved)
 
 
 class TestShutdownLogLines(unittest.TestCase):

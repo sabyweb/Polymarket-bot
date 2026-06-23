@@ -56,3 +56,6 @@ class MarketState:
     # to on_chain under 3 gates. Both reset every cycle.
     fx072_pre_cycle_dump: dict = field(default_factory=lambda: {"yes": None, "no": None})  # (shares, dump_order_id) captured at cycle top; consumed by the drift sweep
     fx072_unwound_this_cycle: dict = field(default_factory=lambda: {"yes": False, "no": False})  # set True by check_dump_fills when it records an unwind this cycle
+    # L-1: consecutive cycles where a MATCHED dump could not be balance-verified.
+    # Used to page the operator if RPC stays down, without auto-recording a false unwind.
+    unverified_count: dict = field(default_factory=lambda: {"yes": 0, "no": 0})

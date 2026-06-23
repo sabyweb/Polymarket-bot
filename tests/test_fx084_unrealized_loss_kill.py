@@ -50,8 +50,12 @@ T = 100.0
 
 class TestFX084UnrealizedLossKill(unittest.TestCase):
 
-    def _call(self, rf, total_capital=T, frac=FRAC):
-        with patch.object(reward_farmer, "cfg", lambda k: frac):
+    def _call(self, rf, total_capital=T, frac=FRAC, unknown_floor=False):
+        def _cfg(name):
+            if name == "RF_FX084_UNKNOWN_COST_BASIS_FLOOR_ENABLED":
+                return unknown_floor
+            return frac
+        with patch.object(reward_farmer, "cfg", _cfg):
             return rf._guardrail_unrealized_loss(total_capital)
 
     # ── Kill paths ──────────────────────────────────────────────────────────
@@ -134,6 +138,36 @@ class TestFX084UnrealizedLossKill(unittest.TestCase):
         # avg_price 0 (orphan/startup) → leg skipped even with a deep markdown.
         rf = _farmer({"c": _pos(yes_shares=100, yes_avg=0.0)}, {"c": _mkt(0.05)})
         self.assertEqual(self._call(rf), (False, ""))
+
+    def test_unknown_cost_basis_floor_enabled(self):
+        # avg_price 0 + flag ON → leg counted at midpoint floor.
+        # YES 100 @ mid 0.05 (floor avg = 0.05) → pnl = 0, so unrealized loss = 0.
+        # The leg is marked (not silently skipped) and will contribute if mid moves.
+        rf = _farmer({"c": _pos(yes_shares=100, yes_avg=0.0)}, {"c": _mkt(0.05)})
+        kill, reason = self._call(rf, frac=FRAC, unknown_floor=True)
+        self.assertFalse(kill)
+        self.assertAlmostEqual(rf._last_unrealized_loss, 0.0, places=4)
+
+    def test_unknown_cost_basis_floor_counts_marked_leg(self):
+        # avg_price 0 + flag ON → leg is marked even though current unrealized loss is 0.
+        rf = _farmer({"c": _pos(yes_shares=100, yes_avg=0.0)}, {"c": _mkt(0.30)})
+        kill, reason = self._call(rf, frac=FRAC, unknown_floor=True)
+        self.assertFalse(kill)
+        self.assertAlmostEqual(rf._last_unrealized_loss, 0.0, places=4)
+        self.assertEqual(reason, "")
+
+    def test_known_and_unknown_leg_together(self):
+        # c1: known YES avg 0.50, mid 0.20 → -$30 loss.
+        # c2: unknown NO avg, mid 0.20 → floor avg=0.20, pnl = 0.
+        # Net loss = $30 > $20 threshold → kill fires.
+        rf = _farmer(
+            {"c1": _pos(yes_shares=100, yes_avg=0.50),
+             "c2": _pos(no_shares=100, no_avg=0.0)},
+            {"c1": _mkt(0.20), "c2": _mkt(0.20)},
+        )
+        kill, _ = self._call(rf, unknown_floor=True)
+        self.assertTrue(kill)
+        self.assertAlmostEqual(rf._last_unrealized_loss, 30.0, places=4)
 
     def test_skip_invalid_midpoint(self):
         for bad_mid in (0.0, 1.0, -0.1, 1.5):

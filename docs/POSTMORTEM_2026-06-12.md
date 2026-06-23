@@ -169,9 +169,12 @@ IPO-day suite — "…above $2T?", "…on IPO day", "…First Day") Polymarket s
 to a **far-future sentinel** (`2027-12-31`) or leaves it **null**, even though they resolve
 at market close *that same day*. The filter therefore computed **~13,590h to resolution**
 (sentinel) or skipped the check entirely (null → fail-open) and let them through. The
-farmer's two backstops don't cover this: its `resolution_proximity` block is **price-based**
-(mid <0.10/>0.90; these traded 0.22–0.74) and its expiry/game guard is **sports-keyword-only**
-("SpaceX IPO" isn't sports). **Result:** on 06-12 the bot farmed the SpaceX IPO-cap markets
+farmer's backstops don't cover this: its `resolution_proximity` block is **price-based**
+(mid <0.10/>0.90; these traded 0.22–0.74); its **expiry sweep** (`_sweep_expiring_markets`,
+reward_farmer.py:1169) checks *all* markets with an `end_date_iso` but keys off that date — so a
+**sentinel/null `end_date` makes it a no-op** for exactly these markets (it's the RC-4 defect again,
+not a sports gate); and its sports/game block *is* sports-keyword-only, so "SpaceX IPO" never trips
+it. (Correcting an earlier imprecision that lumped the general expiry sweep in as "sports-only.") **Result:** on 06-12 the bot farmed the SpaceX IPO-cap markets
 hours before resolution and they adversely filled — and **this was the dominant driver of a
 true 24h loss of −$72.58** (authoritative: portfolio total_value $1,120.42→$1,047.84,
 confirmed to the cent by the data-api net cash flow; gross position loss ≈ −$83 before +$10.38

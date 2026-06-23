@@ -14,6 +14,20 @@ For the **immutable contract**, see `ground_rules.md`.
 
 ---
 
+## B-3 — Persistent kill switch (2026-06-23)
+
+- Added `RF_KILL_PERSISTENT_ENABLED` (default `False`). When enabled, the farmer's
+  own guard kills in `MODE_LIVE` are persisted to the single-row `kill_state` table
+  in `bot_history.db` and survive process restart/crash.
+- Oversight-sourced kills (`reason` starts with `"oversight:"`) and non-LIVE kills
+  are intentionally **not** persisted, preserving oversight auto-clear semantics
+  and preventing test/dev processes from locking out the live farmer.
+- Startup load happens before reconciliation; an active sentinel boots the farmer
+  halted. A DB read error at startup fails safe to halted.
+- Added `--clear-kill-switch` CLI for explicit operator clear after investigation.
+
+---
+
 ## v6.1 → v6.6 (2026-05-28 → 2026-06-01) — summary (detail in fixit doc + STATUS dumps)
 
 This CHANGELOG was not maintained per-commit through the v6.1→v6.6 era; the

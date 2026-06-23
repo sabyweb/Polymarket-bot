@@ -325,5 +325,49 @@ class TestStartupDryRun(unittest.TestCase):
         stub.db.purge_all_active_orders.assert_not_called()
 
 
+class TestPersistentKillBoot(unittest.TestCase):
+    """B-3 regression: a restart with an active persistent kill sentinel must
+    still run startup reconciliation (recover fills, cancel outstanding orders,
+    purge stale DB rows) and remain halted afterwards."""
+
+    def test_persistent_kill_boot_still_reconciles(self):
+        from reward_farmer import RewardFarmer, MODE_LIVE
+        from config import BotConfig
+
+        bc = BotConfig.instance()
+        saved = dict(bc._overrides)
+        bc._overrides["RF_KILL_PERSISTENT_ENABLED"] = True
+        try:
+            stub = _make_farmer_stub()
+            stub.mode = MODE_LIVE
+            stub._kill_switch_active = False
+            stub._kill_switch_reason = ""
+            stub._kill_switch_triggered_at = 0.0
+            stub.db.get_kill_switch.return_value = {
+                "active": True,
+                "reason": "fill_rate_kill",
+                "triggered_at": 12345.0,
+            }
+
+            RewardFarmer._load_persistent_kill_switch(stub)
+            self.assertTrue(stub._kill_switch_active)
+            self.assertEqual(stub._kill_switch_reason, "fill_rate_kill")
+
+            # Reconciliation should still run and cancel the tracked order.
+            stub.db.load_active_orders.return_value = [
+                _make_db_order("oid_clean", side="yes", price=0.50, shares=30),
+            ]
+            stub.client.get_open_orders.return_value = [{"id": "oid_clean"}]
+            stub.client.get_order.return_value = {
+                "status": "LIVE", "size_matched": 0, "price": "0.50",
+            }
+            RewardFarmer._reconcile_on_startup(stub)
+            stub.client.cancel_order.assert_called_once()
+            stub.db.purge_all_active_orders.assert_called_once()
+        finally:
+            bc._overrides.clear()
+            bc._overrides.update(saved)
+
+
 if __name__ == "__main__":
     unittest.main()

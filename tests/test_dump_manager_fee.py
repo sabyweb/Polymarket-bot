@@ -349,5 +349,100 @@ class TestDumpSlippageFloor(unittest.TestCase):
         self.assertAlmostEqual(self._posted_price(dm), 0.01, places=4)
 
 
+def _cfg_with_verify(mock_cfg, fee_value, verify_failsafe):
+    """cfg side-effect that returns the dump-verify flag + fee + retry thresholds."""
+    def side_effect(name):
+        if name == "RF_POLYMARKET_TAKER_FEE":
+            return fee_value
+        if name == "RF_DUMP_VERIFY_FAILSAFE_ENABLED":
+            return verify_failsafe
+        if name == "RF_DUMP_VERIFY_MAX_UNVERIFIED_CYCLES":
+            return 2
+        return 2
+    mock_cfg.side_effect = side_effect
+
+
+class TestDumpVerifyFailsafe(unittest.TestCase):
+    """L-1: balance-verification RPC failure must not record a false unwind."""
+
+    @patch("dump_manager.cfg")
+    def test_balance_rpc_failure_flag_on_skips_unwind(self, mock_cfg):
+        _cfg_with_verify(mock_cfg, fee_value=0.009, verify_failsafe=True)
+        ms = _make_ms_with_dump()
+        positions = MagicMock()
+        positions.get_shares.return_value = 50.0
+        positions.get_avg_price.return_value = 0.50
+        dm = _make_dm(positions, fee_value=0.009)
+        dm.client.get_order.return_value = {
+            "status": "MATCHED", "price": "0.78", "size_matched": "50",
+        }
+        dm.client.get_balance_allowance.side_effect = Exception("RPC timeout")
+
+        dm.check_dump_fills({"cid_fx050": ms}, open_ids=set())
+
+        dm.db.log_unwind.assert_not_called()
+        self.assertEqual(ms.unverified_count["yes"], 1)
+        self.assertIsNotNone(ms.dump_orders["yes"])
+        self.assertIsNotNone(ms.dump_state["yes"])
+
+    @patch("dump_manager.cfg")
+    def test_balance_rpc_failure_flag_off_proceeds_old_behavior(self, mock_cfg):
+        _cfg_with_verify(mock_cfg, fee_value=0.009, verify_failsafe=False)
+        ms = _make_ms_with_dump()
+        positions = MagicMock()
+        positions.get_shares.return_value = 50.0
+        positions.get_avg_price.return_value = 0.50
+        dm = _make_dm(positions, fee_value=0.009)
+        dm.client.get_order.return_value = {
+            "status": "MATCHED", "price": "0.78", "size_matched": "50",
+        }
+        dm.client.get_balance_allowance.side_effect = Exception("RPC timeout")
+
+        dm.check_dump_fills({"cid_fx050": ms}, open_ids=set())
+
+        dm.db.log_unwind.assert_called_once()
+
+    @patch("alerts.alert_dump_verify_stuck")
+    @patch("dump_manager.cfg")
+    def test_persistent_unverified_pages_operator(self, mock_cfg, mock_alert):
+        _cfg_with_verify(mock_cfg, fee_value=0.009, verify_failsafe=True)
+        ms = _make_ms_with_dump()
+        positions = MagicMock()
+        positions.get_shares.return_value = 50.0
+        positions.get_avg_price.return_value = 0.50
+        dm = _make_dm(positions, fee_value=0.009)
+        dm.client.get_order.return_value = {
+            "status": "MATCHED", "price": "0.78", "size_matched": "50",
+        }
+        dm.client.get_balance_allowance.side_effect = Exception("RPC timeout")
+
+        # First cycle: counter -> 1, no page.
+        dm.check_dump_fills({"cid_fx050": ms}, open_ids=set())
+        self.assertEqual(ms.unverified_count["yes"], 1)
+        mock_alert.assert_not_called()
+
+        # Second cycle: counter hits threshold -> page.
+        dm.check_dump_fills({"cid_fx050": ms}, open_ids=set())
+        self.assertEqual(ms.unverified_count["yes"], 2)
+        mock_alert.assert_called_once()
+
+    @patch("dump_manager.cfg")
+    def test_zero_size_matched_skips_unwind(self, mock_cfg):
+        _cfg_with_verify(mock_cfg, fee_value=0.009, verify_failsafe=False)
+        ms = _make_ms_with_dump()
+        positions = MagicMock()
+        positions.get_shares.return_value = 50.0
+        positions.get_avg_price.return_value = 0.50
+        dm = _make_dm(positions, fee_value=0.009)
+        dm.client.get_order.return_value = {
+            "status": "MATCHED", "price": "0.78", "size_matched": "0",
+        }
+        dm.client.get_balance_allowance.return_value = {"balance": "0"}
+
+        dm.check_dump_fills({"cid_fx050": ms}, open_ids=set())
+
+        dm.db.log_unwind.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

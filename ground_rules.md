@@ -294,6 +294,54 @@ below.
   - Risk acknowledged: strategy is net-negative/unproven; the sweep lever's offline edge rested on ~1
     market and its J was lookahead-inflated; the tight floor may halt mid-soak. The soak is the proof.
 
+- 2026-06-22 — **Operator-authorized kill-accounting fix: merge cost basis (single behavioral axis,
+  stacked on the orphan-leak soak as a recorded deviation).** Operator (Saby) authorized enabling
+  **`RF_KILL_ACCT_MERGE_COST_ENABLED=true`** on the live farmer (commit `804e3bb`): the both-sides MERGE
+  exit now records its true per-leg cost basis, so a pair acquired >$1 (an adverse merge) books `pnl<0` and
+  is VISIBLE to the realized-loss kill (10%/24h). Closes one verified bypass in the `realized_loss_kill_bypass`
+  family — pre-fix every merge logged `usd_value` with no `vwap_cost` → `pnl=+amount` (all 3 lifetime merges
+  booked as profit), hiding adverse merges from the kill.
+  - **Single-axis honesty / deviation recorded:** this is a *kill-input* behavioral change. The master
+    invariant is "≤1 behavioral change in its proving window"; the orphan-leak backstop (`72beaf4`, enabled
+    06-21) is mid-soak. Operator accepts STACKING this second *safety-accuracy* fix as a deliberate, recorded
+    deviation — it is orthogonal to the A/B net experiment (touches no selection/sizing/cohort path), and the
+    kill was blind to merge losses while the bot sits ~$20 from the floor, so enabling now outweighs waiting.
+    The A/B net-experiment slot is unaffected. Future safety-accuracy fixes form a sequenced batch (one at a
+    time, each gated + recorded) per `docs/MASTER_PLAN_2026-06-22.md`.
+  - **Scope:** Change-1 (merge cost basis) ONLY. Sibling bypasses remain OPEN and are sequenced as separate
+    single-axis changes: startup-dump `+pnl`, the `"price"`→`"fill_price"` dump-notional typo, the no-row
+    write-down paths, and the `total_capital` kill-stack SPOF.
+  - **Safety:** strengthens the kill (makes it SEE a previously-hidden loss); loosens NO threshold.
+    Forward-only (historical merge rows unchanged → no retroactive trip). Unknown/corrupt basis floors
+    `pnl=0` (never a phantom profit).
+  - **Gate:** `run_audit_v5 --seeds 1 42 1337` PASS + fast pytest 1180/0-fail on the box (hermetic) + 6 new
+    tests incl. the real-`PositionStore` ordering test. Byte-identical when the flag is off.
+  - **Revert:** `RF_KILL_ACCT_MERGE_COST_ENABLED=false` (hot-reload) → instant byte-identical; inert when off.
+
+- 2026-06-22 (B-1) — **Operator-authorized kill-accounting fixes: startup-dump cost basis + dump-notional
+  typo (two single-axis safety-accuracy fixes, stacked on the soak as recorded deviations).** Operator
+  (Saby) authorized enabling, on the live farmer (commit `fbf3e63`, verified hot-reloaded 2026-06-22 06:05Z):
+  - **`RF_KILL_ACCT_STARTUP_DUMP_ENABLED=true`** — the startup-recovered dump SELL logged `usd_value` with
+    no `vwap_cost` → `pnl=+proceeds` (a forced loss-exit booked as PROFIT, invisible to the realized-loss
+    kill). Now records the true cost basis (captured BEFORE `record_unwind` zeroes `avg_price`) so
+    `pnl<=0`, idempotent via an order-keyed `unwind_event_id` (FX-067) so a re-processed startup order
+    can't double-count the now-negative loss; floors `pnl=0` when basis is unknown (orphan). Latent —
+    fires only at a restart that recovers a loss-dump.
+  - **`RF_GUARDRAIL_DUMP_NOTIONAL_FIX_ENABLED=true`** — `_guardrail_live_notional_per_market` read the
+    dead `"price"` key (always 0) instead of `"fill_price"`, so resting-dump exposure was invisible to the
+    notional/cluster/rapid-growth kills. Now reads `fill_price`. Verified live: a resting Hormuz dump now
+    counts toward `total_live_notional` (76.78), previously $0.
+  - **Single-axis honesty / deviation recorded:** both are *kill-input* behavioral changes touching
+    DIFFERENT kills (realized-loss vs notional-family), so independently attributable. Stacked on the
+    orphan + merge-cost soaks as deliberate, recorded safety-accuracy deviations — orthogonal to the A/B
+    net experiment (untouched). **LOW runway-risk:** neither touches the 28% drawdown floor; the
+    realized-loss kill had ~$78 headroom at enable.
+  - **Safety:** strengthen the kills (make hidden exposure/losses visible); loosen NO threshold. Both
+    byte-identical when off; forward-only (no retroactive trip).
+  - **Gate:** `run_audit_v5 --seeds 1 42 1337` PASS + fast pytest 1210/0-fail (5 new tests incl. the
+    real-`PositionStore` ordering proof + byte-identical-off); gated hermetically in-place on the box (A-1).
+  - **Revert:** set either flag `=false` (hot-reload) → instant byte-identical; inert when off.
+
 - 2026-05-26 v1.0 — Created. Three core rules defined after the
   SimpleAllocator kill-switch event of 2026-05-25 demonstrated that the
   deployed code violated all three rules simultaneously.

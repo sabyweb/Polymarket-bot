@@ -587,6 +587,44 @@ def alert_wallet_desync(
     _write_alert("WALLET_DESYNC", msg)
 
 
+def alert_dump_verify_stuck(
+    cid: str,
+    question: str,
+    side: str,
+    order_id: str,
+    cycles: int,
+) -> None:
+    """Page the operator when a dump fill cannot be balance-verified for many
+    consecutive cycles (L-1). The bot refuses to auto-record the unwind; a human
+    must verify the exchange state."""
+    embed = {
+        "title": "DUMP VERIFY STUCK — Manual Check Required",
+        "description": (
+            f"A dump SELL shows `status=MATCHED` on the exchange, but the balance-"
+            f"verification RPC has failed for **{cycles}** consecutive cycles.\n\n"
+            f"The bot has **NOT** recorded an unwind. Please verify on Polymarket "
+            f"whether the dump actually filled and reconcile manually if needed."
+        ),
+        "color": 0xFF0000,
+        "fields": [
+            {"name": "Market", "value": question[:120] or cid, "inline": False},
+            {"name": "Side", "value": side.upper(), "inline": True},
+            {"name": "Order ID", "value": order_id[:20], "inline": True},
+        ],
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+    _send_critical(
+        "**DUMP VERIFY STUCK** — manual check required (unwind NOT recorded)",
+        embed,
+    )
+    msg = (
+        f"DUMP_VERIFY_STUCK | cid={cid[:12]} side={side} order={order_id[:20]} "
+        f"unverified_cycles={cycles}"
+    )
+    log.critical(msg)
+    _write_alert("DUMP_VERIFY_STUCK", msg)
+
+
 def alert_heartbeat_failure(last_success_secs_ago: float, process: str = "bot") -> None:
     """Send a Discord alert when a process has not cycled recently.
 

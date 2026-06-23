@@ -61,8 +61,18 @@ def net_unrealized_loss(
     no_shares: float,
     no_avg: float,
     midpoint: float,
+    unknown_floor: bool = False,
 ) -> tuple[float, int]:
-    """Per-market net unrealized loss (positive = underwater) and marked legs."""
+    """Per-market net unrealized loss (positive = underwater) and marked legs.
+
+    Args:
+        unknown_floor: When True, legs with unknown cost basis (avg <= 0) are
+            included using the current midpoint as a conservative placeholder
+            (PnL = 0, max_loss = current value). This prevents orphan/startup
+            positions from being invisible to the unrealized-loss kill.
+    """
+    if not (0 < midpoint < 1):
+        return 0.0, 0
     marked = 0
     net_pnl = 0.0
     max_loss = 0.0
@@ -71,8 +81,12 @@ def net_unrealized_loss(
         ("no", no_shares, no_avg),
     )
     for side, shares, avg in legs:
-        if shares <= 0 or avg <= 0 or not (0 < midpoint < 1):
+        if shares <= 0:
             continue
+        if avg <= 0:
+            if not unknown_floor:
+                continue
+            avg = midpoint
         net_pnl += leg_unrealized_pnl(side, shares, avg, midpoint)
         max_loss += leg_max_loss(side, shares, avg)
         marked += 1
@@ -83,18 +97,27 @@ def net_unrealized_loss(
 
 def portfolio_unrealized_loss(
     legs: list[tuple[str, float, float, float]],
+    unknown_floor: bool = False,
 ) -> tuple[float, int]:
     """Global net unrealized loss across all legs (gains offset losses).
 
     Each leg: (side, shares, yes_equiv_avg, midpoint).
     Returns (positive_loss, marked_leg_count).
+
+    Args:
+        unknown_floor: When True, legs with unknown cost basis (avg <= 0) are
+            included using their own midpoint as a conservative placeholder.
     """
     net_pnl = 0.0
     max_loss = 0.0
     marked = 0
     for side, shares, avg, mid in legs:
-        if shares <= 0 or avg <= 0 or not (0 < mid < 1):
+        if shares <= 0 or not (0 < mid < 1):
             continue
+        if avg <= 0:
+            if not unknown_floor:
+                continue
+            avg = mid
         net_pnl += leg_unrealized_pnl(side, shares, avg, mid)
         max_loss += leg_max_loss(side, shares, avg)
         marked += 1

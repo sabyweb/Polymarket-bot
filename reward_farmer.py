@@ -31,6 +31,7 @@ from models import OrderSlot, MarketState
 from market_discovery import fetch_all_reward_markets, get_merged_book
 from order_lifecycle import OrderLifecycle
 from dump_manager import DumpManager
+from portfolio_value import compute_portfolio_value
 import alerts
 # Oversight integration (final safety layer): the farmer calls
 # `oversight_agent.evaluate(guard)` once per cycle, after the guardrail
@@ -169,6 +170,10 @@ class RewardFarmer:
         # Database
         from database import get_db
         self.db = get_db()
+
+        # B-3: load persistent kill switch before startup reconciliation.
+        # If the previous run ended with a farmer-own guard kill, we must stay halted.
+        self._load_persistent_kill_switch()
 
         # Startup reconciliation
         self._reconcile_on_startup()
@@ -1401,19 +1406,81 @@ class RewardFarmer:
             )
         return None
 
+    def _wallet_total_capital(self) -> float | None:
+        """Wallet-based capital = cash + marked inventory (FX-095).
+
+        Used as a conservative CAP on the alloc-derived total_capital when
+        RF_KILL_TOTAL_CAPITAL_WALLET_CAP_ENABLED is on. A stale-high alloc value
+        can otherwise inflate kill thresholds and delay protection (L-10).
+        Returns None on any missing signal (fail-open for the cap itself).
+        """
+        try:
+            cash, _ts = self.db.load_usdc_balance()
+            # Prefer the freshest portfolio snapshot total_value if available;
+            # it is updated every 10 cycles and includes marked inventory.
+            snap_total = self.db.get_portfolio_value_usd()
+            snap_ts = None
+            if snap_total is not None:
+                # portfolio_snapshots timestamps are not exposed; use _ts as a
+                # freshness proxy only when snapshot is unavailable.
+                pass
+            if cash is None:
+                return None
+            if snap_total is not None and snap_total > 0:
+                return float(snap_total)
+            # Fallback: compute from positions + current mids.
+            positions = self.db.load_all_positions()
+            mids = {
+                cid: getattr(ms, "midpoint", 0.0) or 0.0
+                for cid, ms in self.markets.items()
+            }
+            return compute_portfolio_value(float(cash), positions, mids)
+        except Exception as e:
+            log.debug(f"[GUARDRAIL] wallet_total_capital compute failed: {e}")
+            return None
+
     def _total_capital_armed(self) -> float | None:
-        """total_capital for the capital-relative kills, with a last-good RAM cache (B-2).
+        """total_capital for the capital-relative kills, with a last-good RAM cache (B-2)
+        and an optional wallet-based cap (L-10).
 
         The raw alloc read returns None only when market_allocations.json is missing/corrupt/unstamped
         (no TTL — a stale-but-present file still returns its value); when that happens, ALL capital-
         relative kill limbs skip at once (the total_capital SPOF). When RF_KILL_PERSIST_TOTAL_CAPITAL_
         ENABLED is on, cache the last good value and reuse it on a None read if it is fresher than
-        RF_TOTAL_CAPITAL_MAX_STALE_SECS, so the kills stay armed across a transient file loss. A
-        stale-high cache only RAISES thresholds (frac*T) => never a false kill, and is strictly safer
-        than the limbs skipping. An expired/absent cache returns None (today's block-new behavior).
-        OFF => returns the raw read unchanged (byte-identical), no caching.
+        RF_TOTAL_CAPITAL_MAX_STALE_SECS, so the kills stay armed across a transient file loss.
+
+        CRITICAL (L-10): a stale-high total_capital LOWERS the percentage threshold for the same
+        dollar loss and DELAYS the kill. Example: $880 floor with $1000 capital = 12% drawdown kill;
+        if capital is stale-high at $2000, the same $880 floor triggers at 56% drawdown. Therefore,
+        when RF_KILL_TOTAL_CAPITAL_WALLET_CAP_ENABLED is on, the effective value is capped at the
+        current wallet-based capital (cash + marked inventory). The cap is applied BEFORE caching so
+        the B-2 cache can never remember a stale-high number.
+
+        OFF => returns the raw read unchanged (byte-identical), no caching or capping.
         """
         raw = self._guardrail_total_capital_from_alloc()
+
+        # L-10 wallet cap: never let a stale-high alloc value inflate thresholds.
+        if cfg("RF_KILL_TOTAL_CAPITAL_WALLET_CAP_ENABLED"):
+            wallet_cap = self._wallet_total_capital()
+            if raw is not None and raw > 0 and wallet_cap is not None and wallet_cap > 0:
+                if wallet_cap < raw * 0.9999:
+                    log.warning(
+                        f"[GUARDRAIL] total_capital capped by wallet: "
+                        f"alloc=${raw:.2f} wallet=${wallet_cap:.2f} "
+                        f"effective=${wallet_cap:.2f} (L-10)"
+                    )
+                raw = min(raw, wallet_cap)
+            elif wallet_cap is not None and wallet_cap > 0 and (raw is None or raw <= 0):
+                # No usable alloc value but we have a wallet value — use it so kills stay armed.
+                log.warning(
+                    f"[GUARDRAIL] total_capital alloc missing — using wallet value "
+                    f"${wallet_cap:.2f} (L-10)"
+                )
+                raw = wallet_cap
+            elif raw is None or raw <= 0:
+                log.warning("[GUARDRAIL] total_capital unavailable (alloc and wallet both missing)")
+
         if not cfg("RF_KILL_PERSIST_TOTAL_CAPITAL_ENABLED"):
             return raw
         now = time.time()
@@ -1762,6 +1829,7 @@ class RewardFarmer:
         from portfolio_mark import portfolio_unrealized_loss
 
         leg_rows: list[tuple[str, float, float, float]] = []
+        unknown_floor = cfg("RF_FX084_UNKNOWN_COST_BASIS_FLOOR_ENABLED")
         for cid, pos in positions.items():
             ms = self.markets.get(cid)
             if ms is None:
@@ -1771,19 +1839,23 @@ class RewardFarmer:
             ya = float(pos.get("yes_avg_price", 0.0) or 0.0)
             ns = float(pos.get("no_shares", 0.0) or 0.0)
             na = float(pos.get("no_avg_price", 0.0) or 0.0)
-            if ys > 0 and ya > 0:
+            # L-2: include legs with unknown cost basis when the floor is enabled.
+            if ys > 0 and (ya > 0 or unknown_floor):
                 leg_rows.append(("yes", ys, ya, mid))
-            if ns > 0 and na > 0:
+            if ns > 0 and (na > 0 or unknown_floor):
                 leg_rows.append(("no", ns, na, mid))
-        unrealized_loss, marked_legs = portfolio_unrealized_loss(leg_rows)
+        unrealized_loss, marked_legs = portfolio_unrealized_loss(
+            leg_rows, unknown_floor=unknown_floor,
+        )
         if marked_legs == 0:
             return False, ""                          # nothing markable → fail-open
         self._last_unrealized_loss = unrealized_loss
         limit = frac * total_capital
         if unrealized_loss > limit:
+            floor_note = " (unknown-cost floor ON)" if unknown_floor else ""
             return True, (
                 f"unrealized_loss=${unrealized_loss:.2f} > {frac:.0%}·T "
-                f"(=${limit:.2f}) across {marked_legs} marked leg(s)"
+                f"(=${limit:.2f}) across {marked_legs} marked leg(s){floor_note}"
             )
         return False, ""
 
@@ -2026,6 +2098,32 @@ class RewardFarmer:
         self._last_guard = result
         return result
 
+    def _load_persistent_kill_switch(self) -> None:
+        """B-3: read persisted kill switch from DB. Fails safe to halted on
+        any read error."""
+        if not cfg("RF_KILL_PERSISTENT_ENABLED"):
+            return
+        try:
+            state = self.db.get_kill_switch()
+        except Exception as e:
+            log.error(f"[GUARDRAIL] persistent kill-switch DB read failed — failing safe to HALT: {e}")
+            self._kill_switch_active = True
+            self._kill_switch_reason = "persistent_kill_read_error"
+            self._kill_switch_triggered_at = time.time()
+            return
+
+        if state is None:
+            return
+
+        if state["active"]:
+            self._kill_switch_active = True
+            self._kill_switch_reason = state["reason"]
+            self._kill_switch_triggered_at = state["triggered_at"]
+            log.error(
+                f"[GUARDRAIL] RESTARTED INTO PERSISTENT KILL SWITCH: {state['reason']} "
+                f"(triggered_at={state['triggered_at']})"
+            )
+
     def _activate_kill_switch(self, reason: str) -> None:
         """Atomic halt (spec §5.1): set flag → cancel every live order
         → log event → caller returns immediately. No further logic
@@ -2036,6 +2134,20 @@ class RewardFarmer:
         self._kill_switch_active = True
         self._kill_switch_reason = reason
         self._kill_switch_triggered_at = time.time()
+
+        # B-3: persist farmer-own LIVE kills only. Oversight-sourced kills auto-clear
+        # and must NOT become permanent. DRY_RUN/SHADOW kills must NOT lock out LIVE.
+        if (
+            cfg("RF_KILL_PERSISTENT_ENABLED")
+            and self.mode == MODE_LIVE
+            and not str(reason).lower().startswith("oversight:")
+        ):
+            ok = self.db.set_kill_switch(True, reason, self._kill_switch_triggered_at)
+            if not ok:
+                log.critical(
+                    "[GUARDRAIL] kill switch activated but persistent sentinel FAILED to write — "
+                    "a restart will NOT honor this kill; investigate DB health"
+                )
 
         # 2. Cancel ALL live orders immediately (BUY slots + dump SELLs).
         # All cancels go through _gated_cancel_order. Because
@@ -3007,6 +3119,13 @@ def parse_duration(s: str) -> int:
     return int(s.rstrip("s"))
 
 
+def clear_persistent_kill_switch() -> bool:
+    """Operator helper: clear the persistent kill switch sentinel."""
+    from database import get_db
+    db = get_db()
+    return db.clear_kill_switch()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Reward Farmer — Polymarket LP reward farming bot")
     # Execution mode: staged deployment DRY_RUN → SHADOW → LIVE. Default
@@ -3017,7 +3136,18 @@ def main():
              "live: full execution",
     )
     parser.add_argument("--duration", default="0", help="Run duration (e.g. 10m, 1h, 6h). 0 = indefinite")
+    parser.add_argument(
+        "--clear-kill-switch", action="store_true",
+        help="Clear the persistent kill-switch sentinel and exit (operator only)",
+    )
     args = parser.parse_args()
+
+    if args.clear_kill_switch:
+        if clear_persistent_kill_switch():
+            log.info("[GUARDRAIL] persistent kill switch cleared by operator")
+        else:
+            log.error("[GUARDRAIL] failed to clear persistent kill switch")
+        return
 
     duration = parse_duration(args.duration) if args.duration != "0" else 0
 
