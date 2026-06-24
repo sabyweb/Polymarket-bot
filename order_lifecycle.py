@@ -6,6 +6,7 @@ Extracted from reward_farmer.py. All order-related logic in one module.
 import logging
 import time
 
+from ab.cohort import cohort as ab_cohort
 from config import cfg
 from fast_vol_guard import check_fast_vol_timeout
 from models import OrderSlot, MarketState
@@ -18,7 +19,28 @@ def SHARES_PER_SIDE(): return cfg("RF_SHARES_PER_SIDE")
 def PLACEMENT_TICKS_INSIDE(): return cfg("RF_PLACEMENT_TICKS_INSIDE")
 def BATCH_SIZE(): return cfg("RF_BATCH_SIZE")
 def TARGET_QUEUE_AHEAD_USD(): return cfg("RF_TARGET_QUEUE_AHEAD_USD")
+def AB_C1_TARGET_QUEUE_AHEAD_USD(): return cfg("RF_AB_C1_TARGET_QUEUE_AHEAD_USD")
+def AB_COHORT_COUNT(): return cfg("RF_AB_COHORT_COUNT")
 def DUMP_DEPTH_SAFETY_FACTOR(): return cfg("RF_DUMP_DEPTH_SAFETY_FACTOR")
+
+
+def _effective_target_queue_usd(cid: str) -> float:
+    """Cohort-aware queue-ahead target for `place_orders_for_market`.
+
+    When the A/B experiment is enabled and `cid` is in cohort 1, use the C1
+    target (RF_AB_C1_TARGET_QUEUE_AHEAD_USD). Otherwise use the baseline
+    RF_TARGET_QUEUE_AHEAD_USD. A non-positive C1 config falls back to baseline
+    so a typo/disabled value never zeroes queue-aware placement globally.
+    """
+    if cfg("RF_AB_EXPERIMENT_ENABLED"):
+        try:
+            if ab_cohort(cid, AB_COHORT_COUNT()) == 1:
+                c1_target = float(AB_C1_TARGET_QUEUE_AHEAD_USD() or 0.0)
+                if c1_target > 0:
+                    return c1_target
+        except Exception:
+            pass
+    return TARGET_QUEUE_AHEAD_USD()
 
 # FX-054 constants
 #
@@ -1022,7 +1044,7 @@ class OrderLifecycle:
             tick=tick,
             decimals=decimals,
             ticks_inside=PLACEMENT_TICKS_INSIDE(),
-            target_queue_usd=TARGET_QUEUE_AHEAD_USD(),
+            target_queue_usd=_effective_target_queue_usd(ms.cid),
             shares_per_side=ms.agent_shares if ms.agent_shares > 0 else SHARES_PER_SIDE(),
             dump_depth_safety_factor=DUMP_DEPTH_SAFETY_FACTOR(),
         )

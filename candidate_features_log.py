@@ -26,8 +26,9 @@ DEFAULT_DB = os.path.join(_DIR, "candidate_features.db")
 
 _INSERT_COLS = (
     "ts", "cycle_ts", "condition_id", "cohort", "action", "reason", "daily_rate", "max_spread",
-    "min_size", "midpoint_guess", "expected_q_share", "q_share_source", "expected_daily_reward",
-    "target_shares", "target_capital", "end_date_iso", "game_start_time", "question",
+    "min_size", "midpoint_guess", "volume_24h", "expected_q_share", "q_share_source",
+    "expected_daily_reward", "target_shares", "target_capital", "target_queue_usd",
+    "hours_to_resolution", "end_date_iso", "game_start_time", "question",
 )
 
 
@@ -39,13 +40,24 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             ts REAL, cycle_ts REAL,
             condition_id TEXT, cohort INTEGER, action TEXT, reason TEXT,
             daily_rate REAL, max_spread REAL, min_size INTEGER, midpoint_guess REAL,
-            expected_q_share REAL, q_share_source TEXT, expected_daily_reward REAL,
-            target_shares INTEGER, target_capital REAL,
+            volume_24h REAL, expected_q_share REAL, q_share_source TEXT,
+            expected_daily_reward REAL, target_shares INTEGER, target_capital REAL,
+            target_queue_usd REAL, hours_to_resolution REAL,
             end_date_iso TEXT, game_start_time TEXT, question TEXT
         )"""
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_cf_cycle ON candidate_features(cycle_ts)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_cf_cid ON candidate_features(condition_id)")
+    # Forward-only migration for existing DBs: add columns introduced after A3 launch.
+    for col, dtype in (
+        ("volume_24h", "REAL"),
+        ("target_queue_usd", "REAL"),
+        ("hours_to_resolution", "REAL"),
+    ):
+        try:
+            conn.execute(f"ALTER TABLE candidate_features ADD COLUMN {col} {dtype}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
 
 
 def append(records: list[dict], db_path: str = DEFAULT_DB, cycle_ts: float | None = None) -> int:
@@ -64,8 +76,9 @@ def append(records: list[dict], db_path: str = DEFAULT_DB, cycle_ts: float | Non
         rows = [
             (now, cts, r.get("condition_id"), r.get("cohort"), r.get("action"), r.get("reason"),
              r.get("daily_rate"), r.get("max_spread"), r.get("min_size"), r.get("midpoint_guess"),
-             r.get("expected_q_share"), r.get("q_share_source"), r.get("expected_daily_reward"),
-             r.get("target_shares"), r.get("target_capital"), r.get("end_date_iso"),
+             r.get("volume_24h"), r.get("expected_q_share"), r.get("q_share_source"),
+             r.get("expected_daily_reward"), r.get("target_shares"), r.get("target_capital"),
+             r.get("target_queue_usd"), r.get("hours_to_resolution"), r.get("end_date_iso"),
              r.get("game_start_time"), r.get("question"))
             for r in records
         ]

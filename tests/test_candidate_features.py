@@ -98,9 +98,10 @@ def test_log_module(tmp_path):
     db = str(tmp_path / "cf.db")
     rec = {"condition_id": "0xA", "cohort": 0, "action": "deploy", "reason": "",
            "daily_rate": 100.0, "max_spread": 4.5, "min_size": 20, "midpoint_guess": 0.5,
-           "expected_q_share": 0.005, "q_share_source": "cold_start", "expected_daily_reward": 0.5,
-           "target_shares": 22, "target_capital": 22.0, "end_date_iso": "", "game_start_time": "",
-           "question": "Will X?"}
+           "volume_24h": 12345.0, "expected_q_share": 0.005, "q_share_source": "cold_start",
+           "expected_daily_reward": 0.5, "target_shares": 22, "target_capital": 22.0,
+           "target_queue_usd": 400.0, "hours_to_resolution": 48.0,
+           "end_date_iso": "", "game_start_time": "", "question": "Will X?"}
     assert cfl.append([rec], db_path=db) == 1
     assert cfl.append([], db_path=db) == 0           # empty -> no-op
     assert cfl.append([rec], db_path=db) == 1         # idempotent schema, second append
@@ -116,9 +117,32 @@ def test_log_result_glue(tmp_path):
     import candidate_features_log as cfl
     db = str(tmp_path / "cf.db")
     rec = {"condition_id": "0xA", "cohort": 0, "action": "deploy", "reason": "", "daily_rate": 100.0,
-           "max_spread": 4.5, "min_size": 20, "midpoint_guess": 0.5, "expected_q_share": 0.005,
-           "q_share_source": "cold_start", "expected_daily_reward": 0.5, "target_shares": 22,
-           "target_capital": 22.0, "end_date_iso": "", "game_start_time": "", "question": "Q?"}
+           "max_spread": 4.5, "min_size": 20, "midpoint_guess": 0.5, "volume_24h": 12345.0,
+           "expected_q_share": 0.005, "q_share_source": "cold_start", "expected_daily_reward": 0.5,
+           "target_shares": 22, "target_capital": 22.0, "target_queue_usd": 400.0,
+           "hours_to_resolution": 48.0, "end_date_iso": "", "game_start_time": "", "question": "Q?"}
     assert cfl.log_result(SimpleNamespace(candidate_features=[rec]), db_path=db) == 1   # writes
     assert cfl.log_result(SimpleNamespace(candidate_features=[]), db_path=db) == 0       # empty -> no-op
     assert cfl.log_result(SimpleNamespace(), db_path=db) == 0                            # missing attr -> no-op
+
+
+def test_log_module_new_columns(tmp_path):
+    """A3 schema carries the C1-rule/logging columns: volume_24h,
+    target_queue_usd, hours_to_resolution."""
+    import candidate_features_log as cfl
+    db = str(tmp_path / "cf_cols.db")
+    rec = {"condition_id": "0xA", "cohort": 1, "action": "deploy", "reason": "",
+           "daily_rate": 100.0, "max_spread": 4.5, "min_size": 20, "midpoint_guess": 0.5,
+           "volume_24h": 250001.0, "expected_q_share": 0.005, "q_share_source": "cold_start",
+           "expected_daily_reward": 0.5, "target_shares": 22, "target_capital": 22.0,
+           "target_queue_usd": 400.0, "hours_to_resolution": 4.0,
+           "end_date_iso": "", "game_start_time": "", "question": "Q?"}
+    cfl.append([rec], db_path=db)
+    conn = sqlite3.connect(db)
+    try:
+        row = conn.execute(
+            "SELECT volume_24h, target_queue_usd, hours_to_resolution FROM candidate_features"
+        ).fetchone()
+        assert row == (250001.0, 400.0, 4.0)
+    finally:
+        conn.close()

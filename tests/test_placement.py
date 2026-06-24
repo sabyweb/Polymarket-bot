@@ -38,6 +38,7 @@ from models import MarketState
 from order_lifecycle import (
     OrderLifecycle,
     _compute_edge_prices,
+    _effective_target_queue_usd,
     _has_sufficient_dump_depth,
     _queue_aware_edge,
 )
@@ -750,6 +751,39 @@ class TestPlaceOrdersForMarketUsesQueueAware(unittest.TestCase):
         first_call_args = ol.client.create_and_post_order.call_args_list[0]
         order_args = first_call_args[0][0]
         self.assertAlmostEqual(order_args.price, 0.45, places=4)
+
+
+class TestEffectiveTargetQueueUSD(unittest.TestCase):
+    """Cohort-aware queue-ahead target: C1 uses a tighter target than baseline."""
+
+    def test_baseline_uses_default_target(self):
+        with patch("order_lifecycle.cfg", lambda k: {"RF_AB_EXPERIMENT_ENABLED": False,
+                                                      "RF_TARGET_QUEUE_AHEAD_USD": 1000.0}.get(k, None)):
+            self.assertEqual(_effective_target_queue_usd("0xANY"), 1000.0)
+
+    def test_c1_uses_c1_target_when_ab_enabled(self):
+        with patch("order_lifecycle.cfg", lambda k: {"RF_AB_EXPERIMENT_ENABLED": True,
+                                                      "RF_AB_COHORT_COUNT": 2,
+                                                      "RF_AB_C1_TARGET_QUEUE_AHEAD_USD": 400.0,
+                                                      "RF_TARGET_QUEUE_AHEAD_USD": 1000.0}.get(k, None)), \
+             patch("order_lifecycle.ab_cohort", lambda cid, n: 1):
+            self.assertEqual(_effective_target_queue_usd("0xC1"), 400.0)
+
+    def test_c0_uses_baseline_when_ab_enabled(self):
+        with patch("order_lifecycle.cfg", lambda k: {"RF_AB_EXPERIMENT_ENABLED": True,
+                                                      "RF_AB_COHORT_COUNT": 2,
+                                                      "RF_AB_C1_TARGET_QUEUE_AHEAD_USD": 400.0,
+                                                      "RF_TARGET_QUEUE_AHEAD_USD": 1000.0}.get(k, None)), \
+             patch("order_lifecycle.ab_cohort", lambda cid, n: 0):
+            self.assertEqual(_effective_target_queue_usd("0xC0"), 1000.0)
+
+    def test_c1_falls_back_to_baseline_if_c1_target_non_positive(self):
+        with patch("order_lifecycle.cfg", lambda k: {"RF_AB_EXPERIMENT_ENABLED": True,
+                                                      "RF_AB_COHORT_COUNT": 2,
+                                                      "RF_AB_C1_TARGET_QUEUE_AHEAD_USD": 0.0,
+                                                      "RF_TARGET_QUEUE_AHEAD_USD": 1000.0}.get(k, None)), \
+             patch("order_lifecycle.ab_cohort", lambda cid, n: 1):
+            self.assertEqual(_effective_target_queue_usd("0xC1"), 1000.0)
 
 
 if __name__ == "__main__":

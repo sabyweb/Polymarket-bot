@@ -38,7 +38,7 @@ from typing import Optional
 
 import requests
 
-from config import cfg
+from config import cfg, GAMMA_API
 
 log = logging.getLogger("simple_allocator")
 
@@ -139,6 +139,7 @@ USER_PCTS_PATH = "/rewards/user/percentages"
 USER_TOTAL_PATH = "/rewards/user/total"
 MARKETS_CURRENT_PATH = "/rewards/markets/current"
 MARKET_DETAIL_PATH = "/markets/"        # FX-090: per-market timing (game_start_time, end_date_iso)
+GAMMA_MARKETS_KEYSET_PATH = "/markets/keyset"  # Gamma volume + enrichment
 
 
 @dataclass
@@ -157,6 +158,7 @@ class CandidateMarket:
     end_date_iso: str = ""
 
     # Filled in by SimpleAllocator
+    volume_24h: float = 0.0     # USD CLOB 24h volume from Gamma API
     expected_q_share: float = 0.0
     expected_daily_reward: float = 0.0
     q_share_source: str = ""    # "api" | "cumulative" | "cold_start"
@@ -329,6 +331,17 @@ class SimpleAllocator:
             cursor = data.get("next_cursor") if isinstance(data, dict) else None
             if not cursor or cursor == "LTE=":
                 break
+
+        # A/B C1 volume filter + feature log need 24h CLOB volume. Fetch once
+        # from Gamma and attach fail-open (missing volume -> 0, filter disabled
+        # by default so unknown volume never excludes). Skip the extra Gamma
+        # call when neither feature is enabled.
+        if markets and (cfg("RF_AB_EXPERIMENT_ENABLED") or cfg("RF_CANDIDATE_FEATURE_LOG_ENABLED")):
+            gamma_volumes = self._fetch_gamma_volume_map()
+            if gamma_volumes:
+                for m in markets:
+                    m.volume_24h = gamma_volumes.get(m.condition_id, 0.0)
+
         return markets
 
     # ── Q-share estimation (3-tier priority) ──
@@ -514,6 +527,37 @@ class SimpleAllocator:
         h = int(hashlib.sha1(cid.encode("utf-8")).hexdigest(), 16)
         return h % n
 
+    def _effective_target_queue_usd(self, cid: str) -> float:
+        """Decision-time queue-ahead target used by order_lifecycle for this cid.
+
+        Baseline uses RF_TARGET_QUEUE_AHEAD_USD. A/B C1 uses its cohort-specific
+        target when the experiment is enabled.
+        """
+        if cfg("RF_AB_EXPERIMENT_ENABLED") and self._ab_cohort(cid) == 1:
+            try:
+                c1_target = float(cfg("RF_AB_C1_TARGET_QUEUE_AHEAD_USD") or 0.0)
+            except (TypeError, ValueError):
+                c1_target = 0.0
+            if c1_target > 0:
+                return c1_target
+        return cfg("RF_TARGET_QUEUE_AHEAD_USD")
+
+    def _hours_to_resolution(self, end_date_iso: str) -> float | None:
+        """Hours from now to end_date_iso, or None if unparseable/absent.
+
+        Uses the allocator's injected clock so tests with a frozen _now get
+        deterministic values.
+        """
+        if not end_date_iso:
+            return None
+        from datetime import datetime, timezone
+        try:
+            dt = datetime.fromisoformat(end_date_iso.replace("Z", "+00:00"))
+            now_dt = datetime.fromtimestamp(self._now(), tz=timezone.utc)
+            return (dt - now_dt).total_seconds() / 3600.0
+        except (ValueError, TypeError):
+            return None
+
     def _apply_timing_meta(self, m: "CandidateMarket", meta: dict) -> None:
         """Copy a _fetch_timing dict onto the candidate + mark enrichment attempted."""
         m.game_start_time = meta.get("game_start_time", "") or ""
@@ -533,6 +577,14 @@ class SimpleAllocator:
         now_dt = datetime.fromtimestamp(self._now(), tz=timezone.utc)
 
         res_floor = ALLOC_MIN_HOURS_TO_RESOLUTION()
+        # A/B C1 trader rule: looser resolution guard for C1 only.
+        if cfg("RF_AB_EXPERIMENT_ENABLED") and self._ab_cohort(m.condition_id) == 1:
+            try:
+                c1_res_floor = float(cfg("RF_AB_C1_MIN_HOURS_TO_RESOLUTION") or 0.0)
+            except (TypeError, ValueError):
+                c1_res_floor = 0.0
+            if c1_res_floor > 0:
+                res_floor = c1_res_floor
         if m.end_date_iso and res_floor and res_floor > 0:
             try:
                 dt = datetime.fromisoformat(m.end_date_iso.replace("Z", "+00:00"))
@@ -612,6 +664,53 @@ class SimpleAllocator:
             if pat in q:
                 return True, f"no_gamestart_event[{pat}]"
         return False, ""
+
+    def _fetch_gamma_volume_map(self) -> dict[str, float]:
+        """Fetch active-market 24h CLOB volume from Gamma API.
+
+        Uses Gamma `/markets/keyset` cursor pagination. Returns
+        {conditionId: volume_24h_usd}. Fail-open: any error returns an empty map
+        so volume-dependent filters/log silently degrade to "unknown volume".
+        """
+        out: dict[str, float] = {}
+        cursor = ""
+        url = f"{GAMMA_API}{GAMMA_MARKETS_KEYSET_PATH}"
+        params_base = {
+            "active": "true",
+            "closed": "false",
+            "archived": "false",
+            "enableOrderBook": "true",
+            "limit": "100",
+        }
+        for _ in range(100):  # bounded at 10k markets
+            params = dict(params_base)
+            if cursor:
+                params["next_cursor"] = cursor
+            try:
+                r = self._http(url, params=params, timeout=20)
+                if getattr(r, "status_code", 0) != 200:
+                    log.warning(f"Gamma keyset status={getattr(r, 'status_code', 0)}")
+                    break
+                data = r.json()
+            except Exception as e:
+                log.debug(f"Gamma keyset fetch error: {e}")
+                break
+            if not isinstance(data, dict):
+                break
+            for m in data.get("markets", []) or []:
+                cid = m.get("conditionId") or m.get("condition_id")
+                if not cid:
+                    continue
+                try:
+                    vol = float(m.get("volume24hrClob") or 0.0)
+                except (TypeError, ValueError):
+                    vol = 0.0
+                out[cid] = vol
+            nxt = data.get("next_cursor") or ""
+            if not nxt or nxt == cursor:
+                break
+            cursor = nxt
+        return out
 
     def _recent_volatility(self, cid: str) -> Optional[float]:
         """FX-093: recent midpoint RANGE (max-min) for `cid` from book_snapshots
@@ -862,6 +961,7 @@ class SimpleAllocator:
         event_excluded_count = 0  # FIX-1 (RC-4): event/same-day guard
         ng_excluded_count = 0  # no-gamestart discrete-event guard (held-to-resolution lever)
         sweep_excluded_count = 0  # calm-book sweep-rate filter (net-validated 2026-06-17)
+        volume_excluded_count = 0  # A/B C1: max 24h volume filter
         for m in eligible:
             if len(deploys) >= max_deploys:
                 # Soft cap hit — extremely rare in practice (5k market pool
@@ -945,6 +1045,20 @@ class SimpleAllocator:
                     avoids.append(m)
                     continue
 
+            # A/B C1: 24h volume cap. Exclude C1 markets whose CLOB volume is
+            # above the cap (high-volume / high-competition hypothesis). Fail-open:
+            # unknown/missing volume (0) is treated as "not above cap".
+            if cfg("RF_AB_EXPERIMENT_ENABLED") and self._ab_cohort(m.condition_id) == 1:
+                try:
+                    volume_cap = float(cfg("RF_AB_C1_MAX_VOLUME_24H") or 0.0)
+                except (TypeError, ValueError):
+                    volume_cap = 0.0
+                if volume_cap > 0 and m.volume_24h > volume_cap:
+                    m.timing_excluded_reason = f"volume_24h_{m.volume_24h:.0f}>{volume_cap:.0f}"
+                    volume_excluded_count += 1
+                    avoids.append(m)
+                    continue
+
             cost_per_market = self._est_cost_per_market(m)
             expected_fill_cost = self._estimate_fill_cost(m, cost_per_market)
             # Positive-EV gate: only deploy if expected reward clears fill cost.
@@ -1024,7 +1138,7 @@ class SimpleAllocator:
         log.info(
             f"[OVERCOMMIT_ALLOC] eligible={len(eligible)} positive_ev={positive_ev_count} "
             f"deploys={len(deploys)} avoids={len(avoids)} "
-            f"timing_excluded={timing_excluded_count} event_excluded={event_excluded_count} ng_event_excluded={ng_excluded_count} vol_excluded={vol_excluded_count} sweep_excluded={sweep_excluded_count} timing_fetches={timing_budget['fetches']} "
+            f"timing_excluded={timing_excluded_count} event_excluded={event_excluded_count} ng_event_excluded={ng_excluded_count} vol_excluded={vol_excluded_count} sweep_excluded={sweep_excluded_count} volume_excluded={volume_excluded_count} timing_fetches={timing_budget['fetches']} "
             f"notional_total=${used:.2f} wallet=${wallet_usd:.2f} "
             f"overcommit_ratio={notional_overcommit_ratio:.2f}× "
             f"(target band 3-8× per Ground Rule 2) "
@@ -1053,11 +1167,14 @@ class SimpleAllocator:
                         "max_spread": m.max_spread,
                         "min_size": m.min_size,
                         "midpoint_guess": m.midpoint_guess,
+                        "volume_24h": m.volume_24h,
                         "expected_q_share": m.expected_q_share,
                         "q_share_source": m.q_share_source,
                         "expected_daily_reward": m.expected_daily_reward,
                         "target_shares": m.target_shares,
                         "target_capital": m.target_capital,
+                        "target_queue_usd": self._effective_target_queue_usd(m.condition_id),
+                        "hours_to_resolution": self._hours_to_resolution(m.end_date_iso),
                         "end_date_iso": m.end_date_iso,
                         "game_start_time": m.game_start_time,
                         "question": m.question,

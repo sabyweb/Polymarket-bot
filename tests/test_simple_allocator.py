@@ -986,3 +986,79 @@ def test_C37_volatility_filter_disabled(monkeypatch):
     result = _compute_one(a, [cand])
     assert cid in {m.condition_id for m in result.deploys}
     os.unlink(db)
+
+
+# ── A/B C1 trader-rule contracts ──
+
+def _c1_cfg(monkeypatch, **overrides):
+    """Hermetic cfg for C1-rule tests: A/B on + C1 values, all other knobs
+    fall through to the original config.cfg.
+
+    compute() does a local ``from config import cfg`` at runtime, so it reads
+    config.cfg directly; other allocator methods read sa.cfg. We patch both so
+    the C1 knobs are visible everywhere without depending on the live box's
+    config_overrides.json."""
+    import config
+    base = {
+        "RF_AB_EXPERIMENT_ENABLED": True,
+        "RF_AB_COHORT_COUNT": 2,
+        "RF_AB_C1_MIN_HOURS_TO_RESOLUTION": 4.0,
+        "RF_AB_C1_MAX_VOLUME_24H": 250000.0,
+    }
+    base.update(overrides)
+    orig = config.cfg
+    def _wrapper(k):
+        return base.get(k, orig(k))
+    monkeypatch.setattr(config, "cfg", _wrapper)
+    monkeypatch.setattr(sa, "cfg", _wrapper)
+
+
+def test_C38_c1_resolution_guard_allows_shorter_dated_than_baseline(monkeypatch):
+    """C38: with A/B on, C1 uses a 4h resolution floor — a market 10h out
+    deploys even though the baseline 48h floor would exclude it."""
+    _c1_cfg(monkeypatch)
+    a = _alloc_with_q({"0xMID": 0.05})
+    a._ab_cohort = lambda cid: 1
+    cand = _make_candidate("0xMID", daily_rate=500)
+    cand.end_date_iso = _iso(10)  # 10h out >= 4h C1 floor
+    result = _compute_one(a, [cand])
+    assert "0xMID" in {m.condition_id for m in result.deploys}
+
+
+def test_C39_c1_resolution_guard_still_excludes_very_near_resolution(monkeypatch):
+    """C39: C1's 4h floor still excludes markets resolving within 4h."""
+    _c1_cfg(monkeypatch)
+    a = _alloc_with_q({"0xNEAR": 0.05})
+    a._ab_cohort = lambda cid: 1
+    cand = _make_candidate("0xNEAR", daily_rate=500)
+    cand.end_date_iso = _iso(2)  # 2h out < 4h C1 floor
+    result = _compute_one(a, [cand])
+    assert "0xNEAR" not in {m.condition_id for m in result.deploys}
+    assert "0xNEAR" in {m.condition_id for m in result.avoids}
+
+
+def test_C40_c1_volume_cap_excludes_high_volume_c1_markets(monkeypatch):
+    """C40: C1 markets with 24h volume above RF_AB_C1_MAX_VOLUME_24H are
+    excluded; non-C1 markets with the same volume are not affected."""
+    _c1_cfg(monkeypatch)
+    a = _alloc_with_q({"0xVOL1": 0.05, "0xVOL0": 0.05})
+    a._ab_cohort = lambda cid: 1 if cid == "0xVOL1" else 0
+    c1 = _make_candidate("0xVOL1", daily_rate=500)
+    c1.volume_24h = 300000.0  # above 250k cap
+    c0 = _make_candidate("0xVOL0", daily_rate=500)
+    c0.volume_24h = 300000.0
+    result = _compute_one(a, [c1, c0])
+    deploys = {m.condition_id for m in result.deploys}
+    assert "0xVOL1" not in deploys
+    assert "0xVOL0" in deploys
+
+
+def test_C41_c1_volume_cap_disabled_when_cap_zero(monkeypatch):
+    """C41: setting RF_AB_C1_MAX_VOLUME_24H=0 disables the C1 volume filter."""
+    _c1_cfg(monkeypatch, RF_AB_C1_MAX_VOLUME_24H=0.0)
+    a = _alloc_with_q({"0xBIG": 0.05})
+    a._ab_cohort = lambda cid: 1
+    cand = _make_candidate("0xBIG", daily_rate=500)
+    cand.volume_24h = 9999999.0
+    result = _compute_one(a, [cand])
+    assert "0xBIG" in {m.condition_id for m in result.deploys}

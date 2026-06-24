@@ -14,6 +14,36 @@ For the **immutable contract**, see `ground_rules.md`.
 
 ---
 
+## C1 trader-rule cohort (2026-06-24)
+
+- Added three C1-specific A/B treatments, all gated by
+  `RF_AB_EXPERIMENT_ENABLED` and applied only to cohort-1 markets:
+  - `RF_AB_C1_TARGET_QUEUE_AHEAD_USD = 400.0` — C1 uses a tighter queue-ahead
+    target than the baseline `RF_TARGET_QUEUE_AHEAD_USD = 1000.0`, so C1 sits
+    closer to mid while still behind $400 of book queue.
+  - `RF_AB_C1_MIN_HOURS_TO_RESOLUTION = 4.0` — C1 resolution guard is looser
+    than the baseline `RF_ALLOC_MIN_HOURS_TO_RESOLUTION = 48.0`; only markets
+    resolving within 4h are excluded.
+  - `RF_AB_C1_MAX_VOLUME_24H = 250000.0` — C1 markets whose 24h CLOB volume
+    exceeds $250k are excluded (high-volume / high-competition hypothesis).
+- Wired cohort-aware queue target into `order_lifecycle.place_orders_for_market`
+  via `_effective_target_queue_usd(cid)`.
+- Fetched 24h CLOB volume from Gamma `/markets/keyset` in
+  `SimpleAllocator.fetch_reward_markets` and stored it on `CandidateMarket.volume_24h`.
+- Applied the C1 resolution override in `_timing_excluded` and the C1 volume cap
+  in `compute()`, with fail-open semantics (unknown volume or disabled cap never
+  excludes).
+- Extended `candidate_features_log.py` schema with `volume_24h`,
+  `target_queue_usd`, and `hours_to_resolution`, plus idempotent `ALTER TABLE`
+  migration for existing DBs. The allocator now logs these fields for every
+  eligible candidate when `RF_CANDIDATE_FEATURE_LOG_ENABLED=True`.
+- Telemetry: `[OVERCOMMIT_ALLOC]` now reports `volume_excluded=`.
+- New tests: C38–C41 in `tests/test_simple_allocator.py`,
+  `TestEffectiveTargetQueueUSD` in `tests/test_placement.py`, and
+  `test_log_module_new_columns` in `tests/test_candidate_features.py`.
+
+---
+
 ## FX-098 — Farmer-side fast-volatility timeout (2026-06-24)
 
 - Added `fast_vol_guard.py`: detects midpoint moves of 4c in 30s or 6c in 60s
