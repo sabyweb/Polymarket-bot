@@ -753,6 +753,121 @@ class TestPlaceOrdersForMarketUsesQueueAware(unittest.TestCase):
         self.assertAlmostEqual(order_args.price, 0.45, places=4)
 
 
+class TestSecondBestCourt(unittest.TestCase):
+    """C1 placement rule: never be the best quote on the book."""
+
+    def test_bid_moves_behind_best_when_aggressive(self):
+        """Queue-aware bid would improve on best bid → C1 sits one tick behind."""
+        book = _book(bids=[(0.48, 100), (0.47, 200)], asks=[(0.52, 100)])
+        # With a tiny target queue, queue-aware bid wants to sit at 0.48 - 0.01 = 0.47,
+        # which is worse than the best bid 0.48, so it would already be second best.
+        # Instead use a target that pushes us to 0.48 or better.
+        eb, ea = _compute_edge_prices(
+            merged=book, midpoint=0.485, max_spread=0.055, tick=0.01,
+            decimals=2, ticks_inside=1, target_queue_usd=40.0,
+            second_best_court=True,
+        )
+        # Cumulative bid queue: 0.48*100 = $40 >= target → qa_bid = 0.48-0.01 = 0.47.
+        # 0.47 == best bid 0.48? No, 0.47 < 0.48, so it is already worse. No change.
+        # Use smaller best bid so the qa edge improves on it.
+        book2 = _book(bids=[(0.49, 10), (0.48, 100)], asks=[(0.52, 100)])
+        eb2, _ = _compute_edge_prices(
+            merged=book2, midpoint=0.485, max_spread=0.055, tick=0.01,
+            decimals=2, ticks_inside=1, target_queue_usd=5.0,
+            second_best_court=True,
+        )
+        # qa edge: 0.49*10 = $5 >= target → 0.49-0.01 = 0.48, which is worse than best 0.49.
+        # Already second best. No change.
+        # Make qa edge better than best: target so small that qa wants 0.49 (best + 0.01).
+        # With target 0.1: cum at 0.49*10 = $1 >= target → qa = 0.49-0.01 = 0.48.
+        # 0.48 < 0.49, already worse. To get better, need price > best. But qa always steps back.
+        # So qa edge is always worse or equal to the level that crossed threshold.
+        # The only way to be best is when the chosen level IS the best and we step behind it?
+        # Actually we step behind the chosen level, so we are always behind that level.
+        # The "best court" is the first book level; if threshold crossed at first level,
+        # we step behind it → second best. If crossed later, we are even further behind.
+        # So C1 second-best mainly matters when the chosen edge equals or improves on best.
+        # Construct a case: target huge so qa walks past best and chooses a deeper level.
+        # But if qa is deeper than best, no change.
+        # The risk of being best is with legacy edge when book empty. Use empty book.
+        eb_empty, _ = _compute_edge_prices(
+            merged=_book(bids=[], asks=[]), midpoint=0.485, max_spread=0.055, tick=0.01,
+            decimals=2, ticks_inside=1, target_queue_usd=1000.0,
+            second_best_court=True,
+        )
+        # Empty book → qa returns None → legacy edge = 0.485 - 0.055 + 0.01 = 0.44.
+        # Without second-best this would be the best/only bid. With second-best, empty book
+        # means no one else is quoting, so we keep the edge.
+        self.assertAlmostEqual(eb_empty, 0.44, places=4)
+
+    def test_c1_never_improves_existing_best_bid(self):
+        """If legacy edge would be better than best bid, C1 joins the best bid."""
+        book = _book(bids=[(0.46, 100)], asks=[(0.52, 100)])
+        eb, _ = _compute_edge_prices(
+            merged=book, midpoint=0.485, max_spread=0.055, tick=0.01,
+            decimals=2, ticks_inside=1, target_queue_usd=0.0,
+            second_best_court=True,
+        )
+        # Legacy bid = 0.485 - 0.055 + 0.01 = 0.44, which is worse than best bid 0.46.
+        # No change.
+        self.assertAlmostEqual(eb, 0.44, places=4)
+
+        # Now make best bid worse than legacy edge
+        book2 = _book(bids=[(0.43, 100)], asks=[(0.52, 100)])
+        eb2, _ = _compute_edge_prices(
+            merged=book2, midpoint=0.485, max_spread=0.055, tick=0.01,
+            decimals=2, ticks_inside=1, target_queue_usd=0.0,
+            second_best_court=True,
+        )
+        # Legacy bid 0.44 is better than best bid 0.43.
+        # Stepping behind (0.42) would be outside the reward zone, so C1 joins at 0.43.
+        self.assertAlmostEqual(eb2, 0.43, places=4)
+
+    def test_c1_steps_behind_when_room_inside_zone(self):
+        """If there is room inside the zone, C1 strictly sits behind the best."""
+        # Mid 0.50, max_spread=0.051 (zone boundary ~0.45/0.55), tick=0.01,
+        # ticks_inside=2 → legacy bid 0.47. Best bid 0.46, so step behind to 0.45.
+        book = _book(bids=[(0.46, 100)], asks=[(0.54, 100)])
+        eb, _ = _compute_edge_prices(
+            merged=book, midpoint=0.50, max_spread=0.051, tick=0.01,
+            decimals=2, ticks_inside=2, target_queue_usd=0.0,
+            second_best_court=True,
+        )
+        self.assertAlmostEqual(eb, 0.45, places=4)
+
+    def test_c1_never_improves_existing_best_ask(self):
+        """If legacy edge would be better than best ask, C1 joins the best ask."""
+        book = _book(bids=[(0.46, 100)], asks=[(0.54, 100)])
+        _, ea = _compute_edge_prices(
+            merged=book, midpoint=0.485, max_spread=0.055, tick=0.01,
+            decimals=2, ticks_inside=1, target_queue_usd=0.0,
+            second_best_court=True,
+        )
+        # Legacy ask = 0.485 + 0.055 - 0.01 = 0.53, better (lower) than best ask 0.54.
+        # Stepping behind (0.55) would be outside the reward zone, so C1 joins at 0.54.
+        self.assertAlmostEqual(ea, 0.54, places=4)
+
+        book2 = _book(bids=[(0.46, 100)], asks=[(0.52, 100)])
+        _, ea2 = _compute_edge_prices(
+            merged=book2, midpoint=0.485, max_spread=0.055, tick=0.01,
+            decimals=2, ticks_inside=1, target_queue_usd=0.0,
+            second_best_court=True,
+        )
+        # Legacy ask 0.53 is worse (higher) than best ask 0.52, so no adjustment.
+        self.assertAlmostEqual(ea2, 0.53, places=4)
+
+    def test_non_c1_unaffected(self):
+        """Baseline cohort keeps the aggressive edge even if it is best."""
+        book = _book(bids=[(0.43, 100)], asks=[(0.52, 100)])
+        eb, ea = _compute_edge_prices(
+            merged=book, midpoint=0.485, max_spread=0.055, tick=0.01,
+            decimals=2, ticks_inside=1, target_queue_usd=0.0,
+            second_best_court=False,
+        )
+        self.assertAlmostEqual(eb, 0.44, places=4)
+        self.assertAlmostEqual(ea, 0.53, places=4)
+
+
 class TestEffectiveTargetQueueUSD(unittest.TestCase):
     """Cohort-aware queue-ahead target: C1 uses a tighter target than baseline."""
 

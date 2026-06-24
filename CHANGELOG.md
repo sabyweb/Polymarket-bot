@@ -16,7 +16,7 @@ For the **immutable contract**, see `ground_rules.md`.
 
 ## C1 trader-rule cohort (2026-06-24)
 
-- Added three C1-specific A/B treatments, all gated by
+- Added four C1-specific A/B treatments, all gated by
   `RF_AB_EXPERIMENT_ENABLED` and applied only to cohort-1 markets:
   - `RF_AB_C1_TARGET_QUEUE_AHEAD_USD = 400.0` — C1 uses a tighter queue-ahead
     target than the baseline `RF_TARGET_QUEUE_AHEAD_USD = 1000.0`, so C1 sits
@@ -26,6 +26,10 @@ For the **immutable contract**, see `ground_rules.md`.
     resolving within 4h are excluded.
   - `RF_AB_C1_MAX_VOLUME_24H = 250000.0` — C1 markets whose 24h CLOB volume
     exceeds $250k are excluded (high-volume / high-competition hypothesis).
+  - `RF_AB_C1_SECOND_BEST_COURT_ENABLED = True` — C1 orders are never placed
+    at a strictly better price than the current best quote; they join one tick
+    behind the best when there is room, or join the best price when the book is
+    already at the zone edge.
 - Wired cohort-aware queue target into `order_lifecycle.place_orders_for_market`
   via `_effective_target_queue_usd(cid)`.
 - Fetched 24h CLOB volume from Gamma `/markets/keyset` in
@@ -39,8 +43,9 @@ For the **immutable contract**, see `ground_rules.md`.
   eligible candidate when `RF_CANDIDATE_FEATURE_LOG_ENABLED=True`.
 - Telemetry: `[OVERCOMMIT_ALLOC]` now reports `volume_excluded=`.
 - New tests: C38–C41 in `tests/test_simple_allocator.py`,
-  `TestEffectiveTargetQueueUSD` in `tests/test_placement.py`, and
-  `test_log_module_new_columns` in `tests/test_candidate_features.py`.
+  `TestEffectiveTargetQueueUSD` and `TestSecondBestCourt` in
+  `tests/test_placement.py`, and `test_log_module_new_columns` in
+  `tests/test_candidate_features.py`.
 
 ---
 

@@ -479,6 +479,7 @@ RF_AB_TOTAL_CAPITAL_USD: float = 0.0          # 0 = no experiment budget cap; e.
 RF_AB_C1_TARGET_QUEUE_AHEAD_USD: float = 400.0   # C1 queue-depth target: sit closer to mid than the 1000 USD baseline
 RF_AB_C1_MIN_HOURS_TO_RESOLUTION: float = 4.0    # C1 resolution guard: exclude markets resolving within <4h (baseline = RF_ALLOC_MIN_HOURS_TO_RESOLUTION)
 RF_AB_C1_MAX_VOLUME_24H: float = 250000.0        # C1 volume cap: exclude markets whose 24h CLOB volume exceeds this USD (0 = disabled)
+RF_AB_C1_SECOND_BEST_COURT_ENABLED: bool = True  # C1 placement: never be the best quote; join one tick behind the current best
 
 RF_BOOK_CACHE_TTL: int = 180                 # Max age (seconds) for MarketState.cached_book used by Q-score sampling in record_cycle; 0 disables
 RF_ORDER_STALE_CHECK_SECS: int = 300         # Force-check orders still in open_ids after this many seconds

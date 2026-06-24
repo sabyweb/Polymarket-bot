@@ -64,12 +64,13 @@ bleed is the cost of having a control, and it is bounded by §5.
 its bucket, apply the trader-rule bundle: `RF_ALLOC_MAX_RECENT_VOLATILITY` 0.10 → **0.03** (only
 markets whose mid barely moved over the vol window), `RF_AB_C1_MIN_HOURS_TO_RESOLUTION` 4h (looser
 than the 48h baseline, so C1 can trade shorter-dated calm markets), `RF_AB_C1_MAX_VOLUME_24H`
-$250k (exclude the highest-volume / highest-competition markets), and
-`RF_AB_C1_TARGET_QUEUE_AHEAD_USD` $400 (sit closer to mid than the baseline $1000 queue shield).
-This is the "quiet, selective, closer-to-mid" cohort — the closest automatable version of the manual
-edge. *Allocator + placement side; small branch on `cohort(cid)`, no new runtime behavior when the A/B
-experiment is off.* (If very few markets qualify, that itself is a finding: calm + $10-reward markets
-are now scarce.)
+$250k (exclude the highest-volume / highest-competition markets),
+`RF_AB_C1_TARGET_QUEUE_AHEAD_USD` $400 (sit closer to mid than the baseline $1000 queue shield),
+and `RF_AB_C1_SECOND_BEST_COURT_ENABLED` (never post a strictly better quote than the current best;
+join behind or at the best level). This is the "quiet, selective, closer-to-mid, second-in-line"
+cohort — the closest automatable version of the manual edge. *Allocator + placement side; small branch
+on `cohort(cid)`, no new runtime behavior when the A/B experiment is off.* (If very few markets qualify,
+that itself is a finding: calm + $10-reward markets are now scarce.)
 
 **C2 — Real-time reaction** (tests Lesson 1: react to the move, since the move is observable even if
 not predictable). Baseline selection, but the **farmer pulls all quotes on a market when its mid is

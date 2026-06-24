@@ -20,6 +20,7 @@ def PLACEMENT_TICKS_INSIDE(): return cfg("RF_PLACEMENT_TICKS_INSIDE")
 def BATCH_SIZE(): return cfg("RF_BATCH_SIZE")
 def TARGET_QUEUE_AHEAD_USD(): return cfg("RF_TARGET_QUEUE_AHEAD_USD")
 def AB_C1_TARGET_QUEUE_AHEAD_USD(): return cfg("RF_AB_C1_TARGET_QUEUE_AHEAD_USD")
+def AB_C1_SECOND_BEST_COURT_ENABLED(): return cfg("RF_AB_C1_SECOND_BEST_COURT_ENABLED")
 def AB_COHORT_COUNT(): return cfg("RF_AB_COHORT_COUNT")
 def DUMP_DEPTH_SAFETY_FACTOR(): return cfg("RF_DUMP_DEPTH_SAFETY_FACTOR")
 
@@ -41,6 +42,65 @@ def _effective_target_queue_usd(cid: str) -> float:
         except Exception:
             pass
     return TARGET_QUEUE_AHEAD_USD()
+
+
+def _second_best_court_enabled(cid: str) -> bool:
+    """C1-specific rule: do not be the best quote; join behind the current best.
+
+    Enabled only when the A/B experiment is on, the C1 second-best flag is on,
+    and `cid` hashes to cohort 1. Fail-open: any config/cohort lookup error
+    returns False so non-C1 placement is unaffected.
+    """
+    if not cfg("RF_AB_EXPERIMENT_ENABLED"):
+        return False
+    try:
+        if AB_C1_SECOND_BEST_COURT_ENABLED() and ab_cohort(cid, AB_COHORT_COUNT()) == 1:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _second_best_adjust(
+    side: str,
+    edge: float,
+    book_levels,
+    midpoint: float,
+    max_spread: float,
+    tick: float,
+    decimals: int,
+) -> float | None:
+    """Move an aggressive C1 quote behind the current best level.
+
+    For bids: if `edge` is higher (better) than the best existing bid, move it
+    to `best_bid - tick`. For asks: if `edge` is lower (better) than the best
+    existing ask, move it to `best_ask + tick`.
+
+    If stepping one tick behind the best would push us outside the reward zone
+    (the best quote is already at the zone edge), we instead join the best
+    price rather than improve it. We never post a strictly better quote than
+    the current best.
+
+    Returns None when there is no existing level on that side (C1 refuses to be
+    the first quote — "happy being second best").
+    """
+    if not book_levels:
+        return None
+    try:
+        best_price = float(book_levels[0]["price"])
+    except (KeyError, ValueError, TypeError):
+        return None
+    if side == "bid":
+        if edge > best_price:
+            edge = round(best_price - tick, decimals)
+            if abs(edge - midpoint) >= max_spread:
+                edge = best_price
+    else:  # ask
+        if edge < best_price:
+            edge = round(best_price + tick, decimals)
+            if abs(edge - midpoint) >= max_spread:
+                edge = best_price
+    return edge
 
 # FX-054 constants
 #
@@ -175,6 +235,7 @@ def _compute_edge_prices(
     target_queue_usd: float,
     shares_per_side: int = 0,
     dump_depth_safety_factor: float = 0.0,
+    second_best_court: bool = False,
 ) -> tuple[float, float]:
     """Return ``(edge_bid, edge_ask)`` for placement.
 
@@ -195,6 +256,12 @@ def _compute_edge_prices(
     ``shares_per_side=0, dump_depth_safety_factor=0.0`` keep the helper
     backwards-compatible — callers that don't pass these args get
     pre-FX-041 behaviour.
+
+    C1 second-best-court rule: when `second_best_court=True`, a C1 order is
+    never placed at the best available level. If the queue-aware price would
+    improve on the current best, it is pushed one tick behind that best level;
+    if the book is empty on that side, C1 refuses to be the first quote and
+    that side falls back to the legacy edge.
 
     Falls back to the legacy zone-edge formula when either the queue-aware
     walk or the dump-depth check fails on a side (thin book, escape hatch,
@@ -229,6 +296,24 @@ def _compute_edge_prices(
 
     edge_bid = qa_bid if qa_bid is not None else legacy_bid
     edge_ask = qa_ask if qa_ask is not None else legacy_ask
+
+    # C1 second-best-court rule: never post a quote better than the current
+    # best. If the chosen edge would improve on the best level, push it one
+    # tick behind. If the book is empty on that side we keep the chosen edge
+    # (no one else is quoting, so "second best" is impossible).
+    if second_best_court:
+        adj_bid = _second_best_adjust(
+            "bid", edge_bid, merged.get("bids", []),
+            midpoint, max_spread, tick, decimals,
+        )
+        if adj_bid is not None:
+            edge_bid = adj_bid
+        adj_ask = _second_best_adjust(
+            "ask", edge_ask, merged.get("asks", []),
+            midpoint, max_spread, tick, decimals,
+        )
+        if adj_ask is not None:
+            edge_ask = adj_ask
 
     edge_bid = max(0.01, edge_bid)
     edge_ask = min(0.99, edge_ask)
@@ -1047,6 +1132,7 @@ class OrderLifecycle:
             target_queue_usd=_effective_target_queue_usd(ms.cid),
             shares_per_side=ms.agent_shares if ms.agent_shares > 0 else SHARES_PER_SIDE(),
             dump_depth_safety_factor=DUMP_DEPTH_SAFETY_FACTOR(),
+            second_best_court=_second_best_court_enabled(ms.cid),
         )
 
         # Reprice stale orders outside reward window
