@@ -139,7 +139,7 @@ USER_PCTS_PATH = "/rewards/user/percentages"
 USER_TOTAL_PATH = "/rewards/user/total"
 MARKETS_CURRENT_PATH = "/rewards/markets/current"
 MARKET_DETAIL_PATH = "/markets/"        # FX-090: per-market timing (game_start_time, end_date_iso)
-GAMMA_MARKETS_KEYSET_PATH = "/markets/keyset"  # Gamma volume + enrichment
+GAMMA_MARKETS_LIST_PATH = "/markets"  # Gamma volume + enrichment (offset pagination)
 
 
 @dataclass
@@ -668,36 +668,44 @@ class SimpleAllocator:
     def _fetch_gamma_volume_map(self) -> dict[str, float]:
         """Fetch active-market 24h CLOB volume from Gamma API.
 
-        Uses Gamma `/markets/keyset` cursor pagination. Returns
+        Uses Gamma `/markets` offset pagination. Returns
         {conditionId: volume_24h_usd}. Fail-open: any error returns an empty map
         so volume-dependent filters/log silently degrade to "unknown volume".
+
+        Note: Gamma's `/markets/keyset` cursor currently returns the same page
+        regardless of `next_cursor`, so we use the older offset param here.
         """
         out: dict[str, float] = {}
-        cursor = ""
-        url = f"{GAMMA_API}{GAMMA_MARKETS_KEYSET_PATH}"
+        url = f"{GAMMA_API}{GAMMA_MARKETS_LIST_PATH}"
         params_base = {
             "active": "true",
             "closed": "false",
             "archived": "false",
             "enableOrderBook": "true",
-            "limit": "100",
+            "limit": "500",
         }
-        for _ in range(100):  # bounded at 10k markets
+        offset = 0
+        for _ in range(40):  # bounded at 20k markets
             params = dict(params_base)
-            if cursor:
-                params["next_cursor"] = cursor
+            params["offset"] = str(offset)
             try:
-                r = self._http(url, params=params, timeout=20)
+                r = self._http(url, params=params, timeout=30)
                 if getattr(r, "status_code", 0) != 200:
-                    log.warning(f"Gamma keyset status={getattr(r, 'status_code', 0)}")
+                    log.warning(f"Gamma markets status={getattr(r, 'status_code', 0)}")
                     break
                 data = r.json()
             except Exception as e:
-                log.debug(f"Gamma keyset fetch error: {e}")
+                log.debug(f"Gamma markets fetch error: {e}")
                 break
-            if not isinstance(data, dict):
+            if isinstance(data, dict):
+                markets = data.get("markets") or []
+            elif isinstance(data, list):
+                markets = data
+            else:
                 break
-            for m in data.get("markets", []) or []:
+            if not markets:
+                break
+            for m in markets:
                 cid = m.get("conditionId") or m.get("condition_id")
                 if not cid:
                     continue
@@ -706,10 +714,9 @@ class SimpleAllocator:
                 except (TypeError, ValueError):
                     vol = 0.0
                 out[cid] = vol
-            nxt = data.get("next_cursor") or ""
-            if not nxt or nxt == cursor:
+            if len(markets) < int(params_base["limit"]):
                 break
-            cursor = nxt
+            offset += len(markets)
         return out
 
     def _recent_volatility(self, cid: str) -> Optional[float]:
