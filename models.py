@@ -45,6 +45,9 @@ class MarketState:
     kill_fill_times: list = field(default_factory=list)
     end_date_iso: str = ""
     book_failures: int = 0  # consecutive get_merged_book failures (404/timeout)
+    # FX-098: unix timestamp until which this market is fast-volatility timed out.
+    # Orders are cancelled and new placements blocked while time.time() < this.
+    fast_vol_timeout_until: float = 0.0
     # FX-072: ephemeral per-cycle dump-mask recovery state. In a fast
     # BUY->dump burst, a dump SELL can drain on-chain while check_dump_fills
     # defers/skips the unwind (its phantom check mis-fires when a concurrent

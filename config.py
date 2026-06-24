@@ -479,6 +479,22 @@ RF_AB_TOTAL_CAPITAL_USD: float = 0.0          # 0 = no experiment budget cap; e.
 RF_BOOK_CACHE_TTL: int = 180                 # Max age (seconds) for MarketState.cached_book used by Q-score sampling in record_cycle; 0 disables
 RF_ORDER_STALE_CHECK_SECS: int = 300         # Force-check orders still in open_ids after this many seconds
 
+# ── FX-098: Farmer-side fast-volatility timeout ─────────────────────────────
+# When a market's midpoint moves 4c in 30s or 6c in 60s, cancel resting BUY
+# orders and block new placements for RF_FAST_VOL_TIMEOUT_SECS. This closes
+# the resting-order liquidity-monitoring gap: previously a market with both
+# orders short-circuited book fetches for 300s, so queue-ahead/dump-depth
+# liquidity was not re-checked as the book moved. The book-cache TTL below is
+# lowered to 30s so the guard sees fresh data. Fail-open: sparse snapshots or
+# DB errors do NOT trigger a timeout. Gated to one A/B cohort when
+# RF_AB_EXPERIMENT_ENABLED is on (default C1), so the treatment effect can be
+# measured against a baseline cohort.
+RF_RESTING_BOOK_MAX_AGE_SECS: float = 30.0   # FX-098: max age of cached book before re-fetching (was hardcoded 300s)
+RF_FAST_VOL_30S_CENTS: float = 0.04          # FX-098: midpoint range over 30s that triggers timeout
+RF_FAST_VOL_60S_CENTS: float = 0.06          # FX-098: midpoint range over 60s that triggers timeout
+RF_FAST_VOL_TIMEOUT_SECS: float = 120.0      # FX-098: how long to block/cancel after trigger
+RF_FAST_VOL_COHORT_ONLY: int = 1             # FX-098: when A/B is enabled, only apply to this cohort (-1 = all)
+
 # ── Sports Keywords ──────────────────────────────────────────────────────────
 # Unified list used by agent (market_scorer), bot (order_lifecycle), and
 # pre-cycle sweep (reward_farmer). Define once, import everywhere.

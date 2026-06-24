@@ -7,6 +7,7 @@ import logging
 import time
 
 from config import cfg
+from fast_vol_guard import check_fast_vol_timeout
 from models import OrderSlot, MarketState
 from market_discovery import get_merged_book
 
@@ -796,8 +797,9 @@ class OrderLifecycle:
         ``orderID`` from ``client.create_and_post_order`` AND wrote a row
         to the ``orders_placed`` DB table contribute to this count. Early
         returns (no book, wide spread, resolution proximity, sports block,
-        has-both shortcut, unliquidatable-gate) and DRY-run-mode
-        placements return 0 — those do not write to ``orders_placed``.
+        has-both shortcut, unliquidatable-gate, fast-vol timeout) and
+        DRY-run-mode placements return 0 — those do not write to
+        ``orders_placed``.
 
         Drives FX-004 (telemetry / DB consistency): the caller accumulates
         this value into ``_cycle_orders_placed`` so ``[CYCLE_SUMMARY]
@@ -819,12 +821,27 @@ class OrderLifecycle:
         if self.db.is_unliquidatable(ms.cid):
             return placed_count
 
+        now = time.time()
+
+        # FX-098: enforce an active fast-volatility timeout immediately,
+        # before the has-both shortcut can skip the book fetch.
+        if ms.fast_vol_timeout_until > now:
+            for side in ("yes", "no"):
+                slot = ms.orders[side]
+                if slot.order_id:
+                    if self.cancel_order(slot.order_id, reason="fast_vol_timeout"):
+                        self.db.delete_active_order(slot.order_id)
+                        slot.order_id = None
+            self.db.write_placement_feedback(ms.cid, "yes", "skipped", "fast_vol_timeout")
+            self.db.write_placement_feedback(ms.cid, "no", "skipped", "fast_vol_timeout")
+            return placed_count
+
         # Skip book fetch if both sides already have orders — saves 2 API calls.
-        # Still fetch if a book refresh is due (every 5 min) so repricing and
-        # resolution-proximity guards stay active.
+        # Still fetch if a book refresh is due (every RF_RESTING_BOOK_MAX_AGE_SECS)
+        # so repricing, liquidity, and fast-vol guards stay active.
         has_both = ms.orders["yes"].order_id and ms.orders["no"].order_id
-        book_age = time.time() - ms.last_book_fetch
-        if has_both and book_age < 300:
+        book_age = now - ms.last_book_fetch
+        if has_both and book_age < cfg("RF_RESTING_BOOK_MAX_AGE_SECS"):
             return placed_count
 
         merged = get_merged_book(self.client, ms.yes_tid, ms.no_tid)
@@ -855,6 +872,28 @@ class OrderLifecycle:
             )
         except Exception:
             pass  # never break production
+
+        # FX-098: fast-volatility timeout guard. Check midpoint range over the
+        # last 30s/60s using the snapshots we just logged. If triggered, cancel
+        # resting orders and block placement for RF_FAST_VOL_TIMEOUT_SECS.
+        if check_fast_vol_timeout(ms, self.db, now=now):
+            log.info(
+                f"SKIP fast-vol timeout | until={ms.fast_vol_timeout_until:.0f} "
+                f"| {ms.question[:30]}"
+            )
+            self.db.write_placement_feedback(
+                ms.cid, "yes", "skipped", "fast_vol_timeout",
+            )
+            self.db.write_placement_feedback(
+                ms.cid, "no", "skipped", "fast_vol_timeout",
+            )
+            for side in ("yes", "no"):
+                slot = ms.orders[side]
+                if slot.order_id:
+                    if self.cancel_order(slot.order_id, reason="fast_vol_timeout"):
+                        self.db.delete_active_order(slot.order_id)
+                        slot.order_id = None
+            return placed_count
 
         # Phase 5b: farmer-side FX-093 volatility mirror (~30s cadence)
         vol_cap = cfg("RF_ALLOC_MAX_RECENT_VOLATILITY")

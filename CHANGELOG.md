@@ -14,6 +14,36 @@ For the **immutable contract**, see `ground_rules.md`.
 
 ---
 
+## FX-098 — Farmer-side fast-volatility timeout (2026-06-24)
+
+- Added `fast_vol_guard.py`: detects midpoint moves of 4c in 30s or 6c in 60s
+  from `book_snapshots` and sets a per-market 120s timeout during which resting
+  BUY orders are cancelled and new placements blocked.
+- Added `MarketState.fast_vol_timeout_until` to persist the timeout per market.
+- Added config knobs:
+  - `RF_RESTING_BOOK_MAX_AGE_SECS` (default 30s, was hardcoded 300s)
+  - `RF_FAST_VOL_30S_CENTS` (default 0.04)
+  - `RF_FAST_VOL_60S_CENTS` (default 0.06)
+  - `RF_FAST_VOL_TIMEOUT_SECS` (default 120s)
+  - `RF_FAST_VOL_COHORT_ONLY` (default 1, applies to C1 when A/B is on; -1 = all)
+- Wired guard into `order_lifecycle.place_orders_for_market`:
+  - Active timeout is enforced before the resting-book shortcut.
+  - After each fresh book fetch + snapshot log, the guard queries recent history
+    and cancels/blocks if triggered.
+- Cohort-gated: when `RF_AB_EXPERIMENT_ENABLED=True`, only the configured cohort
+  (default C1) receives the timeout; other cohorts continue as baseline. When A/B
+  is off or `RF_FAST_VOL_COHORT_ONLY=-1`, the guard applies to all markets.
+- Fail-open: DB errors or fewer than two snapshots in a window do NOT trigger
+  timeouts.
+- Lowered resting-book cache TTL closes the FX-098 liquidity-monitoring gap:
+  markets with both orders now re-fetch the book every 30s instead of 300s,
+  so queue-ahead and dump-depth guards stay current.
+- New tests: `tests/test_fast_vol_guard.py` (13 cases) and integration tests in
+  `tests/test_order_lifecycle.py`.
+- Audit gate: `python3 -m simulation.run_audit_v5 --seeds 1 42 1337` → PASS.
+
+---
+
 ## B-3 — Persistent kill switch (2026-06-23)
 
 - Added `RF_KILL_PERSISTENT_ENABLED` (default `False`). When enabled, the farmer's

@@ -280,6 +280,34 @@ class TestPlaceOrdersForMarketEarlyReturns(unittest.TestCase):
         mock_book.assert_not_called()  # noqa: F841 (mock used by decorator)
 
     @patch("order_lifecycle.get_merged_book")
+    def test_fetches_book_when_resting_cache_exceeds_30s_ttl(self, mock_book):
+        """FX-098: RF_RESTING_BOOK_MAX_AGE_SECS defaults to 30s, not 300s."""
+        ms = _make_ms()
+        ms.orders["yes"] = OrderSlot(order_id="existing_yes", price=0.48,
+                                     shares=50, placed_at=time.time())
+        ms.orders["no"] = OrderSlot(order_id="existing_no", price=0.52,
+                                    shares=50, placed_at=time.time())
+        ms.last_book_fetch = time.time() - 60.0  # older than 30s TTL
+        ol = _make_lifecycle(dry_run=False, ms=ms)
+        # book is irrelevant for the assertion; we only care that it was fetched.
+        mock_book.return_value = _healthy_book()
+        ol.place_orders_for_market(ms)
+        mock_book.assert_called_once()
+
+    @patch("order_lifecycle.get_merged_book")
+    def test_skips_fetch_when_resting_cache_within_30s_ttl(self, mock_book):
+        """FX-098: a 10s-old cache should still short-circuit."""
+        ms = _make_ms()
+        ms.orders["yes"] = OrderSlot(order_id="existing_yes", price=0.48,
+                                     shares=50, placed_at=time.time())
+        ms.orders["no"] = OrderSlot(order_id="existing_no", price=0.52,
+                                    shares=50, placed_at=time.time())
+        ms.last_book_fetch = time.time() - 10.0
+        ol = _make_lifecycle(dry_run=False, ms=ms)
+        self.assertEqual(0, ol.place_orders_for_market(ms))
+        mock_book.assert_not_called()
+
+    @patch("order_lifecycle.get_merged_book")
     def test_returns_0_when_market_in_resolution_proximity(self, mock_book):
         # Midpoint > 0.90 → resolution proximity → block.
         mock_book.return_value = {
@@ -303,6 +331,65 @@ class TestPlaceOrdersForMarketDryRunReturnsZero(unittest.TestCase):
         self.assertEqual(0, ol.place_orders_for_market(ms))
         # log_order_placed must NOT have been called.
         ol.db.log_order_placed.assert_not_called()
+
+
+# ── FX-098: fast-volatility timeout integration ──────────────────────────────
+
+
+class TestFastVolTimeoutIntegration(unittest.TestCase):
+    """FX-098: when fast-vol guard triggers, orders are cancelled and
+    placement is blocked; an active timeout is enforced before the book fetch.
+    """
+
+    @patch("order_lifecycle.get_merged_book")
+    def test_trigger_cancels_resting_orders_and_blocks_placement(self, mock_book):
+        mock_book.return_value = _healthy_book()
+        ms = _make_ms()
+        ms.orders["yes"] = OrderSlot(order_id="y_oid", price=0.48,
+                                     shares=50, placed_at=time.time())
+        ms.orders["no"] = OrderSlot(order_id="n_oid", price=0.52,
+                                    shares=50, placed_at=time.time())
+        ol = _make_lifecycle(dry_run=False, ms=ms)
+        ol.client.cancel_order.return_value = True
+
+        with patch("order_lifecycle.check_fast_vol_timeout") as mock_guard:
+            future = time.time() + 120.0
+            def _set_timeout(_ms, _db, now=None):
+                _ms.fast_vol_timeout_until = future
+                return True
+            mock_guard.side_effect = _set_timeout
+            self.assertEqual(0, ol.place_orders_for_market(ms))
+
+        # Both resting orders should have been cancelled.
+        self.assertIsNone(ms.orders["yes"].order_id)
+        self.assertIsNone(ms.orders["no"].order_id)
+        cancelled_ids = {
+            call.args[0].orderID for call in ol.client.cancel_order.call_args_list
+        }
+        self.assertIn("y_oid", cancelled_ids)
+        self.assertIn("n_oid", cancelled_ids)
+        # No new placements attempted.
+        ol.client.create_and_post_order.assert_not_called()
+        # Placement feedback logged for both sides.
+        calls = [call for call in ol.db.write_placement_feedback.call_args_list
+                 if call.args[3] == "fast_vol_timeout"]
+        self.assertEqual(2, len(calls))
+
+    @patch("order_lifecycle.get_merged_book")
+    def test_active_timeout_enforced_before_book_fetch(self, mock_book):
+        """An existing timeout cancels orders and returns 0 without fetching."""
+        ms = _make_ms()
+        ms.fast_vol_timeout_until = time.time() + 60.0
+        ms.orders["yes"] = OrderSlot(order_id="y_oid", price=0.48,
+                                     shares=50, placed_at=time.time())
+        ms.orders["no"] = OrderSlot(order_id="n_oid", price=0.52,
+                                    shares=50, placed_at=time.time())
+        ol = _make_lifecycle(dry_run=False, ms=ms)
+        ol.client.cancel_order.return_value = True
+        self.assertEqual(0, ol.place_orders_for_market(ms))
+        mock_book.assert_not_called()
+        self.assertIsNone(ms.orders["yes"].order_id)
+        self.assertIsNone(ms.orders["no"].order_id)
 
 
 # ── FX-004: gated wrapper accumulates correctly ──────────────────────────────
