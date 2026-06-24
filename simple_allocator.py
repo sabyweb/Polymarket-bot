@@ -682,16 +682,20 @@ class SimpleAllocator:
             "closed": "false",
             "archived": "false",
             "enableOrderBook": "true",
-            "limit": "500",
+            "limit": "100",  # Gamma caps this at 100 regardless of higher values
         }
         offset = 0
-        for _ in range(40):  # bounded at 20k markets
+        for _ in range(100):  # bounded at 10k markets
             params = dict(params_base)
             params["offset"] = str(offset)
             try:
                 r = self._http(url, params=params, timeout=30)
-                if getattr(r, "status_code", 0) != 200:
-                    log.warning(f"Gamma markets status={getattr(r, 'status_code', 0)}")
+                sc = getattr(r, "status_code", 0)
+                if sc == 422:
+                    # Gamma rejects very large offsets; treat as end of available data.
+                    break
+                if sc != 200:
+                    log.warning(f"Gamma markets status={sc}")
                     break
                 data = r.json()
             except Exception as e:
