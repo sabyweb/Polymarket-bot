@@ -162,6 +162,19 @@ Old entry points & stack: `bot.py`, `main.py`, `oversight_agent.py` (see 4c cave
   oversight-silence farmer backstop (FX-082), **kill→Discord page (FX-092)**, heartbeat→Discord stall alert
   (FX-083), wallet-desync paging (FX-049/055/074).
 
+### Dashboard v2
+
+A React + FastAPI dashboard now runs on the box (localhost-only, same SSH-tunnel security model as the
+old Streamlit dashboard):
+
+- **Service:** `polymarket-dashboard-v2.service`
+- **Local port:** `8502`
+- **Tunnel:** `ssh -i ~/.ssh/polymarket_bot_ed25519 -L 8502:127.0.0.1:8502 -N polymarket@46.62.209.203`
+- **Open:** http://localhost:8502
+- **Pages:** Command Center, A/B Experiment Lab, P&L, Positions, Markets, Health, Config.
+- **Source:** `api/` (FastAPI) and `frontend/` (React). Build output is served from `frontend/dist/`.
+- **Actions:** read-only by default; safe operator actions are behind confirmation modals (not yet wired in Phase 1).
+
 ## 6. What shipped recently (this session, the path to here)
 
 - **FX-090** (`b8a0a95`): allocator **adverse-selection / time-to-event filter** — excludes markets within
