@@ -32,3 +32,9 @@ SAFETY_ALERT.txt
 # Ad-hoc diagnostic scripts
 analyze_distributions.py
 diagnose_*.py
+
+# Dashboard frontend build artifacts
+frontend/node_modules/
+frontend/dist/
+.venv-test/
+api.egg-info/

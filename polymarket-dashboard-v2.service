@@ -1,0 +1,30 @@
+# Systemd unit for the React + FastAPI dashboard.
+# Serves on localhost only; access via SSH tunnel:
+#   ssh -L 8502:127.0.0.1:8502 -N polymarket@<host>
+# Then open http://localhost:8502
+
+[Unit]
+Description=Polymarket reward farmer dashboard v2 (React + FastAPI)
+Documentation=https://github.com/sabyweb/Polymarket-bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=polymarket
+Group=polymarket
+WorkingDirectory=/home/polymarket/Polymarket-bot
+
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/polymarket/Polymarket-bot/venv/bin/uvicorn api.main:app \
+  --host 127.0.0.1 \
+  --port 8502 \
+  --workers 1
+
+Restart=on-failure
+RestartSec=15s
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target
