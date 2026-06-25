@@ -124,6 +124,30 @@ CREATE TABLE IF NOT EXISTS daily_pnl (
     num_stop_losses     INTEGER DEFAULT 0
 );
 
+-- A/B cohort P&L snapshots. Produced by ab_cohort_pnl.py each oversight cycle.
+-- One row per cohort per (window_end_ts). Cohorts are defined by the
+-- candidate_features table: condition_ids that were deployed while the A/B
+-- experiment was active.
+CREATE TABLE IF NOT EXISTS cohort_pnl (
+    ts                REAL NOT NULL,          -- when this row was computed
+    window_start_ts   REAL NOT NULL,          -- start of the rolling window
+    window_end_ts     REAL NOT NULL,          -- end of the rolling window
+    cohort            INTEGER NOT NULL,       -- 0 or 1
+    reward_earned     REAL NOT NULL DEFAULT 0,
+    unwind_pnl        REAL NOT NULL DEFAULT 0,
+    net_pnl           REAL NOT NULL DEFAULT 0,  -- reward_earned + unwind_pnl
+    fill_count        INTEGER NOT NULL DEFAULT 0,
+    filled_markets    INTEGER NOT NULL DEFAULT 0,
+    shares_filled     REAL NOT NULL DEFAULT 0,
+    gross_fill_cost   REAL NOT NULL DEFAULT 0,
+    total_slippage    REAL NOT NULL DEFAULT 0,
+    avg_fill_age_secs REAL NOT NULL DEFAULT 0,
+    avg_slippage      REAL NOT NULL DEFAULT 0,
+    deployed_markets  INTEGER NOT NULL DEFAULT 0,
+    target_capital    REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (window_end_ts, cohort)
+);
+
 -- Reward estimate vs. actual comparison (hourly snapshots)
 CREATE TABLE IF NOT EXISTS reward_comparisons (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -478,6 +502,17 @@ CREATE TABLE IF NOT EXISTS daily_reward_cache (
     PRIMARY KEY (date, condition_id)
 );
 CREATE INDEX IF NOT EXISTS idx_drc_date ON daily_reward_cache(date);
+
+-- 24h CLOB volume cache. Populated by volume_cache.py from Gamma via CLOB slug.
+-- Used by SimpleAllocator for the C1 volume cap and candidate feature logging.
+CREATE TABLE IF NOT EXISTS volume_24h_cache (
+    condition_id   TEXT PRIMARY KEY,
+    slug           TEXT,
+    volume_24h     REAL NOT NULL DEFAULT 0,
+    fetched_at     REAL NOT NULL,
+    source         TEXT NOT NULL DEFAULT 'gamma'
+);
+CREATE INDEX IF NOT EXISTS idx_v24_fetched_at ON volume_24h_cache(fetched_at);
 
 -- FX-061 (P11 of 9/10 plan): q_share recalibration events. When the API
 -- q_share for a held market diverges from the cumulative DB ratio by
@@ -1081,6 +1116,50 @@ class BotDatabase:
         except Exception as e:
             log.debug(f"DB get_reward_accuracy_history error: {e}")
             return []
+
+    def log_cohort_pnl(self, rows: list[dict]) -> None:
+        """Upsert A/B cohort P&L snapshots produced by ab_cohort_pnl.py."""
+        if not rows:
+            return
+        try:
+            conn = self._get_conn()
+            conn.executemany(
+                """INSERT INTO cohort_pnl (
+                    ts, window_start_ts, window_end_ts, cohort, reward_earned,
+                    unwind_pnl, net_pnl, fill_count, filled_markets, shares_filled,
+                    gross_fill_cost, total_slippage, avg_fill_age_secs, avg_slippage,
+                    deployed_markets, target_capital
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(window_end_ts, cohort) DO UPDATE SET
+                    ts=excluded.ts,
+                    window_start_ts=excluded.window_start_ts,
+                    reward_earned=excluded.reward_earned,
+                    unwind_pnl=excluded.unwind_pnl,
+                    net_pnl=excluded.net_pnl,
+                    fill_count=excluded.fill_count,
+                    filled_markets=excluded.filled_markets,
+                    shares_filled=excluded.shares_filled,
+                    gross_fill_cost=excluded.gross_fill_cost,
+                    total_slippage=excluded.total_slippage,
+                    avg_fill_age_secs=excluded.avg_fill_age_secs,
+                    avg_slippage=excluded.avg_slippage,
+                    deployed_markets=excluded.deployed_markets,
+                    target_capital=excluded.target_capital""",
+                [
+                    (
+                        r["ts"], r["window_start_ts"], r["window_end_ts"], r["cohort"],
+                        r["reward_earned"], r["unwind_pnl"], r["net_pnl"],
+                        r["fill_count"], r["filled_markets"], r["shares_filled"],
+                        r["gross_fill_cost"], r["total_slippage"], r["avg_fill_age_secs"],
+                        r["avg_slippage"], r["deployed_markets"], r["target_capital"],
+                    )
+                    for r in rows
+                ],
+            )
+            conn.commit()
+        except Exception as e:
+            self._rollback_quiet()
+            log.warning(f"DB log_cohort_pnl error: {e}")
 
     # ── Query Methods ─────────────────────────────────────────────────────────
 

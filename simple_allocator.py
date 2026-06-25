@@ -38,7 +38,8 @@ from typing import Optional
 
 import requests
 
-from config import cfg, GAMMA_API
+from config import cfg
+from volume_cache import lookup as volume_cache_lookup
 
 log = logging.getLogger("simple_allocator")
 
@@ -139,7 +140,6 @@ USER_PCTS_PATH = "/rewards/user/percentages"
 USER_TOTAL_PATH = "/rewards/user/total"
 MARKETS_CURRENT_PATH = "/rewards/markets/current"
 MARKET_DETAIL_PATH = "/markets/"        # FX-090: per-market timing (game_start_time, end_date_iso)
-GAMMA_MARKETS_LIST_PATH = "/markets"  # Gamma volume + enrichment (offset pagination)
 
 
 @dataclass
@@ -332,15 +332,21 @@ class SimpleAllocator:
             if not cursor or cursor == "LTE=":
                 break
 
-        # A/B C1 volume filter + feature log need 24h CLOB volume. Fetch once
-        # from Gamma and attach fail-open (missing volume -> 0, filter disabled
-        # by default so unknown volume never excludes). Skip the extra Gamma
-        # call when neither feature is enabled.
+        # A/B C1 volume filter + feature log need 24h CLOB volume. Use the
+        # slug-based cache; on a warm cache this is a local SQLite lookup.
+        # Fail-open: any error leaves volume_24h at 0.0.
         if markets and (cfg("RF_AB_EXPERIMENT_ENABLED") or cfg("RF_CANDIDATE_FEATURE_LOG_ENABLED")):
-            gamma_volumes = self._fetch_gamma_volume_map()
-            if gamma_volumes:
+            try:
+                vol_map = volume_cache_lookup(
+                    [m.condition_id for m in markets],
+                    db_path=self.db_path,
+                    ttl=cfg("RF_VOLUME_CACHE_TTL_SEC"),
+                    max_workers=cfg("RF_VOLUME_CACHE_MAX_WORKERS"),
+                )
                 for m in markets:
-                    m.volume_24h = gamma_volumes.get(m.condition_id, 0.0)
+                    m.volume_24h = vol_map.get(m.condition_id, 0.0)
+            except Exception as e:
+                log.warning(f"volume_cache lookup failed: {e}")
 
         return markets
 
@@ -664,64 +670,6 @@ class SimpleAllocator:
             if pat in q:
                 return True, f"no_gamestart_event[{pat}]"
         return False, ""
-
-    def _fetch_gamma_volume_map(self) -> dict[str, float]:
-        """Fetch active-market 24h CLOB volume from Gamma API.
-
-        Uses Gamma `/markets` offset pagination. Returns
-        {conditionId: volume_24h_usd}. Fail-open: any error returns an empty map
-        so volume-dependent filters/log silently degrade to "unknown volume".
-
-        Note: Gamma's `/markets/keyset` cursor currently returns the same page
-        regardless of `next_cursor`, so we use the older offset param here.
-        """
-        out: dict[str, float] = {}
-        url = f"{GAMMA_API}{GAMMA_MARKETS_LIST_PATH}"
-        params_base = {
-            "active": "true",
-            "closed": "false",
-            "archived": "false",
-            "enableOrderBook": "true",
-            "limit": "100",  # Gamma caps this at 100 regardless of higher values
-        }
-        offset = 0
-        for _ in range(100):  # bounded at 10k markets
-            params = dict(params_base)
-            params["offset"] = str(offset)
-            try:
-                r = self._http(url, params=params, timeout=30)
-                sc = getattr(r, "status_code", 0)
-                if sc == 422:
-                    # Gamma rejects very large offsets; treat as end of available data.
-                    break
-                if sc != 200:
-                    log.warning(f"Gamma markets status={sc}")
-                    break
-                data = r.json()
-            except Exception as e:
-                log.debug(f"Gamma markets fetch error: {e}")
-                break
-            if isinstance(data, dict):
-                markets = data.get("markets") or []
-            elif isinstance(data, list):
-                markets = data
-            else:
-                break
-            if not markets:
-                break
-            for m in markets:
-                cid = m.get("conditionId") or m.get("condition_id")
-                if not cid:
-                    continue
-                try:
-                    vol = float(m.get("volume24hrClob") or 0.0)
-                except (TypeError, ValueError):
-                    vol = 0.0
-                out[cid] = vol
-            if len(markets) < int(params_base["limit"]):
-                break
-            offset += len(markets)
-        return out
 
     def _recent_volatility(self, cid: str) -> Optional[float]:
         """FX-093: recent midpoint RANGE (max-min) for `cid` from book_snapshots

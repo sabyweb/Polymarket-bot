@@ -576,6 +576,14 @@ def run_once(
         except Exception as e:
             log.debug(f"[LEARN_CAPEFF] skipped (fail-quiet): {e}")
 
+    # 5c. A/B cohort P&L snapshot. Read-only aggregation from
+    # reward_snapshots.db + fills/unwinds + candidate_features.db; fail-quiet.
+    try:
+        from ab_cohort_pnl import compute as compute_cohort_pnl
+        compute_cohort_pnl(window_hours=24, db_path=db_path)
+    except Exception as e:
+        log.debug(f"[AB_COHORT_PNL] snapshot skipped (fail-quiet): {e}")
+
     # 6. Telemetry
     summary = {
         "wallet": round(wallet, 2),

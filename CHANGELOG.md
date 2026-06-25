@@ -14,6 +14,30 @@ For the **immutable contract**, see `ground_rules.md`.
 
 ---
 
+## A/B measurement foundation + reliable 24h volume (2026-06-25)
+
+- Fixed the two blockers that made the C1 A/B test unmeasurable:
+  1. **Cohort P&L**: added `ab_cohort_pnl.py` and a new `cohort_pnl` table in
+     `bot_history.db`. It joins `candidate_features.db` (cohort assignment),
+     `reward_snapshots.db` (actual per-market earnings), and `fills`/`unwinds`
+     to produce continuously-updated C0 vs C1 net P&L. Wired into
+     `simple_oversight.py` so every allocation cycle writes a fresh 24h cohort
+     snapshot.
+  2. **24h volume feed**: replaced the broken Gamma top-list fetch with
+     `volume_cache.py`, a slug-based cache that maps
+     `condition_id -> market_slug (CLOB) -> volume24hrClob (Gamma)`. Cache TTL
+     (`RF_VOLUME_CACHE_TTL_SEC`) and concurrency (`RF_VOLUME_CACHE_MAX_WORKERS`)
+     are configurable. This makes the C1 `$250k` volume cap and the
+     `candidate_features` log volume column actually useful.
+- Added `volume_24h_cache` and `cohort_pnl` schemas to `database.py`.
+- Added `BotDatabase.log_cohort_pnl()` helper.
+- New tests: `tests/test_volume_cache.py`, `tests/test_ab_cohort_pnl.py`.
+- Documented that live cohort P&L comes from `cohort_pnl` / `reward_snapshots.db`;
+  the older `reward_attribution` table is the offline calibration path and the
+  `daily_pnl` table is populated from cohort totals where needed.
+
+---
+
 ## C1 trader-rule cohort (2026-06-24)
 
 - Added four C1-specific A/B treatments, all gated by

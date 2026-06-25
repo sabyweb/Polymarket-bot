@@ -45,10 +45,12 @@ deterministically and pseudo-randomly assigned to one cohort and stays there. Ra
 each cohort sees a *representative* market mix, so differences in net are attributable to the **rule**,
 not to which markets happened to land where.
 
-**Measurement needs no schema change.** Because cohort is a pure function of `condition_id`, the
-offline analyzer recomputes it from the existing `fills`/`unwinds`/reward tables — no new column, no
-migration. The only code that must be cohort-aware is the *treatment* (the allocator's selection rule
-and the farmer's reaction reflex), which branch on `cohort(cid)`.
+**Measurement is now explicit, not offline-only.** A dedicated `ab_cohort_pnl.py` module joins
+`candidate_features.db` (which records the cohort a market was deployed under), `reward_snapshots.db`
+(per-market actual earnings), and `bot_history.db` `fills`/`unwinds` to produce a continuously-updated
+`cohort_pnl` table. Because cohort assignment is a stable function of `condition_id`, the treatment
+branches on `cohort(cid)` and the analyzer verifies the recorded cohort matches the deterministic
+assignment. A separate `volume_24h_cache` table feeds the C1 volume cap with real per-cid volume.
 
 ---
 
