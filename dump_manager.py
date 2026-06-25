@@ -571,12 +571,18 @@ class DumpManager:
             orderbook_dead = (
                 "orderbook" in err_str and "does not exist" in err_str
             )
-            if orderbook_dead:
+            # Closed/resolved markets often return a 400 with "invalid token id"
+            # instead of "orderbook does not exist". Treat this as the same
+            # definitive dead-orderbook signal so we stop retrying.
+            invalid_token = "invalid token id" in err_str
+            if orderbook_dead or invalid_token:
+                reason = f"dump_{side}_invalid_token" if invalid_token else f"dump_{side}_orderbook_gone"
                 log.warning(
-                    f"Marking {ms.cid[:16]} unliquidatable: orderbook gone "
+                    f"Marking {ms.cid[:16]} unliquidatable: "
+                    f"{'invalid token' if invalid_token else 'orderbook gone'} "
                     f"({side.upper()} dump) | {ms.question[:30]}"
                 )
-                self.db.mark_unliquidatable(ms.cid, reason=f"dump_{side}_orderbook_gone")
+                self.db.mark_unliquidatable(ms.cid, reason=reason)
                 if ms.dump_state[side]:
                     ms.dump_state[side] = None
                 self.db.delete_dump_state(ms.cid, side)

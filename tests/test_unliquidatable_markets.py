@@ -700,3 +700,84 @@ class TestDeadMarketCleanupCascade(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDumpManagerInvalidToken(unittest.TestCase):
+    """Closed/resolved markets can return 400 {"error":"invalid token id"}.
+    DumpManager must treat this as a definitive dead-orderbook signal."""
+
+    def _make_dm(self, db, client):
+        positions = MagicMock()
+        positions.get_shares.return_value = 0
+        positions.get_avg_price.return_value = 0.5
+        return DumpManager(
+            client=client, db=db, positions=positions,
+            cancel_fn=MagicMock(return_value=True), dry_run=False,
+        )
+
+    def test_marks_unliquidatable_on_invalid_token_id(self):
+        db = MagicMock()
+        db.is_unliquidatable.return_value = False
+        client = MagicMock()
+        client.get_balance_allowance.return_value = {"balance": "1000000000"}
+        client.create_and_post_order.side_effect = RuntimeError(
+            "PolyApiException[status_code=400, error_message={error: invalid token id}]"
+        )
+        dm = self._make_dm(db, client)
+        ms = _make_ms()
+        ms.last_fill_price["yes"] = 0.5
+        dm.dump_position(ms, "yes", 100)
+        db.mark_unliquidatable.assert_called_once()
+        self.assertIn("invalid_token", db.mark_unliquidatable.call_args[1]["reason"])
+        db.delete_dump_state.assert_called_with(ms.cid, "yes")
+        self.assertIsNone(ms.dump_state["yes"])
+
+
+class TestOrderLifecycleInvalidToken(unittest.TestCase):
+    """BUY paths must also retire a cid when the orderbook rejects the token."""
+
+    def _make_ol(self, db, ms):
+        positions = MagicMock()
+        positions.get_shares.return_value = 0
+        positions.can_quote.return_value = True
+        ol = OrderLifecycle(
+            client=MagicMock(), db=db, positions=positions,
+            rewards=MagicMock(), markets={ms.cid: ms}, dry_run=False,
+        )
+        ol.capital_ceiling = None
+        return ol
+
+    @patch("order_lifecycle.get_merged_book")
+    def test_marks_on_yes_buy_invalid_token_id(self, mock_book):
+        mock_book.return_value = _healthy_book()
+        db = MagicMock()
+        db.is_unliquidatable.return_value = False
+        ms = _make_ms()
+        ol = self._make_ol(db, ms)
+        ol.client.create_and_post_order.side_effect = RuntimeError(
+            "PolyApiException[status_code=400, error_message={error: invalid token id}]"
+        )
+        n_placed = ol.place_orders_for_market(ms)
+        self.assertEqual(0, n_placed)
+        db.mark_unliquidatable.assert_called_once()
+        self.assertIn("buy_yes_invalid_token",
+                      db.mark_unliquidatable.call_args[1]["reason"])
+
+    @patch("order_lifecycle.get_merged_book")
+    def test_marks_on_no_buy_invalid_token_id(self, mock_book):
+        mock_book.return_value = _healthy_book()
+        db = MagicMock()
+        db.is_unliquidatable.return_value = False
+        ms = _make_ms()
+        ol = self._make_ol(db, ms)
+        ol.client.create_and_post_order.side_effect = [
+            {"orderID": "OID_YES"},
+            RuntimeError(
+                "PolyApiException[status_code=400, error_message={error: invalid token id}]"
+            ),
+        ]
+        n_placed = ol.place_orders_for_market(ms)
+        self.assertEqual(1, n_placed)
+        db.mark_unliquidatable.assert_called_once()
+        self.assertIn("buy_no_invalid_token",
+                      db.mark_unliquidatable.call_args[1]["reason"])

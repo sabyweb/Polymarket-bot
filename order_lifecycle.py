@@ -1209,13 +1209,17 @@ class OrderLifecycle:
                         orderbook_dead = (
                             "orderbook" in err_str and "does not exist" in err_str
                         )
-                        if orderbook_dead:
+                        # Closed/resolved markets may return "invalid token id".
+                        invalid_token = "invalid token id" in err_str
+                        if orderbook_dead or invalid_token:
+                            reason = "buy_yes_invalid_token" if invalid_token else "buy_yes_orderbook_gone"
                             log.warning(
-                                f"Marking {ms.cid[:16]} unliquidatable: orderbook gone "
+                                f"Marking {ms.cid[:16]} unliquidatable: "
+                                f"{'invalid token' if invalid_token else 'orderbook gone'} "
                                 f"(YES BUY) | {ms.question[:30]}"
                             )
-                            self.db.mark_unliquidatable(ms.cid, reason="buy_yes_orderbook_gone")
-                            self.db.write_placement_feedback(ms.cid, "yes", "failed", "orderbook_gone")
+                            self.db.mark_unliquidatable(ms.cid, reason=reason)
+                            self.db.write_placement_feedback(ms.cid, "yes", "failed", "invalid_token" if invalid_token else "orderbook_gone")
                             # Don't try NO either — same orderbook is dead.
                             return placed_count
                         if "insufficient" in err_str or "balance" in err_str or "not enough" in err_str:
@@ -1270,13 +1274,17 @@ class OrderLifecycle:
                         orderbook_dead = (
                             "orderbook" in err_str and "does not exist" in err_str
                         )
-                        if orderbook_dead:
+                        # Closed/resolved markets may return "invalid token id".
+                        invalid_token = "invalid token id" in err_str
+                        if orderbook_dead or invalid_token:
+                            reason = "buy_no_invalid_token" if invalid_token else "buy_no_orderbook_gone"
                             log.warning(
-                                f"Marking {ms.cid[:16]} unliquidatable: orderbook gone "
+                                f"Marking {ms.cid[:16]} unliquidatable: "
+                                f"{'invalid token' if invalid_token else 'orderbook gone'} "
                                 f"(NO BUY) | {ms.question[:30]}"
                             )
-                            self.db.mark_unliquidatable(ms.cid, reason="buy_no_orderbook_gone")
-                            self.db.write_placement_feedback(ms.cid, "no", "failed", "orderbook_gone")
+                            self.db.mark_unliquidatable(ms.cid, reason=reason)
+                            self.db.write_placement_feedback(ms.cid, "no", "failed", "invalid_token" if invalid_token else "orderbook_gone")
                             return placed_count
                         if "insufficient" in err_str or "balance" in err_str or "not enough" in err_str:
                             failed_cost = no_shares * no_clob
