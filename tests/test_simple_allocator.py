@@ -1037,27 +1037,48 @@ def test_C39_c1_resolution_guard_still_excludes_very_near_resolution(monkeypatch
     assert "0xNEAR" in {m.condition_id for m in result.avoids}
 
 
-def test_C40_c1_volume_cap_excludes_high_volume_c1_markets(monkeypatch):
-    """C40: C1 markets with 24h volume above RF_AB_C1_MAX_VOLUME_24H are
-    excluded; non-C1 markets with the same volume are not affected."""
-    _c1_cfg(monkeypatch)
-    a = _alloc_with_q({"0xVOL1": 0.05, "0xVOL0": 0.05})
-    a._ab_cohort = lambda cid: 1 if cid == "0xVOL1" else 0
+def test_C40_c2_volume_filter_excludes_high_volume_c2_markets(monkeypatch):
+    """C40: C2 markets with 24h volume >= RF_AB_C2_MAX_VOLUME_24H are excluded;
+    C0/C1 markets with the same volume are not affected."""
+    _c1_cfg(monkeypatch, RF_AB_COHORT_COUNT=3)
+    a = _alloc_with_q({"0xVOL2": 0.05, "0xVOL1": 0.05, "0xVOL0": 0.05})
+    def cohort(cid):
+        if cid == "0xVOL2":
+            return 2
+        if cid == "0xVOL1":
+            return 1
+        return 0
+    a._ab_cohort = cohort
+    c2 = _make_candidate("0xVOL2", daily_rate=500)
+    c2.volume_24h = 300000.0  # above 250k cap
     c1 = _make_candidate("0xVOL1", daily_rate=500)
-    c1.volume_24h = 300000.0  # above 250k cap
+    c1.volume_24h = 300000.0
     c0 = _make_candidate("0xVOL0", daily_rate=500)
     c0.volume_24h = 300000.0
-    result = _compute_one(a, [c1, c0])
+    result = _compute_one(a, [c2, c1, c0])
     deploys = {m.condition_id for m in result.deploys}
-    assert "0xVOL1" not in deploys
+    assert "0xVOL2" not in deploys
+    assert "0xVOL1" in deploys
     assert "0xVOL0" in deploys
 
 
-def test_C41_c1_volume_cap_disabled_when_cap_zero(monkeypatch):
-    """C41: setting RF_AB_C1_MAX_VOLUME_24H=0 disables the C1 volume filter."""
-    _c1_cfg(monkeypatch, RF_AB_C1_MAX_VOLUME_24H=0.0)
+def test_C41_c2_volume_filter_excludes_missing_volume(monkeypatch):
+    """C41: C2 markets with unknown/missing volume_24h are excluded."""
+    _c1_cfg(monkeypatch, RF_AB_COHORT_COUNT=3)
+    a = _alloc_with_q({"0xMISS": 0.05})
+    a._ab_cohort = lambda cid: 2
+    cand = _make_candidate("0xMISS", daily_rate=500)
+    cand.volume_24h = 0.0  # unknown / not cached
+    result = _compute_one(a, [cand])
+    assert "0xMISS" not in {m.condition_id for m in result.deploys}
+    assert "0xMISS" in {m.condition_id for m in result.avoids}
+
+
+def test_C41b_c2_volume_filter_disabled_when_cap_zero(monkeypatch):
+    """C41b: setting RF_AB_C2_MAX_VOLUME_24H=0 disables the C2 volume filter."""
+    _c1_cfg(monkeypatch, RF_AB_COHORT_COUNT=3, RF_AB_C2_MAX_VOLUME_24H=0.0)
     a = _alloc_with_q({"0xBIG": 0.05})
-    a._ab_cohort = lambda cid: 1
+    a._ab_cohort = lambda cid: 2
     cand = _make_candidate("0xBIG", daily_rate=500)
     cand.volume_24h = 9999999.0
     result = _compute_one(a, [cand])
@@ -1090,3 +1111,49 @@ def test_C42_ab_equal_per_cohort_budget(monkeypatch):
     assert c0_cap > 0
     assert c1_cap > 0
     assert abs(c0_cap - c1_cap) < 1.0
+
+
+def test_C43_trader_cohorts_use_1000_queue_target(monkeypatch):
+    """C43: C1 and C2 use RF_AB_C1_TARGET_QUEUE_AHEAD_USD (now $1000)."""
+    _c1_cfg(monkeypatch, RF_AB_COHORT_COUNT=3, RF_AB_C1_TARGET_QUEUE_AHEAD_USD=1000.0)
+    a = _make_allocator()
+    assert a._effective_target_queue_usd("0xC1") == 1000.0
+    assert a._effective_target_queue_usd("0xC2") == 1000.0
+    assert a._effective_target_queue_usd("0xC0") == sa.cfg("RF_TARGET_QUEUE_AHEAD_USD")
+
+
+def test_C46_three_cohort_equal_budget(monkeypatch):
+    """C46: with 3 cohorts and a small per-cohort budget, each cohort deploys
+    the same target capital and C2's volume filter does not block low-volume C2 markets."""
+    _c1_cfg(monkeypatch, RF_AB_COHORT_COUNT=3, RF_AB_TOTAL_CAPITAL_USD=90.0)
+    a = _alloc_with_q({
+        "0xC0A": 0.05, "0xC0B": 0.05,
+        "0xC1A": 0.05, "0xC1B": 0.05,
+        "0xC2A": 0.05, "0xC2B": 0.05,
+    })
+
+    def cohort(cid):
+        if cid.startswith("0xC1"):
+            return 1
+        if cid.startswith("0xC2"):
+            return 2
+        return 0
+
+    a._ab_cohort = cohort
+    cands = []
+    for cid in ["0xC0A", "0xC0B", "0xC1A", "0xC1B", "0xC2A", "0xC2B"]:
+        cand = _make_candidate(cid, daily_rate=500)
+        if cohort(cid) == 2:
+            cand.volume_24h = 100000.0  # below $250k C2 cap
+        cands.append(cand)
+
+    result = _compute_one(a, cands)
+
+    caps = {c: 0.0 for c in [0, 1, 2]}
+    for m in result.deploys:
+        caps[cohort(m.condition_id)] += m.target_capital
+
+    assert len(result.deploys) == 3
+    for c in [0, 1, 2]:
+        assert caps[c] > 0
+        assert abs(caps[c] - caps[(c + 1) % 3]) < 1.0

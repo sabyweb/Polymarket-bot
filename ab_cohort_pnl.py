@@ -19,6 +19,8 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Callable
 
+from config import cfg
+
 log = logging.getLogger("ab_cohort_pnl")
 
 
@@ -36,6 +38,7 @@ def compute(
     reward_db_path: str | None = None,
     candidate_db_path: str | None = None,
     _now: Callable[[], float] = time.time,
+    _cohort_count: int | None = None,
 ) -> list[dict]:
     """Compute cohort P&L for the trailing `window_hours` and return row dicts.
 
@@ -46,10 +49,15 @@ def compute(
         reward_db_path = _default_reward_db(db_path)
     if candidate_db_path is None:
         candidate_db_path = _default_candidate_db(db_path)
+    if _cohort_count is None:
+        try:
+            _cohort_count = max(1, int(cfg("RF_AB_COHORT_COUNT") or 2))
+        except Exception:
+            _cohort_count = 2
 
     try:
         return _compute_unsafe(
-            window_hours, db_path, reward_db_path, candidate_db_path, _now
+            window_hours, db_path, reward_db_path, candidate_db_path, _now, _cohort_count
         )
     except Exception as e:
         log.warning(f"[AB_COHORT_PNL] compute failed: {e}")
@@ -62,6 +70,7 @@ def _compute_unsafe(
     reward_db_path: str,
     candidate_db_path: str,
     _now: Callable[[], float],
+    cohort_count: int,
 ) -> list[dict]:
     now = _now()
     window_start = now - window_hours * 3600.0
@@ -192,8 +201,9 @@ def _compute_unsafe(
     except Exception as e:
         log.warning(f"[AB_COHORT_PNL] fills read failed: {e}")
 
-    # 5. Aggregate by cohort.
-    cohorts = {0, 1}
+    # 5. Aggregate by cohort. Include every possible cohort id so rows with
+    # zero activity are still emitted (makes the comparison table complete).
+    cohorts = set(range(cohort_count))
     agg: dict[int, dict] = {
         c: {
             "reward_earned": 0.0,
@@ -244,6 +254,7 @@ def _compute_unsafe(
             "window_start_ts": window_start,
             "window_end_ts": window_end,
             "cohort": cohort,
+            "cohort_count": cohort_count,
             "reward_earned": round(a["reward_earned"], 6),
             "unwind_pnl": round(a["unwind_pnl"], 6),
             "net_pnl": round(a["reward_earned"] + a["unwind_pnl"], 6),
@@ -264,12 +275,12 @@ def _compute_unsafe(
         conn = sqlite3.connect(db_path)
         conn.executemany(
             """INSERT INTO cohort_pnl (
-                ts, window_start_ts, window_end_ts, cohort, reward_earned,
+                ts, window_start_ts, window_end_ts, cohort, cohort_count, reward_earned,
                 unwind_pnl, net_pnl, fill_count, filled_markets, shares_filled,
                 gross_fill_cost, total_slippage, avg_fill_age_secs, avg_slippage,
                 deployed_markets, target_capital
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(window_end_ts, cohort) DO UPDATE SET
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(window_end_ts, cohort, cohort_count) DO UPDATE SET
                 ts=excluded.ts,
                 window_start_ts=excluded.window_start_ts,
                 reward_earned=excluded.reward_earned,
@@ -287,7 +298,7 @@ def _compute_unsafe(
             [
                 (
                     r["ts"], r["window_start_ts"], r["window_end_ts"], r["cohort"],
-                    r["reward_earned"], r["unwind_pnl"], r["net_pnl"],
+                    r["cohort_count"], r["reward_earned"], r["unwind_pnl"], r["net_pnl"],
                     r["fill_count"], r["filled_markets"], r["shares_filled"],
                     r["gross_fill_cost"], r["total_slippage"], r["avg_fill_age_secs"],
                     r["avg_slippage"], r["deployed_markets"], r["target_capital"],
@@ -297,9 +308,11 @@ def _compute_unsafe(
         )
         conn.commit()
         conn.close()
+        net_parts = " ".join(
+            f"C{r['cohort']}={r['net_pnl']:.4f}" for r in rows
+        )
         log.info(
-            f"[AB_COHORT_PNL] window={window_hours}h C0={rows[0]['net_pnl']:.4f} "
-            f"C1={rows[1]['net_pnl']:.4f}"
+            f"[AB_COHORT_PNL] window={window_hours}h count={cohort_count} {net_parts}"
         )
     except Exception as e:
         log.warning(f"[AB_COHORT_PNL] persist failed: {e}")
@@ -313,16 +326,18 @@ def report(
     reward_db_path: str | None = None,
     candidate_db_path: str | None = None,
     _now: Callable[[], float] = time.time,
+    _cohort_count: int | None = None,
 ) -> None:
     """Compute and print a human-readable cohort P&L report."""
-    rows = compute(window_hours, db_path, reward_db_path, candidate_db_path, _now)
+    rows = compute(window_hours, db_path, reward_db_path, candidate_db_path, _now, _cohort_count)
     if not rows:
         print("No cohort P&L data available for the requested window.")
         return
 
     start_dt = datetime.fromtimestamp(rows[0]["window_start_ts"], tz=timezone.utc)
     end_dt = datetime.fromtimestamp(rows[0]["window_end_ts"], tz=timezone.utc)
-    print(f"Cohort P&L — {window_hours}h window ending {end_dt.isoformat()} UTC")
+    cohort_count = rows[0]["cohort_count"]
+    print(f"Cohort P&L — {window_hours}h window ending {end_dt.isoformat()} UTC (cohort_count={cohort_count})")
     print(f"  window start: {start_dt.isoformat()} UTC")
     print()
     for r in rows:

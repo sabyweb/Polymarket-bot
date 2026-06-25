@@ -58,27 +58,22 @@ assignment. A separate `volume_24h_cache` table feeds the C1 volume cap with rea
 
 Each gets ~1/N of eligible markets via the hash. Each tests one of the surviving levers.
 
-**C0 — Baseline (control).** Current selection rules, unchanged. We already know it's ~net-negative;
-it is the **bar to beat** and the control that proves the other cohorts' differences are real. Its
-bleed is the cost of having a control, and it is bounded by §5.
+**C0 — Baseline (control).** Current selection rules, unchanged. It is the **bar to beat** and the
+control that proves the other cohorts' differences are real.
 
-**C1 — Calmer pond / trader rules** (tests Lesson 3: high-reward = high-activity = adverse). Within
+**C1 — Trader rules / deeper queue** (tests Lesson 3: high-reward = high-activity = adverse). Within
 its bucket, apply the trader-rule bundle: `RF_ALLOC_MAX_RECENT_VOLATILITY` 0.10 → **0.03** (only
 markets whose mid barely moved over the vol window), `RF_AB_C1_MIN_HOURS_TO_RESOLUTION` 4h (looser
-than the 48h baseline, so C1 can trade shorter-dated calm markets), `RF_AB_C1_MAX_VOLUME_24H`
-$250k (exclude the highest-volume / highest-competition markets),
-`RF_AB_C1_TARGET_QUEUE_AHEAD_USD` $400 (sit closer to mid than the baseline $1000 queue shield),
-and `RF_AB_C1_SECOND_BEST_COURT_ENABLED` (never post a strictly better quote than the current best;
-join behind or at the best level). This is the "quiet, selective, closer-to-mid, second-in-line"
-cohort — the closest automatable version of the manual edge. *Allocator + placement side; small branch
-on `cohort(cid)`, no new runtime behavior when the A/B experiment is off.* (If very few markets qualify,
-that itself is a finding: calm + $10-reward markets are now scarce.)
+than the 48h baseline), `RF_AB_C1_TARGET_QUEUE_AHEAD_USD` **$1,000** (same as baseline queue shield
+— tests whether the adverse-selection problem was sitting too close to mid), and
+`RF_AB_C1_SECOND_BEST_COURT_ENABLED` (never post a strictly better quote; join behind or at the best
+level). This cohort asks: *with the same queue depth as baseline but calmer selection and second-best
+placement, do we stop the bleed?*
 
-**C2 — Real-time reaction** (tests Lesson 1: react to the move, since the move is observable even if
-not predictable). Baseline selection, but the **farmer pulls all quotes on a market when its mid is
-actively moving** — `|Δmid|` over the last K ~30s cycles exceeds a threshold — and does not replace
-until it's been calm for M cycles. Sheds fills *during* moves (when adverse selection happens).
-*Farmer-side; new reflex, must be gated and behind a flag.*
+**C2 — Trader rules + volume filter** (tests Lesson 2: low-volume / low-competition markets may have
+less adverse selection). Same rules as C1, plus a strict 24h CLOB volume ceiling of **$250,000**.
+A market only qualifies if we have a known `volume_24h` and it is below the cap. This cohort asks:
+*does avoiding the busiest markets improve net P&L?*
 
 ---
 
@@ -86,7 +81,7 @@ until it's been calm for M cycles. Sheds fills *during* moves (when adverse sele
 
 | Bound | Value | Rationale |
 |---|---|---|
-| Experiment deployed-notional budget | **~$400** total | Caps data-rate exposure; rest of the ~$975 stays cash. |
+| Experiment deployed-notional budget | **~$600** total ($200 per cohort) | Equal target capital per cohort so rule differences, not capital differences, drive results. |
 | Cash reserve (untouched) | **~$575+** | Keeps the portfolio well above the floor regardless of cohort behavior. |
 | Per-market cap (`RF_MAX_CAPITAL_PER_MARKET_USD`) | **~$15–20** | Forces min-size, spreads thin (Ground Rule 1) → maximizes *fills/data per dollar of risk*. |
 | Overcommit ratio | **current, NOT pushed** | Prove-first; raise only after a cohort proves positive. |

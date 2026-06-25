@@ -41,6 +41,7 @@ from order_lifecycle import (
     _effective_target_queue_usd,
     _has_sufficient_dump_depth,
     _queue_aware_edge,
+    _second_best_court_enabled,
 )
 
 
@@ -899,6 +900,21 @@ class TestEffectiveTargetQueueUSD(unittest.TestCase):
                                                       "RF_TARGET_QUEUE_AHEAD_USD": 1000.0}.get(k, None)), \
              patch("order_lifecycle.ab_cohort", lambda cid, n: 1):
             self.assertEqual(_effective_target_queue_usd("0xC1"), 1000.0)
+
+    def test_c2_uses_trader_target_when_ab_enabled(self):
+        with patch("order_lifecycle.cfg", lambda k: {"RF_AB_EXPERIMENT_ENABLED": True,
+                                                      "RF_AB_COHORT_COUNT": 3,
+                                                      "RF_AB_C1_TARGET_QUEUE_AHEAD_USD": 1000.0,
+                                                      "RF_TARGET_QUEUE_AHEAD_USD": 4000.0}.get(k, None)), \
+             patch("order_lifecycle.ab_cohort", lambda cid, n: 2):
+            self.assertEqual(_effective_target_queue_usd("0xC2"), 1000.0)
+
+    def test_second_best_enabled_for_c2(self):
+        with patch("order_lifecycle.cfg", lambda k: {"RF_AB_EXPERIMENT_ENABLED": True,
+                                                      "RF_AB_COHORT_COUNT": 3,
+                                                      "RF_AB_C1_SECOND_BEST_COURT_ENABLED": True}.get(k, None)), \
+             patch("order_lifecycle.ab_cohort", lambda cid, n: 2):
+            self.assertTrue(_second_best_court_enabled("0xC2"))
 
 
 if __name__ == "__main__":

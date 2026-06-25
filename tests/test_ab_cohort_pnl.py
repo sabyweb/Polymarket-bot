@@ -32,6 +32,7 @@ def _make_dbs(tmp_path):
             window_start_ts REAL NOT NULL,
             window_end_ts REAL NOT NULL,
             cohort INTEGER NOT NULL,
+            cohort_count INTEGER NOT NULL DEFAULT 2,
             reward_earned REAL NOT NULL DEFAULT 0,
             unwind_pnl REAL NOT NULL DEFAULT 0,
             net_pnl REAL NOT NULL DEFAULT 0,
@@ -44,7 +45,7 @@ def _make_dbs(tmp_path):
             avg_slippage REAL NOT NULL DEFAULT 0,
             deployed_markets INTEGER NOT NULL DEFAULT 0,
             target_capital REAL NOT NULL DEFAULT 0,
-            PRIMARY KEY (window_end_ts, cohort)
+            PRIMARY KEY (window_end_ts, cohort, cohort_count)
         );
         """
     )
@@ -137,6 +138,7 @@ def test_cohort_pnl_combines_reward_and_unwind_pnl(tmp_path, capsys):
         reward_db_path=reward,
         candidate_db_path=candidate,
         _now=lambda: now,
+        _cohort_count=2,
     )
 
     assert len(rows) == 2
@@ -178,8 +180,8 @@ def test_cohort_pnl_idempotent(tmp_path):
     conn.commit()
     conn.close()
 
-    compute(window_hours=1, db_path=bot, reward_db_path=reward, candidate_db_path=candidate, _now=lambda: now)
-    compute(window_hours=1, db_path=bot, reward_db_path=reward, candidate_db_path=candidate, _now=lambda: now)
+    compute(window_hours=1, db_path=bot, reward_db_path=reward, candidate_db_path=candidate, _now=lambda: now, _cohort_count=2)
+    compute(window_hours=1, db_path=bot, reward_db_path=reward, candidate_db_path=candidate, _now=lambda: now, _cohort_count=2)
 
     conn = sqlite3.connect(bot)
     rows = conn.execute("SELECT COUNT(*), net_pnl FROM cohort_pnl WHERE cohort=1").fetchone()
@@ -205,7 +207,7 @@ def test_cohort_pnl_missing_reward_falls_back_to_zero(tmp_path):
     conn.commit()
     conn.close()
 
-    rows = compute(window_hours=1, db_path=bot, reward_db_path=reward, candidate_db_path=candidate, _now=lambda: now)
+    rows = compute(window_hours=1, db_path=bot, reward_db_path=reward, candidate_db_path=candidate, _now=lambda: now, _cohort_count=2)
     c1 = next(r for r in rows if r["cohort"] == 1)
     assert c1["reward_earned"] == 0.0
     assert c1["unwind_pnl"] == -7.0
@@ -232,7 +234,37 @@ def test_report_output(tmp_path, capsys):
     conn.commit()
     conn.close()
 
-    report(window_hours=1, db_path=bot, reward_db_path=reward, candidate_db_path=candidate, _now=lambda: now)
+    report(window_hours=1, db_path=bot, reward_db_path=reward, candidate_db_path=candidate, _now=lambda: now, _cohort_count=2)
     out = capsys.readouterr().out
     assert "Cohort 0" in out
     assert "net pnl" in out
+
+
+def test_three_cohort_pnl_and_cohort_count_tag(tmp_path):
+    """Cohort P&L supports 3 cohorts and tags rows with cohort_count."""
+    bot, reward, candidate = _make_dbs(tmp_path)
+    now = 1000000.0
+
+    conn = sqlite3.connect(candidate)
+    for cid, cohort in [("0xC0", 0), ("0xC1", 1), ("0xC2", 2)]:
+        conn.execute(
+            "INSERT INTO candidate_features (ts, cycle_ts, condition_id, cohort, action, target_capital) VALUES (?,?,?,?,?,?)",
+            (now - 100, now - 100, cid, cohort, "deploy", 100.0),
+        )
+    conn.commit()
+    conn.close()
+
+    rows = compute(
+        window_hours=1,
+        db_path=bot,
+        reward_db_path=reward,
+        candidate_db_path=candidate,
+        _now=lambda: now,
+        _cohort_count=3,
+    )
+
+    assert {r["cohort"] for r in rows} == {0, 1, 2}
+    assert all(r["cohort_count"] == 3 for r in rows)
+    c2 = next(r for r in rows if r["cohort"] == 2)
+    assert c2["deployed_markets"] == 1
+    assert c2["target_capital"] == 100.0

@@ -125,14 +125,16 @@ CREATE TABLE IF NOT EXISTS daily_pnl (
 );
 
 -- A/B cohort P&L snapshots. Produced by ab_cohort_pnl.py each oversight cycle.
--- One row per cohort per (window_end_ts). Cohorts are defined by the
--- candidate_features table: condition_ids that were deployed while the A/B
--- experiment was active.
+-- One row per cohort per (window_end_ts, cohort_count). Cohorts are defined by
+-- the candidate_features table. cohort_count records the experiment generation
+-- (e.g. 2 for the old 2-cohort run, 3 for the new 3-cohort run) so historical
+-- rows remain interpretable after cohort reassignment.
 CREATE TABLE IF NOT EXISTS cohort_pnl (
     ts                REAL NOT NULL,          -- when this row was computed
     window_start_ts   REAL NOT NULL,          -- start of the rolling window
     window_end_ts     REAL NOT NULL,          -- end of the rolling window
-    cohort            INTEGER NOT NULL,       -- 0 or 1
+    cohort            INTEGER NOT NULL,       -- cohort id under the experiment generation
+    cohort_count      INTEGER NOT NULL DEFAULT 2, -- RF_AB_COHORT_COUNT at compute time
     reward_earned     REAL NOT NULL DEFAULT 0,
     unwind_pnl        REAL NOT NULL DEFAULT 0,
     net_pnl           REAL NOT NULL DEFAULT 0,  -- reward_earned + unwind_pnl
@@ -145,7 +147,7 @@ CREATE TABLE IF NOT EXISTS cohort_pnl (
     avg_slippage      REAL NOT NULL DEFAULT 0,
     deployed_markets  INTEGER NOT NULL DEFAULT 0,
     target_capital    REAL NOT NULL DEFAULT 0,
-    PRIMARY KEY (window_end_ts, cohort)
+    PRIMARY KEY (window_end_ts, cohort, cohort_count)
 );
 
 -- Reward estimate vs. actual comparison (hourly snapshots)
@@ -1125,12 +1127,12 @@ class BotDatabase:
             conn = self._get_conn()
             conn.executemany(
                 """INSERT INTO cohort_pnl (
-                    ts, window_start_ts, window_end_ts, cohort, reward_earned,
+                    ts, window_start_ts, window_end_ts, cohort, cohort_count, reward_earned,
                     unwind_pnl, net_pnl, fill_count, filled_markets, shares_filled,
                     gross_fill_cost, total_slippage, avg_fill_age_secs, avg_slippage,
                     deployed_markets, target_capital
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(window_end_ts, cohort) DO UPDATE SET
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(window_end_ts, cohort, cohort_count) DO UPDATE SET
                     ts=excluded.ts,
                     window_start_ts=excluded.window_start_ts,
                     reward_earned=excluded.reward_earned,
@@ -1148,7 +1150,7 @@ class BotDatabase:
                 [
                     (
                         r["ts"], r["window_start_ts"], r["window_end_ts"], r["cohort"],
-                        r["reward_earned"], r["unwind_pnl"], r["net_pnl"],
+                        r["cohort_count"], r["reward_earned"], r["unwind_pnl"], r["net_pnl"],
                         r["fill_count"], r["filled_markets"], r["shares_filled"],
                         r["gross_fill_cost"], r["total_slippage"], r["avg_fill_age_secs"],
                         r["avg_slippage"], r["deployed_markets"], r["target_capital"],

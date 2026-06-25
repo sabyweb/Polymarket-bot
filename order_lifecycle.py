@@ -28,33 +28,31 @@ def DUMP_DEPTH_SAFETY_FACTOR(): return cfg("RF_DUMP_DEPTH_SAFETY_FACTOR")
 def _effective_target_queue_usd(cid: str) -> float:
     """Cohort-aware queue-ahead target for `place_orders_for_market`.
 
-    When the A/B experiment is enabled and `cid` is in cohort 1, use the C1
-    target (RF_AB_C1_TARGET_QUEUE_AHEAD_USD). Otherwise use the baseline
-    RF_TARGET_QUEUE_AHEAD_USD. A non-positive C1 config falls back to baseline
-    so a typo/disabled value never zeroes queue-aware placement globally.
+    Trader cohorts (C1/C2) use RF_AB_C1_TARGET_QUEUE_AHEAD_USD. C0 uses the
+    baseline RF_TARGET_QUEUE_AHEAD_USD. A non-positive trader config falls back
+    to baseline so a typo/disabled value never zeroes queue-aware placement.
     """
     if cfg("RF_AB_EXPERIMENT_ENABLED"):
         try:
-            if ab_cohort(cid, AB_COHORT_COUNT()) == 1:
-                c1_target = float(AB_C1_TARGET_QUEUE_AHEAD_USD() or 0.0)
-                if c1_target > 0:
-                    return c1_target
+            if ab_cohort(cid, AB_COHORT_COUNT()) != 0:
+                trader_target = float(AB_C1_TARGET_QUEUE_AHEAD_USD() or 0.0)
+                if trader_target > 0:
+                    return trader_target
         except Exception:
             pass
     return TARGET_QUEUE_AHEAD_USD()
 
 
 def _second_best_court_enabled(cid: str) -> bool:
-    """C1-specific rule: do not be the best quote; join behind the current best.
+    """Trader-cohort rule: do not be the best quote; join behind the current best.
 
-    Enabled only when the A/B experiment is on, the C1 second-best flag is on,
-    and `cid` hashes to cohort 1. Fail-open: any config/cohort lookup error
-    returns False so non-C1 placement is unaffected.
+    Enabled for any non-baseline cohort (C1/C2) when the A/B experiment is on
+    and the second-best flag is enabled. Fail-open: any error returns False.
     """
     if not cfg("RF_AB_EXPERIMENT_ENABLED"):
         return False
     try:
-        if AB_C1_SECOND_BEST_COURT_ENABLED() and ab_cohort(cid, AB_COHORT_COUNT()) == 1:
+        if AB_C1_SECOND_BEST_COURT_ENABLED() and ab_cohort(cid, AB_COHORT_COUNT()) != 0:
             return True
     except Exception:
         pass

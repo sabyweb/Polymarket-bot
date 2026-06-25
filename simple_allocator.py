@@ -536,16 +536,16 @@ class SimpleAllocator:
     def _effective_target_queue_usd(self, cid: str) -> float:
         """Decision-time queue-ahead target used by order_lifecycle for this cid.
 
-        Baseline uses RF_TARGET_QUEUE_AHEAD_USD. A/B C1 uses its cohort-specific
-        target when the experiment is enabled.
+        Baseline (C0) uses RF_TARGET_QUEUE_AHEAD_USD. Trader cohorts (C1/C2)
+        use RF_AB_C1_TARGET_QUEUE_AHEAD_USD when the experiment is enabled.
         """
-        if cfg("RF_AB_EXPERIMENT_ENABLED") and self._ab_cohort(cid) == 1:
+        if cfg("RF_AB_EXPERIMENT_ENABLED") and self._ab_cohort(cid) != 0:
             try:
-                c1_target = float(cfg("RF_AB_C1_TARGET_QUEUE_AHEAD_USD") or 0.0)
+                trader_target = float(cfg("RF_AB_C1_TARGET_QUEUE_AHEAD_USD") or 0.0)
             except (TypeError, ValueError):
-                c1_target = 0.0
-            if c1_target > 0:
-                return c1_target
+                trader_target = 0.0
+            if trader_target > 0:
+                return trader_target
         return cfg("RF_TARGET_QUEUE_AHEAD_USD")
 
     def _hours_to_resolution(self, end_date_iso: str) -> float | None:
@@ -583,14 +583,14 @@ class SimpleAllocator:
         now_dt = datetime.fromtimestamp(self._now(), tz=timezone.utc)
 
         res_floor = ALLOC_MIN_HOURS_TO_RESOLUTION()
-        # A/B C1 trader rule: looser resolution guard for C1 only.
-        if cfg("RF_AB_EXPERIMENT_ENABLED") and self._ab_cohort(m.condition_id) == 1:
+        # A/B trader cohorts (C1/C2): looser resolution guard.
+        if cfg("RF_AB_EXPERIMENT_ENABLED") and self._ab_cohort(m.condition_id) != 0:
             try:
-                c1_res_floor = float(cfg("RF_AB_C1_MIN_HOURS_TO_RESOLUTION") or 0.0)
+                trader_res_floor = float(cfg("RF_AB_C1_MIN_HOURS_TO_RESOLUTION") or 0.0)
             except (TypeError, ValueError):
-                c1_res_floor = 0.0
-            if c1_res_floor > 0:
-                res_floor = c1_res_floor
+                trader_res_floor = 0.0
+            if trader_res_floor > 0:
+                res_floor = trader_res_floor
         if m.end_date_iso and res_floor and res_floor > 0:
             try:
                 dt = datetime.fromisoformat(m.end_date_iso.replace("Z", "+00:00"))
@@ -973,15 +973,15 @@ class SimpleAllocator:
             # quotes. Triggered by book movement (no fill needed); fail-open
             # when there's insufficient history (FX-051 cooldown backstops).
             vol_cap = ALLOC_MAX_RECENT_VOLATILITY()
-            # A/B C1 (calmer-pond cohort): apply a TIGHTER volatility gate to its
-            # bucket only. Off (or other cohorts) => unchanged baseline gate.
-            if cfg("RF_AB_EXPERIMENT_ENABLED") and self._ab_cohort(m.condition_id) == 1:
+            # A/B trader cohorts (C1/C2): apply a TIGHTER volatility gate.
+            # Off (or C0) => unchanged baseline gate.
+            if cfg("RF_AB_EXPERIMENT_ENABLED") and self._ab_cohort(m.condition_id) != 0:
                 try:
-                    c1_cap = float(cfg("RF_AB_C1_MAX_RECENT_VOLATILITY") or 0.0)
+                    trader_cap = float(cfg("RF_AB_C1_MAX_RECENT_VOLATILITY") or 0.0)
                 except (TypeError, ValueError):
-                    c1_cap = 0.0
-                if c1_cap > 0:
-                    vol_cap = c1_cap
+                    trader_cap = 0.0
+                if trader_cap > 0:
+                    vol_cap = trader_cap
             if vol_cap and vol_cap > 0:
                 recent_vol = self._recent_volatility(m.condition_id)
                 if recent_vol is not None and recent_vol > vol_cap:
@@ -1005,19 +1005,25 @@ class SimpleAllocator:
                     avoids.append(m)
                     continue
 
-            # A/B C1: 24h volume cap. Exclude C1 markets whose CLOB volume is
-            # above the cap (high-volume / high-competition hypothesis). Fail-open:
-            # unknown/missing volume (0) is treated as "not above cap".
-            if cfg("RF_AB_EXPERIMENT_ENABLED") and self._ab_cohort(m.condition_id) == 1:
+            # A/B C2: strict 24h volume filter. C2 only trades markets where we
+            # have a known volume_24h and it is below the cap. Missing/unknown
+            # volume (<= 0) is excluded, matching the user's strict interpretation.
+            if cfg("RF_AB_EXPERIMENT_ENABLED") and self._ab_cohort(m.condition_id) == 2:
                 try:
-                    volume_cap = float(cfg("RF_AB_C1_MAX_VOLUME_24H") or 0.0)
+                    volume_cap = float(cfg("RF_AB_C2_MAX_VOLUME_24H") or 0.0)
                 except (TypeError, ValueError):
                     volume_cap = 0.0
-                if volume_cap > 0 and m.volume_24h > volume_cap:
-                    m.timing_excluded_reason = f"volume_24h_{m.volume_24h:.0f}>{volume_cap:.0f}"
-                    volume_excluded_count += 1
-                    avoids.append(m)
-                    continue
+                if volume_cap > 0:
+                    if m.volume_24h <= 0:
+                        m.timing_excluded_reason = "volume_24h_missing"
+                        volume_excluded_count += 1
+                        avoids.append(m)
+                        continue
+                    if m.volume_24h >= volume_cap:
+                        m.timing_excluded_reason = f"volume_24h_{m.volume_24h:.0f}>={volume_cap:.0f}"
+                        volume_excluded_count += 1
+                        avoids.append(m)
+                        continue
 
             cost_per_market = self._est_cost_per_market(m)
             expected_fill_cost = self._estimate_fill_cost(m, cost_per_market)

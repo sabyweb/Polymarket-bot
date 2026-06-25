@@ -14,6 +14,30 @@ For the **immutable contract**, see `ground_rules.md`.
 
 ---
 
+## Three-way A/B experiment — C1 queue $1,000 + C2 volume < $250k (2026-06-25)
+
+- Expanded A/B experiment from 2 cohorts to 3:
+  - **C0** baseline unchanged.
+  - **C1** trader rules with queue target raised from $400 → **$1,000**, 4h
+    resolution guard, tighter volatility gate, and second-best-court placement.
+    Volume cap removed from C1.
+  - **C2** all C1 rules plus a strict 24h volume filter: only markets with a
+    known `volume_24h < $250,000` qualify.
+- Allocator cohort-rule logic refactored: trader rules (queue, resolution,
+  volatility, second-best) now apply to all non-baseline cohorts; the volume
+  filter applies only to C2.
+- `RF_AB_C1_TARGET_QUEUE_AHEAD_USD` default raised to $1,000;
+  `RF_AB_C2_MAX_VOLUME_24H` added; `RF_AB_COHORT_COUNT` default is now 3;
+  `RF_AB_TOTAL_CAPITAL_USD` default is now $600 (=$200 per cohort).
+- `cohort_pnl` table gained `cohort_count` column to preserve old 2-cohort rows
+  while tagging new 3-cohort snapshots; `ab_cohort_pnl.py` derives cohorts
+  dynamically and stores the experiment generation.
+- New tests: C43 (trader queue target), C44/C41b (C2 volume filter), C46
+  (3-cohort equal budget), plus `test_c2_uses_trader_target`,
+  `test_second_best_enabled_for_c2`, and `test_three_cohort_pnl`.
+
+---
+
 ## A/B measurement foundation + reliable 24h volume (2026-06-25)
 
 - Fixed the two blockers that made the C1 A/B test unmeasurable:
