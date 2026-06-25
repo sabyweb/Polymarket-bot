@@ -912,6 +912,7 @@ class SimpleAllocator:
         deploys: list[CandidateMarket] = []
         avoids: list[CandidateMarket] = []
         used = 0.0
+        cohort_used: dict[int, float] = {}
         positive_ev_count = 0
         # FX-090: time-to-event enrichment budget + counter for this cycle.
         timing_budget = {"fetches": 0, "exhausted": False}
@@ -1061,23 +1062,29 @@ class SimpleAllocator:
                 target_shares = capped_shares
                 cost_per_market = target_shares * cost_per_share
 
-            # A/B experiment: enforce a total deployed-notional budget so the
-            # bounded learning run cannot exceed its capital allocation. Markets
-            # beyond the budget this cycle are deferred (treated as avoids).
+            # A/B experiment: enforce a per-cohort deployed-notional budget so
+            # each cohort deploys the same target capital. This isolates the rule
+            # effect from capital-allocation differences in the A/B analysis.
+            cohort = self._ab_cohort(m.condition_id) if cfg("RF_AB_EXPERIMENT_ENABLED") else 0
             if cfg("RF_AB_EXPERIMENT_ENABLED"):
                 try:
                     ab_budget = float(cfg("RF_AB_TOTAL_CAPITAL_USD") or 0.0)
+                    cohort_count = max(1, int(cfg("RF_AB_COHORT_COUNT") or 1))
                 except (TypeError, ValueError):
                     ab_budget = 0.0
-                if ab_budget > 0 and (used + cost_per_market) > ab_budget:
-                    avoids.append(m)
-                    continue
+                    cohort_count = 1
+                if ab_budget > 0:
+                    per_cohort_budget = ab_budget / cohort_count
+                    if cohort_used.get(cohort, 0.0) + cost_per_market > per_cohort_budget:
+                        avoids.append(m)
+                        continue
 
             m.target_shares = target_shares
             m.target_capital = round(cost_per_market, 2)
 
             deploys.append(m)
             used += cost_per_market
+            cohort_used[cohort] = cohort_used.get(cohort, 0.0) + cost_per_market
 
         # Include non-eligible candidates as avoids (for telemetry / farmer visibility)
         non_eligible = [m for m in candidates if m not in eligible]

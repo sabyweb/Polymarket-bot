@@ -1062,3 +1062,31 @@ def test_C41_c1_volume_cap_disabled_when_cap_zero(monkeypatch):
     cand.volume_24h = 9999999.0
     result = _compute_one(a, [cand])
     assert "0xBIG" in {m.condition_id for m in result.deploys}
+
+
+def test_C42_ab_equal_per_cohort_budget(monkeypatch):
+    """C42: RF_AB_TOTAL_CAPITAL_USD is split equally across cohorts so each
+    cohort deploys the same target capital."""
+    _c1_cfg(monkeypatch, RF_AB_TOTAL_CAPITAL_USD=60.0)
+    a = _alloc_with_q({
+        "0xC0A": 0.05, "0xC0B": 0.05,
+        "0xC1A": 0.05, "0xC1B": 0.05,
+    })
+
+    def cohort(cid):
+        return 1 if cid.startswith("0xC1") else 0
+
+    a._ab_cohort = cohort
+    cands = [
+        _make_candidate(cid, daily_rate=500)
+        for cid in ["0xC0A", "0xC0B", "0xC1A", "0xC1B"]
+    ]
+    result = _compute_one(a, cands)
+
+    c0_cap = sum(m.target_capital for m in result.deploys if cohort(m.condition_id) == 0)
+    c1_cap = sum(m.target_capital for m in result.deploys if cohort(m.condition_id) == 1)
+
+    assert len(result.deploys) == 2
+    assert c0_cap > 0
+    assert c1_cap > 0
+    assert abs(c0_cap - c1_cap) < 1.0
