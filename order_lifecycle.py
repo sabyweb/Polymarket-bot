@@ -1177,6 +1177,8 @@ class OrderLifecycle:
         # Place YES bid
         if can_exit_yes:
             can, reason = self.can_place(ms.cid, "yes", yes_shares * edge_bid)
+            if not can:
+                self.db.write_placement_feedback(ms.cid, "yes", "skipped", reason)
             if can:
                 if self.dry_run:
                     log.info(f"[DRY] BID YES @ {edge_bid:.3f} ({yes_shares:.0f}sh) | {ms.question[:30]}")
@@ -1242,6 +1244,8 @@ class OrderLifecycle:
         # Place NO ask
         if can_exit_no:
             can, reason = self.can_place(ms.cid, "no", no_shares * no_clob)
+            if not can:
+                self.db.write_placement_feedback(ms.cid, "no", "skipped", reason)
             if can:
                 if self.dry_run:
                     log.info(f"[DRY] ASK NO @ {edge_ask:.3f} (clob={no_clob:.3f}, {no_shares:.0f}sh) | {ms.question[:30]}")
