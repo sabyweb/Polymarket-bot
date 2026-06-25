@@ -68,7 +68,7 @@ def test_cache_miss_fetches_slug_and_volume(tmp_path):
     conn = sqlite3.connect(db)
     row = conn.execute("SELECT slug, volume_24h, source FROM volume_24h_cache WHERE condition_id=?", ("0xB",)).fetchone()
     conn.close()
-    assert row == ("market-b", 99999.0, "gamma")
+    assert row == ("market-b", 99999.0, "gamma-slug")
 
 
 def test_expired_cache_re_fetches(tmp_path):
