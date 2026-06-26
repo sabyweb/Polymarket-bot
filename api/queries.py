@@ -529,54 +529,104 @@ def get_config() -> list[dict]:
 # Rewards
 # ---------------------------------------------------------------------------
 def get_rewards_24h() -> dict:
+    """Return cumulative reward totals over the last 24 hours and the
+    reward *earned* in that window.
+
+    reward_snapshots stores cumulative earnings_usd per condition per snapshot,
+    so summing rows directly double-counts. We instead compute, for each hour,
+    the latest cumulative total per condition at or before that hour.
+    """
     try:
         conn = sqlite3.connect(f"file:{RS_PATH}?mode=ro", uri=True, timeout=5)
-        cutoff = time.time() - 86400
         rows = conn.execute(
-            """SELECT strftime('%Y-%m-%d %H:00', ts, 'unixepoch') as hour,
-                      SUM(earnings_usd) as earnings
-               FROM reward_snapshots
-               WHERE ts >= ?
-               GROUP BY hour
-               ORDER BY hour ASC""",
-            (cutoff,),
+            "SELECT ts, condition_id, earnings_usd FROM reward_snapshots ORDER BY ts ASC"
         ).fetchall()
-        latest_rows = conn.execute(
-            "SELECT SUM(earnings_usd) FROM reward_snapshots WHERE ts >= ?",
-            (cutoff,),
-        ).fetchone()
-        latest = float(latest_rows[0] or 0.0)
-        total_rows = conn.execute(
-            "SELECT SUM(earnings_usd) FROM reward_snapshots"
-        ).fetchone()
-        total = float(total_rows[0] or 0.0)
         conn.close()
+        if not rows:
+            return {"total": 0.0, "latest": 0.0, "hours": []}
+
+        by_cid: dict[str, list[tuple[float, float]]] = {}
+        for ts, cid, earnings in rows:
+            by_cid.setdefault(cid, []).append((float(ts), float(earnings or 0)))
+
+        total_now = sum(series[-1][1] for series in by_cid.values())
+
+        cutoff = time.time() - 86400
+        total_at_cutoff = 0.0
+        for series in by_cid.values():
+            # latest snapshot strictly before the 24h cutoff
+            before = [e for t, e in series if t < cutoff]
+            total_at_cutoff += before[-1] if before else 0.0
+        earned_24h = total_now - total_at_cutoff
+
+        # Build 24 hourly cumulative totals.
+        now = time.time()
+        start_hour = (int(now) // 3600 - 23) * 3600
+        hours = []
+        for i in range(24):
+            bucket_end = start_hour + (i + 1) * 3600
+            bucket_total = 0.0
+            for series in by_cid.values():
+                val = 0.0
+                for t, e in series:
+                    if t <= bucket_end:
+                        val = e
+                    else:
+                        break
+                bucket_total += val
+            label = datetime.fromtimestamp(bucket_end, tz=timezone.utc).strftime(
+                "%Y-%m-%d %H:00"
+            )
+            hours.append({"hour": label, "earnings_usd": round(bucket_total, 4)})
+
         return {
-            "total": round(total, 4),
-            "latest": round(latest, 4),
-            "hours": [{"hour": r[0], "earnings_usd": round(r[1] or 0, 4)} for r in rows],
+            "total": round(total_now, 4),
+            "latest": round(earned_24h, 4),
+            "hours": hours,
         }
     except Exception:
         return {"total": 0.0, "latest": 0.0, "hours": []}
 
 
 def get_rewards_daily(days: int = 7) -> list[dict]:
+    """Return reward *earned* per calendar day.
+
+    reward_snapshots.date is the reward day, and earnings_usd for that day is
+    cumulative *within that day*. We therefore take the latest snapshot per
+    condition per date and sum those — summing raw rows would double-count.
+    """
     try:
         conn = sqlite3.connect(f"file:{RS_PATH}?mode=ro", uri=True, timeout=5)
         rows = conn.execute(
             """SELECT date,
-                      SUM(earnings_usd) as earnings,
-                      COUNT(DISTINCT condition_id) as markets
+                      condition_id,
+                      MAX(ts),
+                      earnings_usd
                FROM reward_snapshots
-               GROUP BY date
-               ORDER BY date DESC
-               LIMIT ?""",
-            (days,),
+               GROUP BY date, condition_id
+               ORDER BY date ASC, condition_id ASC"""
+        ).fetchall()
+        markets_rows = conn.execute(
+            """SELECT date, COUNT(DISTINCT condition_id)
+               FROM reward_snapshots
+               GROUP BY date"""
         ).fetchall()
         conn.close()
+
+        date_totals: dict[str, float] = {}
+        for date, cid, ts, earnings in rows:
+            date_totals[date] = date_totals.get(date, 0.0) + float(earnings or 0)
+
+        markets_by_date = {r[0]: r[1] for r in markets_rows}
+
+        sorted_dates = sorted(date_totals.keys(), reverse=True)
         return [
-            {"date": r[0], "earnings_usd": round(r[1] or 0, 4), "markets": r[2]}
-            for r in rows
+            {
+                "date": date,
+                "earnings_usd": round(date_totals[date], 4),
+                "markets": markets_by_date.get(date, 0),
+            }
+            for date in sorted_dates[:days]
         ]
     except Exception:
         return []
