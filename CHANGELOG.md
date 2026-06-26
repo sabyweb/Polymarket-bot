@@ -13,6 +13,23 @@ For **open issues**, see `Polymarket bot fixit.md`.
 For the **immutable contract**, see `ground_rules.md`.
 
 ---
+## C1 cohort pause + configurable realized-loss kill (2026-06-26)
+
+- **C1 paused**: added `RF_AB_PAUSED_COHORTS` config list and set override to
+  `[1]`. Markets assigned to cohort 1 are now written as `avoid` with reason
+  `cohort_paused`; the farmer cancels their live orders and does not redeploy.
+- **Configurable realized-loss kill**: added
+  `RF_KILL_DAILY_REALIZED_LOSS_FRAC` (default 0.1, same as the previous
+  hardcoded 10%). Both `simple_allocator.py` (oversight-level kill written into
+  `market_allocations.json`) and `reward_farmer.py` (farmer-level guardrail)
+  now honor the override. Raised to **0.25** temporarily so the A/B experiment
+  can continue collecting data while realized losses are elevated.
+- Hardened dashboard health endpoint to read `kill_state` and surface an active
+  farmer kill switch in the Command Center banner.
+- New test: `test_C47_paused_cohort_skipped`.
+
+---
+
 
 ## Three-way A/B experiment — C1 queue $1,000 + C2 volume < $250k (2026-06-25)
 

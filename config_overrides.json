@@ -27,5 +27,6 @@
   "RF_BATCH_SIZE": 30,
   "RF_AB_PAUSED_COHORTS": [
     1
-  ]
+  ],
+  "RF_KILL_DAILY_REALIZED_LOSS_FRAC": 0.25
 }

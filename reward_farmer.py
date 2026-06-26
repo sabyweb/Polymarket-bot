@@ -1936,11 +1936,14 @@ class RewardFarmer:
         # ── Decisions ─────────────────────────────────────────────
         kill_reasons: list[str] = []
         if total_capital is not None and daily_loss is not None:
-            loss_limit = MAX_DAILY_LOSS_FRAC * total_capital
+            loss_frac = cfg("RF_KILL_DAILY_REALIZED_LOSS_FRAC")
+            if loss_frac is None or loss_frac <= 0.0:
+                loss_frac = MAX_DAILY_LOSS_FRAC
+            loss_limit = loss_frac * total_capital
             if daily_loss > loss_limit:
                 kill_reasons.append(
                     f"daily_realized_loss={daily_loss:.2f} > "
-                    f"{loss_limit:.2f} (= {MAX_DAILY_LOSS_FRAC:.0%}·T)"
+                    f"{loss_limit:.2f} (= {loss_frac:.0%}·T)"
                 )
         if cf is not None and cf < CRITICAL_CF_THRESHOLD:
             kill_reasons.append(

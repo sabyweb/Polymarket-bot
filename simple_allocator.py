@@ -1193,10 +1193,16 @@ class SimpleAllocator:
         if portfolio_value_usd <= 0:
             return True, f"portfolio collapsed to ${portfolio_value_usd:.2f}"
 
-        if realized_loss_24h > wallet_usd * KILL_LOSS_FRAC:
+        try:
+            loss_frac = float(cfg("RF_KILL_DAILY_REALIZED_LOSS_FRAC") or KILL_LOSS_FRAC)
+        except (TypeError, ValueError):
+            loss_frac = KILL_LOSS_FRAC
+        if loss_frac <= 0.0:
+            loss_frac = KILL_LOSS_FRAC
+        if realized_loss_24h > wallet_usd * loss_frac:
             return True, (
                 f"24h realized loss ${realized_loss_24h:.2f} > "
-                f"{KILL_LOSS_FRAC * 100:.0f}% of wallet ${wallet_usd:.2f}"
+                f"{loss_frac * 100:.0f}% of wallet ${wallet_usd:.2f}"
             )
 
         if portfolio_peak_usd > 0:
