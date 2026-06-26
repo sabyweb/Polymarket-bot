@@ -46,11 +46,13 @@ export default function CommandCenter() {
         </div>
       )}
 
-      {/* Safety banner */}
+      {/* Safety / kill banner */}
       {health && (
         <div
           className={`flex items-center justify-between rounded-xl border px-4 py-3 ${
-            ["OK", "HEALTHY", "NORMAL", "RUNNING"].includes((health.safety_state || "").toUpperCase())
+            health.kill_active
+              ? "border-down/30 bg-down/10"
+              : ["OK", "HEALTHY", "NORMAL", "RUNNING"].includes((health.safety_state || "").toUpperCase())
               ? "border-up/30 bg-up/10"
               : ["DEGRADED", "WARN", "WARNING", "PAUSED"].includes(
                   (health.safety_state || "").toUpperCase()
@@ -60,10 +62,15 @@ export default function CommandCenter() {
           }`}
         >
           <div className="flex items-center gap-3">
-            <StatusBadge state={health.safety_state} />
+            {health.kill_active ? (
+              <StatusBadge state="KILLED" />
+            ) : (
+              <StatusBadge state={health.safety_state} />
+            )}
             <span className="text-sm text-slate-200">
-              {health.safety_reason || "No active alerts"}
-              {health.safety_since && ` · ${health.safety_since}`}
+              {health.kill_active
+                ? `${health.kill_reason}${health.kill_triggered_at ? ` · ${health.kill_triggered_at}` : ""}`
+                : `${health.safety_reason || "No active alerts"}${health.safety_since ? ` · ${health.safety_since}` : ""}`}
             </span>
           </div>
           <span className="text-xs text-slate-400">DB {health.db_size_mb} MB · {health.db_updated}</span>

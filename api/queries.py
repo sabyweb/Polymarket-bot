@@ -123,6 +123,18 @@ def get_health() -> dict:
     except Exception:
         pass
 
+    kill = {}
+    try:
+        conn = _conn(DB_PATH)
+        row = conn.execute(
+            "SELECT active, reason, triggered_at FROM kill_state ORDER BY updated_at DESC LIMIT 1"
+        ).fetchone()
+        conn.close()
+        if row:
+            kill = {"active": bool(row[0]), "reason": row[1], "triggered_at": row[2]}
+    except Exception:
+        pass
+
     db_size = DB_PATH.stat().st_size / (1024 * 1024) if DB_PATH.exists() else 0.0
     db_mtime = DB_PATH.stat().st_mtime if DB_PATH.exists() else None
 
@@ -141,6 +153,9 @@ def get_health() -> dict:
         "heartbeats": {k: _ts_ago(v) for k, v in heartbeats.items()},
         "db_size_mb": round(db_size, 2),
         "db_updated": _ts_ago(db_mtime),
+        "kill_active": kill.get("active", False),
+        "kill_reason": kill.get("reason"),
+        "kill_triggered_at": _ts_str(kill.get("triggered_at")),
     }
 
 

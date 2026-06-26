@@ -11,6 +11,9 @@ export interface Health {
   active_dumps: number
   db_size_mb: number
   db_updated: string | null
+  kill_active: boolean
+  kill_reason: string | null
+  kill_triggered_at: string | null
   heartbeats: Record<string, string | null>
 }
 

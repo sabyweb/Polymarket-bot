@@ -21,6 +21,9 @@ class Health(BaseModel):
     active_dumps: int = 0
     db_size_mb: float = 0.0
     db_updated: str | None = None
+    kill_active: bool = False
+    kill_reason: str | None = None
+    kill_triggered_at: str | None = None
     heartbeats: dict[str, str | None] = Field(default_factory=dict)
 
 
