@@ -64,3 +64,39 @@ def test_cohort_latest_endpoint():
 def test_logs_rejects_unknown_service():
     resp = client.get("/api/logs?service=unknown")
     assert resp.status_code == 400
+
+
+def test_rewards_24h_endpoint():
+    with patch(
+        "api.queries.get_rewards_24h",
+        return_value={
+            "total": 1234.56,
+            "latest": 78.9,
+            "hours": [
+                {"hour": "2026-06-26 10:00", "earnings_usd": 12.34},
+                {"hour": "2026-06-26 11:00", "earnings_usd": 56.78},
+            ],
+        },
+    ):
+        resp = client.get("/api/rewards/24h")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["total"] == 1234.56
+    assert data["latest"] == 78.9
+    assert len(data["hours"]) == 2
+    assert data["hours"][0]["hour"]
+
+
+def test_rewards_daily_endpoint():
+    with patch(
+        "api.queries.get_rewards_daily",
+        return_value=[
+            {"date": "2026-06-26", "earnings_usd": 78.9, "markets": 5},
+            {"date": "2026-06-25", "earnings_usd": 123.4, "markets": 6},
+        ],
+    ):
+        resp = client.get("/api/rewards/daily?days=7")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data) == 2
+    assert data[0]["date"] == "2026-06-26"

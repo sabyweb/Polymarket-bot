@@ -24,6 +24,7 @@ ALLOC_PATH = _DIR / "market_allocations.json"
 ENV_PATH = _DIR / ".env"
 CONFIG_PATH = _DIR / "config.py"
 OVERRIDES_PATH = _DIR / "config_overrides.json"
+RS_PATH = _DIR / "reward_snapshots.db"
 
 FUNDER = ""
 if ENV_PATH.exists():
@@ -519,6 +520,64 @@ def get_config() -> list[dict]:
                 }
             )
         return sorted(rows, key=lambda x: x["key"])
+    except Exception:
+        return []
+
+
+
+# ---------------------------------------------------------------------------
+# Rewards
+# ---------------------------------------------------------------------------
+def get_rewards_24h() -> dict:
+    try:
+        conn = sqlite3.connect(f"file:{RS_PATH}?mode=ro", uri=True, timeout=5)
+        cutoff = time.time() - 86400
+        rows = conn.execute(
+            """SELECT strftime('%Y-%m-%d %H:00', ts, 'unixepoch') as hour,
+                      SUM(earnings_usd) as earnings
+               FROM reward_snapshots
+               WHERE ts >= ?
+               GROUP BY hour
+               ORDER BY hour ASC""",
+            (cutoff,),
+        ).fetchall()
+        latest_rows = conn.execute(
+            "SELECT SUM(earnings_usd) FROM reward_snapshots WHERE ts >= ?",
+            (cutoff,),
+        ).fetchone()
+        latest = float(latest_rows[0] or 0.0)
+        total_rows = conn.execute(
+            "SELECT SUM(earnings_usd) FROM reward_snapshots"
+        ).fetchone()
+        total = float(total_rows[0] or 0.0)
+        conn.close()
+        return {
+            "total": round(total, 4),
+            "latest": round(latest, 4),
+            "hours": [{"hour": r[0], "earnings_usd": round(r[1] or 0, 4)} for r in rows],
+        }
+    except Exception:
+        return {"total": 0.0, "latest": 0.0, "hours": []}
+
+
+def get_rewards_daily(days: int = 7) -> list[dict]:
+    try:
+        conn = sqlite3.connect(f"file:{RS_PATH}?mode=ro", uri=True, timeout=5)
+        rows = conn.execute(
+            """SELECT date,
+                      SUM(earnings_usd) as earnings,
+                      COUNT(DISTINCT condition_id) as markets
+               FROM reward_snapshots
+               GROUP BY date
+               ORDER BY date DESC
+               LIMIT ?""",
+            (days,),
+        ).fetchall()
+        conn.close()
+        return [
+            {"date": r[0], "earnings_usd": round(r[1] or 0, 4), "markets": r[2]}
+            for r in rows
+        ]
     except Exception:
         return []
 

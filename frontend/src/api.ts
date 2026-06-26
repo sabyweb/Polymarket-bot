@@ -12,6 +12,8 @@ import type {
   Allocation,
   ConfigEntry,
   LogLine,
+  RewardSummary,
+  RewardDaily,
 } from "./types"
 
 const API = ""
@@ -37,4 +39,6 @@ export const api = {
   allocation: () => get<Allocation>("/api/allocations"),
   config: () => get<ConfigEntry[]>("/api/config"),
   logs: (service: string, lines = 100) => get<LogLine[]>(`/api/logs?service=${service}&lines=${lines}`),
+  rewards24h: () => get<RewardSummary>("/api/rewards/24h"),
+  rewardsDaily: (days = 7) => get<RewardDaily[]>(`/api/rewards/daily?days=${days}`),
 }

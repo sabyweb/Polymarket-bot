@@ -7,6 +7,7 @@ import {
   Settings,
   BarChart3,
   FileText,
+  Gift,
 } from "lucide-react"
 
 const nav = [
@@ -15,6 +16,7 @@ const nav = [
   { path: "/pnl", label: "P&L", icon: TrendingUp },
   { path: "/positions", label: "Positions", icon: Wallet },
   { path: "/markets", label: "Markets", icon: BarChart3 },
+  { path: "/rewards", label: "Rewards", icon: Gift },
   { path: "/health", label: "Health", icon: FileText },
   { path: "/config", label: "Config", icon: Settings },
 ]

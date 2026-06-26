@@ -131,3 +131,20 @@ export interface LogLine {
   level: string
   message: string
 }
+
+export interface RewardHour {
+  hour: string
+  earnings_usd: number
+}
+
+export interface RewardSummary {
+  total: number
+  latest: number
+  hours: RewardHour[]
+}
+
+export interface RewardDaily {
+  date: string
+  earnings_usd: number
+  markets: number
+}

@@ -99,6 +99,16 @@ def config():
     return [models.ConfigEntry(**r) for r in queries.get_config()]
 
 
+@app.get("/api/rewards/24h", response_model=models.RewardSummary)
+def rewards_24h():
+    return models.RewardSummary(**queries.get_rewards_24h())
+
+
+@app.get("/api/rewards/daily")
+def rewards_daily(days: int = Query(7, ge=1, le=90)):
+    return [models.RewardDaily(**r) for r in queries.get_rewards_daily(days)]
+
+
 @app.get("/api/logs")
 def logs(service: str = Query("polymarket-farmer"), lines: int = Query(100, ge=1, le=500)):
     if service not in {"polymarket-farmer", "polymarket-oversight"}:

@@ -147,3 +147,20 @@ class LogLine(BaseModel):
     ts: str
     level: str
     message: str
+
+
+class RewardHour(BaseModel):
+    hour: str
+    earnings_usd: float
+
+
+class RewardSummary(BaseModel):
+    total: float
+    latest: float
+    hours: list[RewardHour]
+
+
+class RewardDaily(BaseModel):
+    date: str
+    earnings_usd: float
+    markets: int
