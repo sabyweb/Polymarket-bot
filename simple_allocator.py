@@ -1073,6 +1073,18 @@ class SimpleAllocator:
             # effect from capital-allocation differences in the A/B analysis.
             cohort = self._ab_cohort(m.condition_id) if cfg("RF_AB_EXPERIMENT_ENABLED") else 0
             if cfg("RF_AB_EXPERIMENT_ENABLED"):
+                # Pause individual cohorts without restarting the experiment. Paused
+                # markets are written as "avoid" so the farmer cancels their active
+                # orders and stops placing new ones.
+                try:
+                    paused = list(cfg("RF_AB_PAUSED_COHORTS") or [])
+                except Exception:
+                    paused = []
+                if cohort in paused:
+                    m.event_guard_reason = "cohort_paused"
+                    avoids.append(m)
+                    continue
+
                 try:
                     ab_budget = float(cfg("RF_AB_TOTAL_CAPITAL_USD") or 0.0)
                     cohort_count = max(1, int(cfg("RF_AB_COHORT_COUNT") or 1))

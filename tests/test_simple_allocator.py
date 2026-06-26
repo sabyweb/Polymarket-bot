@@ -1157,3 +1157,46 @@ def test_C46_three_cohort_equal_budget(monkeypatch):
     for c in [0, 1, 2]:
         assert caps[c] > 0
         assert abs(caps[c] - caps[(c + 1) % 3]) < 1.0
+
+
+def test_C47_paused_cohort_skipped(monkeypatch):
+    """C47: RF_AB_PAUSED_COHORTS prevents paused cohorts from deploying and marks them avoid."""
+    _c1_cfg(monkeypatch, RF_AB_COHORT_COUNT=3, RF_AB_TOTAL_CAPITAL_USD=90.0,
+             RF_AB_PAUSED_COHORTS=[1])
+    a = _alloc_with_q({
+        "0xC0A": 0.05, "0xC0B": 0.05,
+        "0xC1A": 0.05, "0xC1B": 0.05,
+        "0xC2A": 0.05, "0xC2B": 0.05,
+    })
+
+    def cohort(cid):
+        if cid.startswith("0xC1"):
+            return 1
+        if cid.startswith("0xC2"):
+            return 2
+        return 0
+
+    a._ab_cohort = cohort
+    cands = []
+    for cid in ["0xC0A", "0xC0B", "0xC1A", "0xC1B", "0xC2A", "0xC2B"]:
+        cand = _make_candidate(cid, daily_rate=500)
+        if cohort(cid) == 2:
+            cand.volume_24h = 100000.0
+        cands.append(cand)
+
+    result = _compute_one(a, cands)
+
+    # No C1 deploys; all C1 markets are in avoids
+    c1_deploys = [m for m in result.deploys if cohort(m.condition_id) == 1]
+    c1_avoids = [m for m in result.avoids if cohort(m.condition_id) == 1]
+    assert len(c1_deploys) == 0
+    assert len(c1_avoids) == 2
+    assert all(m.event_guard_reason == "cohort_paused" for m in c1_avoids)
+
+    # C0 and C2 still deploy with equal per-cohort budget
+    caps = {c: 0.0 for c in [0, 2]}
+    for m in result.deploys:
+        caps[cohort(m.condition_id)] += m.target_capital
+    assert caps[0] > 0
+    assert caps[2] > 0
+    assert abs(caps[0] - caps[2]) < 1.0

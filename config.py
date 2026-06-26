@@ -475,6 +475,7 @@ RF_AB_EXPERIMENT_ENABLED: bool = False        # master switch; off = no behaviou
 RF_AB_COHORT_COUNT: int = 3                   # Phase 2: C0 baseline + C1 trader + C2 trader+volume
 RF_AB_C1_MAX_RECENT_VOLATILITY: float = 0.03  # Trader cohorts (C1/C2): tighter vol gate vs RF_ALLOC_MAX_RECENT_VOLATILITY
 RF_AB_TOTAL_CAPITAL_USD: float = 600.0        # Total target capital split equally across cohorts ($200 each with count=3)
+RF_AB_PAUSED_COHORTS: list[int] = []            # Cohort ids to pause (no new deployments; active orders cancelled by farmer)
 # C1/C2 trader-specific treatments (measured against C0 baseline in the A/B experiment).
 RF_AB_C1_TARGET_QUEUE_AHEAD_USD: float = 1000.0  # Trader cohorts queue-depth target (was 400 in Phase 1)
 RF_AB_C1_MIN_HOURS_TO_RESOLUTION: float = 4.0    # Trader cohorts resolution guard: exclude markets resolving within <4h
